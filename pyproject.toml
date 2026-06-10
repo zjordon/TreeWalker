@@ -1,0 +1,29 @@
+[project]
+name = "treewalker"
+version = "0.1.0"
+description = "A simplified browser automation agent based on browser-use architecture"
+requires-python = ">=3.12"
+dependencies = [
+    "cdp-use>=1.4.5",
+    "anthropic>=0.104.0",
+    "pydantic>=2.13.0",
+    "python-dotenv>=1.0.0",
+    "textual>=3.0.0",
+    "click>=8.0.0",
+]
+
+[project.scripts]
+tw-tui = "tree_walker.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tree_walker"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.0",
+    "pytest-asyncio>=0.24.0",
+]

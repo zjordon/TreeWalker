@@ -1,0 +1,664 @@
+﻿"""Browser session management via cdp-use CDP WebSocket client."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import logging
+from typing import Any
+
+from cdp_use import CDPClient
+
+from tree_walker.browser.circuit_breaker import CircuitBreaker
+from tree_walker.browser.dom import build_dom_state
+from tree_walker.browser.highlight import HighlightManager
+from tree_walker.config import BrowserSettings
+from tree_walker.browser.views import (
+    BrowserStateSummary,
+    DOMCollectionConfig,
+    DOMDegradationLevel,
+    DOMRect,
+    DOMSelectorMap,
+    TabInfo,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────
+
+
+def _walk_for_file_inputs(node: dict) -> list[int]:
+    """Recursively walk a CDP DOM Node tree to find file input backendNodeIds."""
+    results: list[int] = []
+
+    node_name = node.get("nodeName", "").upper()
+    if node_name == "INPUT":
+        attrs_list = node.get("attributes", [])
+        attrs = {}
+        for i in range(0, len(attrs_list) - 1, 2):
+            attrs[attrs_list[i]] = attrs_list[i + 1]
+        if attrs.get("type", "").lower() == "file":
+            bid = node.get("backendNodeId")
+            if bid is not None:
+                results.append(bid)
+
+    for child in node.get("children", []):
+        results.extend(_walk_for_file_inputs(child))
+
+    for shadow_root in node.get("shadowRoots", []):
+        results.extend(_walk_for_file_inputs(shadow_root))
+
+    content_doc = node.get("contentDocument")
+    if content_doc:
+        results.extend(_walk_for_file_inputs(content_doc))
+
+    return results
+
+
+class BrowserSession:
+    """Manages browser connection and provides high-level page operations."""
+
+    def __init__(self, settings: BrowserSettings | None = None, *, ws_url: str | None = None) -> None:
+        _settings = settings or BrowserSettings()
+        self.ws_url = ws_url or _settings.ws_url or ""
+        if not self.ws_url:
+            raise ValueError("BrowserSession requires a ws_url via settings or keyword argument")
+        self._settings = _settings
+        self.client: CDPClient | None = None
+        self.current_target_id: str | None = None
+        self.current_session_id: str | None = None
+        self._completed_downloads: list[dict] = []
+        self._pending_downloads: dict[str, str] = {}
+        # 三层 DOM 缓存
+        self._cached_selector_map: DOMSelectorMap | None = None
+        self._previous_cached_selector_map: DOMSelectorMap | None = None
+        # DOM 管线健壮性
+        self._dom_circuit_breaker = CircuitBreaker(
+            failure_threshold=_settings.circuit_breaker_threshold,
+            recovery_timeout=_settings.circuit_breaker_recovery_s,
+        )
+        self._dom_collection_config = DOMCollectionConfig(
+            cdp_first_timeout=_settings.cdp_first_timeout,
+            cdp_retry_timeout=_settings.cdp_retry_timeout,
+            max_iframes=_settings.max_iframes,
+            heavy_page_element_threshold=_settings.heavy_page_element_threshold,
+        )
+        self._highlight = HighlightManager(
+            settings=_settings.highlight,
+            execute_js=self.execute_js,
+            client=None,
+            session_id=None,
+        )
+        self._highlight_settings = _settings.highlight
+
+    async def start(self, *, track_downloads: bool = False) -> None:
+        """Connect to the browser via CDP WebSocket."""
+        self.client = CDPClient(self.ws_url)
+        await self._connect()
+        if track_downloads:
+            await self._setup_download_tracking()
+
+    async def _connect(self) -> None:
+        """Perform CDP connection, target discovery, and session setup."""
+        await self.client.start()
+
+        targets = await self.client.send.Target.getTargets({})
+        for t in targets.get("targetInfos", []):
+            if t.get("type") == "page":
+                self.current_target_id = t["targetId"]
+                result = await self.client.send.Target.attachToTarget(
+                    {"targetId": self.current_target_id, "flatten": True},
+                )
+                self.current_session_id = result["sessionId"]
+                break
+
+        if not self.current_session_id:
+            raise RuntimeError("No page target found. Is Chrome running with --remote-debugging-port?")
+
+        await self.client.send.Page.enable({}, session_id=self.current_session_id)
+        await self.client.send.DOM.enable({}, session_id=self.current_session_id)
+
+        # 自动发现 iframe target，确保跨源 iframe 可被 Target.getTargets 发现
+        try:
+            await self.client.send.Target.setAutoAttach(
+                {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True},
+                session_id=self.current_session_id,
+            )
+        except Exception:
+            pass
+
+        logger.info("Browser connected: target=%s", self.current_target_id)
+
+        # Wire up highlight manager with live CDP client
+        self._highlight._client = self.client
+        self._highlight._session_id = self.current_session_id
+
+    @property
+    def is_connected(self) -> bool:
+        """Whether the browser session has an active CDP client."""
+        return self.client is not None
+
+    async def reconnect(self) -> bool:
+        """Attempt to reconnect to the browser. Returns True on success."""
+        try:
+            if self.client:
+                await self.client.stop()
+            self.client = CDPClient(self.ws_url)
+            self.current_target_id = None
+            self.current_session_id = None
+            self._cached_selector_map = None
+            self._previous_cached_selector_map = None
+            self._dom_circuit_breaker.reset()
+            await self._connect()
+            self._highlight._client = self.client
+            self._highlight._session_id = self.current_session_id
+            return True
+        except Exception as e:
+            logger.warning("Reconnect failed: %s", e)
+            self.client = None
+            return False
+
+    async def _setup_download_tracking(self) -> None:
+        """Enable CDP download events and register callbacks."""
+        await self.client.send.Browser.setDownloadBehavior(
+            {"behavior": "allow", "eventsEnabled": True},
+            session_id=self.current_session_id,
+        )
+
+        def _on_download_begin(event: dict, session_id: str | None = None) -> None:
+            guid = event.get("guid", "")
+            filename = event.get("suggestedFilename", "unknown")
+            self._pending_downloads[guid] = filename
+            logger.info("Download started: %s", filename)
+
+        async def _on_download_progress(event: dict, session_id: str | None = None) -> None:
+            if event.get("state") == "completed":
+                guid = event.get("guid", "")
+                filename = self._pending_downloads.pop(guid, "unknown")
+                self._completed_downloads.append({
+                    "filename": filename,
+                    "url": event.get("url", ""),
+                    "path": event.get("filePath"),
+                })
+                logger.info("Download completed: %s", filename)
+
+        self.client.register.Browser.downloadWillBegin(_on_download_begin)
+        self.client.register.Browser.downloadProgress(_on_download_progress)
+
+    def consume_completed_downloads(self) -> list[dict]:
+        """Return and clear completed downloads buffer."""
+        downloads = list(self._completed_downloads)
+        self._completed_downloads.clear()
+        return downloads
+
+    async def stop(self) -> None:
+        """Disconnect from the browser."""
+        self._cached_selector_map = None
+        self._previous_cached_selector_map = None
+        if self.client:
+            await self.client.stop()
+            self.client = None
+            logger.info("Browser disconnected")
+
+    # ── State ──────────────────────────────────────────────────────────
+
+    async def get_current_url(self) -> str:
+        """Lightweight URL fetch — avoids full state rebuild."""
+        try:
+            result = await self.client.send.Runtime.evaluate(
+                {"expression": "location.href", "returnByValue": True},
+                session_id=self.current_session_id,
+            )
+            return result.get("result", {}).get("value", "")
+        except Exception:
+            return ""
+
+    async def get_state(self, include_screenshot: bool = True) -> BrowserStateSummary:
+        """Get full browser state: URL, title, tabs, DOM, optional screenshot."""
+        sid = self.current_session_id
+
+        # 轮转缓存：当前 → 前一步（用于新元素检测）
+        self._previous_cached_selector_map = self._cached_selector_map
+
+        url = ""
+        title = ""
+        try:
+            result = await self.client.send.Runtime.evaluate(
+                {
+                    "expression": "JSON.stringify({url: location.href, title: document.title})",
+                    "returnByValue": True,
+                },
+                session_id=sid,
+            )
+            import json
+            info = json.loads(result["result"]["value"])
+            url = info.get("url", "")
+            title = info.get("title", "")
+        except Exception:
+            pass
+
+        tabs: list[TabInfo] = []
+        try:
+            targets = await self.client.send.Target.getTargets({})
+            for t in targets.get("targetInfos", []):
+                if t.get("type") == "page":
+                    tabs.append(TabInfo(
+                        target_id=t["targetId"],
+                        url=t.get("url", ""),
+                        title=t.get("title", ""),
+                    ))
+        except Exception:
+            pass
+
+        dom_state = None
+        if self._dom_circuit_breaker.is_open:
+            logger.warning("DOM circuit breaker is open; returning empty DOM state")
+            from tree_walker.browser.dom import EMPTY_DOM_STATE
+            dom_state = EMPTY_DOM_STATE
+        else:
+            try:
+                dom_state, dom_metrics = await build_dom_state(
+                    self.client, session_id=sid,
+                    previous_selector_map=self._previous_cached_selector_map,
+                    config=self._dom_collection_config,
+                )
+                if dom_metrics.degradation_level == DOMDegradationLevel.FAILED:
+                    self._dom_circuit_breaker.record_failure()
+                else:
+                    self._dom_circuit_breaker.record_success()
+            except Exception as e:
+                logger.error("build_dom_state raised: %s", e)
+                self._dom_circuit_breaker.record_failure()
+                from tree_walker.browser.dom import EMPTY_DOM_STATE
+                dom_state = EMPTY_DOM_STATE
+        self._cached_selector_map = dom_state.selector_map if dom_state else None
+
+        # Remove JS-injected highlights before screenshot
+        if self._highlight_settings.enabled and self._highlight_settings.debug_mode:
+            try:
+                await self._highlight.remove_highlights()
+            except Exception:
+                pass
+
+        screenshot: bytes | None = None
+        if include_screenshot:
+            try:
+                screenshot = await self.take_screenshot()
+            except Exception:
+                pass
+
+        # Re-inject debug highlights after screenshot (visible in browser, not in screenshot)
+        if self._highlight_settings.enabled and self._highlight_settings.debug_mode and self._cached_selector_map:
+            try:
+                await self._highlight.add_debug_highlights(self._cached_selector_map)
+            except Exception:
+                pass
+
+        return BrowserStateSummary(
+            url=url,
+            title=title,
+            tabs=tabs,
+            dom_state=dom_state,
+            screenshot=screenshot,
+        )
+
+    async def take_screenshot(self) -> bytes:
+        """Capture a PNG screenshot of the current viewport."""
+        result = await self.client.send.Page.captureScreenshot(
+            {"format": "png"},
+            session_id=self.current_session_id,
+        )
+        return base64.b64decode(result["data"])
+
+    # ── Navigation ─────────────────────────────────────────────────────
+
+    async def navigate(self, url: str) -> None:
+        """Navigate current page to URL."""
+        self._previous_cached_selector_map = None
+        await self.client.send.Page.navigate(
+            {"url": url},
+            session_id=self.current_session_id,
+        )
+        await asyncio.sleep(0.5)
+
+    async def go_back(self) -> None:
+        """Navigate to the previous page in history."""
+        history = await self.client.send.Page.getNavigationHistory(
+            {}, session_id=self.current_session_id,
+        )
+        idx = history.get("currentIndex", 0)
+        entries = history.get("entries", [])
+        if idx > 0 and entries:
+            await self.client.send.Page.navigateToHistoryEntry(
+                {"entryId": entries[idx - 1]["id"]},
+                session_id=self.current_session_id,
+            )
+            await asyncio.sleep(0.3)
+
+    # ── Element interaction ────────────────────────────────────────────
+
+    async def highlight_element(self, backend_node_id: int) -> None:
+        """Highlight an element for visual feedback (non-blocking, non-critical)."""
+        await self._highlight.highlight_element(backend_node_id)
+
+    async def click_at(self, x: float, y: float) -> None:
+        """Click at viewport coordinates."""
+        sid = self.current_session_id
+        for evt_type in ("mousePressed", "mouseReleased"):
+            await self.client.send.Input.dispatchMouseEvent(
+                {
+                    "type": evt_type,
+                    "x": x,
+                    "y": y,
+                    "button": "left",
+                    "clickCount": 1,
+                },
+                session_id=sid,
+            )
+        await asyncio.sleep(0.3)
+        if self._highlight_settings.enabled and self._highlight_settings.click_feedback_enabled:
+            await self._highlight.highlight_click_point(x, y)
+
+    async def get_element_coordinates(self, backend_node_id: int) -> DOMRect | None:
+        """Get real-time viewport coordinates for an element via CDP.
+
+        Three-tier fallback chain (same as browser-use):
+        1. DOM.getContentQuads — best for inline/complex layouts
+        2. DOM.getBoxModel — fallback using box model content
+        3. JS getBoundingClientRect() via DOM.resolveNode + Runtime.callFunctionOn
+        """
+        sid = self.current_session_id
+
+        # Method 1: DOM.getContentQuads
+        try:
+            result = await self.client.send.DOM.getContentQuads(
+                {"backendNodeId": backend_node_id},
+                session_id=sid,
+            )
+            quads = result.get("quads", [])
+            if quads:
+                quad = quads[0]
+                if len(quad) >= 8:
+                    xs = [quad[i] for i in range(0, 8, 2)]
+                    ys = [quad[i] for i in range(1, 8, 2)]
+                    return DOMRect(
+                        x=min(xs), y=min(ys),
+                        width=max(xs) - min(xs),
+                        height=max(ys) - min(ys),
+                    )
+        except Exception:
+            pass
+
+        # Method 2: DOM.getBoxModel
+        try:
+            result = await self.client.send.DOM.getBoxModel(
+                {"backendNodeId": backend_node_id},
+                session_id=sid,
+            )
+            model = result.get("model", {})
+            content = model.get("content", [])
+            if len(content) >= 8:
+                xs = [content[i] for i in range(0, 8, 2)]
+                ys = [content[i] for i in range(1, 8, 2)]
+                return DOMRect(
+                    x=min(xs), y=min(ys),
+                    width=max(xs) - min(xs),
+                    height=max(ys) - min(ys),
+                )
+        except Exception:
+            pass
+
+        # Method 3: JS getBoundingClientRect()
+        try:
+            resolve = await self.client.send.DOM.resolveNode(
+                {"backendNodeId": backend_node_id},
+                session_id=sid,
+            )
+            object_id = resolve["object"]["objectId"]
+            js_result = await self.client.send.Runtime.callFunctionOn(
+                {
+                    "objectId": object_id,
+                    "functionDeclaration": """
+                    function() {
+                        const rect = this.getBoundingClientRect();
+                        return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+                    }
+                    """,
+                    "returnByValue": True,
+                },
+                session_id=sid,
+            )
+            rect = js_result.get("result", {}).get("value")
+            if rect and rect.get("width", 0) > 0 and rect.get("height", 0) > 0:
+                return DOMRect(
+                    x=rect["x"], y=rect["y"],
+                    width=rect["width"], height=rect["height"],
+                )
+        except Exception:
+            pass
+
+        return None
+
+    async def click_element(self, backend_node_id: int) -> None:
+        """Click an element using real-time CDP coordinates."""
+        # Scroll into view first
+        try:
+            await self.client.send.DOM.scrollIntoViewIfNeeded(
+                {"backendNodeId": backend_node_id},
+                session_id=self.current_session_id,
+            )
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+
+        rect = await self.get_element_coordinates(backend_node_id)
+        if rect:
+            x = int(rect.x + rect.width / 2)
+            y = int(rect.y + rect.height / 2)
+            await self.click_at(x, y)
+        else:
+            logger.warning(
+                "Could not get coordinates for backendNodeId=%d, skipping click",
+                backend_node_id,
+            )
+
+    async def type_text(self, text: str, clear: bool = False) -> None:
+        """Type text into the currently focused element."""
+        sid = self.current_session_id
+        if clear:
+            await self.client.send.Input.dispatchKeyEvent(
+                {"type": "keyDown", "key": "a", "code": "KeyA", "modifiers": 2},
+                session_id=sid,
+            )
+            await self.client.send.Input.dispatchKeyEvent(
+                {"type": "keyUp", "key": "a", "code": "KeyA", "modifiers": 2},
+                session_id=sid,
+            )
+            await self.client.send.Input.dispatchKeyEvent(
+                {"type": "keyDown", "key": "Backspace", "code": "Backspace"},
+                session_id=sid,
+            )
+            await self.client.send.Input.dispatchKeyEvent(
+                {"type": "keyUp", "key": "Backspace", "code": "Backspace"},
+                session_id=sid,
+            )
+        await self.client.send.Input.insertText(
+            {"text": text},
+            session_id=sid,
+        )
+        await asyncio.sleep(0.1)
+
+    async def send_keys(self, keys: str) -> None:
+        """Send key combinations like 'Enter', 'Control+a', etc."""
+        sid = self.current_session_id
+        key_map = {
+            "enter": ("Enter", "Enter"),
+            "tab": ("Tab", "Tab"),
+            "escape": ("Escape", "Escape"),
+            "backspace": ("Backspace", "Backspace"),
+        }
+        modifier_map = {"control": 2, "alt": 1, "shift": 8, "meta": 4}
+
+        parts = keys.replace("+", "+").split("+")
+        modifiers = 0
+        main_key = parts[-1].strip()
+
+        for part in parts[:-1]:
+            mod = modifier_map.get(part.strip().lower(), 0)
+            modifiers |= mod
+
+        mapped = key_map.get(main_key.lower(), (main_key, f"Key{main_key.upper()}" if len(main_key) == 1 else main_key))
+
+        await self.client.send.Input.dispatchKeyEvent(
+            {"type": "keyDown", "key": mapped[0], "code": mapped[1], "modifiers": modifiers},
+            session_id=sid,
+        )
+        await self.client.send.Input.dispatchKeyEvent(
+            {"type": "keyUp", "key": mapped[0], "code": mapped[1], "modifiers": modifiers},
+            session_id=sid,
+        )
+        await asyncio.sleep(0.1)
+
+    # ── Scrolling ──────────────────────────────────────────────────────
+
+    async def scroll(self, direction: str = "down", amount: int = 3) -> None:
+        """Scroll the page by a number of viewport heights."""
+        sid = self.current_session_id
+        metrics = await self.client.send.Page.getLayoutMetrics(
+            {}, session_id=sid,
+        )
+        viewport = metrics.get("cssVisualViewport", {})
+        viewport_height = viewport.get("clientHeight", 800)
+        delta = amount * viewport_height
+        if direction == "up":
+            delta = -delta
+
+        await self.client.send.Input.dispatchMouseEvent(
+            {
+                "type": "mouseWheel",
+                "x": viewport.get("clientWidth", 1280) / 2,
+                "y": viewport.get("clientHeight", 800) / 2,
+                "deltaX": 0,
+                "deltaY": delta,
+            },
+            session_id=sid,
+        )
+        await asyncio.sleep(0.3)
+
+    # ── Tabs ───────────────────────────────────────────────────────────
+
+    async def switch_tab(self, target_id: str) -> None:
+        """Switch to a different tab by target ID."""
+        self._cached_selector_map = None
+        self._previous_cached_selector_map = None
+        await self.client.send.Target.activateTarget({"targetId": target_id})
+        result = await self.client.send.Target.attachToTarget(
+            {"targetId": target_id, "flatten": True},
+        )
+        self.current_target_id = target_id
+        self.current_session_id = result["sessionId"]
+        logger.info("Switched to tab: %s", target_id)
+
+    async def close_tab(self, target_id: str) -> None:
+        """Close a tab. If it's the current tab, switch to another."""
+        was_current = target_id == self.current_target_id
+        await self.client.send.Target.closeTarget({"targetId": target_id})
+        if was_current:
+            targets = await self.client.send.Target.getTargets({})
+            for t in targets.get("targetInfos", []):
+                if t.get("type") == "page" and t["targetId"] != target_id:
+                    await self.switch_tab(t["targetId"])
+                    return
+
+    async def create_tab(self, url: str = "about:blank") -> str:
+        """Create a new tab and return its target ID."""
+        result = await self.client.send.Target.createTarget({"url": url})
+        target_id = result["targetId"]
+        await self.switch_tab(target_id)
+        return target_id
+
+    # ── JavaScript execution ───────────────────────────────────────────
+
+    async def execute_js(self, code: str) -> Any:
+        """Execute JavaScript and return the result value."""
+        result = await self.client.send.Runtime.evaluate(
+            {
+                "expression": code,
+                "returnByValue": True,
+                "awaitPromise": True,
+                "timeout": 30000,
+            },
+            session_id=self.current_session_id,
+        )
+        if "exceptionDetails" in result:
+            err = result["exceptionDetails"]
+            raise RuntimeError(f"JS error: {err.get('text', err)}")
+        return result.get("result", {}).get("value")
+
+    # ── File operations (via CDP) ──────────────────────────────────────
+
+    async def find_file_inputs_in_shadow_dom(self) -> list[int]:
+        """Find all file input backendNodeIds including those inside shadow DOM.
+
+        Uses DOM.getDocument with pierce=True to traverse into shadow roots.
+        """
+        try:
+            result = await self.client.send.DOM.getDocument(
+                {"depth": -1, "pierce": True},
+                session_id=self.current_session_id,
+            )
+            return _walk_for_file_inputs(result.get("root", {}))
+        except Exception as e:
+            logger.warning("DOM.getDocument(pierce) failed: %s", e)
+            return []
+
+    async def _log_shadow_dom_file_inputs(self) -> list[int]:
+        """Debug: find and log all shadow DOM file inputs."""
+        ids = await self.find_file_inputs_in_shadow_dom()
+        logger.info("Shadow DOM file inputs: count=%d, ids=%s", len(ids), ids)
+        return ids
+
+    async def set_file_input(
+        self,
+        backend_node_id: int | None,
+        file_path: str,
+        file_input_backend_ids: list[int] | None = None,
+    ) -> None:
+        """Set files on a file input element via CDP DOM.setFileInputFiles.
+
+        Uses backendNodeId to directly set files without opening the OS file chooser.
+        Falls back to file_input_backend_ids, then shadow DOM search.
+        """
+        target_id = backend_node_id
+
+        logger.info(
+            "set_file_input: backend_node_id=%s, file_input_backend_ids=%s, file=%s",
+            backend_node_id, file_input_backend_ids, file_path,
+        )
+
+        # If the provided backendNodeId might not be a file input,
+        # use the first available file input backend ID from the DOM state
+        if target_id is None and file_input_backend_ids:
+            target_id = file_input_backend_ids[0]
+
+        # Last resort: search shadow DOM for file inputs
+        if target_id is None:
+            shadow_ids = await self.find_file_inputs_in_shadow_dom()
+            if shadow_ids:
+                target_id = shadow_ids[0]
+                logger.info(
+                    "Found file input in shadow DOM: backendNodeId=%d", target_id,
+                )
+
+        if target_id is None:
+            raise RuntimeError(
+                "No file input element found. "
+                "Ensure the page has an <input type='file'> element."
+            )
+
+        logger.info("DOM.setFileInputFiles: backendNodeId=%d, file=%s", target_id, file_path)
+        await self.client.send.DOM.setFileInputFiles(
+            {"backendNodeId": target_id, "files": [file_path]},
+            session_id=self.current_session_id,
+        )
