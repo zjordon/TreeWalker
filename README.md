@@ -176,6 +176,10 @@ FALLBACK_LLM_API_KEY=sk-xxx
 
 所有配置通过环境变量或 `.env` 文件设置，参见 [.env.example](.env.example) 获取完整配置项。
 
+## 致谢
+
+本项目的设计思路参考了 [browser-use](https://github.com/browser-use/browser-use)，感谢其开创性的工作。
+
 ## License
 
 本项目采用 [CC BY-NC 4.0](LICENSE) 协议开源，仅供非商业用途。
