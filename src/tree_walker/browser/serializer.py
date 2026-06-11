@@ -204,6 +204,7 @@ class DOMTreeSerializer:
         has_shadow_content = bool(node.children_and_shadow_roots)
         is_shadow_host = any(
             child.node_type == NodeType.DOCUMENT_FRAGMENT_NODE
+            and child.shadow_root_type != 'user-agent'
             for child in node.children_and_shadow_roots
         )
 
@@ -229,8 +230,11 @@ class DOMTreeSerializer:
                 is_shadow_host=is_shadow_host,
             )
 
-            # 递归处理所有子节点（包括 shadow roots）
+            # 递归处理所有子节点（包括 shadow roots，跳过 UA 内部 shadow）
             for child in node.children_and_shadow_roots:
+                if (child.node_type == NodeType.DOCUMENT_FRAGMENT_NODE
+                        and child.shadow_root_type == 'user-agent'):
+                    continue
                 simplified_child = self._create_simplified_tree(child, depth + 1)
                 if simplified_child:
                     simplified.children.append(simplified_child)
