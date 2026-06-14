@@ -56,6 +56,70 @@ def _walk_for_file_inputs(node: dict) -> list[int]:
     return results
 
 
+# Virtual key codes for send_keys
+_KEY_VK_MAP: dict[str, int] = {
+    "enter": 13, "tab": 9, "escape": 27, "backspace": 8,
+    "arrowup": 38, "arrowdown": 40, "arrowleft": 37, "arrowright": 39,
+}
+
+# Char text for keys that need it
+_KEY_CHAR_TEXT: dict[str, str] = {
+    "enter": "\r",
+    "tab": "\t",
+}
+
+
+def _get_char_modifiers_and_vk(char: str) -> tuple[int, int, str]:
+    """Return (modifiers, windowsVirtualKeyCode, base_key) for a character."""
+    shift_chars: dict[str, tuple[str, int]] = {
+        "!": ("1", 49), "@": ("2", 50), "#": ("3", 51), "$": ("4", 52),
+        "%": ("5", 53), "^": ("6", 54), "&": ("7", 55), "*": ("8", 56),
+        "(": ("9", 57), ")": ("0", 48), "_": ("-", 189), "+": ("=", 187),
+        "{": ("[", 219), "}": ("]", 221), "|": ("\\", 220),
+        ":": (";", 186), '"': ("'", 222), "<": (",", 188),
+        ">": (".", 190), "?": ("/", 191), "~": ("`", 192),
+    }
+    if char in shift_chars:
+        base_key, vk = shift_chars[char]
+        return (8, vk, base_key)
+    if char.isupper():
+        return (8, ord(char), char.lower())
+    if char.islower():
+        return (0, ord(char.upper()), char)
+    if char.isdigit():
+        return (0, ord(char), char)
+    no_shift: dict[str, int] = {
+        " ": 32, "-": 189, "=": 187, "[": 219, "]": 221,
+        "\\": 220, ";": 186, "'": 222, ",": 188, ".": 190,
+        "/": 191, "`": 192,
+    }
+    if char in no_shift:
+        return (0, no_shift[char], char)
+    return (0, ord(char.upper()) if char.isalpha() else ord(char), char)
+
+
+def _get_key_code_for_char(char: str) -> str:
+    """Return the DOM key code string for a character."""
+    key_codes: dict[str, str] = {
+        " ": "Space", ".": "Period", ",": "Comma", "-": "Minus",
+        "@": "Digit2", "!": "Digit1", "?": "Slash", ":": "Semicolon",
+        ";": "Semicolon", "(": "Digit9", ")": "Digit0",
+        "[": "BracketLeft", "]": "BracketRight",
+        "/": "Slash", "\\": "Backslash", "=": "Equal",
+        "+": "Equal", "*": "Digit8", "&": "Digit7",
+        "%": "Digit5", "$": "Digit4", "#": "Digit3",
+        "^": "Digit6", "~": "Backquote", "`": "Backquote",
+        "'": "Quote", '"': "Quote", "_": "Minus",
+        "{": "BracketLeft", "}": "BracketRight", "|": "Backslash",
+        "<": "Comma", ">": "Period",
+    }
+    if char.isdigit():
+        return f"Digit{char}"
+    if char.isalpha():
+        return f"Key{char.upper()}"
+    return key_codes.get(char, f"Key{char.upper()}")
+
+
 class BrowserSession:
     """Manages browser connection and provides high-level page operations."""
 
@@ -464,7 +528,12 @@ class BrowserSession:
             )
 
     async def type_text(self, text: str, clear: bool = False) -> None:
-        """Type text into the currently focused element."""
+        """Type text into the currently focused element character by character.
+
+        Uses CDP keyDown → char → keyUp for each character to ensure
+        framework event listeners (Vue v-model, React onChange) are triggered.
+        After typing, dispatches framework-compatible events via JS.
+        """
         sid = self.current_session_id
         if clear:
             await self.client.send.Input.dispatchKeyEvent(
@@ -483,11 +552,115 @@ class BrowserSession:
                 {"type": "keyUp", "key": "Backspace", "code": "Backspace"},
                 session_id=sid,
             )
-        await self.client.send.Input.insertText(
-            {"text": text},
+
+        for char in text:
+            await self._type_char(char, sid)
+            await asyncio.sleep(0.001)
+
+        await asyncio.sleep(0.05)
+        await self._trigger_framework_events()
+
+    async def _type_char(self, char: str, sid: str | None = None) -> None:
+        """Send a single character as keyDown → char → keyUp."""
+        if sid is None:
+            sid = self.current_session_id
+        modifiers, vk_code, base_key = _get_char_modifiers_and_vk(char)
+        key_code = _get_key_code_for_char(base_key)
+
+        # For non-ASCII characters (CJK, etc.), skip keyDown/keyUp and
+        # use insertText for the char event only
+        is_ascii = ord(char) < 128
+
+        if is_ascii:
+            await self.client.send.Input.dispatchKeyEvent(
+                {
+                    "type": "keyDown",
+                    "key": base_key,
+                    "code": key_code,
+                    "modifiers": modifiers,
+                    "windowsVirtualKeyCode": vk_code,
+                },
+                session_id=sid,
+            )
+            await asyncio.sleep(0.005)
+
+        await self.client.send.Input.dispatchKeyEvent(
+            {"type": "char", "text": char, "key": char},
             session_id=sid,
         )
-        await asyncio.sleep(0.1)
+
+        if is_ascii:
+            await self.client.send.Input.dispatchKeyEvent(
+                {
+                    "type": "keyUp",
+                    "key": base_key,
+                    "code": key_code,
+                    "modifiers": modifiers,
+                    "windowsVirtualKeyCode": vk_code,
+                },
+                session_id=sid,
+            )
+
+    async def _trigger_framework_events(self) -> None:
+        """Dispatch framework-compatible DOM events on the focused element.
+
+        Triggers InputEvent('input') (primary for React/Vue v-model) and a
+        deferred Event('input') for Vue reactivity. We intentionally do NOT
+        dispatch 'change' or 'blur' — those can trigger framework side
+        effects (e.g. a tag-input clearing its value on blur) that wipe
+        the value we just typed.
+
+        Best-effort — failures are logged but do not raise.
+        """
+        try:
+            await self.client.send.Runtime.evaluate(
+                {
+                    "expression": """
+                    (function() {
+                        var el = document.activeElement;
+                        if (!el || el === document.body) return false;
+
+                        el.focus();
+
+                        // InputEvent — primary for React/Vue v-model
+                        try {
+                            el.dispatchEvent(new InputEvent('input', {
+                                bubbles: true,
+                                cancelable: true,
+                                data: el.value,
+                                inputType: 'insertText'
+                            }));
+                        } catch(e) {}
+
+                        // Vue reactivity trigger — check element AND ancestors
+                        var hasVue = el.__vue__ || el._vnode || el.__vueParentComponent__;
+                        if (!hasVue) {
+                            var p = el.parentElement;
+                            while (p && p !== document.body) {
+                                if (p.__vue__ || p._vnode || p.__vueParentComponent__) {
+                                    hasVue = true;
+                                    break;
+                                }
+                                p = p.parentElement;
+                            }
+                        }
+                        if (hasVue) {
+                            try {
+                                setTimeout(function() {
+                                    el.dispatchEvent(new Event('input', {bubbles: true}));
+                                }, 0);
+                            } catch(e) {}
+                        }
+
+                        return true;
+                    })()
+                    """,
+                    "returnByValue": True,
+                },
+                session_id=self.current_session_id,
+            )
+        except Exception as e:
+            logger.debug("Framework event trigger failed (non-critical): %s", e)
 
     async def send_keys(self, keys: str) -> None:
         """Send key combinations like 'Enter', 'Control+a', etc."""
@@ -511,11 +684,32 @@ class BrowserSession:
         mapped = key_map.get(main_key.lower(), (main_key, f"Key{main_key.upper()}" if len(main_key) == 1 else main_key))
 
         await self.client.send.Input.dispatchKeyEvent(
-            {"type": "keyDown", "key": mapped[0], "code": mapped[1], "modifiers": modifiers},
+            {
+                "type": "keyDown",
+                "key": mapped[0],
+                "code": mapped[1],
+                "modifiers": modifiers,
+                "windowsVirtualKeyCode": _KEY_VK_MAP.get(mapped[0].lower(), 0),
+            },
             session_id=sid,
         )
+
+        # Enter and Tab need a char event for proper event handling
+        char_text = _KEY_CHAR_TEXT.get(mapped[0].lower())
+        if char_text:
+            await self.client.send.Input.dispatchKeyEvent(
+                {"type": "char", "text": char_text, "key": mapped[0]},
+                session_id=sid,
+            )
+
         await self.client.send.Input.dispatchKeyEvent(
-            {"type": "keyUp", "key": mapped[0], "code": mapped[1], "modifiers": modifiers},
+            {
+                "type": "keyUp",
+                "key": mapped[0],
+                "code": mapped[1],
+                "modifiers": modifiers,
+                "windowsVirtualKeyCode": _KEY_VK_MAP.get(mapped[0].lower(), 0),
+            },
             session_id=sid,
         )
         await asyncio.sleep(0.1)
