@@ -604,9 +604,13 @@ class BrowserSession:
     async def _trigger_framework_events(self) -> None:
         """Dispatch framework-compatible DOM events on the focused element.
 
-        Triggers InputEvent('input'), Event('change'), Event('blur') and
-        special Vue reactivity triggers. Best-effort — failures are logged
-        but do not raise.
+        Triggers InputEvent('input') (primary for React/Vue v-model) and a
+        deferred Event('input') for Vue reactivity. We intentionally do NOT
+        dispatch 'change' or 'blur' — those can trigger framework side
+        effects (e.g. a tag-input clearing its value on blur) that wipe
+        the value we just typed.
+
+        Best-effort — failures are logged but do not raise.
         """
         try:
             await self.client.send.Runtime.evaluate(
@@ -626,16 +630,6 @@ class BrowserSession:
                                 data: el.value,
                                 inputType: 'insertText'
                             }));
-                        } catch(e) {}
-
-                        // Change event
-                        try {
-                            el.dispatchEvent(new Event('change', {bubbles: true}));
-                        } catch(e) {}
-
-                        // Blur event
-                        try {
-                            el.dispatchEvent(new Event('blur', {bubbles: true}));
                         } catch(e) {}
 
                         // Vue reactivity trigger — check element AND ancestors

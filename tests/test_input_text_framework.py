@@ -184,9 +184,11 @@ class TestTypeTextCharByChar:
 		call_args = browser.client.send.Runtime.evaluate.call_args
 		expr = call_args[0][0]["expression"]
 		assert "InputEvent" in expr
-		assert "change" in expr
-		assert "blur" in expr
 		assert "__vue__" in expr
+		# 'change'/'blur' must NOT be dispatched — they can trigger framework
+		# side effects (e.g. tag-input clearing value on blur).
+		assert "Event('change'" not in expr
+		assert "Event('blur'" not in expr
 
 	@pytest.mark.asyncio
 	async def test_type_text_framework_events_non_critical(self, browser):

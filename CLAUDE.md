@@ -13,6 +13,7 @@
 ## 包管理
 
 - **使用 uv 管理 Python 包**，不要使用 pip。安装/更新依赖用 `uv pip install`，同步依赖用 `uv sync`。
+- **运行 Python 脚本必须用 `uv run`**，例如 `uv run python examples/xxx.py`、`uv run python -m pytest ...`。直接调用系统 `python` 会因为找不到虚拟环境中的依赖（如 `tree_walker`）而失败。
 
 ## 单元测试要求
 
