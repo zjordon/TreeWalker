@@ -12,14 +12,14 @@ import sys
 
 sys.path.insert(0, f"{__file__}/../src")
 
-from browser_agent.browser.dom import (
+from tree_walker.browser.dom import (
 	ClickableElementDetector,
 	build_dom_state,
 	_detect_js_click_listeners,
 )
-from browser_agent.browser.session import BrowserSession
-from browser_agent.browser.views import NodeType
-from browser_agent.config import BrowserSettings, load_settings
+from tree_walker.browser.session import BrowserSession
+from tree_walker.browser.views import NodeType
+from tree_walker.config import BrowserSettings, load_settings
 
 logging.basicConfig(
 	level=logging.INFO,
@@ -163,7 +163,7 @@ async def main():
 
 def _serial_find_cover(node):
 	"""在 SimplifiedNode 树中搜索封面相关元素。"""
-	from browser_agent.browser.views import SimplifiedNode
+	from tree_walker.browser.views import SimplifiedNode
 
 	def _walk(n, depth=0):
 		orig = n.original_node

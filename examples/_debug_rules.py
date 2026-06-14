@@ -4,10 +4,10 @@ import sys
 
 sys.path.insert(0, f"{__file__}/../src")
 
-from browser_agent.browser.dom import build_dom_state, _detect_js_click_listeners
-from browser_agent.browser.session import BrowserSession
-from browser_agent.browser.views import NodeType
-from browser_agent.config import load_settings
+from tree_walker.browser.dom import build_dom_state, _detect_js_click_listeners
+from tree_walker.browser.session import BrowserSession
+from tree_walker.browser.views import NodeType
+from tree_walker.config import load_settings
 
 # 目标元素 class 列表
 TARGET_CLASSES = [

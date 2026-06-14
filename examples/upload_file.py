@@ -17,8 +17,8 @@ import sys
 
 sys.path.insert(0, f"{__file__}/../src")
 
-from browser_agent import Agent, BrowserSession, LLMClient
-from browser_agent.config import AgentSettings, load_settings
+from tree_walker import Agent, BrowserSession, LLMClient
+from tree_walker.config import AgentSettings, load_settings
 
 
 async def main():

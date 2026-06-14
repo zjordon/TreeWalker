@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 import uuid
@@ -364,6 +365,16 @@ class StepPipeline:
         messages: list[dict[str, Any]],
     ) -> dict[str, Any]:
         """Call LLM; retry once on empty action; fallback to done."""
+        # Log available actions and tool schema for debugging
+        action_enum = (
+            self._tool_schema.get("input_schema", {})
+            .get("properties", {}).get("action", {})
+            .get("properties", {}).get("name", {})
+            .get("enum", [])
+        )
+        logger.debug("Available actions for this step: %s", action_enum)
+        logger.debug("Tool schema: %s", json.dumps(self._tool_schema, ensure_ascii=False, indent=2))
+
         response = await self.llm.get_action(
             system_prompt=self._system_prompt,
             messages=messages,

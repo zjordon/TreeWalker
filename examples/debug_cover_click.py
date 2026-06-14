@@ -11,9 +11,9 @@ import sys
 
 sys.path.insert(0, f"{__file__}/../src")
 
-from browser_agent.browser.dom import build_dom_state
-from browser_agent.browser.session import BrowserSession
-from browser_agent.config import load_settings
+from tree_walker.browser.dom import build_dom_state
+from tree_walker.browser.session import BrowserSession
+from tree_walker.config import load_settings
 
 # 封面相关 class 关键词
 COVER_KEYWORDS = ['cover-jg3t4p', 'title-wa45xd', 'covercontrol-cjlzqc', 'filter-k_cjvj', 'cover-tip']

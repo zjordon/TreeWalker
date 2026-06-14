@@ -11,9 +11,9 @@ import sys
 
 sys.path.insert(0, f"{__file__}/../src")
 
-from browser_agent.browser.dom import build_dom_state
-from browser_agent.browser.session import BrowserSession
-from browser_agent.config import load_settings
+from tree_walker.browser.dom import build_dom_state
+from tree_walker.browser.session import BrowserSession
+from tree_walker.config import load_settings
 
 # 自主声明相关 class 关键词（从实际 HTML 中提取的哈希化 class 名）
 DECLARATION_CLASS_KEYWORDS = [
