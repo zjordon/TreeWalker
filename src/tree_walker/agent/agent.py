@@ -63,6 +63,7 @@ class Agent(StepPipeline):
         self.llm_timeout = _settings.llm_timeout
         self.action_timeout = _settings.action_timeout
         self.reconnect_timeout = _settings.reconnect_timeout
+        self.max_actions_per_step = _settings.max_actions_per_step
 
         self.state = AgentState()
         self.history = AgentHistoryList()
@@ -146,10 +147,12 @@ class Agent(StepPipeline):
             action_descriptions=self.tools.registry.get_action_descriptions_text(),
             task=self._safe_task,
             enable_decision_attribution=self._enable_decision_attribution,
+            max_actions=self.max_actions_per_step,
         )
         self._tool_schema = self.tools.registry.get_tool_schema(
             enable_planning=self._enable_planning,
             output_mode=self._output_mode,
+            max_actions=self.max_actions_per_step,
         )
 
     # ── Public API ─────────────────────────────────────────────────────
