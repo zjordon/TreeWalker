@@ -96,6 +96,7 @@ def _make_agent(results: list[ActionResult] | None = None) -> Any:
 	agent = MagicMock()
 	agent.state = AgentState()
 	agent.action_timeout = 30
+	agent.wait_between_actions = 0.0
 	agent.tools = _FakeTools(results)
 	agent.browser = _FakeBrowser()
 	agent._obs_bus = None
@@ -935,3 +936,378 @@ class TestWaitForPageSettle:
 
 		# 不应该抛异常
 		await session._wait_for_page_settle()
+
+
+# ── 9. Phase 4 exception triage ─────────────────────────────────────────
+
+
+class TestPhase4ExceptionTriage:
+	"""Phase 4 异常三分流：InterruptedError 重抛 / 连接错误重抛 / 其他吞掉。"""
+
+	@pytest.mark.asyncio
+	async def test_interrupted_error_propagates(self):
+		"""InterruptedError 向上抛，不被转化为 ActionResult。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = _make_agent([])
+		call_count = {"n": 0}
+
+		async def interrupting_execute(*args, **kwargs):
+			call_count["n"] += 1
+			raise InterruptedError("user stopped")
+		agent.tools.execute = interrupting_execute
+
+		model_output = {"action": {"name": "click", "params": {}}}
+		browser_state = MagicMock()
+		browser_state.url = "https://example.com"
+
+		with pytest.raises(InterruptedError):
+			await StepPipeline._execute_actions(agent, model_output, browser_state)
+
+		# action 被尝试执行一次（异常发生在 result.append 之前）
+		assert call_count["n"] == 1
+
+	@pytest.mark.asyncio
+	async def test_connection_error_propagates(self):
+		"""连接错误向上抛，触发上层重连逻辑。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = _make_agent([])
+
+		async def failing_execute(*args, **kwargs):
+			raise ConnectionError("websocket connection closed")
+		agent.tools.execute = failing_execute
+
+		model_output = {"action": {"name": "click", "params": {}}}
+		browser_state = MagicMock()
+		browser_state.url = "https://example.com"
+
+		with pytest.raises(ConnectionError):
+			await StepPipeline._execute_actions(agent, model_output, browser_state)
+
+	@pytest.mark.asyncio
+	async def test_generic_exception_returns_error_result(self):
+		"""普通异常被吞掉，追加 ActionResult(error)，剩余动作被跳过。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = _make_agent([])
+		call_count = {"n": 0}
+
+		async def failing_execute(*args, **kwargs):
+			call_count["n"] += 1
+			raise RuntimeError("element not found")
+		agent.tools.execute = failing_execute
+
+		model_output = {
+			"actions": [
+				{"name": "click", "params": {}},
+				{"name": "click", "params": {}},  # 应被跳过
+			],
+		}
+		browser_state = MagicMock()
+		browser_state.url = "https://example.com"
+
+		results = await StepPipeline._execute_actions(agent, model_output, browser_state)
+
+		assert len(results) == 1
+		assert "RuntimeError" in results[0].error
+		# 只有第一个 action 被调用，第二个被跳过
+		assert call_count["n"] == 1
+
+	@pytest.mark.asyncio
+	async def test_timeout_in_second_action_returns_partial_results(self):
+		"""第一个 action 成功、第二个 timeout → 返回 [success, timeout_error]。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = _make_agent([ActionResult()])
+		# 第二次调用 execute 时阻塞，触发 action_timeout
+		call_count = {"n": 0}
+		original = agent.tools.execute
+
+		async def slow_second_call(name, params, browser, browser_state):
+			call_count["n"] += 1
+			if call_count["n"] == 2:
+				await asyncio.sleep(10)
+			return await original(name, params, browser, browser_state)
+		agent.tools.execute = slow_second_call
+		agent.action_timeout = 0.05
+
+		model_output = {
+			"actions": [
+				{"name": "click", "params": {"index": 1}},
+				{"name": "click", "params": {"index": 2}},
+				{"name": "click", "params": {"index": 3}},  # 应被跳过
+			],
+		}
+		browser_state = MagicMock()
+		browser_state.url = "https://example.com"
+
+		results = await StepPipeline._execute_actions(agent, model_output, browser_state)
+
+		# 1 个成功 + 1 个 timeout error，共 2 个；第三个被跳过
+		assert len(results) == 2
+		assert results[0].error is None
+		assert results[1].error is not None
+		assert "timed out" in results[1].error.lower()
+		# 第二个 action 进入 wrapper 但被 wait_for 超时取消；第三个被跳过
+		assert call_count["n"] == 2
+
+
+# ── 10. Phase 4 failure count semantics ─────────────────────────────────
+
+
+class TestPhase4FailureCount:
+	"""Phase 4 _post_process 失败计数语义细化。"""
+
+	def _make_post_process_agent(self, *, initial_failures: int = 0) -> Any:
+		from tree_walker.agent.step import StepPipeline  # noqa: F401
+
+		agent = MagicMock()
+		agent.state = AgentState()
+		agent.state.consecutive_failures = initial_failures
+		agent._enable_planning = False
+		agent.plan_manager = None
+
+		class _NoOpLoopDetector:
+			def record_action(self, *args, **kwargs):
+				pass
+
+		agent.loop_detector = _NoOpLoopDetector()
+		return agent
+
+	def test_single_action_error_increments(self):
+		"""单动作步失败 → consecutive_failures += 1。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = self._make_post_process_agent(initial_failures=0)
+		model_output = {"action": {"name": "click", "params": {}}}
+		results = [ActionResult(error="boom")]
+
+		StepPipeline._post_process(agent, results, model_output)
+
+		assert agent.state.consecutive_failures == 1
+
+	def test_multi_action_all_error_increments(self):
+		"""多动作步全失败 → consecutive_failures += 1。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = self._make_post_process_agent(initial_failures=0)
+		model_output = {
+			"actions": [
+				{"name": "click", "params": {}},
+				{"name": "click", "params": {}},
+			],
+		}
+		results = [
+			ActionResult(error="err1"),
+			ActionResult(error="err2"),
+		]
+
+		StepPipeline._post_process(agent, results, model_output)
+
+		assert agent.state.consecutive_failures == 1
+
+	def test_multi_action_partial_error_does_not_increment(self):
+		"""多动作步部分失败 → consecutive_failures 不增加（保持原值或被 reset，但不 +1）。"""
+		from tree_walker.agent.step import StepPipeline
+
+		# initial_failures=0 → 部分失败不会让计数变成 1
+		agent = self._make_post_process_agent(initial_failures=0)
+		model_output = {
+			"actions": [
+				{"name": "click", "params": {}},
+				{"name": "click", "params": {}},
+			],
+		}
+		results = [
+			ActionResult(),
+			ActionResult(error="oops"),
+		]
+
+		StepPipeline._post_process(agent, results, model_output)
+
+		# 关键断言：没有增加到 1
+		assert agent.state.consecutive_failures == 0
+
+	def test_multi_action_partial_error_resets_prior_failures(self):
+		"""多动作步部分失败、有 prior failures → reset 为 0（fall through 到 success 分支）。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = self._make_post_process_agent(initial_failures=2)
+		model_output = {
+			"actions": [
+				{"name": "click", "params": {}},
+				{"name": "click", "params": {}},
+			],
+		}
+		results = [
+			ActionResult(),
+			ActionResult(error="oops"),
+		]
+
+		StepPipeline._post_process(agent, results, model_output)
+
+		# partial failure 含至少一个 success → reset 为 0
+		assert agent.state.consecutive_failures == 0
+
+	def test_multi_action_partial_error_resets_when_no_history(self):
+		"""多动作步部分失败、无 prior failures → 仍为 0（明确不计数）。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = self._make_post_process_agent(initial_failures=0)
+		model_output = {
+			"actions": [
+				{"name": "click", "params": {}},
+				{"name": "click", "params": {}},
+			],
+		}
+		results = [
+			ActionResult(error="err"),
+			ActionResult(),
+		]
+
+		StepPipeline._post_process(agent, results, model_output)
+
+		assert agent.state.consecutive_failures == 0
+
+	def test_all_success_resets_counter(self):
+		"""全成功 → consecutive_failures 重置为 0。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = self._make_post_process_agent(initial_failures=3)
+		model_output = {
+			"actions": [
+				{"name": "click", "params": {}},
+				{"name": "click", "params": {}},
+			],
+		}
+		results = [ActionResult(), ActionResult()]
+
+		StepPipeline._post_process(agent, results, model_output)
+
+		assert agent.state.consecutive_failures == 0
+
+
+# ── 11. Phase 4 wait_between_actions ────────────────────────────────────
+
+
+class TestPhase4WaitBetweenActions:
+	"""Phase 4 wait_between_actions 反爬节奏停顿。"""
+
+	@pytest.mark.asyncio
+	async def test_default_zero_does_not_sleep(self, monkeypatch):
+		"""wait_between_actions=0 → 不调用 asyncio.sleep。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = _make_agent([ActionResult(), ActionResult()])
+		# 默认 _make_agent 设 wait_between_actions=0.0
+		sleep_calls: list[float] = []
+		original_sleep = asyncio.sleep
+
+		async def tracking_sleep(seconds):
+			# 仅追踪正向停顿；其他 await 走原 sleep
+			if seconds > 0:
+				sleep_calls.append(seconds)
+			await original_sleep(0)
+		monkeypatch.setattr("tree_walker.agent.step.asyncio.sleep", tracking_sleep)
+
+		model_output = {
+			"actions": [
+				{"name": "click", "params": {}},
+				{"name": "click", "params": {}},
+			],
+		}
+		browser_state = MagicMock()
+		browser_state.url = "https://example.com"
+
+		await StepPipeline._execute_actions(agent, model_output, browser_state)
+
+		# 没有任何 wait_between_actions 触发的 sleep
+		assert sleep_calls == []
+
+	@pytest.mark.asyncio
+	async def test_positive_value_sleeps_between_actions(self, monkeypatch):
+		"""wait_between_actions=0.5 → 两个 action 之间 sleep 一次。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = _make_agent([ActionResult(), ActionResult(), ActionResult()])
+		agent.wait_between_actions = 0.5
+		sleep_calls: list[float] = []
+		original_sleep = asyncio.sleep
+
+		async def tracking_sleep(seconds):
+			if seconds == 0.5:
+				sleep_calls.append(seconds)
+			await original_sleep(0)
+		monkeypatch.setattr("tree_walker.agent.step.asyncio.sleep", tracking_sleep)
+
+		model_output = {
+			"actions": [
+				{"name": "click", "params": {}},
+				{"name": "click", "params": {}},
+				{"name": "click", "params": {}},
+			],
+		}
+		browser_state = MagicMock()
+		browser_state.url = "https://example.com"
+
+		await StepPipeline._execute_actions(agent, model_output, browser_state)
+
+		# 3 个 action，应有 2 次 wait_between_actions sleep（i=1 和 i=2 之前）
+		assert sleep_calls == [0.5, 0.5]
+
+	@pytest.mark.asyncio
+	async def test_no_sleep_on_last_action(self, monkeypatch):
+		"""单 action 不触发 wait_between_actions sleep（i==0 跳过）。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = _make_agent([ActionResult()])
+		agent.wait_between_actions = 0.5
+		sleep_calls: list[float] = []
+		original_sleep = asyncio.sleep
+
+		async def tracking_sleep(seconds):
+			if seconds == 0.5:
+				sleep_calls.append(seconds)
+			await original_sleep(0)
+		monkeypatch.setattr("tree_walker.agent.step.asyncio.sleep", tracking_sleep)
+
+		model_output = {"action": {"name": "click", "params": {}}}
+		browser_state = MagicMock()
+		browser_state.url = "https://example.com"
+
+		await StepPipeline._execute_actions(agent, model_output, browser_state)
+
+		assert sleep_calls == []
+
+	@pytest.mark.asyncio
+	async def test_no_sleep_after_guard_break(self, monkeypatch):
+		"""guard #1 在 done 处 break → 不在 done 之前 sleep（done 是 i>0 但被跳过）。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = _make_agent([ActionResult()])
+		agent.wait_between_actions = 0.5
+		sleep_calls: list[float] = []
+		original_sleep = asyncio.sleep
+
+		async def tracking_sleep(seconds):
+			if seconds == 0.5:
+				sleep_calls.append(seconds)
+			await original_sleep(0)
+		monkeypatch.setattr("tree_walker.agent.step.asyncio.sleep", tracking_sleep)
+
+		# 第一个是 click（i==0，不 sleep），第二个是 done（i>0，guard #1 break）
+		model_output = {
+			"actions": [
+				{"name": "click", "params": {}},
+				{"name": "done", "params": {}},
+			],
+		}
+		browser_state = MagicMock()
+		browser_state.url = "https://example.com"
+
+		await StepPipeline._execute_actions(agent, model_output, browser_state)
+
+		# done 在 sleep 之前被 guard #1 拦截
+		assert sleep_calls == []
+

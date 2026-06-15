@@ -53,6 +53,7 @@ class StepPipeline:
     action_timeout: int
     reconnect_timeout: int
     max_actions_per_step: int
+    wait_between_actions: float
     _track_downloads: bool
     _step_start_time: float
     messages: list[dict[str, Any]]
@@ -498,11 +499,14 @@ class StepPipeline:
     ) -> list[ActionResult]:
         """Execute the action(s) decided by the LLM.
 
-        Multi-action loop with five guards (Phase 2 + 3):
+        Multi-action loop with five guards (Phase 2 + 3) and exception
+        triage (Phase 4):
           - Reads ``model_output["actions"]`` (list) when present, falls back to
             single-action ``model_output["action"]`` for backward compatibility.
           - Executes actions strictly sequentially — never concurrently.
           - Each action has its own per-action timeout and observability event.
+          - Pauses ``wait_between_actions`` seconds before each non-first
+            action (anti-detection cadence, browser-use parity).
 
         Guards stop the sequence:
           #1 done as single action — list midpoint ``done`` short-circuits
@@ -514,6 +518,12 @@ class StepPipeline:
                                     pre/post-action sampling. Covers implicit
                                     side effects (e.g. click on <a> navigating,
                                     opening a new tab).
+
+        Exception triage (Phase 4):
+          - ``InterruptedError``        — re-raise (user stop/pause signal)
+          - connection-like errors      — re-raise (browser crashed / CDP lost)
+          - other errors / TimeoutError — append ``ActionResult(error)`` and
+                                            stop the sequence (return results)
         """
         if self.state.stopped or self.state.paused:
             return [ActionResult(error="Agent stopped or paused")]
@@ -535,6 +545,11 @@ class StepPipeline:
                     total - i, total,
                 )
                 break
+
+            # Phase 4: anti-detection cadence between chained actions.
+            # Skipped on the first action and whenever guard #1 already broke.
+            if i > 0 and self.wait_between_actions > 0:
+                await asyncio.sleep(self.wait_between_actions)
 
             tool_call_id = ""
             tool_start = time.time()
@@ -570,6 +585,10 @@ class StepPipeline:
             except asyncio.TimeoutError:
                 logger.warning("Action '%s' timed out after %ds", action_name, self.action_timeout)
                 result = ActionResult(error=f"Action timed out after {self.action_timeout}s")
+            except InterruptedError:
+                # Phase 4: user stop/pause signal must propagate to
+                # _handle_step_error without being wrapped in ActionResult.
+                raise
             except Exception as e:
                 if _is_connection_error(e):
                     raise
@@ -659,14 +678,21 @@ class StepPipeline:
             if action_name not in _LOOP_EXEMPT_ACTIONS:
                 self.loop_detector.record_action(action_name, action_params)
 
-        # Failure count: single-action error → increment + early return.
-        # Multi-action step failure accounting is intentionally unchanged in
-        # Phase 1 (it falls through to the success branch); Phase 4 will
-        # introduce partial-failure semantics.
-        if results and len(results) == 1 and results[-1].error:
+        # Phase 4 failure semantics:
+        #   - all-error step (single-action OR multi-action all failed) → count
+        #   - multi-action step with partial failure → do NOT count
+        #     (loop_detector + replan handle recovery)
+        #   - any success → reset counter
+        if results and all(r.error for r in results):
             self.state.consecutive_failures += 1
             logger.debug("Consecutive failures: %d", self.state.consecutive_failures)
             return
+        if results and any(r.error for r in results) and not all(r.error for r in results):
+            logger.info(
+                "Multi-action step had partial failure (%d/%d actions failed) "
+                "— not incrementing consecutive_failures",
+                sum(1 for r in results if r.error), len(results),
+            )
 
         # Success → reset failure counter
         if self.state.consecutive_failures > 0:
@@ -811,15 +837,6 @@ _CONNECTION_ERROR_PATTERNS = (
 
 # Actions excluded from loop detection — always hash the same or are terminal.
 _LOOP_EXEMPT_ACTIONS = frozenset({"wait", "done", "go_back"})
-
-
-# Actions that don't change the page, so skip post-action URL check.
-_NO_URL_CHECK_ACTIONS = frozenset({
-    "click", "input_text", "scroll", "send_keys", "wait",
-    "extract", "find_elements", "find_text", "search_page",
-    "dropdown_options", "select_dropdown", "screenshot",
-    "save_as_pdf", "upload_file", "read_file", "write_file", "replace_file",
-})
 
 
 def _flatten_params_for_validation(params: dict, action_name: str) -> dict:

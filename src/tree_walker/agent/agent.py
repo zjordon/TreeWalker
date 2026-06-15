@@ -64,6 +64,7 @@ class Agent(StepPipeline):
         self.action_timeout = _settings.action_timeout
         self.reconnect_timeout = _settings.reconnect_timeout
         self.max_actions_per_step = _settings.max_actions_per_step
+        self.wait_between_actions = browser._settings.wait_between_actions
 
         self.state = AgentState()
         self.history = AgentHistoryList()
