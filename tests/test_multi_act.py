@@ -22,8 +22,8 @@ class _DummyParams(BaseModel):
 	pass
 
 
-def _make_registry(*names: str) -> ActionRegistry:
-	"""创建包含指定 action 的 registry。"""
+def _make_registry(*names: str, terminating: tuple[str, ...] = ()) -> ActionRegistry:
+	"""创建包含指定 action 的 registry；terminating 中的动作标 terminates_sequence=True。"""
 	registry = ActionRegistry()
 	for name in names:
 		registry.actions[name] = RegisteredAction(
@@ -31,8 +31,24 @@ def _make_registry(*names: str) -> ActionRegistry:
 			description=f"{name} action",
 			param_model=_DummyParams,
 			handler=MagicMock(),
+			terminates_sequence=name in terminating,
 		)
 	return registry
+
+
+# Phase 2+: _execute_actions 守卫门需要 navigate/search/switch_tab/go_back/evaluate
+# 这些「page-changing」动作的元数据。下面这个集合对齐 src/tree_walker/tools/models.py
+# 的 ACTION_DEFINITIONS 中 terminates=True 的 5 个动作。
+_TERMINATING_ACTIONS = ("navigate", "search", "switch_tab", "go_back", "evaluate")
+_ALL_FAKE_ACTIONS = (
+	"click", "input_text", "done", "scroll", "wait",
+	*_TERMINATING_ACTIONS,
+)
+
+
+def _build_full_registry() -> ActionRegistry:
+	"""构建含全部常用动作的 registry，page-changing 动作标 terminates_sequence=True。"""
+	return _make_registry(*_ALL_FAKE_ACTIONS, terminating=_TERMINATING_ACTIONS)
 
 
 def _make_tool_use_response(tool_input: dict[str, Any]) -> MagicMock:
@@ -64,7 +80,7 @@ class _FakeTools:
 		self.calls: list[tuple[str, dict]] = []
 		self._results = list(results or [])
 		self._idx = 0
-		self.registry = _make_registry("click", "input_text", "done", "scroll", "wait")
+		self.registry = _build_full_registry()
 
 	async def execute(self, name: str, params: dict, browser: Any, browser_state: Any) -> ActionResult:
 		self.calls.append((name, dict(params)))
@@ -478,3 +494,241 @@ class TestBackwardCompat:
 		StepPipeline._post_process(agent, results, model_output)
 
 		assert agent.state.consecutive_failures == 1
+
+
+# ── 6. Phase 2 guards ───────────────────────────────────────────────────
+
+
+class TestPhase2Guards:
+	"""Phase 2 静态守卫门：done 单动作 / is_done / error / terminates_sequence。"""
+
+	@pytest.mark.asyncio
+	async def test_guard1_done_in_midpoint_is_skipped(self):
+		"""门 #1：list 中段出现 done → done 及之后动作被跳过。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = _make_agent([ActionResult(), ActionResult()])
+		model_output = {
+			"actions": [
+				{"name": "click", "params": {"index": 1}},
+				{"name": "done", "params": {"text": "done"}},
+				{"name": "click", "params": {"index": 99}},  # 应被跳过
+			],
+		}
+		browser_state = MagicMock()
+		browser_state.url = "https://example.com"
+
+		results = await StepPipeline._execute_actions(agent, model_output, browser_state)
+
+		# 只执行了第一个 click，done 与后续 click 被守卫门跳过
+		assert len(results) == 1
+		assert len(agent.tools.calls) == 1
+		assert agent.tools.calls[0][0] == "click"
+
+	@pytest.mark.asyncio
+	async def test_guard1_done_as_single_action_executes(self):
+		"""门 #1：done 作为单动作（i==0）正常执行。"""
+		from tree_walker.agent.step import StepPipeline
+
+		done_result = ActionResult(is_done=True, success=True, extracted_content="task done")
+		agent = _make_agent([done_result])
+		model_output = {
+			"actions": [{"name": "done", "params": {"text": "task done", "success": True}}],
+		}
+		browser_state = MagicMock()
+		browser_state.url = "https://example.com"
+
+		results = await StepPipeline._execute_actions(agent, model_output, browser_state)
+
+		assert len(results) == 1
+		assert results[0].is_done is True
+		assert len(agent.tools.calls) == 1
+
+	@pytest.mark.asyncio
+	async def test_guard2_is_done_terminates_sequence(self):
+		"""门 #2：第一个 action 返回 is_done → 终止后续动作。"""
+		from tree_walker.agent.step import StepPipeline
+
+		done_result = ActionResult(is_done=True, success=True, extracted_content="ok")
+		agent = _make_agent([done_result, ActionResult()])
+		model_output = {
+			"actions": [
+				{"name": "click", "params": {"index": 1}},
+				{"name": "click", "params": {"index": 99}},  # 应被跳过
+			],
+		}
+		browser_state = MagicMock()
+		browser_state.url = "https://example.com"
+
+		results = await StepPipeline._execute_actions(agent, model_output, browser_state)
+
+		# _FakeTools 按 results 列表顺序返回，所以这里 click 的返回值是 done_result
+		# 第一个 click 返回 is_done=True → 门 #2 触发，第二个 click 被跳过
+		assert len(results) == 1
+		assert results[0].is_done is True
+		assert len(agent.tools.calls) == 1
+
+	@pytest.mark.asyncio
+	async def test_guard3_error_terminates_sequence(self):
+		"""门 #3：第一个 action 返回 error → 终止后续动作。"""
+		from tree_walker.agent.step import StepPipeline
+
+		err_result = ActionResult(error="element not found")
+		agent = _make_agent([err_result, ActionResult()])
+		model_output = {
+			"actions": [
+				{"name": "click", "params": {"index": 1}},
+				{"name": "click", "params": {"index": 99}},  # 应被跳过
+			],
+		}
+		browser_state = MagicMock()
+		browser_state.url = "https://example.com"
+
+		results = await StepPipeline._execute_actions(agent, model_output, browser_state)
+
+		assert len(results) == 1
+		assert results[0].error == "element not found"
+		assert len(agent.tools.calls) == 1
+
+	@pytest.mark.asyncio
+	async def test_guard4_navigate_terminates(self):
+		"""门 #4：navigate 是 terminates_sequence → 后续动作被跳过。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = _make_agent([ActionResult(), ActionResult()])
+		model_output = {
+			"actions": [
+				{"name": "navigate", "params": {"url": "https://other.com"}},
+				{"name": "click", "params": {"index": 99}},  # 应被跳过
+			],
+		}
+		browser_state = MagicMock()
+		browser_state.url = "https://example.com"
+
+		results = await StepPipeline._execute_actions(agent, model_output, browser_state)
+
+		assert len(results) == 1
+		assert len(agent.tools.calls) == 1
+		assert agent.tools.calls[0][0] == "navigate"
+
+	@pytest.mark.asyncio
+	async def test_guard4_search_terminates(self):
+		"""门 #4：search 是 terminates_sequence → 后续动作被跳过。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = _make_agent([ActionResult(), ActionResult()])
+		model_output = {
+			"actions": [
+				{"name": "search", "params": {"query": "test"}},
+				{"name": "click", "params": {}},  # 应被跳过
+			],
+		}
+		browser_state = MagicMock()
+		browser_state.url = "https://example.com"
+
+		results = await StepPipeline._execute_actions(agent, model_output, browser_state)
+
+		assert len(results) == 1
+		assert agent.tools.calls[0][0] == "search"
+
+	@pytest.mark.asyncio
+	async def test_guard4_evaluate_terminates(self):
+		"""门 #4：evaluate 是 terminates_sequence → 后续动作被跳过。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = _make_agent([ActionResult(), ActionResult()])
+		model_output = {
+			"actions": [
+				{"name": "evaluate", "params": {"script": "return 1"}},
+				{"name": "click", "params": {}},  # 应被跳过
+			],
+		}
+		browser_state = MagicMock()
+		browser_state.url = "https://example.com"
+
+		results = await StepPipeline._execute_actions(agent, model_output, browser_state)
+
+		assert len(results) == 1
+		assert agent.tools.calls[0][0] == "evaluate"
+
+	@pytest.mark.asyncio
+	async def test_guard4_switch_tab_terminates(self):
+		"""门 #4：switch_tab 是 terminates_sequence。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = _make_agent([ActionResult(), ActionResult()])
+		model_output = {
+			"actions": [
+				{"name": "switch_tab", "params": {"target_id": "abc"}},
+				{"name": "click", "params": {}},
+			],
+		}
+		browser_state = MagicMock()
+		browser_state.url = "https://example.com"
+
+		results = await StepPipeline._execute_actions(agent, model_output, browser_state)
+
+		assert len(results) == 1
+		assert agent.tools.calls[0][0] == "switch_tab"
+
+	@pytest.mark.asyncio
+	async def test_guard4_go_back_terminates(self):
+		"""门 #4：go_back 是 terminates_sequence。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = _make_agent([ActionResult(), ActionResult()])
+		model_output = {
+			"actions": [
+				{"name": "go_back", "params": {}},
+				{"name": "click", "params": {}},
+			],
+		}
+		browser_state = MagicMock()
+		browser_state.url = "https://example.com"
+
+		results = await StepPipeline._execute_actions(agent, model_output, browser_state)
+
+		assert len(results) == 1
+		assert agent.tools.calls[0][0] == "go_back"
+
+	@pytest.mark.asyncio
+	async def test_guard4_non_terminating_actions_chain(self):
+		"""反向验证：click / input_text / scroll 不触发守卫 → 全部执行。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = _make_agent([ActionResult(), ActionResult(), ActionResult()])
+		model_output = {
+			"actions": [
+				{"name": "input_text", "params": {"index": 1, "text": "a"}},
+				{"name": "input_text", "params": {"index": 2, "text": "b"}},
+				{"name": "click", "params": {"index": 3}},
+			],
+		}
+		browser_state = MagicMock()
+		browser_state.url = "https://example.com"
+
+		results = await StepPipeline._execute_actions(agent, model_output, browser_state)
+
+		assert len(results) == 3
+		assert [c[0] for c in agent.tools.calls] == ["input_text", "input_text", "click"]
+
+	@pytest.mark.asyncio
+	async def test_guard4_terminating_as_last_action_ok(self):
+		"""terminates_sequence 动作作为最后一个时正常执行（不触发 skip）。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = _make_agent([ActionResult(), ActionResult()])
+		model_output = {
+			"actions": [
+				{"name": "click", "params": {"index": 1}},
+				{"name": "navigate", "params": {"url": "https://x.com"}},
+			],
+		}
+		browser_state = MagicMock()
+		browser_state.url = "https://example.com"
+
+		results = await StepPipeline._execute_actions(agent, model_output, browser_state)
+
+		# 两个都执行；门 #4 在 navigate 后触发但因为已是最后一个，行为无差异
+		assert len(results) == 2
+		assert [c[0] for c in agent.tools.calls] == ["click", "navigate"]

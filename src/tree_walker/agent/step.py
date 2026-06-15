@@ -498,26 +498,42 @@ class StepPipeline:
     ) -> list[ActionResult]:
         """Execute the action(s) decided by the LLM.
 
-        Multi-action loop (Phase 1 of multi_act rollout):
+        Multi-action loop with Phase 2 static guards:
           - Reads ``model_output["actions"]`` (list) when present, falls back to
             single-action ``model_output["action"]`` for backward compatibility.
           - Executes actions strictly sequentially — never concurrently.
           - Each action has its own per-action timeout and observability event.
-          - URL change is detected per action (debug log only in Phase 1;
-            loop termination on URL change arrives in Phase 3).
 
-        Guards (done-only-as-single-action / terminates_sequence / runtime URL
-        drift) are NOT applied in Phase 1 and will be added in Phase 2-3.
+        Four guards stop the sequence (Phase 2):
+          #1 done as single action — list midpoint ``done`` short-circuits
+          #2 result.is_done       — task completion signal
+          #3 result.error         — execution failure
+          #4 terminates_sequence  — navigate/search/switch_tab/go_back/evaluate
+                                    and any other action flagged at registration
+
+        Runtime URL drift detection (Phase 3) is not yet wired: the post-action
+        URL comparison here is debug-only.
         """
         if self.state.stopped or self.state.paused:
             return [ActionResult(error="Agent stopped or paused")]
 
         actions = model_output.get("actions") or [model_output.get("action", {})]
+        total = len(actions)
         results: list[ActionResult] = []
 
         for i, action in enumerate(actions):
             action_name = action.get("name", "done")
             action_params = action.get("params", {})
+
+            # Guard #1: done is only allowed as a single action. Encountering
+            # it after position 0 means the LLM mis-chained; we stop here so
+            # subsequent (meaningless) actions are skipped silently.
+            if i > 0 and action_name == "done":
+                logger.debug(
+                    "done is only allowed as a single action — skipping %d/%d remaining",
+                    total - i, total,
+                )
+                break
 
             tool_call_id = ""
             tool_start = time.time()
@@ -529,7 +545,7 @@ class StepPipeline:
                     model_call_id=getattr(self, "_current_model_call_id", ""),
                     tool_call_id=tool_call_id, action_name=action_name,
                     params=action_params,
-                    action_index=i, total_actions=len(actions),
+                    action_index=i, total_actions=total,
                 ))
 
             pre_action_url = browser_state.url
@@ -558,10 +574,26 @@ class StepPipeline:
                     tool_call_id=tool_call_id,
                     success=result.success, error=result.error,
                     duration_seconds=duration,
-                    action_index=i, total_actions=len(actions),
+                    action_index=i, total_actions=total,
                 ))
 
-            if not result.error and action_name not in _NO_URL_CHECK_ACTIONS:
+            # Guard #2/#3: is_done or error terminates the sequence — the LLM
+            # will see the failure / completion in the next step's state.
+            if result.is_done or result.error or i == total - 1:
+                break
+
+            # Guard #4: static terminates_sequence flag. Covers page-changing
+            # actions (navigate / search / switch_tab / go_back / evaluate)
+            # and any custom action that opts in via registration metadata.
+            registered = self.tools.registry.actions.get(action_name)
+            if registered is not None and registered.terminates_sequence:
+                logger.info(
+                    "Action '%s' terminates sequence — skipping %d/%d remaining",
+                    action_name, total - i - 1, total,
+                )
+                break
+
+            if action_name not in _NO_URL_CHECK_ACTIONS:
                 try:
                     post_url = await self.browser.get_current_url()
                     if post_url and post_url != pre_action_url:
