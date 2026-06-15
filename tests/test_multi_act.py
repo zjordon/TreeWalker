@@ -732,3 +732,206 @@ class TestPhase2Guards:
 		# 两个都执行；门 #4 在 navigate 后触发但因为已是最后一个，行为无差异
 		assert len(results) == 2
 		assert [c[0] for c in agent.tools.calls] == ["click", "navigate"]
+
+
+# ── 7. Phase 3 runtime guards ───────────────────────────────────────────
+
+
+def _wrap_execute_with_drift(tools: _FakeTools, *, drift_url: str | None = None, drift_target_id: str | None = None) -> None:
+	"""让 _FakeTools 在第一次 execute 调用后改 browser 的 URL/target_id（模拟副作用）。
+
+	在调用 ``await StepPipeline._execute_actions`` 之前调用本函数，即可让守卫门 #5
+	在第一次动作执行后看到 URL 或 target_id 漂移。
+	"""
+	original = tools.execute
+	calls = {"n": 0}
+
+	async def drifting_execute(name: str, params: dict, browser: Any, browser_state: Any) -> ActionResult:
+		result = await original(name, params, browser, browser_state)
+		calls["n"] += 1
+		if calls["n"] == 1:
+			if drift_url is not None:
+				browser._url = drift_url
+			if drift_target_id is not None:
+				browser.current_target_id = drift_target_id
+		return result
+
+	tools.execute = drifting_execute
+
+
+class TestPhase3RuntimeGuards:
+	"""Phase 3 运行时守卫门 #5：URL / target_id 漂移检测。"""
+
+	@pytest.mark.asyncio
+	async def test_guard5_url_drift_breaks_loop(self):
+		"""门 #5：第一个 action 后 URL 变化 → 后续动作被跳过。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = _make_agent([ActionResult(), ActionResult()])
+		_wrap_execute_with_drift(agent.tools, drift_url="https://other.com")
+		model_output = {
+			"actions": [
+				{"name": "click", "params": {}},
+				{"name": "click", "params": {}},  # 应被跳过
+			],
+		}
+		browser_state = MagicMock()
+		browser_state.url = "https://example.com"
+
+		results = await StepPipeline._execute_actions(agent, model_output, browser_state)
+
+		assert len(results) == 1
+		assert len(agent.tools.calls) == 1
+
+	@pytest.mark.asyncio
+	async def test_guard5_target_id_drift_breaks_loop(self):
+		"""门 #5：第一个 action 后 target_id 变化（新 tab 打开）→ 后续动作被跳过。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = _make_agent([ActionResult(), ActionResult()])
+		_wrap_execute_with_drift(agent.tools, drift_target_id="new-tab-xyz")
+		model_output = {
+			"actions": [
+				{"name": "click", "params": {}},
+				{"name": "click", "params": {}},  # 应被跳过
+			],
+		}
+		browser_state = MagicMock()
+		browser_state.url = "https://example.com"
+
+		results = await StepPipeline._execute_actions(agent, model_output, browser_state)
+
+		assert len(results) == 1
+		assert len(agent.tools.calls) == 1
+
+	@pytest.mark.asyncio
+	async def test_guard5_no_drift_continues_loop(self):
+		"""反向验证：URL 与 target_id 都不变 → 所有动作执行。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = _make_agent([ActionResult(), ActionResult(), ActionResult()])
+		model_output = {
+			"actions": [
+				{"name": "click", "params": {"index": 1}},
+				{"name": "click", "params": {"index": 2}},
+				{"name": "click", "params": {"index": 3}},
+			],
+		}
+		browser_state = MagicMock()
+		browser_state.url = "https://example.com"
+
+		results = await StepPipeline._execute_actions(agent, model_output, browser_state)
+
+		assert len(results) == 3
+		assert len(agent.tools.calls) == 3
+
+	@pytest.mark.asyncio
+	async def test_guard5_skips_on_second_action_only(self):
+		"""门 #5：漂移发生在第二个 action 后 → 第三个被跳过，前两个执行。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = _make_agent([ActionResult(), ActionResult(), ActionResult()])
+		original = agent.tools.execute
+		calls = {"n": 0}
+
+		async def drifting_execute(name: str, params: dict, browser: Any, browser_state: Any) -> ActionResult:
+			result = await original(name, params, browser, browser_state)
+			calls["n"] += 1
+			if calls["n"] == 2:  # 第二个 action 后漂移
+				browser._url = "https://other.com"
+			return result
+
+		agent.tools.execute = drifting_execute
+		model_output = {
+			"actions": [
+				{"name": "click", "params": {}},
+				{"name": "click", "params": {}},
+				{"name": "click", "params": {}},  # 应被跳过
+			],
+		}
+		browser_state = MagicMock()
+		browser_state.url = "https://example.com"
+
+		results = await StepPipeline._execute_actions(agent, model_output, browser_state)
+
+		assert len(results) == 2
+		assert len(agent.tools.calls) == 2
+
+
+# ── 8. _wait_for_page_settle ────────────────────────────────────────────
+
+
+class TestWaitForPageSettle:
+	"""BrowserSession._wait_for_page_settle 行为。"""
+
+	def _make_session_with_state_sequence(self, states: list[str]) -> Any:
+		"""构造一个 BrowserSession 替身，按顺序返回 document.readyState 值。"""
+		from tree_walker.config import BrowserSettings
+		from tree_walker.browser.session import BrowserSession
+
+		# 不连真浏览器，直接构造一个半初始化的 session
+		session = BrowserSession.__new__(BrowserSession)
+		session._settings = BrowserSettings(
+			ws_url="ws://x",
+			page_settle_timeout=0.5,
+			page_settle_poll_interval=0.01,
+		)
+		session.client = MagicMock()
+		session.current_session_id = "fake-session"
+		queue = list(states)
+
+		async def fake_send(method, params=None, session_id=None, **kwargs):
+			# 模拟 Runtime.evaluate
+			state = queue.pop(0) if queue else "complete"
+			return {"result": {"value": state}}
+
+		session.client.send = MagicMock()
+		# client.send.Runtime.evaluate(...) 是 attribute chain；直接把
+		# Runtime.evaluate 替身为可 await 的 callable
+		session.client.send.Runtime.evaluate = fake_send
+		return session
+
+	@pytest.mark.asyncio
+	async def test_returns_immediately_when_complete(self):
+		"""readyState == 'complete' → 立即返回，不轮询。"""
+		session = self._make_session_with_state_sequence(["complete"])
+		# 应该几乎瞬间返回
+		import time as _time
+		t0 = _time.monotonic()
+		await session._wait_for_page_settle()
+		elapsed = _time.monotonic() - t0
+		assert elapsed < 0.1
+
+	@pytest.mark.asyncio
+	async def test_polls_until_complete(self):
+		"""readyState 从 loading → interactive → complete → 返回。"""
+		session = self._make_session_with_state_sequence([
+			"loading", "interactive", "complete",
+		])
+		# 不应该抛异常，且应该正常返回（不是超时）
+		await session._wait_for_page_settle()
+
+	@pytest.mark.asyncio
+	async def test_times_out_when_never_complete(self):
+		"""readyState 一直非 complete → 超时后返回。"""
+		session = self._make_session_with_state_sequence(["loading"] * 1000)
+		import time as _time
+		t0 = _time.monotonic()
+		await session._wait_for_page_settle()
+		elapsed = _time.monotonic() - t0
+		# timeout 是 0.5s；实际 elapsed 应该接近 0.5s（容忍一点波动）
+		assert 0.4 < elapsed < 1.5
+
+	@pytest.mark.asyncio
+	async def test_returns_immediately_without_client(self):
+		"""client=None 时立即返回（不抛异常）。"""
+		from tree_walker.browser.session import BrowserSession
+		from tree_walker.config import BrowserSettings
+
+		session = BrowserSession.__new__(BrowserSession)
+		session._settings = BrowserSettings(ws_url="ws://x")
+		session.client = None
+		session.current_session_id = None
+
+		# 不应该抛异常
+		await session._wait_for_page_settle()

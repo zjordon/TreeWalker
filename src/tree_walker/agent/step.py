@@ -498,21 +498,22 @@ class StepPipeline:
     ) -> list[ActionResult]:
         """Execute the action(s) decided by the LLM.
 
-        Multi-action loop with Phase 2 static guards:
+        Multi-action loop with five guards (Phase 2 + 3):
           - Reads ``model_output["actions"]`` (list) when present, falls back to
             single-action ``model_output["action"]`` for backward compatibility.
           - Executes actions strictly sequentially — never concurrently.
           - Each action has its own per-action timeout and observability event.
 
-        Four guards stop the sequence (Phase 2):
+        Guards stop the sequence:
           #1 done as single action — list midpoint ``done`` short-circuits
           #2 result.is_done       — task completion signal
           #3 result.error         — execution failure
           #4 terminates_sequence  — navigate/search/switch_tab/go_back/evaluate
                                     and any other action flagged at registration
-
-        Runtime URL drift detection (Phase 3) is not yet wired: the post-action
-        URL comparison here is debug-only.
+          #5 runtime drift        — URL or current_target_id changed between
+                                    pre/post-action sampling. Covers implicit
+                                    side effects (e.g. click on <a> navigating,
+                                    opening a new tab).
         """
         if self.state.stopped or self.state.paused:
             return [ActionResult(error="Agent stopped or paused")]
@@ -548,7 +549,18 @@ class StepPipeline:
                     action_index=i, total_actions=total,
                 ))
 
-            pre_action_url = browser_state.url
+            # Sample pre-action state for runtime drift detection (guard #5).
+            # First iteration reuses the step-start URL from browser_state to
+            # avoid an extra CDP call; later iterations read fresh values
+            # because earlier actions may have changed them.
+            if i == 0:
+                pre_action_url = browser_state.url
+            else:
+                try:
+                    pre_action_url = await self.browser.get_current_url()
+                except Exception:
+                    pre_action_url = browser_state.url
+            pre_target_id = self.browser.current_target_id
 
             try:
                 result = await asyncio.wait_for(
@@ -593,16 +605,24 @@ class StepPipeline:
                 )
                 break
 
-            if action_name not in _NO_URL_CHECK_ACTIONS:
-                try:
-                    post_url = await self.browser.get_current_url()
-                    if post_url and post_url != pre_action_url:
-                        logger.debug(
-                            "Page changed after '%s': %s -> %s",
-                            action_name, pre_action_url, post_url,
-                        )
-                except Exception:
-                    pass
+            # Guard #5: runtime drift. Catches implicit side effects not flagged
+            # by terminates_sequence — e.g. click on <a> navigating, JS opening
+            # a new tab, form submit redirecting. Compare URL + target_id; if
+            # either changed, the remaining queued actions operate on stale DOM.
+            try:
+                post_url = await self.browser.get_current_url()
+            except Exception:
+                post_url = pre_action_url
+            post_target_id = self.browser.current_target_id
+            if post_url != pre_action_url or post_target_id != pre_target_id:
+                logger.info(
+                    "Page drifted after '%s' (url: %s→%s, tab: %s→%s) — "
+                    "skipping %d/%d remaining",
+                    action_name, pre_action_url, post_url,
+                    pre_target_id, post_target_id,
+                    total - i - 1, total,
+                )
+                break
 
         return results
 

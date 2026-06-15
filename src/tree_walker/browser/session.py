@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import time
 from typing import Any
 
 from cdp_use import CDPClient
@@ -384,7 +385,7 @@ class BrowserSession:
             {"url": url},
             session_id=self.current_session_id,
         )
-        await asyncio.sleep(0.5)
+        await self._wait_for_page_settle()
 
     async def go_back(self) -> None:
         """Navigate to the previous page in history."""
@@ -398,7 +399,40 @@ class BrowserSession:
                 {"entryId": entries[idx - 1]["id"]},
                 session_id=self.current_session_id,
             )
-            await asyncio.sleep(0.3)
+            await self._wait_for_page_settle()
+
+    async def _wait_for_page_settle(
+        self,
+        timeout: float | None = None,
+        poll_interval: float | None = None,
+    ) -> None:
+        """Poll document.readyState until 'complete' or timeout.
+
+        Replaces hard-coded ``asyncio.sleep`` after navigation actions. Falls
+        through silently on timeout — caller proceeds with whatever state the
+        page reached. Returns immediately if the CDP client is unavailable.
+        """
+        if self.client is None or self.current_session_id is None:
+            return
+        timeout = timeout if timeout is not None else self._settings.page_settle_timeout
+        poll_interval = (
+            poll_interval if poll_interval is not None
+            else self._settings.page_settle_poll_interval
+        )
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                result = await self.client.send.Runtime.evaluate(
+                    {"expression": "document.readyState", "returnByValue": True},
+                    session_id=self.current_session_id,
+                )
+                state = result.get("result", {}).get("value", "")
+                if state == "complete":
+                    return
+            except Exception:
+                # CDP hiccup — retry on next poll rather than aborting
+                pass
+            await asyncio.sleep(poll_interval)
 
     # ── Element interaction ────────────────────────────────────────────
 
@@ -753,6 +787,7 @@ class BrowserSession:
         self.current_target_id = target_id
         self.current_session_id = result["sessionId"]
         logger.info("Switched to tab: %s", target_id)
+        await self._wait_for_page_settle()
 
     async def close_tab(self, target_id: str) -> None:
         """Close a tab. If it's the current tab, switch to another."""

@@ -127,6 +127,9 @@ class BrowserSettings:
     circuit_breaker_threshold: int = 3
     circuit_breaker_recovery_s: float = 30.0
     highlight: HighlightSettings = field(default_factory=HighlightSettings)
+    page_settle_timeout: float = 2.0
+    page_settle_poll_interval: float = 0.1
+    wait_between_actions: float = 0.0
 
 
 @dataclass
