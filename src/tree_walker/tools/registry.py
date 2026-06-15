@@ -110,10 +110,10 @@ class ActionRegistry:
                 "minItems": 1,
                 "maxItems": max_actions,
                 "description": (
-                    "One or more actions to execute in order. Most steps should "
-                    f"contain exactly 1 action. You may chain up to {max_actions} "
-                    "actions when they operate on the same stable DOM (e.g. multiple "
-                    "input_text fills before a click submit, or multiple scrolls)."
+                    f"One or more actions to execute in order (up to {max_actions}). "
+                    "Chain when targeting the same stable DOM: form filling, clearing "
+                    "multiple items, sequential scrolls, multi-field extraction. The "
+                    "runtime stops the sequence automatically if the page changes."
                 ),
                 "items": action_property,
             }

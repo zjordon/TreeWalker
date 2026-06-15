@@ -249,6 +249,27 @@ class LLMClient:
         else:
             actions_list = [{"name": "done", "params": {"text": "Invalid action shape", "success": False}}]
 
+        # Phase A diagnostic: log the actual shape LLM emitted so we can tell
+        # whether multi-action is being used. Reads schema maxItems when present
+        # so the single-action message can say "schema allowed up to N".
+        schema_max = (
+            tool_schema.get("input_schema", {})
+            .get("properties", {}).get("action", {})
+            .get("maxItems")
+        )
+        if isinstance(raw_action, list):
+            names = [a.get("name", "?") for a in raw_action if isinstance(a, dict)]
+            logger.info(
+                "multi_act: LLM emitted list with %d action(s): %s",
+                len(raw_action), names,
+            )
+        elif isinstance(raw_action, dict):
+            logger.info(
+                "multi_act: LLM emitted single action %r (schema allows up to %s)",
+                raw_action.get("name", "?"),
+                schema_max if schema_max else "1",
+            )
+
         for a in actions_list:
             if isinstance(a, dict):
                 a.setdefault("params", {})

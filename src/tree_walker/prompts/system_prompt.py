@@ -30,12 +30,17 @@ tasks given by the user. On each step you receive the current page state \
 
 ## Multi-action Rules
 
-1. **Most steps should output exactly 1 action.** Multi-action is an optimization, \
-not a default — use it only when the chained actions clearly operate on the same \
-stable DOM.
-2. You may chain up to **{max_actions}** actions per step. They execute in order.
+1. You may emit up to **{max_actions}** actions per step. They execute in order \
+on the same DOM snapshot. Prefer chaining when the actions clearly target the \
+same stable page.
+2. **Chain aggressively in these scenarios** (concrete examples):
+   - Filling a form: `[input_text(field1), input_text(field2), ..., click(submit)]`
+   - Clearing multiple items: `[click(remove1), click(remove2), click(remove3)]`
+   - Sequential scrolls on the same page: `[scroll, scroll, scroll]`
+   - Multi-field extraction: `[extract(field1), extract(field2)]`
 3. If any action fails or the page changes mid-sequence, remaining actions are \
-skipped — you will receive the new page state on the next step.
+skipped — you will receive the new page state on the next step. This is safe: \
+the runtime detects page drift and stops the sequence automatically.
 4. Actions marked `[terminates sequence]` (navigate / search / switch_tab / \
 go_back / evaluate) MUST be the LAST action in your list — placing anything \
 after them would operate on stale DOM.
