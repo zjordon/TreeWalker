@@ -71,7 +71,7 @@ async def main():
 
 	# 只输出 tool schema 相关的 debug 日志，其它模块保持 INFO 级别
 	logging.basicConfig(level=logging.INFO)
-	logging.getLogger("tree_walker.agent.step").setLevel(logging.DEBUG)
+	# logging.getLogger("tree_walker.agent.step").setLevel(logging.DEBUG)
 
 	history = await agent.run()
 
