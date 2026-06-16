@@ -62,8 +62,15 @@ class ActionRegistry:
         page_url: str | None = None,
         output_mode: str = "standard",
         include_actions: list[str] | None = None,
+        max_actions: int = 1,
     ) -> dict[str, Any]:
-        """Build the Anthropic tool_use schema for the agent_response tool."""
+        """Build the Anthropic tool_use schema for the agent_response tool.
+
+        When ``max_actions > 1`` the ``action`` field is wrapped as a JSON array
+        so the LLM can emit multiple actions per step (multi_act). When
+        ``max_actions == 1`` the field stays a single object for backward
+        compatibility with single-action execution.
+        """
         action_names = sorted(
             name for name in self.actions
             if self._action_available(name, page_url)
@@ -97,6 +104,22 @@ class ActionRegistry:
             },
         }
 
+        if max_actions > 1:
+            action_field: dict[str, Any] = {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": max_actions,
+                "description": (
+                    f"One or more actions to execute in order (up to {max_actions}). "
+                    "Chain when targeting the same stable DOM: form filling, clearing "
+                    "multiple items, sequential scrolls, multi-field extraction. The "
+                    "runtime stops the sequence automatically if the page changes."
+                ),
+                "items": action_property,
+            }
+        else:
+            action_field = action_property
+
         # Flash mode: minimal schema with only action
         if output_mode == "flash":
             return {
@@ -106,7 +129,7 @@ class ActionRegistry:
                     "type": "object",
                     "required": ["action"],
                     "properties": {
-                        "action": action_property,
+                        "action": action_field,
                     },
                 },
             }
@@ -125,7 +148,7 @@ class ActionRegistry:
                 "type": "string",
                 "description": "What you plan to do in this step.",
             },
-            "action": action_property,
+            "action": action_field,
         }
 
         required = [

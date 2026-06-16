@@ -229,6 +229,7 @@ class LLMClient:
                 "memory": "",
                 "next_goal": "Ending task due to empty response",
                 "action": {"name": "done", "params": {"text": "No response from LLM", "success": False}},
+                "actions": [{"name": "done", "params": {"text": "No response from LLM", "success": False}}],
             }
             if url_map:
                 result = self._restore_urls_in_output(result, url_map)
@@ -237,16 +238,48 @@ class LLMClient:
                 result = self._restore_sensitive_in_output(result, sensitive_map)
             return result
 
-        # Ensure action params exist
-        action = tool_input.get("action", {})
-        if isinstance(action, dict):
-            action.setdefault("params", {})
+        # Normalize action input: accept list (multi_act) or single dict (legacy).
+        # Both `action` (first element, for backward compatibility) and `actions`
+        # (full list, for the new multi-action loop) are exposed to downstream.
+        raw_action = tool_input.get("action", {})
+        if isinstance(raw_action, list):
+            actions_list = raw_action
+        elif isinstance(raw_action, dict):
+            actions_list = [raw_action]
+        else:
+            actions_list = [{"name": "done", "params": {"text": "Invalid action shape", "success": False}}]
+
+        # Phase A diagnostic: log the actual shape LLM emitted so we can tell
+        # whether multi-action is being used. Reads schema maxItems when present
+        # so the single-action message can say "schema allowed up to N".
+        schema_max = (
+            tool_schema.get("input_schema", {})
+            .get("properties", {}).get("action", {})
+            .get("maxItems")
+        )
+        if isinstance(raw_action, list):
+            names = [a.get("name", "?") for a in raw_action if isinstance(a, dict)]
+            logger.info(
+                "multi_act: LLM emitted list with %d action(s): %s",
+                len(raw_action), names,
+            )
+        elif isinstance(raw_action, dict):
+            logger.info(
+                "multi_act: LLM emitted single action %r (schema allows up to %s)",
+                raw_action.get("name", "?"),
+                schema_max if schema_max else "1",
+            )
+
+        for a in actions_list:
+            if isinstance(a, dict):
+                a.setdefault("params", {})
 
         result = {
             "evaluation_previous_goal": tool_input.get("evaluation_previous_goal", ""),
             "memory": tool_input.get("memory", ""),
             "next_goal": tool_input.get("next_goal", ""),
-            "action": action,
+            "action": actions_list[0] if actions_list else {},
+            "actions": actions_list,
         }
 
         # URL restoration

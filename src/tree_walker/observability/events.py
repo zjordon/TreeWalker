@@ -42,6 +42,8 @@ class ToolCallEvent(BaseEvent):
     tool_call_id: str
     action_name: str
     params: dict[str, Any] = Field(default_factory=dict)
+    action_index: int = 0
+    total_actions: int = 1
 
 
 class ToolResultEvent(BaseEvent):
@@ -50,6 +52,8 @@ class ToolResultEvent(BaseEvent):
     success: bool | None
     error: str | None = None
     duration_seconds: float = 0.0
+    action_index: int = 0
+    total_actions: int = 1
 
 
 class StepEndEvent(BaseEvent):

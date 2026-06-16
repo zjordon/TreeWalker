@@ -60,7 +60,7 @@ class JudgeSettings:
 class AgentSettings:
     max_steps: int = 100
     max_failures: int = 5
-    max_actions_per_step: int = 1  # reserved for future multi-action
+    max_actions_per_step: int = 5  # multi-action per step (browser-use parity)
     llm_timeout: int = 120  # seconds; wraps the entire retry sequence
     action_timeout: int = 30  # seconds; per-action execution timeout
     reconnect_timeout: int = 30  # seconds; wait for browser reconnection
@@ -127,6 +127,9 @@ class BrowserSettings:
     circuit_breaker_threshold: int = 3
     circuit_breaker_recovery_s: float = 30.0
     highlight: HighlightSettings = field(default_factory=HighlightSettings)
+    page_settle_timeout: float = 2.0
+    page_settle_poll_interval: float = 0.1
+    wait_between_actions: float = 0.0
 
 
 @dataclass

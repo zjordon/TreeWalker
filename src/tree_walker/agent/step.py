@@ -52,6 +52,8 @@ class StepPipeline:
     llm_timeout: int
     action_timeout: int
     reconnect_timeout: int
+    max_actions_per_step: int
+    wait_between_actions: float
     _track_downloads: bool
     _step_start_time: float
     messages: list[dict[str, Any]]
@@ -199,6 +201,7 @@ class StepPipeline:
             page_url=page_url,
             enable_planning=self._enable_planning,
             output_mode=self._output_mode,
+            max_actions=self.max_actions_per_step,
         )
         self._system_prompt = build_system_prompt(
             action_descriptions=self.tools.registry.get_action_descriptions_text(page_url=page_url),
@@ -255,6 +258,7 @@ class StepPipeline:
             self._tool_schema = self.tools.registry.get_tool_schema(
                 include_actions=["done"],
                 output_mode=self._output_mode,
+                max_actions=1,
             )
             logger.info("Force-done injected: last step reached (done-only schema)")
 
@@ -270,6 +274,7 @@ class StepPipeline:
             self._tool_schema = self.tools.registry.get_tool_schema(
                 include_actions=["done"],
                 output_mode=self._output_mode,
+                max_actions=1,
             )
             logger.info(
                 "Force-done injected: %d consecutive failures (done-only schema)",
@@ -494,66 +499,151 @@ class StepPipeline:
     ) -> list[ActionResult]:
         """Execute the action(s) decided by the LLM.
 
-        Key improvements over naive execution:
-          - Cached browser state avoids redundant CDP calls in action handlers.
-          - Pre/post-action URL comparison detects page navigation.
-          - Per-action timeout prevents hung CDP calls from blocking the loop.
-          - Connection errors propagate up to trigger agent stop.
+        Multi-action loop with five guards (Phase 2 + 3) and exception
+        triage (Phase 4):
+          - Reads ``model_output["actions"]`` (list) when present, falls back to
+            single-action ``model_output["action"]`` for backward compatibility.
+          - Executes actions strictly sequentially — never concurrently.
+          - Each action has its own per-action timeout and observability event.
+          - Pauses ``wait_between_actions`` seconds before each non-first
+            action (anti-detection cadence, browser-use parity).
+
+        Guards stop the sequence:
+          #1 done as single action — list midpoint ``done`` short-circuits
+          #2 result.is_done       — task completion signal
+          #3 result.error         — execution failure
+          #4 terminates_sequence  — navigate/search/switch_tab/go_back/evaluate
+                                    and any other action flagged at registration
+          #5 runtime drift        — URL or current_target_id changed between
+                                    pre/post-action sampling. Covers implicit
+                                    side effects (e.g. click on <a> navigating,
+                                    opening a new tab).
+
+        Exception triage (Phase 4):
+          - ``InterruptedError``        — re-raise (user stop/pause signal)
+          - connection-like errors      — re-raise (browser crashed / CDP lost)
+          - other errors / TimeoutError — append ``ActionResult(error)`` and
+                                            stop the sequence (return results)
         """
         if self.state.stopped or self.state.paused:
             return [ActionResult(error="Agent stopped or paused")]
 
-        action = model_output.get("action", {})
-        action_name = action.get("name", "done")
-        action_params = action.get("params", {})
+        actions = model_output.get("actions") or [model_output.get("action", {})]
+        total = len(actions)
+        results: list[ActionResult] = []
 
-        tool_call_id = ""
-        tool_start = time.time()
-        if self._obs_bus:
-            from tree_walker.observability.events import ToolCallEvent
-            tool_call_id = uuid.uuid4().hex[:8]
-            self._obs_bus.emit(ToolCallEvent(
-                step=self.state.n_steps, session_id=self._obs_session_id,
-                model_call_id=getattr(self, "_current_model_call_id", ""),
-                tool_call_id=tool_call_id, action_name=action_name,
-                params=action_params,
-            ))
+        for i, action in enumerate(actions):
+            action_name = action.get("name", "done")
+            action_params = action.get("params", {})
 
-        pre_action_url = browser_state.url
+            # Guard #1: done is only allowed as a single action. Encountering
+            # it after position 0 means the LLM mis-chained; we stop here so
+            # subsequent (meaningless) actions are skipped silently.
+            if i > 0 and action_name == "done":
+                logger.debug(
+                    "done is only allowed as a single action — skipping %d/%d remaining",
+                    total - i, total,
+                )
+                break
 
-        try:
-            result = await asyncio.wait_for(
-                self.tools.execute(action_name, action_params, self.browser, browser_state),
-                timeout=self.action_timeout,
-            )
-        except asyncio.TimeoutError:
-            logger.warning("Action '%s' timed out after %ds", action_name, self.action_timeout)
-            result = ActionResult(error=f"Action timed out after {self.action_timeout}s")
-        except Exception as e:
-            if _is_connection_error(e):
+            # Phase 4: anti-detection cadence between chained actions.
+            # Skipped on the first action and whenever guard #1 already broke.
+            if i > 0 and self.wait_between_actions > 0:
+                await asyncio.sleep(self.wait_between_actions)
+
+            tool_call_id = ""
+            tool_start = time.time()
+            if self._obs_bus:
+                from tree_walker.observability.events import ToolCallEvent
+                tool_call_id = uuid.uuid4().hex[:8]
+                self._obs_bus.emit(ToolCallEvent(
+                    step=self.state.n_steps, session_id=self._obs_session_id,
+                    model_call_id=getattr(self, "_current_model_call_id", ""),
+                    tool_call_id=tool_call_id, action_name=action_name,
+                    params=action_params,
+                    action_index=i, total_actions=total,
+                ))
+
+            # Sample pre-action state for runtime drift detection (guard #5).
+            # First iteration reuses the step-start URL from browser_state to
+            # avoid an extra CDP call; later iterations read fresh values
+            # because earlier actions may have changed them.
+            if i == 0:
+                pre_action_url = browser_state.url
+            else:
+                try:
+                    pre_action_url = await self.browser.get_current_url()
+                except Exception:
+                    pre_action_url = browser_state.url
+            pre_target_id = self.browser.current_target_id
+
+            try:
+                result = await asyncio.wait_for(
+                    self.tools.execute(action_name, action_params, self.browser, browser_state),
+                    timeout=self.action_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Action '%s' timed out after %ds", action_name, self.action_timeout)
+                result = ActionResult(error=f"Action timed out after {self.action_timeout}s")
+            except InterruptedError:
+                # Phase 4: user stop/pause signal must propagate to
+                # _handle_step_error without being wrapped in ActionResult.
                 raise
-            logger.error("Action '%s' raised %s: %s", action_name, type(e).__name__, e)
-            result = ActionResult(error=f"{type(e).__name__}: {e}")
+            except Exception as e:
+                if _is_connection_error(e):
+                    raise
+                logger.error("Action '%s' raised %s: %s", action_name, type(e).__name__, e)
+                result = ActionResult(error=f"{type(e).__name__}: {e}")
 
-        duration = time.time() - tool_start
-        if self._obs_bus and tool_call_id:
-            from tree_walker.observability.events import ToolResultEvent
-            self._obs_bus.emit(ToolResultEvent(
-                step=self.state.n_steps, session_id=self._obs_session_id,
-                tool_call_id=tool_call_id,
-                success=result.success, error=result.error,
-                duration_seconds=duration,
-            ))
+            results.append(result)
 
-        if not result.error and action_name not in _NO_URL_CHECK_ACTIONS:
+            duration = time.time() - tool_start
+            if self._obs_bus and tool_call_id:
+                from tree_walker.observability.events import ToolResultEvent
+                self._obs_bus.emit(ToolResultEvent(
+                    step=self.state.n_steps, session_id=self._obs_session_id,
+                    tool_call_id=tool_call_id,
+                    success=result.success, error=result.error,
+                    duration_seconds=duration,
+                    action_index=i, total_actions=total,
+                ))
+
+            # Guard #2/#3: is_done or error terminates the sequence — the LLM
+            # will see the failure / completion in the next step's state.
+            if result.is_done or result.error or i == total - 1:
+                break
+
+            # Guard #4: static terminates_sequence flag. Covers page-changing
+            # actions (navigate / search / switch_tab / go_back / evaluate)
+            # and any custom action that opts in via registration metadata.
+            registered = self.tools.registry.actions.get(action_name)
+            if registered is not None and registered.terminates_sequence:
+                logger.info(
+                    "Action '%s' terminates sequence — skipping %d/%d remaining",
+                    action_name, total - i - 1, total,
+                )
+                break
+
+            # Guard #5: runtime drift. Catches implicit side effects not flagged
+            # by terminates_sequence — e.g. click on <a> navigating, JS opening
+            # a new tab, form submit redirecting. Compare URL + target_id; if
+            # either changed, the remaining queued actions operate on stale DOM.
             try:
                 post_url = await self.browser.get_current_url()
-                if post_url and post_url != pre_action_url:
-                    logger.debug("Page changed after '%s': %s -> %s", action_name, pre_action_url, post_url)
             except Exception:
-                pass
+                post_url = pre_action_url
+            post_target_id = self.browser.current_target_id
+            if post_url != pre_action_url or post_target_id != pre_target_id:
+                logger.info(
+                    "Page drifted after '%s' (url: %s→%s, tab: %s→%s) — "
+                    "skipping %d/%d remaining",
+                    action_name, pre_action_url, post_url,
+                    pre_target_id, post_target_id,
+                    total - i - 1, total,
+                )
+                break
 
-        return [result]
+        return results
 
     # ── Stage 4: Post-process ─────────────────────────────────────────
 
@@ -578,18 +668,31 @@ class StepPipeline:
         if self._enable_planning and self.plan_manager:
             self.plan_manager.update_from_model_output(self.state, model_output)
 
-        # Record action to loop detector with exemption filtering
-        action = model_output.get("action", {})
-        action_name = action.get("name", "done")
-        action_params = action.get("params", {})
-        if action_name not in _LOOP_EXEMPT_ACTIONS:
-            self.loop_detector.record_action(action_name, action_params)
+        # Record each action to loop detector with exemption filtering.
+        # Multi-action steps record each action individually so the detector
+        # sees the full sequence; Phase 4 will refine failure semantics.
+        actions = model_output.get("actions") or [model_output.get("action", {})]
+        for action in actions:
+            action_name = action.get("name", "done")
+            action_params = action.get("params", {})
+            if action_name not in _LOOP_EXEMPT_ACTIONS:
+                self.loop_detector.record_action(action_name, action_params)
 
-        # Failure count: single-action error → increment + early return
-        if results and len(results) == 1 and results[-1].error:
+        # Phase 4 failure semantics:
+        #   - all-error step (single-action OR multi-action all failed) → count
+        #   - multi-action step with partial failure → do NOT count
+        #     (loop_detector + replan handle recovery)
+        #   - any success → reset counter
+        if results and all(r.error for r in results):
             self.state.consecutive_failures += 1
             logger.debug("Consecutive failures: %d", self.state.consecutive_failures)
             return
+        if results and any(r.error for r in results) and not all(r.error for r in results):
+            logger.info(
+                "Multi-action step had partial failure (%d/%d actions failed) "
+                "— not incrementing consecutive_failures",
+                sum(1 for r in results if r.error), len(results),
+            )
 
         # Success → reset failure counter
         if self.state.consecutive_failures > 0:
@@ -734,15 +837,6 @@ _CONNECTION_ERROR_PATTERNS = (
 
 # Actions excluded from loop detection — always hash the same or are terminal.
 _LOOP_EXEMPT_ACTIONS = frozenset({"wait", "done", "go_back"})
-
-
-# Actions that don't change the page, so skip post-action URL check.
-_NO_URL_CHECK_ACTIONS = frozenset({
-    "click", "input_text", "scroll", "send_keys", "wait",
-    "extract", "find_elements", "find_text", "search_page",
-    "dropdown_options", "select_dropdown", "screenshot",
-    "save_as_pdf", "upload_file", "read_file", "write_file", "replace_file",
-})
 
 
 def _flatten_params_for_validation(params: dict, action_name: str) -> dict:

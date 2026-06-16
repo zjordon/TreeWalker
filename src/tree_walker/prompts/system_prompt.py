@@ -9,7 +9,7 @@ from tree_walker.browser.views import BrowserStateSummary, TabInfo
 SYSTEM_PROMPT = """\
 You are a browser automation agent. You control a web browser to accomplish \
 tasks given by the user. On each step you receive the current page state \
-(DOM tree with indexed elements) and you respond with an action.
+(DOM tree with indexed elements) and you respond with one or more actions.
 
 ## Task
 
@@ -27,6 +27,24 @@ tasks given by the user. On each step you receive the current page state \
 4. For text input, set `clear: true` to replace existing text.
 5. If a page hasn't loaded or an element is missing, `wait` and try again.
 6. Avoid repeating the same action more than 3 times without progress.
+
+## Multi-action Rules
+
+1. You may emit up to **{max_actions}** actions per step. They execute in order \
+on the same DOM snapshot. Prefer chaining when the actions clearly target the \
+same stable page.
+2. **Chain aggressively in these scenarios** (concrete examples):
+   - Filling a form: `[input_text(field1), input_text(field2), ..., click(submit)]`
+   - Clearing multiple items: `[click(remove1), click(remove2), click(remove3)]`
+   - Sequential scrolls on the same page: `[scroll, scroll, scroll]`
+   - Multi-field extraction: `[extract(field1), extract(field2)]`
+3. If any action fails or the page changes mid-sequence, remaining actions are \
+skipped — you will receive the new page state on the next step. This is safe: \
+the runtime detects page drift and stops the sequence automatically.
+4. Actions marked `[terminates sequence]` (navigate / search / switch_tab / \
+go_back / evaluate) MUST be the LAST action in your list — placing anything \
+after them would operate on stale DOM.
+5. The `done` action must be a single action; never combine it with others.
 
 ## Task Completion Rules
 
@@ -54,8 +72,13 @@ def build_system_prompt(
     action_descriptions: str,
     task: str = "",
     enable_decision_attribution: bool = False,
+    max_actions: int = 5,
 ) -> str:
-    prompt = SYSTEM_PROMPT.format(action_descriptions=action_descriptions, task=task)
+    prompt = SYSTEM_PROMPT.format(
+        action_descriptions=action_descriptions,
+        task=task,
+        max_actions=max_actions,
+    )
     if enable_decision_attribution:
         from tree_walker.observability.decision_prompt import get_decision_attribution_prompt
         prompt += get_decision_attribution_prompt()

@@ -23,6 +23,7 @@ def _make_agent_with_filters(filters: dict[str, list[str]] | None = None):
     agent._enable_planning = False
     agent._enable_decision_attribution = False
     agent._output_mode = "standard"
+    agent.max_actions_per_step = 1
     agent._tool_schema = tools.registry.get_tool_schema(enable_planning=False)
     agent._system_prompt = "old prompt"
 
