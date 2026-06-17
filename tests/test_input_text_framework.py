@@ -157,16 +157,27 @@ class TestTypeTextCharByChar:
 
 	@pytest.mark.asyncio
 	async def test_type_text_clear_first(self, browser):
-		"""With clear=True, should send Ctrl+A + Backspace before typing."""
+		"""With clear=True, _clear_text_field is called and strategy 1 (JS) handles clearing;
+		only character-typing key events should reach dispatchKeyEvent."""
+		# Strategy 1 of _clear_text_field reports success
+		browser.client.send.Runtime.evaluate = AsyncMock(
+			side_effect=[
+				{"result": {"value": {"cleared": True, "method": "value", "final": ""}}},  # _clear_text_field strategy 1
+				{"result": {"value": True}},  # _trigger_framework_events
+				{"result": {"value": "X"}},  # _read_active_text (concatenation guard, matches)
+			],
+		)
+
 		await browser.type_text("X", clear=True)
 
 		dispatch = browser.client.send.Input.dispatchKeyEvent
-		# 4 clear events + 3 char events = 7
-		assert dispatch.call_count == 7
+		# Strategy 1 (JS) handled clearing — no Ctrl+A/Backspace key events.
+		# Only the 3 events for typing 'X' (keyDown + char + keyUp).
+		assert dispatch.call_count == 3
 
-		# First two calls: Ctrl+A keyDown/keyUp
-		assert dispatch.call_args_list[0][0][0]["key"] == "a"
-		assert dispatch.call_args_list[0][0][0]["modifiers"] == 2
+		# All key events should be for 'x' (base of 'X'), NOT Ctrl+A
+		for call in dispatch.call_args_list:
+			assert call[0][0]["key"] != "a" or call[0][0].get("modifiers") != 2
 
 	@pytest.mark.asyncio
 	async def test_type_text_no_longer_uses_insert_text(self, browser):
