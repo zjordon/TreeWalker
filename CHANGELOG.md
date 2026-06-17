@@ -5,6 +5,33 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0] - 2026-06-17
+
+### Added
+
+- **multi_act：一次执行多个浏览器动作**（#4）
+  - Phase 1 核心循环：单次决策返回多个 action，顺序执行
+  - Phase 2 静态守卫层：动作序列前置校验（非法 action、索引越界等）
+  - Phase 3 运行时守卫层 + `_wait_for_page_settle`：动作间页面稳定等待
+  - Phase 4 异常分流 + 失败语义 + `wait_between_actions`：单动作失败不影响后续，可配置动作间延时
+  - prompt 软化 + 诊断日志，引导 LLM 真正使用多动作（#5）
+  - `examples/multi_act_demo.py` 集成 demo
+
+### Fixed
+
+- **input_text 无法操作 Vue/React 控制的输入框**（#1）：逐字符 keyDown → char → keyUp 输入 + `_trigger_framework_events` 触发框架事件
+- `_trigger_framework_events` 移除 `change`/`blur` 派发，避免触发框架副作用（如标签输入框 blur 时清空 value）
+- **B 站标题输入框清空失效，旧文本未被清除导致追加**（#6）：完整复刻 browser-use 两层防线
+  - `_clear_text_field` 三层清空策略：JS `select()+value=""` → 三击+Delete → Ctrl+A+Backspace
+  - `type_text` 末尾拼接检测兜底：回读值 `endswith`/`startswith` 新文本且更长时，用 native setter 强制覆盖
+  - 新增 22 个单元测试，新代码 100% 覆盖
+
+### Docs
+
+- multi_act 实现方案、browser-use vs TreeWalker 工具子系统对比评估、#6 修复方案文档
+- CLAUDE.md 补充 Git 提交规则（不主动提交）
+- README 增加致谢
+
 ## [0.1.0] - 2026-06-10
 
 ### Added
@@ -35,4 +62,5 @@
 - 编程接口（`Agent`、`LLMClient`、`BrowserSession` 可独立使用）
 - 498 项单元测试
 
+[0.2.0]: https://github.com/zjordon/TreeWalker/releases/tag/v0.2.0
 [0.1.0]: https://github.com/zjordon/TreeWalker/releases/tag/v0.1.0
