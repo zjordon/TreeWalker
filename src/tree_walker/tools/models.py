@@ -29,6 +29,10 @@ class ScrollParams(BaseModel):
 class SearchParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
     query: str = Field(description="Search query to type into the search engine")
+    engine: Literal["baidu", "google", "bing", "duckduckgo"] = Field(
+        default="baidu",
+        description="Search engine: baidu (default, works in China), google, bing, or duckduckgo",
+    )
 
 
 class ExtractParams(BaseModel):
@@ -146,7 +150,7 @@ ACTION_DEFINITIONS: dict[str, tuple[type[BaseModel], str, bool]] = {
     "scroll": (ScrollParams, "Scroll the page up or down by a number of increments", False),
     "search": (
         SearchParams,
-        "Search the web using a search engine (navigates to search results)",
+        "Search the web via a search engine (baidu/google/bing/duckduckgo; default baidu). Navigates to the results page",
         True,
     ),
     "extract": (
