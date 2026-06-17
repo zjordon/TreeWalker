@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import time
 from typing import Any
@@ -567,9 +568,220 @@ class BrowserSession:
         Uses CDP keyDown → char → keyUp for each character to ensure
         framework event listeners (Vue v-model, React onChange) are triggered.
         After typing, dispatches framework-compatible events via JS.
+
+        When clear=True, uses _clear_text_field (three-layer strategy) and
+        runs a concatenation check at the end — if the field ended up with
+        OLD+NEW text (clear silently failed), force-overwrites via native
+        setter. Mirrors browser-use's _input_text_element_node_impl.
         """
         sid = self.current_session_id
         if clear:
+            await self._clear_text_field()
+
+        for char in text:
+            await self._type_char(char, sid)
+            await asyncio.sleep(0.001)
+
+        await asyncio.sleep(0.05)
+        await self._trigger_framework_events()
+
+        # Concatenation guard: if clear was requested but the field still
+        # contains the old text + new text (silent clear failure on a
+        # site that swallows Ctrl+A / select), force-overwrite via native
+        # setter. This is the last line of defense.
+        #
+        # _read_active_text and _force_set_value are both non-critical
+        # (they catch their own exceptions), so no outer try/except needed.
+        if clear:
+            actual = await self._read_active_text()
+            if (
+                isinstance(actual, str)
+                and actual != text
+                and len(actual) > len(text)
+                and (actual.endswith(text) or actual.startswith(text))
+            ):
+                logger.info(
+                    "Concatenation detected (%r), force-overwriting via native setter",
+                    actual,
+                )
+                await self._force_set_value(text)
+
+    async def _read_active_text(self) -> str:
+        """Read activeElement.value (input/textarea) or textContent (contenteditable)."""
+        try:
+            result = await self.client.send.Runtime.evaluate(
+                {
+                    "expression": """(function() {
+                        var el = document.activeElement;
+                        if (!el || el === document.body) return '';
+                        if (el.value !== undefined) return el.value;
+                        return el.textContent || '';
+                    })()""",
+                    "returnByValue": True,
+                },
+                session_id=self.current_session_id,
+            )
+            value = (result.get("result") or {}).get("value")
+            return value if isinstance(value, str) else ""
+        except Exception as e:
+            logger.debug("_read_active_text failed: %s", e)
+            return ""
+
+    async def _force_set_value(self, text: str) -> None:
+        """Force-overwrite activeElement value via native setter.
+
+        For input/textarea: uses Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,
+        'value').set to bypass React/Vue tracking.
+        For contenteditable: assigns textContent directly.
+        Dispatches input + change so frameworks notice the change.
+
+        Note: we DO dispatch 'change' here — unlike _trigger_framework_events
+        which intentionally omits it. This path only runs when concatenation
+        was detected (silent clear failure), and the element is still focused,
+        so there's no blur-related side effect to worry about.
+        """
+        try:
+            escaped = json.dumps(text)
+            await self.client.send.Runtime.evaluate(
+                {
+                    "expression": f"""
+                    (function() {{
+                        var el = document.activeElement;
+                        if (!el || el === document.body) return;
+                        var tag = el.tagName.toLowerCase();
+                        if (tag === 'input' || tag === 'textarea') {{
+                            var proto = tag === 'input'
+                                ? HTMLInputElement.prototype
+                                : HTMLTextAreaElement.prototype;
+                            var desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                            if (desc && desc.set) {{
+                                desc.set.call(el, {escaped});
+                            }} else {{
+                                el.value = {escaped};
+                            }}
+                            el.dispatchEvent(new Event('input', {{bubbles: true}}));
+                            el.dispatchEvent(new Event('change', {{bubbles: true}}));
+                        }} else if (el.isContentEditable) {{
+                            el.textContent = {escaped};
+                            el.dispatchEvent(new InputEvent('input', {{
+                                bubbles: true, inputType: 'insertText'
+                            }}));
+                            el.dispatchEvent(new Event('change', {{bubbles: true}}));
+                        }}
+                    }})()
+                    """,
+                    "returnByValue": True,
+                },
+                session_id=self.current_session_id,
+            )
+        except Exception as e:
+            logger.debug("_force_set_value failed: %s", e)
+
+    async def _clear_text_field(self) -> bool:
+        """Three-layer clear strategy, mirrors browser-use _clear_text_field.
+
+        Returns True if activeElement.value/textContent is empty after some layer.
+        Strategy 1: JS select() + value='' (covers input/textarea/contenteditable).
+        Strategy 2: Triple-click + Delete (mouse-based fallback).
+        Strategy 3: Ctrl+A + Backspace (keyboard last resort).
+        """
+        sid = self.current_session_id
+
+        # Strategy 1: JS select() + value=''
+        try:
+            result = await self.client.send.Runtime.evaluate(
+                {
+                    "expression": """
+                    (function() {
+                        var el = document.activeElement;
+                        if (!el || el === document.body) return {cleared: false, error: 'no active'};
+                        el.focus();
+                        if (el.isContentEditable) {
+                            var sel = window.getSelection();
+                            var range = document.createRange();
+                            range.selectNodeContents(el);
+                            sel.removeAllRanges();
+                            sel.addRange(range);
+                            el.textContent = '';
+                            el.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'deleteContent'}));
+                            el.dispatchEvent(new Event('change', {bubbles: true}));
+                            return {cleared: true, method: 'contenteditable', final: el.textContent};
+                        }
+                        if (el.value !== undefined) {
+                            try { el.select(); } catch(e) {}
+                            el.value = '';
+                            el.dispatchEvent(new Event('input', {bubbles: true}));
+                            el.dispatchEvent(new Event('change', {bubbles: true}));
+                            return {cleared: true, method: 'value', final: el.value};
+                        }
+                        return {cleared: false, error: 'unsupported element'};
+                    })()
+                    """,
+                    "returnByValue": True,
+                },
+                session_id=sid,
+            )
+            info_raw = (result.get("result") or {}).get("value")
+            info = info_raw if isinstance(info_raw, dict) else {}
+            final_raw = info.get("final")
+            final = final_raw.strip() if isinstance(final_raw, str) else ""
+            if info.get("cleared") and not final:
+                return True
+        except Exception as e:
+            logger.debug("_clear_text_field strategy 1 failed: %s", e)
+
+        # Strategy 2: Triple-click + Delete
+        try:
+            coord_result = await self.client.send.Runtime.evaluate(
+                {
+                    "expression": """(function() {
+                        var el = document.activeElement;
+                        if (!el || el === document.body) return null;
+                        var r = el.getBoundingClientRect();
+                        return JSON.stringify({x: r.x + r.width/2, y: r.y + r.height/2});
+                    })()""",
+                    "returnByValue": True,
+                },
+                session_id=sid,
+            )
+            coord_json = (coord_result.get("result") or {}).get("value")
+            if coord_json:
+                c = json.loads(coord_json)
+                await self.client.send.Input.dispatchMouseEvent(
+                    {
+                        "type": "mousePressed",
+                        "x": c["x"],
+                        "y": c["y"],
+                        "button": "left",
+                        "clickCount": 3,
+                    },
+                    session_id=sid,
+                )
+                await self.client.send.Input.dispatchMouseEvent(
+                    {
+                        "type": "mouseReleased",
+                        "x": c["x"],
+                        "y": c["y"],
+                        "button": "left",
+                        "clickCount": 3,
+                    },
+                    session_id=sid,
+                )
+                await self.client.send.Input.dispatchKeyEvent(
+                    {"type": "keyDown", "key": "Delete", "code": "Delete"},
+                    session_id=sid,
+                )
+                await self.client.send.Input.dispatchKeyEvent(
+                    {"type": "keyUp", "key": "Delete", "code": "Delete"},
+                    session_id=sid,
+                )
+                if await self._read_active_text() == "":
+                    return True
+        except Exception as e:
+            logger.debug("_clear_text_field strategy 2 failed: %s", e)
+
+        # Strategy 3: Ctrl+A + Backspace (last resort)
+        try:
             await self.client.send.Input.dispatchKeyEvent(
                 {"type": "keyDown", "key": "a", "code": "KeyA", "modifiers": 2},
                 session_id=sid,
@@ -586,13 +798,10 @@ class BrowserSession:
                 {"type": "keyUp", "key": "Backspace", "code": "Backspace"},
                 session_id=sid,
             )
-
-        for char in text:
-            await self._type_char(char, sid)
-            await asyncio.sleep(0.001)
-
-        await asyncio.sleep(0.05)
-        await self._trigger_framework_events()
+            return await self._read_active_text() == ""
+        except Exception as e:
+            logger.debug("_clear_text_field strategy 3 failed: %s", e)
+            return False
 
     async def _type_char(self, char: str, sid: str | None = None) -> None:
         """Send a single character as keyDown → char → keyUp."""
