@@ -107,6 +107,16 @@ def _pick_nearest_file_input(
     return best_id if best_id is not None else file_input_ids[0]
 
 
+# ── Search engines ──────────────────────────────────────────────────
+
+_SEARCH_ENGINE_URLS: dict[str, str] = {
+    "baidu": "https://www.baidu.com/s?wd={query}",
+    "google": "https://www.google.com/search?q={query}&udm=14",
+    "bing": "https://www.bing.com/search?q={query}",
+    "duckduckgo": "https://duckduckgo.com/?q={query}",
+}
+
+
 class Tools:
     """Action registry + execution engine.
 
@@ -231,10 +241,15 @@ class Tools:
         return ActionResult()
 
     async def _action_search(self, params: dict, browser: BrowserSession) -> ActionResult:
+        import urllib.parse
+
         query = params["query"]
-        url = f"https://www.google.com/search?q={query}"
+        engine = params.get("engine", "baidu")
+        encoded_query = urllib.parse.quote_plus(query)
+        url = _SEARCH_ENGINE_URLS[engine].format(query=encoded_query)
         await browser.navigate(url)
-        return ActionResult()
+        memory = f"Searched {engine.title()} for '{query}'"
+        return ActionResult(extracted_content=memory, long_term_memory=memory)
 
     async def _action_extract(self, params: dict, browser: BrowserSession) -> ActionResult:
         goal = params["goal"]
