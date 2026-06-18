@@ -379,14 +379,33 @@ class BrowserSession:
 
     # ── Navigation ─────────────────────────────────────────────────────
 
-    async def navigate(self, url: str) -> None:
-        """Navigate current page to URL."""
+    async def navigate(self, url: str, new_tab: bool = False) -> str | None:
+        """Navigate to URL. If new_tab=True, open a new tab first and navigate there.
+
+        Raises ``RuntimeError`` with the CDP errorText if navigation fails (e.g.
+        net::ERR_NAME_NOT_RESOLVED). Returns the new tab's target_id when
+        new_tab=True, else None.
+        """
+        if new_tab:
+            # 先开空白标签页（create_tab 已切换到它），再走 Page.navigate 以保留 errorText 检查
+            target_id = await self.create_tab("about:blank")
+        else:
+            target_id = None
+
+        # 导航会改变页面，两层 selector_map 缓存都要清（与 switch_tab 一致）
+        self._cached_selector_map = None
         self._previous_cached_selector_map = None
-        await self.client.send.Page.navigate(
-            {"url": url},
+
+        result = await self.client.send.Page.navigate(
+            {"url": url, "transitionType": "address_bar"},
             session_id=self.current_session_id,
         )
+        # errorText 仅在导航失败时存在（CDP：present if and only if navigation has failed）
+        error_text = result.get("errorText") if isinstance(result, dict) else None
+        if error_text:
+            raise RuntimeError(f"Navigation failed: {error_text}")
         await self._wait_for_page_settle()
+        return target_id
 
     async def go_back(self) -> None:
         """Navigate to the previous page in history."""

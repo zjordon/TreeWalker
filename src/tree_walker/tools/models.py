@@ -6,6 +6,10 @@ from pydantic import BaseModel, ConfigDict, Field
 class NavigateParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
     url: str = Field(description="The URL to navigate to")
+    new_tab: bool = Field(
+        default=False,
+        description="If True, open the URL in a new tab instead of navigating the current tab",
+    )
 
 
 class ClickParams(BaseModel):
@@ -140,7 +144,11 @@ class DoneParams(BaseModel):
 
 # Mapping: action name → (param model, description, terminates_sequence)
 ACTION_DEFINITIONS: dict[str, tuple[type[BaseModel], str, bool]] = {
-    "navigate": (NavigateParams, "Navigate to a URL in the current tab", True),
+    "navigate": (
+        NavigateParams,
+        "Navigate to a URL in the current tab, or open it in a new tab with new_tab=True",
+        True,
+    ),
     "click": (ClickParams, "Click an element by its ID from the DOM state", False),
     "input_text": (
         InputTextParams,
