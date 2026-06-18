@@ -46,7 +46,7 @@ def mock_components(tmp_path):
     browser.consume_completed_downloads = MagicMock(return_value=[])
 
     tools = MagicMock(spec=Tools)
-    tools.execute = AsyncMock(return_value=ActionResult(success=True))
+    tools.execute = AsyncMock(return_value=ActionResult())
     tools.registry = MagicMock()
     tools.registry.get_action_descriptions_text = MagicMock(return_value="click: Click element")
     tools.registry.get_tool_schema = MagicMock(return_value={
