@@ -60,40 +60,62 @@
   |---|---|---|
   | `index` | `int` | ID of the element to click, shown in brackets in the DOM tree |
 
-- **主要逻辑**（[actions.py:203-217](../../src/tree_walker/tools/actions.py)）：
+- **主要逻辑**（[actions.py:300-338](../../src/tree_walker/tools/actions.py)，回显 helper `_describe_click` 在 [actions.py:339-360](../../src/tree_walker/tools/actions.py)）：
 
   ```python
   async def _action_click(self, params: dict, browser: BrowserSession) -> ActionResult:
       entry, error = await self._get_element_by_index(params["index"], browser)
       if error:
           return error
-      tag = entry.tag_name.upper()
-      if tag == "SELECT":
-          js_code = (
-              "Array.from(document.querySelectorAll('select option'))"
-              ".map(o => ({value: o.value, text: o.textContent.trim()}))"
-          )
-          options = await browser.execute_js(js_code)
+      backend_id = entry.backend_node_id
+      # SELECT 分支：精确查"指定 index 的那个 select"，不再全页 querySelectorAll
+      if entry.tag_name.upper() == "SELECT":
+          try:
+              options = await browser.fetch_select_options(backend_id)
+          except Exception as e:
+              return ActionResult(error=f"Failed to read select options: {e}")
           return ActionResult(extracted_content=str(options))
-      await browser.highlight_element(entry.backend_node_id)
-      await browser.click_element(entry.backend_node_id)
-      return ActionResult()
+      # 普通点击：highlight -> click_element，映射 bool 信号
+      try:
+          await browser.highlight_element(backend_id)
+          clicked = await browser.click_element(backend_id)
+      except Exception as e:
+          return ActionResult(error=f"Click failed: {e}")
+      if not clicked:
+          return ActionResult(
+              error=(
+                  f"Could not click element {params['index']} "
+                  f"(no coordinates and JS click fallback failed; "
+                  f"the element may be detached, hidden, or in a cross-origin iframe)"
+              ),
+          )
+      # 成功回显（对齐 navigate/go_back 风格）
+      memory = self._describe_click(entry, params["index"])
+      logger.info(memory)
+      return ActionResult(extracted_content=memory, long_term_memory=memory)
   ```
 
-  特殊分支：点击 `<select>` 时不真正点击，而是返回所有 option 让 LLM 接下来用 `select_dropdown`。
+  特殊分支：点击 `<select>` 时不真正点击，而是经 `fetch_select_options(backend_id)` **精确读取该 select 的所有 option**（旧实现用 `document.querySelectorAll('select option')` 扫描全页 select，多 select 页面会返回错误 option），让 LLM 接下来用 `select_dropdown`。普通点击成功时回显 `Clicked [TAG] {text} at index N`（`_describe_click` 优先取 aria-label/placeholder/title/alt/value，再取 node_value，再退化为 `[TAG] at index N`）。
 
 - **CDP 调用清单**：
 
   | CDP 命令 | 主要参数 | 行号 |
   |---|---|---|
-  | `DOM.scrollIntoViewIfNeeded` | `{backendNodeId}` | session.py:511 |
-  | `DOM.getContentQuads` | `{backendNodeId}` | session.py:439 |
-  | `DOM.getBoxModel` (fallback) | `{backendNodeId}` | session.py:459 |
-  | `DOM.resolveNode` + `Runtime.callFunctionOn` (fallback) | `getBoundingClientRect()` | session.py:478, 483 |
-  | `Input.dispatchMouseEvent` × 2 | `{type, x, y, button:left, clickCount:1}` | session.py:413 |
+  | `DOM.scrollIntoViewIfNeeded` | `{backendNodeId}` | session.py:670 |
+  | `Page.getLayoutMetrics` | `{}` | session.py:642 |
+  | `DOM.getContentQuads` | `{backendNodeId}` | session.py:545（取与视口交集最大的 quad） |
+  | `DOM.getBoxModel` (fallback) | `{backendNodeId}` | session.py:562 |
+  | `DOM.resolveNode` + `Runtime.callFunctionOn` (fallback) | `getBoundingClientRect()` | session.py:580, 587 |
+  | `DOM.resolveNode` + `Runtime.callFunctionOn`（遮挡检查） | `document.elementFromPoint(x,y)` 祖先链 | session.py:721, 728（`_is_element_occluded`） |
+  | `DOM.resolveNode` + `Runtime.callFunctionOn`（JS 回退 / SELECT） | `this.click()` / `this.options` | session.py:769, 776（`_js_click`）、session.py:1265, 1272（`fetch_select_options`） |
+  | `Input.dispatchMouseEvent` × 3 | `{type, x, y[, button:left, clickCount:1]}` | session.py:485-513（mouseMoved → mousePressed → mouseReleased） |
   | `Overlay.highlightNode` (可选) | `{highlightConfig, backendNodeId}` | highlight.py:35 |
 
-- **注意事项**：坐标计算用三层 fallback 链（详见 4.3.1）；点击坐标为元素几何中心 `(x+w/2, y+h/2)`。
+- **注意事项**：
+  - 鼠标序列为 `mouseMoved → mousePressed → mouseReleased`（对齐 browser-use `default_action_watchdog.py:902-955`）；前置 `mouseMoved` 触发 hover 菜单 / mousemove 监听器 / 反爬检测。
+  - 坐标计算用三层 fallback 链（详见 4.3.1）；Method 1 取**与视口交集最大的 quad**（不再取 `quads[0]`）；几何中心裁剪到 `[0, viewport-1]`。
+  - 点击点被遮挡（固定 header/footer、弹窗、`<label>` 包 `<input>` 等）时跳过几何点击，回退 `this.click()`；坐标拿不到也走 JS 回退。**坐标拿不到 + JS 回退均失败 → 明确 `ActionResult(error=...)`，不再静默成功**。
+  - 成功回显 `Clicked [TAG] {text} at index N`（对齐 navigate/go_back）。
 
 ---
 
@@ -1028,29 +1050,29 @@
 
 ### 4.3.1 鼠标点击坐标计算（三层 fallback）
 
-源码：[session.py:427-505](../../src/tree_walker/browser/session.py)
+源码：[session.py:518-599](../../src/tree_walker/browser/session.py)（`get_element_coordinates`）、[session.py:601-632](../../src/tree_walker/browser/session.py)（`_best_quad_rect`）、[session.py:651-703](../../src/tree_walker/browser/session.py)（`click_element`）
 
 ```python
-async def get_element_coordinates(self, backend_node_id: int) -> DOMRect | None:
+async def get_element_coordinates(
+    self, backend_node_id: int, viewport: tuple[int, int] | None = None,
+) -> DOMRect | None:
     """Three-tier fallback chain (same as browser-use):
-    1. DOM.getContentQuads — best for inline/complex layouts
+    1. DOM.getContentQuads — best for inline/complex layouts（取与视口交集最大的 quad）
     2. DOM.getBoxModel — fallback using box model content
     3. JS getBoundingClientRect() via DOM.resolveNode + Runtime.callFunctionOn
     """
     sid = self.current_session_id
+    if viewport is None:
+        viewport = await self._get_viewport_size()  # Page.getLayoutMetrics
 
-    # Method 1: DOM.getContentQuads
+    # Method 1: DOM.getContentQuads — 取与视口交集最大的 quad 的外接矩形
     try:
         result = await self.client.send.DOM.getContentQuads(
             {"backendNodeId": backend_node_id}, session_id=sid,
         )
-        quads = result.get("quads", [])
-        if quads:
-            quad = quads[0]
-            if len(quad) >= 8:
-                xs = [quad[i] for i in range(0, 8, 2)]
-                ys = [quad[i] for i in range(1, 8, 2)]
-                return DOMRect(x=min(xs), y=min(xs), width=max(xs)-min(xs), height=max(ys)-min(ys))
+        best = self._best_quad_rect(result.get("quads", []), viewport)
+        if best:
+            return best
     except Exception:
         pass
 
@@ -1086,17 +1108,32 @@ async def get_element_coordinates(self, backend_node_id: int) -> DOMRect | None:
     return None
 ```
 
-最终点击坐标（[session.py:521-522](../../src/tree_walker/browser/session.py)）：
+最终点击坐标与回退链（[session.py:651-703](../../src/tree_walker/browser/session.py)，`click_element` 返回 `bool`）：
 
 ```python
-x = int(rect.x + rect.width / 2)
-y = int(rect.y + rect.height / 2)
-await self.click_at(x, y)
+viewport = await self._get_viewport_size()
+rect = await self.get_element_coordinates(backend_node_id, viewport=viewport)
+if rect:
+    x = int(rect.x + rect.width / 2)
+    y = int(rect.y + rect.height / 2)
+    # 裁剪到视口 [0, viewport-1]
+    if viewport:
+        x = max(0, min(viewport[0] - 1, x))
+        y = max(0, min(viewport[1] - 1, y))
+    if not await self._is_element_occluded(backend_node_id, x, y):
+        await self.click_at(x, y)
+        return True  # 几何点击成功
+# 坐标拿不到 OR 被遮挡 -> JS click 回退（this.click()）
+if await self._js_click(backend_node_id):
+    return True
+return False  # 坐标拿不到 + JS 回退也失败 -> action 层明确报错
 ```
+
+拿到坐标后经 `_is_element_occluded`（`document.elementFromPoint` 祖先链）判遮挡，被遮挡或 `rect is None` 走 `_js_click` 回退；最终 `bool` 信号上浮到 action 层（`False` → `ActionResult(error=...)`，不再静默成功）。
 
 **为什么三层 fallback**：
 
-- `DOM.getContentQuads` 对 CSS transform / position:absolute 等复杂布局最准确，但对某些 display:none 元素返回空 quad
+- `DOM.getContentQuads` 对 CSS transform / position:absolute 等复杂布局最准确，但对某些 display:none 元素返回空 quad；多 quad 元素（跨行 inline、CSS transform 拆分）用 `_best_quad_rect` 选与视口交集最大者
 - `DOM.getBoxModel` 用 layout 信息，对隐藏元素也能给出尺寸
 - JS `getBoundingClientRect()` 是 web 标准方法，但需要先 `DOM.resolveNode` 拿到 objectId
 
@@ -1242,8 +1279,9 @@ async def set_file_input(
 
 | CDP 命令 | 参数 | 用于 action | 行号 |
 |---|---|---|---|
-| `dispatchMouseEvent(mousePressed)` | `{x, y, button:left, clickCount:1}` | click, input_text | session.py:413 |
-| `dispatchMouseEvent(mouseReleased)` | 同上 | click, input_text | session.py:413 |
+| `dispatchMouseEvent(mouseMoved)` | `{x, y}` | click, input_text（mouseMoved → mousePressed → mouseReleased 序列前置） | session.py:485 |
+| `dispatchMouseEvent(mousePressed)` | `{x, y, button:left, clickCount:1}` | click, input_text | session.py:498 |
+| `dispatchMouseEvent(mouseReleased)` | 同上 | click, input_text | session.py:511 |
 | `dispatchMouseEvent(mouseWheel)` | `{x, y, deltaX:0, deltaY}` | scroll | session.py:737 |
 | `dispatchKeyEvent(keyDown)` | `{key, code, modifiers, windowsVirtualKeyCode}` | input_text, send_keys | session.py:539, 575, 692 |
 | `dispatchKeyEvent(char)` | `{text, key}` | input_text, send_keys | session.py:587, 706 |
@@ -1253,10 +1291,10 @@ async def set_file_input(
 
 | CDP 命令 | 参数 | 用于 action | 行号 |
 |---|---|---|---|
-| `scrollIntoViewIfNeeded` | `{backendNodeId}` | click, input_text | session.py:511 |
-| `getContentQuads` | `{backendNodeId}` | click, input_text (坐标方法 1) | session.py:439 |
-| `getBoxModel` | `{backendNodeId}` | click, input_text (坐标方法 2) | session.py:459 |
-| `resolveNode` | `{backendNodeId}` | click, input_text (坐标方法 3) | session.py:478 |
+| `scrollIntoViewIfNeeded` | `{backendNodeId}` | click, input_text | session.py:670 |
+| `getContentQuads` | `{backendNodeId}` | click, input_text (坐标方法 1，取最大交集 quad) | session.py:545 |
+| `getBoxModel` | `{backendNodeId}` | click, input_text (坐标方法 2) | session.py:562 |
+| `resolveNode` | `{backendNodeId}` | click, input_text (坐标方法 3 / 遮挡检查 / JS 回退 / SELECT option) | session.py:580, 721, 769, 1265 |
 | `getDocument` | `{depth:-1, pierce:True}` | upload_file (shadow DOM) | session.py:807 |
 | `setFileInputFiles` | `{backendNodeId, files:[path]}` | upload_file | session.py:861 |
 
@@ -1269,7 +1307,7 @@ async def set_file_input(
 | `navigateToHistoryEntry` | `{entryId}` | go_back | session.py:397 |
 | `captureScreenshot` | `{format:png}` | screenshot | session.py:372 |
 | `printToPDF` | `{printBackground:True}` | save_as_pdf | actions.py:327 |
-| `getLayoutMetrics` | `{}` | scroll | session.py:728 |
+| `getLayoutMetrics` | `{}` | scroll, click（`_get_viewport_size` 取视口用于 quad 选择 + 中心裁剪） | session.py:642, 728 |
 
 #### `Target.*` 域
 
@@ -1286,7 +1324,7 @@ async def set_file_input(
 | CDP 命令 | 参数 | 用于 action | 行号 |
 |---|---|---|---|
 | `evaluate` | `{expression, returnByValue, awaitPromise, timeout:30000}` | evaluate, find_elements, find_text, dropdown_options, select_dropdown, search_page, extract | session.py:785, 612 |
-| `callFunctionOn` | `{objectId, functionDeclaration, returnByValue}` | click (坐标方法 3 内部) | session.py:483 |
+| `callFunctionOn` | `{objectId, functionDeclaration, returnByValue[, arguments]}` | click（坐标方法 3 / 遮挡检查 `elementFromPoint` / JS 回退 `this.click()` / SELECT `this.options`） | session.py:587, 728, 776, 1272 |
 
 #### `Overlay.*` 域（可选视觉反馈）
 
@@ -1299,7 +1337,7 @@ async def set_file_input(
 
 | Action | 平均 CDP 命令数 | 说明 |
 |---|---|---|
-| `click` | 4-8 | scrollIntoView + 坐标 1-3 方法 + 2 个 mouse 事件 + 高亮 |
+| `click` | 5-10 | scrollIntoView + getLayoutMetrics + 坐标 1-3 方法（取最大交集 quad）+ 遮挡检查 + 3 个 mouse 事件 + 高亮（被遮挡或无坐标时改走 JS 回退，命令数减少） |
 | `input_text` | 10+ | click + clear（4 个 keyEvent）+ 每字符 3 个 keyEvent + 框架事件 |
 | `navigate` | 1 | 单 Page.navigate |
 | `scroll` | 2 | getLayoutMetrics + mouseWheel |

@@ -298,20 +298,67 @@ class Tools:
         return ActionResult(error=f"Navigation failed: {error_msg}")
 
     async def _action_click(self, params: dict, browser: BrowserSession) -> ActionResult:
+        # 1. 元素查找（保持原逻辑）
         entry, error = await self._get_element_by_index(params["index"], browser)
         if error:
             return error
-        tag = entry.tag_name.upper()
-        if tag == "SELECT":
-            js_code = (
-                "Array.from(document.querySelectorAll('select option'))"
-                ".map(o => ({value: o.value, text: o.textContent.trim()}))"
-            )
-            options = await browser.execute_js(js_code)
+
+        backend_id = entry.backend_node_id
+
+        # 2. SELECT 分支：精确查"指定 index 的那个 select"，不再全页 querySelectorAll
+        if entry.tag_name.upper() == "SELECT":
+            try:
+                options = await browser.fetch_select_options(backend_id)
+            except Exception as e:
+                return ActionResult(error=f"Failed to read select options: {e}")
             return ActionResult(extracted_content=str(options))
-        await browser.highlight_element(entry.backend_node_id)
-        await browser.click_element(entry.backend_node_id)
-        return ActionResult()
+
+        # 3. 普通点击：highlight -> click_element，映射 bool 信号
+        try:
+            await browser.highlight_element(backend_id)
+            clicked = await browser.click_element(backend_id)
+        except Exception as e:
+            # CDP 异常（连接断开、target 消失等）——友好映射，不让 LLM 看裸堆栈
+            return ActionResult(error=f"Click failed: {e}")
+
+        if not clicked:
+            # 坐标拿不到 + JS 回退也失败 —— 明确告知 LLM，不再静默成功
+            return ActionResult(
+                error=(
+                    f"Could not click element {params['index']} "
+                    f"(no coordinates and JS click fallback failed; "
+                    f"the element may be detached, hidden, or in a cross-origin iframe)"
+                ),
+            )
+
+        # 4. 成功回显（对齐 navigate/go_back 风格）
+        memory = self._describe_click(entry, params["index"])
+        logger.info(memory)
+        return ActionResult(extracted_content=memory, long_term_memory=memory)
+
+    @staticmethod
+    def _describe_click(entry: Any, index: int) -> str:
+        """Build a human-readable click echo, mirroring navigate/go_back style.
+
+        Prefers an identifying attribute the LLM can also see in the DOM tree
+        (aria-label/placeholder/title/alt/value), then node_value, then just the
+        tag. Bounded to ~60 chars per field so the echo fits the LLM context.
+        """
+        tag = entry.tag_name.upper()
+        attrs = getattr(entry, "attributes", {}) or {}
+        for key in ("aria-label", "placeholder", "title", "alt", "value"):
+            v = attrs.get(key)
+            if v:
+                v = v.strip()
+                if len(v) > 60:
+                    v = v[:60] + "..."
+                return f"Clicked [{tag}] {v!r} at index {index}"
+        node_value = (getattr(entry, "node_value", "") or "").strip()
+        if node_value:
+            if len(node_value) > 60:
+                node_value = node_value[:60] + "..."
+            return f"Clicked [{tag}] {node_value!r} at index {index}"
+        return f"Clicked [{tag}] at index {index}"
 
     async def _action_input_text(self, params: dict, browser: BrowserSession) -> ActionResult:
         entry, error = await self._get_element_by_index(params["index"], browser)
