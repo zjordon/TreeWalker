@@ -385,8 +385,46 @@ class Tools:
         return ActionResult()
 
     async def _action_go_back(self, params: dict, browser: BrowserSession) -> ActionResult:
-        await browser.go_back()
-        return ActionResult()
+        try:
+            target_url = await browser.go_back()
+        except Exception as e:
+            return ActionResult(error=f"Failed to go back: {e}")
+
+        if target_url is None:
+            # 无历史可退（currentIndex <= 0）——明确告知，避免 LLM 误以为已后退
+            return ActionResult(error="No previous page in history to go back to")
+
+        # 轻量健康检查：SPA 后退未渲染给一次重试机会（仍空仅 warning，不硬失败）
+        await self._go_back_health_check(target_url, browser)
+
+        memory = f"Navigated back to {target_url}"
+        logger.info(memory)
+        return ActionResult(extracted_content=memory, long_term_memory=memory)
+
+    async def _go_back_health_check(self, target_url: str | None, browser: BrowserSession) -> None:
+        """后退后轻量空 DOM 检测（用户选：轻量，不 reload、不硬失败）。
+
+        与 _navigate_health_check 的差异：go_back 没有"reload 同 URL"的干净机制
+        （重新 navigate 会新增历史项），故仅做一次重试等待，持续空只 warning 不抛错，
+        交由 LLM 下一轮 get_state 自行感知。仅当后退目标为 http(s) 时触发。
+        """
+        state = await browser.get_state(include_screenshot=False)
+        url_is_http = state.url.lower().startswith(("http://", "https://"))
+        if not (url_is_http and self._dom_appears_empty(state)):
+            return
+
+        logger.warning(
+            "Empty DOM after going back to %s, waiting %.0fs and rechecking",
+            target_url, _NAVIGATE_EMPTY_RETRY_WAIT,
+        )
+        await asyncio.sleep(_NAVIGATE_EMPTY_RETRY_WAIT)
+        state = await browser.get_state(include_screenshot=False)
+        if state.url.lower().startswith(("http://", "https://")) and self._dom_appears_empty(state):
+            logger.warning(
+                "Still empty after going back to %s; SPA may still be rendering. "
+                "Not failing hard (no clean reload for history navigation).",
+                target_url,
+            )
 
     async def _action_find_elements(self, params: dict, browser: BrowserSession) -> ActionResult:
         selector = params["selector"]
