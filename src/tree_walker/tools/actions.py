@@ -117,6 +117,23 @@ _SEARCH_ENGINE_URLS: dict[str, str] = {
 }
 
 
+# ── Navigate health check / error mapping (mirrors browser-use) ──────
+
+# 等待/重试时长（秒），参照 browser_use/tools/service.py:501-523
+_NAVIGATE_EMPTY_RETRY_WAIT = 3.0   # 首次发现空 DOM 后等待重查
+_NAVIGATE_EMPTY_RELOAD_WAIT = 5.0  # reload 后等待
+
+# 网络错误码 → 触发 "site unavailable" 友好提示（参照 browser-use service.py:544-557）
+_NAVIGATE_NET_ERROR_MARKERS = (
+    "ERR_NAME_NOT_RESOLVED",
+    "ERR_INTERNET_DISCONNECTED",
+    "ERR_CONNECTION_REFUSED",
+    "ERR_TIMED_OUT",
+    "ERR_TUNNEL_CONNECTION_FAILED",
+    "net::",
+)
+
+
 class Tools:
     """Action registry + execution engine.
 
@@ -207,8 +224,78 @@ class Tools:
         url = params["url"]
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
-        await browser.navigate(url)
-        return ActionResult()
+        new_tab = params.get("new_tab", False)
+
+        try:
+            await browser.navigate(url, new_tab=new_tab)
+            # 健康检查：仅当前标签页 + http(s) URL（chrome://、about:、new_tab=True 跳过）
+            if not new_tab:
+                await self._navigate_health_check(url, browser)
+            memory = (
+                f"Opened new tab with URL {url}" if new_tab else f"Navigated to {url}"
+            )
+            logger.info(memory)
+            return ActionResult(extracted_content=memory, long_term_memory=memory)
+        except Exception as e:
+            return self._map_navigation_error(url, e)
+
+    @staticmethod
+    def _dom_appears_empty(state: BrowserStateSummary) -> bool:
+        """判定页面是否为空（镜像 browser-use 的 _page_appears_empty）。
+
+        SerializedDOMState.llm_representation() 在 _root is None 时返回非空占位符，所以必须
+        单独检查 _root is None（不能只看 element_tree_text）。
+        """
+        ds = state.dom_state
+        if ds is None:
+            return True
+        return ds._root is None or not ds.element_tree_text.strip()
+
+    async def _navigate_health_check(self, url: str, browser: BrowserSession) -> None:
+        """导航后检测空 DOM，参照 browser_use/tools/service.py:493-523 三阶段重试。
+
+        仅 http(s) URL + 当前标签页触发；三阶段判定逐渐收严。
+        """
+        state = await browser.get_state(include_screenshot=False)
+        url_is_http = state.url.lower().startswith(("http://", "https://"))
+        if not (url_is_http and self._dom_appears_empty(state)):
+            return
+
+        logger.warning(
+            "Empty DOM after navigating to %s, waiting %.0fs and rechecking",
+            url, _NAVIGATE_EMPTY_RETRY_WAIT,
+        )
+        await asyncio.sleep(_NAVIGATE_EMPTY_RETRY_WAIT)
+        state = await browser.get_state(include_screenshot=False)
+        if not (state.url.lower().startswith(("http://", "https://")) and self._dom_appears_empty(state)):
+            return
+
+        logger.warning("Still empty after %.0fs, reloading %s", _NAVIGATE_EMPTY_RETRY_WAIT, url)
+        # reload：重新 navigate，异常吞掉（避免健康检查的二次失败中断"初次导航已成功"的外层路径）
+        try:
+            await browser.navigate(url, new_tab=False)
+        except Exception as reload_err:
+            logger.warning("Reload during health check failed: %s", reload_err)
+        await asyncio.sleep(_NAVIGATE_EMPTY_RELOAD_WAIT)
+
+        state = await browser.get_state(include_screenshot=False)
+        if state.url.lower().startswith(("http://", "https://")):
+            ds = state.dom_state
+            if ds is None or ds._root is None:
+                raise RuntimeError(
+                    f"Page loaded but returned empty content for {url}. "
+                    f"The page may require JavaScript that failed to render, use anti-bot measures, "
+                    f"or have a connection issue (e.g. tunnel/proxy error). Try a different URL or approach."
+                )
+
+    @staticmethod
+    def _map_navigation_error(url: str, e: Exception) -> ActionResult:
+        """把导航异常映射为对 LLM 友好的 ActionResult.error（参照 browser-use service.py:534-560）。"""
+        error_msg = str(e)
+        if any(marker in error_msg for marker in _NAVIGATE_NET_ERROR_MARKERS):
+            logger.warning("Navigation to %s failed - site unavailable: %s", url, error_msg)
+            return ActionResult(error=f"Navigation failed - site unavailable: {url}")
+        return ActionResult(error=f"Navigation failed: {error_msg}")
 
     async def _action_click(self, params: dict, browser: BrowserSession) -> ActionResult:
         entry, error = await self._get_element_by_index(params["index"], browser)

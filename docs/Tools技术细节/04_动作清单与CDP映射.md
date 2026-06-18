@@ -20,7 +20,7 @@
 | 8 | [find_text](#48-find_text) | 否 | `text: str` | Runtime (JS) | window.find() 滚动到文本 |
 | 9 | [go_back](#49-go_back) | 是 | (无) | Page | 浏览器后退 |
 | 10 | [input_text](#410-input_text) | 否 | `index, text, clear` | DOM + Input + Runtime | 点击+输入文本+触发框架事件 |
-| 11 | [navigate](#411-navigate) | 是 | `url: str` | Page | 导航到 URL |
+| 11 | [navigate](#411-navigate) | 是 | `url: str, new_tab?: bool` | Page + Target | 导航到 URL（支持 new_tab、健康检查、错误映射） |
 | 12 | [read_file](#412-read_file) | 否 | `path: str` | (本地 fs) | 同步读本地文件 |
 | 13 | [replace_file](#413-replace_file) | 否 | `path, old, new` | (本地 fs) | 字符串替换并写回 |
 | 14 | [save_as_pdf](#414-save_as_pdf) | 否 | `path: str` | Page | 打印页面为 PDF |
@@ -449,34 +449,57 @@
 
 ### 4.11 `navigate`
 
-- **description**：`Navigate to a URL in the current tab` / 在当前标签页导航到 URL
+- **description**：`Navigate to a URL in the current tab, or open it in a new tab with new_tab=True` / 在当前标签页导航到 URL，或用 new_tab=True 在新标签页打开
 - **terminates_sequence**：True
 - **Pydantic 参数**：
 
-  | 字段 | 类型 | 描述 |
-  |---|---|---|
-  | `url` | `str` | The URL to navigate to |
+  | 字段 | 类型 | 默认 | 描述 |
+  |---|---|---|---|
+  | `url` | `str` | (必填) | The URL to navigate to |
+  | `new_tab` | `bool` | `False` | If True, open the URL in a new tab instead of navigating the current tab |
 
-- **主要逻辑**（[actions.py:196-201](../../src/tree_walker/tools/actions.py)）：
+- **主要逻辑**（[actions.py:223-241](../../src/tree_walker/tools/actions.py)）：
 
   ```python
   async def _action_navigate(self, params: dict, browser: BrowserSession) -> ActionResult:
       url = params["url"]
       if not url.startswith(("http://", "https://")):
           url = "https://" + url
-      await browser.navigate(url)
-      return ActionResult()
+      new_tab = params.get("new_tab", False)
+      try:
+          await browser.navigate(url, new_tab=new_tab)
+          if not new_tab:                       # 仅当前标签页 + http(s) 触发健康检查
+              await self._navigate_health_check(url, browser)
+          memory = f"Opened new tab with URL {url}" if new_tab else f"Navigated to {url}"
+          return ActionResult(extracted_content=memory, long_term_memory=memory)
+      except Exception as e:
+          return self._map_navigation_error(url, e)
   ```
 
-  自动补全 `https://` 协议。
+  自动补全 `https://` 协议；导航成功后回显 URL（`extracted_content` + `long_term_memory`），让 LLM 从 result 确认目的地。
+
+- **健康检查 `_navigate_health_check`**（[actions.py:254-290](../../src/tree_walker/tools/actions.py)，仅 `new_tab=False` 且 URL 为 http(s) 时触发，三阶段判定逐渐收严）：
+
+  1. `get_state(include_screenshot=False)` 取状态，若 `_dom_appears_empty`（`dom_state._root is None` 或 `element_tree_text` 为空）→ 等 `_NAVIGATE_EMPTY_RETRY_WAIT`(3s) 重查；
+  2. 仍空 → 重新 `browser.navigate(url)`（reload，异常吞掉）+ 等 `_NAVIGATE_EMPTY_RELOAD_WAIT`(5s)；
+  3. 仍 `_root is None` → 抛 `RuntimeError("Page loaded but returned empty content ...")`，覆盖 SPA 未渲染 / 反爬 / 隧道代理异常等空页场景。
+
+- **错误映射 `_map_navigation_error`**（[actions.py:292-298](../../src/tree_walker/tools/actions.py)）：异常信息命中 `_NAVIGATE_NET_ERROR_MARKERS`（`ERR_NAME_NOT_RESOLVED` / `ERR_CONNECTION_REFUSED` / `ERR_TIMED_OUT` / `ERR_TUNNEL_CONNECTION_FAILED` / `ERR_INTERNET_DISCONNECTED` / `net::`）→ `ActionResult(error="Navigation failed - site unavailable: {url}")`；其余异常保留原始信息。
 
 - **CDP 调用清单**：
 
   | CDP 命令 | 主要参数 | 行号 |
   |---|---|---|
-  | `Page.navigate` | `{url}` | session.py:383 |
+  | `Page.navigate` | `{url, transitionType:'address_bar'}` | session.py:396 |
+  | `Target.createTarget` (new_tab=True) | `{url:'about:blank'}` | session.py:1033（经 `create_tab`） |
 
-- **注意事项**：导航后硬编码 `sleep(0.5)`（[session.py:387](../../src/tree_walker/browser/session.py)）；同时清空 `_previous_cached_selector_map`，确保下次 `get_state` 重新采集。
+  导航失败时 `Page.navigate` 返回值含 `errorText`（CDP："present iff navigation has failed"），由 `BrowserSession.navigate`（[session.py:382-415](../../src/tree_walker/browser/session.py)）检测并抛 `RuntimeError`。
+
+- **注意事项**：
+  - `transitionType:'address_bar'` 模拟地址栏输入，保证历史/过渡语义正确（对齐 browser-use）。
+  - 导航后由 `_wait_for_page_settle()`（[session.py:424](../../src/tree_walker/browser/session.py)，轮询 `document.readyState`）等待，**不再是硬编码 `sleep`**。
+  - `navigate` 同时清空 `_cached_selector_map` 与 `_previous_cached_selector_map`（与 `switch_tab` 一致），避免旧 selector_map 残留。
+  - `new_tab=True` 复用 `create_tab`：先开 `about:blank` 新标签页（`Target.createTarget` + `switch_tab`），再 `Page.navigate` 到真实 URL——两步走是为了保留 `errorText` 检查与统一 settle。
 
 ---
 
