@@ -474,50 +474,76 @@ class BrowserSession:
         await self._highlight.highlight_element(backend_node_id)
 
     async def click_at(self, x: float, y: float) -> None:
-        """Click at viewport coordinates."""
+        """Click at viewport coordinates.
+
+        Mouse sequence mirrors browser-use default_action_watchdog.py:902-955:
+        mouseMoved -> mousePressed -> mouseReleased. The leading mouseMoved is
+        required by hover menus, mousemove listeners, and anti-bot heuristics
+        that only fire on an explicit move event (not press/release alone).
+        """
         sid = self.current_session_id
-        for evt_type in ("mousePressed", "mouseReleased"):
-            await self.client.send.Input.dispatchMouseEvent(
-                {
-                    "type": evt_type,
-                    "x": x,
-                    "y": y,
-                    "button": "left",
-                    "clickCount": 1,
-                },
-                session_id=sid,
-            )
-        await asyncio.sleep(0.3)
+        # 1) mouseMoved — 触发 hover 状态 / mousemove 监听器 / 反爬检测
+        await self.client.send.Input.dispatchMouseEvent(
+            {"type": "mouseMoved", "x": x, "y": y},
+            session_id=sid,
+        )
+        await asyncio.sleep(0.05)  # 对齐 browser-use moved->pressed 间隔
+        # 2) mousePressed
+        await self.client.send.Input.dispatchMouseEvent(
+            {
+                "type": "mousePressed",
+                "x": x,
+                "y": y,
+                "button": "left",
+                "clickCount": 1,
+            },
+            session_id=sid,
+        )
+        await asyncio.sleep(0.08)  # 对齐 browser-use pressed->released 间隔
+        # 3) mouseReleased
+        await self.client.send.Input.dispatchMouseEvent(
+            {
+                "type": "mouseReleased",
+                "x": x,
+                "y": y,
+                "button": "left",
+                "clickCount": 1,
+            },
+            session_id=sid,
+        )
+        await asyncio.sleep(0.3)  # 保留原有等待，让点击反馈动画 / SPA 局部更新有机会
         if self._highlight_settings.enabled and self._highlight_settings.click_feedback_enabled:
             await self._highlight.highlight_click_point(x, y)
 
-    async def get_element_coordinates(self, backend_node_id: int) -> DOMRect | None:
+    async def get_element_coordinates(
+        self, backend_node_id: int, viewport: tuple[int, int] | None = None,
+    ) -> DOMRect | None:
         """Get real-time viewport coordinates for an element via CDP.
 
         Three-tier fallback chain (same as browser-use):
-        1. DOM.getContentQuads — best for inline/complex layouts
-        2. DOM.getBoxModel — fallback using box model content
-        3. JS getBoundingClientRect() via DOM.resolveNode + Runtime.callFunctionOn
+        1. DOM.getContentQuads — best for inline/complex layouts; picks the
+           quad with the largest intersection with the viewport (mirrors
+           browser-use _click_element_node_impl:829-864).
+        2. DOM.getBoxModel — fallback using box model content.
+        3. JS getBoundingClientRect() via DOM.resolveNode + Runtime.callFunctionOn.
+
+        ``viewport`` is an optional (width, height); callers that already fetched
+        it (e.g. click_element) pass it in to avoid a duplicate Page.getLayoutMetrics
+        round-trip. If omitted it is fetched here.
         """
         sid = self.current_session_id
+        if viewport is None:
+            viewport = await self._get_viewport_size()
 
-        # Method 1: DOM.getContentQuads
+        # Method 1: DOM.getContentQuads — 取与视口交集最大的 quad 的外接矩形
         try:
             result = await self.client.send.DOM.getContentQuads(
                 {"backendNodeId": backend_node_id},
                 session_id=sid,
             )
-            quads = result.get("quads", [])
-            if quads:
-                quad = quads[0]
-                if len(quad) >= 8:
-                    xs = [quad[i] for i in range(0, 8, 2)]
-                    ys = [quad[i] for i in range(1, 8, 2)]
-                    return DOMRect(
-                        x=min(xs), y=min(ys),
-                        width=max(xs) - min(xs),
-                        height=max(ys) - min(ys),
-                    )
+            best = self._best_quad_rect(result.get("quads", []), viewport)
+            if best:
+                return best
         except Exception:
             pass
 
@@ -571,9 +597,75 @@ class BrowserSession:
 
         return None
 
-    async def click_element(self, backend_node_id: int) -> None:
-        """Click an element using real-time CDP coordinates."""
-        # Scroll into view first
+    @staticmethod
+    def _best_quad_rect(
+        quads: list, viewport: tuple[int, int] | None,
+    ) -> DOMRect | None:
+        """From a list of quads (each 8 floats: x1,y1,...,x4,y4), return the
+        bounding DOMRect of the quad with the largest intersection with the
+        viewport. Falls back to the first quad when viewport is unknown or
+        empty. Mirrors browser-use _click_element_node_impl:829-864 (simplified
+        to bounding-box intersection instead of exact polygon clipping).
+        """
+        rects: list[DOMRect] = []
+        for quad in quads:
+            if len(quad) < 8:
+                continue
+            xs = [quad[i] for i in range(0, 8, 2)]
+            ys = [quad[i] for i in range(1, 8, 2)]
+            rects.append(DOMRect(
+                x=min(xs), y=min(ys),
+                width=max(xs) - min(xs),
+                height=max(ys) - min(ys),
+            ))
+        if not rects:
+            return None
+        if not viewport or viewport[0] <= 0 or viewport[1] <= 0:
+            return rects[0]
+        vw, vh = viewport
+
+        def _area(r: DOMRect) -> float:
+            iw = max(0.0, min(r.x + r.width, vw) - max(r.x, 0.0))
+            ih = max(0.0, min(r.y + r.height, vh) - max(r.y, 0.0))
+            return iw * ih
+
+        return max(rects, key=_area)
+
+    async def _get_viewport_size(self) -> tuple[int, int] | None:
+        """Viewport (clientWidth, clientHeight) via Page.getLayoutMetrics.
+
+        Used for quad selection (pick the most-visible quad) and center clipping.
+        Returns None on any CDP error so callers degrade gracefully (first quad
+        / no clip).
+        """
+        try:
+            result = await self.client.send.Page.getLayoutMetrics(
+                {}, session_id=self.current_session_id,
+            )
+            lv = result.get("layoutViewport", {})
+            w, h = int(lv.get("clientWidth", 0)), int(lv.get("clientHeight", 0))
+            return (w, h) if w > 0 and h > 0 else None
+        except Exception:
+            return None
+
+    async def click_element(self, backend_node_id: int) -> bool:
+        """Click an element using real-time CDP coordinates.
+
+        Returns True if a mouse-event sequence was dispatched (either at the
+        element's center or via JS fallback). Returns False if coordinates
+        could not be obtained AND JS fallback also failed — the caller (action
+        layer) should treat False as "click did not happen" and surface a
+        friendly error to the LLM.
+
+        Robustness chain (mirrors browser-use _click_element_node_impl):
+        1. scrollIntoViewIfNeeded (best-effort, failures swallowed)
+        2. get_element_coordinates -> center, clipped to viewport
+        3. click_at unless _is_element_occluded reports the click point is
+           covered by another element
+        4. JS fallback this.click() when step 2/3 are skipped (no coords or
+           occluded)
+        """
+        # 1. Scroll into view first (best-effort)
         try:
             await self.client.send.DOM.scrollIntoViewIfNeeded(
                 {"backendNodeId": backend_node_id},
@@ -583,16 +675,108 @@ class BrowserSession:
         except Exception:
             pass
 
-        rect = await self.get_element_coordinates(backend_node_id)
+        viewport = await self._get_viewport_size()
+        rect = await self.get_element_coordinates(backend_node_id, viewport=viewport)
         if rect:
             x = int(rect.x + rect.width / 2)
             y = int(rect.y + rect.height / 2)
-            await self.click_at(x, y)
-        else:
-            logger.warning(
-                "Could not get coordinates for backendNodeId=%d, skipping click",
-                backend_node_id,
+            # 裁剪到视口（对齐 browser-use _click_element_node_impl:866-872）
+            if viewport:
+                x = max(0, min(viewport[0] - 1, x))
+                y = max(0, min(viewport[1] - 1, y))
+            if not await self._is_element_occluded(backend_node_id, x, y):
+                await self.click_at(x, y)
+                return True
+            logger.info(
+                "Element backendNodeId=%d is occluded at (%d,%d), using JS click fallback",
+                backend_node_id, x, y,
             )
+
+        # 2. 坐标拿不到 OR 被遮挡 -> JS click 回退
+        if await self._js_click(backend_node_id):
+            return True
+
+        logger.warning(
+            "Could not click backendNodeId=%d (no coordinates and JS fallback failed)",
+            backend_node_id,
+        )
+        return False
+
+    async def _is_element_occluded(
+        self, backend_node_id: int, x: int, y: int,
+    ) -> bool:
+        """Check if the element is occluded at (x, y) by another element.
+
+        Uses document.elementFromPoint to find the topmost element at the click
+        point, then walks up its ancestor chain looking for the target (covers
+        <label> wrapping <input>, aria-labelledby pairs, and other "visible
+        target is an ancestor of the hit element" patterns that browser-use
+        also handles in _check_element_occlusion:573-700).
+
+        Best-effort: any JS/CDP error returns False (treat as not occluded so
+        the geometric click proceeds — JS fallback would also fail if the page
+        were truly broken). x/y are passed as arguments, not string
+        interpolation, to avoid injection.
+        """
+        try:
+            resolve = await self.client.send.DOM.resolveNode(
+                {"backendNodeId": backend_node_id},
+                session_id=self.current_session_id,
+            )
+            object_id = resolve["object"]["objectId"]
+            result = await self.client.send.Runtime.callFunctionOn(
+                {
+                    "objectId": object_id,
+                    "functionDeclaration": """
+                    function(x, y) {
+                        var hit = document.elementFromPoint(x, y);
+                        if (!hit) return true;  // 视口外或被遮挡
+                        var cur = hit;
+                        while (cur) {
+                            if (cur === this) return false;  // 命中目标或其祖先 -> 未遮挡
+                            cur = cur.parentElement;
+                        }
+                        return true;  // elementFromPoint 命中的是无关元素 -> 被遮挡
+                    }
+                    """,
+                    "arguments": [{"value": x}, {"value": y}],
+                    "returnByValue": True,
+                },
+                session_id=self.current_session_id,
+            )
+            return bool(result.get("result", {}).get("value"))
+        except Exception as e:
+            logger.debug("_is_element_occluded failed (treating as not occluded): %s", e)
+            return False
+
+    async def _js_click(self, backend_node_id: int) -> bool:
+        """JS fallback click via DOM.resolveNode + Runtime.callFunctionOn.
+
+        Used when geometric click is impossible (no coordinates) or when the
+        element is occluded. Calls this.click() directly, bypassing the mouse
+        event pipeline. Mirrors browser-use _click_element_node_impl:957-992.
+
+        Returns True if the JS click dispatched without error, False on any
+        failure (DOM.resolveNode miss, JS exception, transport glitch).
+        """
+        try:
+            resolve = await self.client.send.DOM.resolveNode(
+                {"backendNodeId": backend_node_id},
+                session_id=self.current_session_id,
+            )
+            object_id = resolve["object"]["objectId"]
+            await self.client.send.Runtime.callFunctionOn(
+                {
+                    "objectId": object_id,
+                    "functionDeclaration": "function() { this.click(); }",
+                    "returnByValue": True,
+                },
+                session_id=self.current_session_id,
+            )
+            return True
+        except Exception as e:
+            logger.debug("_js_click failed: %s", e)
+            return False
 
     async def type_text(self, text: str, clear: bool = False) -> None:
         """Type text into the currently focused element character by character.
@@ -1065,6 +1249,44 @@ class BrowserSession:
             err = result["exceptionDetails"]
             raise RuntimeError(f"JS error: {err.get('text', err)}")
         return result.get("result", {}).get("value")
+
+    async def fetch_select_options(self, backend_node_id: int) -> list[dict]:
+        """Read all options of the <select> identified by backendNodeId.
+
+        Uses DOM.resolveNode + Runtime.callFunctionOn to scope the query to the
+        specific select element (NOT document.querySelectorAll('select option'),
+        which scans every select on the page — the bug fixed in the click SELECT
+        branch; dropdown_options / select_dropdown still have it, to be fixed
+        separately).
+
+        Returns a list of {value, text, selected} dicts. Raises on CDP/JS error
+        (caller wraps with a friendly message).
+        """
+        resolve = await self.client.send.DOM.resolveNode(
+            {"backendNodeId": backend_node_id},
+            session_id=self.current_session_id,
+        )
+        object_id = resolve["object"]["objectId"]
+        result = await self.client.send.Runtime.callFunctionOn(
+            {
+                "objectId": object_id,
+                "functionDeclaration": """
+                function() {
+                    return Array.from(this.options).map(function(o) {
+                        return {
+                            value: o.value,
+                            text: (o.textContent || '').trim(),
+                            selected: o.selected,
+                        };
+                    });
+                }
+                """,
+                "returnByValue": True,
+            },
+            session_id=self.current_session_id,
+        )
+        value = result.get("result", {}).get("value")
+        return value if isinstance(value, list) else []
 
     # ── File operations (via CDP) ──────────────────────────────────────
 
