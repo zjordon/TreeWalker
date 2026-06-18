@@ -407,19 +407,32 @@ class BrowserSession:
         await self._wait_for_page_settle()
         return target_id
 
-    async def go_back(self) -> None:
-        """Navigate to the previous page in history."""
+    async def go_back(self) -> str | None:
+        """Navigate to the previous page in history.
+
+        Returns the URL of the previous entry, or ``None`` if there is no
+        previous entry to go back to (caller should treat ``None`` as "nothing
+        happened"). Clears the selector_map caches — like ``navigate`` and
+        ``switch_tab`` — because going back changes the page.
+        """
+        # 后退会改变页面，两层 selector_map 缓存都要清（与 navigate / switch_tab 一致）
+        self._cached_selector_map = None
+        self._previous_cached_selector_map = None
+
         history = await self.client.send.Page.getNavigationHistory(
             {}, session_id=self.current_session_id,
         )
         idx = history.get("currentIndex", 0)
         entries = history.get("entries", [])
-        if idx > 0 and entries:
-            await self.client.send.Page.navigateToHistoryEntry(
-                {"entryId": entries[idx - 1]["id"]},
-                session_id=self.current_session_id,
-            )
-            await self._wait_for_page_settle()
+        if idx <= 0 or not entries:
+            return None  # 无历史可退——返回 None 由 action 层给出明确反馈
+        prev = entries[idx - 1]
+        await self.client.send.Page.navigateToHistoryEntry(
+            {"entryId": prev["id"]},
+            session_id=self.current_session_id,
+        )
+        await self._wait_for_page_settle()
+        return prev.get("url")
 
     async def _wait_for_page_settle(
         self,

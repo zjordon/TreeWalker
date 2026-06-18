@@ -367,36 +367,56 @@
 - **terminates_sequence**：True
 - **Pydantic 参数**：无
 
-- **主要逻辑**（[actions.py:285-287](../../src/tree_walker/tools/actions.py)）：
+- **主要逻辑**（[actions.py:387-402](../../src/tree_walker/tools/actions.py)）：
 
   ```python
   async def _action_go_back(self, params: dict, browser: BrowserSession) -> ActionResult:
-      await browser.go_back()
-      return ActionResult()
+      try:
+          target_url = await browser.go_back()
+      except Exception as e:
+          return ActionResult(error=f"Failed to go back: {e}")
+      if target_url is None:                                        # 无历史可退
+          return ActionResult(error="No previous page in history to go back to")
+      await self._go_back_health_check(target_url, browser)         # 轻量空 DOM 检测
+      memory = f"Navigated back to {target_url}"
+      logger.info(memory)
+      return ActionResult(extracted_content=memory, long_term_memory=memory)
   ```
 
-  委托给 `BrowserSession.go_back()`（[session.py:389-401](../../src/tree_walker/browser/session.py)）：
+  `_go_back_health_check`（[actions.py:404](../../src/tree_walker/tools/actions.py)）仅当后退目标为 http(s) 时触发，复用 `_dom_appears_empty`：空则等一次 `_NAVIGATE_EMPTY_RETRY_WAIT`(3s) 重查，仍空只 `logger.warning` 不硬失败（go_back 无"reload 同 URL"的干净机制）。
+
+  委托给 `BrowserSession.go_back()`（[session.py:410-435](../../src/tree_walker/browser/session.py)）：
 
   ```python
-  async def go_back(self) -> None:
+  async def go_back(self) -> str | None:
+      self._cached_selector_map = None          # 清两层缓存（与 navigate / switch_tab 一致）
+      self._previous_cached_selector_map = None
       history = await self.client.send.Page.getNavigationHistory({}, ...)
       idx = history.get("currentIndex", 0)
       entries = history.get("entries", [])
-      if idx > 0 and entries:
-          await self.client.send.Page.navigateToHistoryEntry(
-              {"entryId": entries[idx - 1]["id"]}, ...
-          )
-          await asyncio.sleep(0.3)
+      if idx <= 0 or not entries:
+          return None                           # 无历史可退
+      prev = entries[idx - 1]
+      await self.client.send.Page.navigateToHistoryEntry({"entryId": prev["id"]}, ...)
+      await self._wait_for_page_settle()        # 轮询 readyState，不再是硬编码 sleep
+      return prev.get("url")                    # 回显后退目标 URL（零额外 CDP 调用）
   ```
 
 - **CDP 调用清单**：
 
   | CDP 命令 | 主要参数 | 行号 |
   |---|---|---|
-  | `Page.getNavigationHistory` | `{}` | session.py:391 |
-  | `Page.navigateToHistoryEntry` | `{entryId}` | session.py:397 |
+  | `Page.getNavigationHistory` | `{}` | session.py:422 |
+  | `Page.navigateToHistoryEntry` | `{entryId}` | session.py:430 |
+  | `Runtime.evaluate`（经 `_wait_for_page_settle`） | `{expression: document.readyState}` | session.py:459 |
 
-- **注意事项**：仅当 `currentIndex > 0` 才后退；后退后硬编码 `sleep(0.3)` 等待页面渲染。
+  > session 层在取历史前清空 `_cached_selector_map` / `_previous_cached_selector_map`（对齐 navigate / switch_tab），避免旧 selector_map 残留导致新元素检测误判。
+
+- **注意事项**：
+  - `idx <= 0`（无历史可退）时 `go_back` 返回 `None`，action 层转为明确 `error="No previous page in history to go back to"`（不再静默成功，避免 LLM 误以为已后退）。
+  - 后退后用 `_wait_for_page_settle()` 轮询 `document.readyState`（**不再是硬编码 `sleep(0.3)`**）。
+  - 成功后退回显 `Navigated back to {url}`（URL 取自 `entries[idx-1]["url"]`，零额外 CDP 调用）到 `extracted_content` + `long_term_memory`。
+  - 轻量健康检查：SPA 未渲染时空→等一次 3s→仍空仅 warning 不硬失败；非 http(s) 目标（chrome:// 等）跳过。
 
 ---
 
