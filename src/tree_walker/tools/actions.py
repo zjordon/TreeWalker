@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 import logging
 import mimetypes
@@ -485,6 +486,30 @@ class Tools:
         return f"Uploaded {shown!r} to [{tag}] at index {index}"
 
     @staticmethod
+    def _describe_dropdown(entry: Any, index: int) -> str:
+        """Build a human-readable dropdown echo, mirroring _describe_click /
+        _describe_upload style.
+
+        select 元素通常没有 placeholder/value（value 是当前选中值），故优先级链用
+        aria-label/title/name/id，再退到 node_value，最后退到 tag。Bounded to ~60 chars.
+        """
+        tag = (getattr(entry, "tag_name", "") or "").upper() or "SELECT"
+        attrs = getattr(entry, "attributes", {}) or {}
+        for key in ("aria-label", "title", "name", "id"):
+            v = attrs.get(key)
+            if v:
+                v = v.strip()
+                if len(v) > 60:
+                    v = v[:60] + "..."
+                return f"[{tag}] {v!r} at index {index}"
+        node_value = (getattr(entry, "node_value", "") or "").strip()
+        if node_value:
+            if len(node_value) > 60:
+                node_value = node_value[:60] + "..."
+            return f"[{tag}] {node_value!r} at index {index}"
+        return f"[{tag}] at index {index}"
+
+    @staticmethod
     def _find_node_by_backend_id(
         backend_node_id: int | None,
         dom_state: SerializedDOMState | None,
@@ -833,15 +858,56 @@ class Tools:
         return ActionResult(extracted_content=f"PDF saved to {path}")
 
     async def _action_dropdown_options(self, params: dict, browser: BrowserSession) -> ActionResult:
-        entry, error = await self._get_element_by_index(params["index"], browser)
+        """读取指定 index 的 <select> 的全部 option。
+
+        复用 session.fetch_select_options（DOM.resolveNode + Runtime.callFunctionOn），
+        精确绑定到目标 select，修掉全局 querySelectorAll('select option') 范围 bug。
+        对齐 _describe_click / _describe_upload 的成功回显 + try/except 软降级规范。
+        """
+        index = params["index"]
+        entry, error = await self._get_element_by_index(index, browser)
         if error:
             return error
-        js_code = (
-            "Array.from(document.querySelectorAll('select option'))"
-            ".map(o => ({value: o.value, text: o.textContent.trim(), selected: o.selected}))"
+
+        # G2: tag 校验 —— 非 <select> 直接报错，不返回全页 select 数据
+        tag = (getattr(entry, "tag_name", "") or "").upper()
+        if tag != "SELECT":
+            return ActionResult(
+                error=(
+                    f"Index {index} is a [{tag}] element, not a <select>. "
+                    f"dropdown_options only supports native <select>. "
+                    f"For ARIA menu/listbox or custom dropdowns, use click to expand and read options manually."
+                ),
+            )
+
+        # G1: 复用 fetch_select_options，精确绑定到目标 select（与 click SELECT 分支一致）
+        backend_id = getattr(entry, "backend_node_id", None)
+        try:
+            raw_options = await browser.fetch_select_options(backend_id)
+        except Exception as e:
+            return ActionResult(error=f"Failed to read select options: {e}")
+
+        # G4: 格式化输出 —— json 编码 text/value 保证含引号/特殊字符的文本可精确复制
+        # action 层 enumerate 补 index（fetch_select_options 返回结构无序号，不动 session）
+        lines: list[str] = []
+        for i, opt in enumerate(raw_options):
+            text = json.dumps(opt.get("text", ""))
+            value = json.dumps(opt.get("value", ""))
+            status = " (selected)" if opt.get("selected") else ""
+            lines.append(f"{i}: text={text}, value={value}{status}")
+
+        # 末尾追加用法提示（本项目 select_dropdown 参数名是 value 不是 text）
+        hint = f"Use the value in select_dropdown(index={index}, value=...)"
+        extracted = hint if not lines else "\n".join(lines) + "\n" + hint
+
+        # G3: 成功回显（short/long 分离）
+        # extracted_content = 紧凑选项列表（靠 ActionResult.__str__ 的 500 字符截断自然兜底）
+        # long_term_memory  = 简短摘要（≤120 字，仿 _describe_upload）
+        memory = (
+            f"Got {len(raw_options)} options from "
+            f"{self._describe_dropdown(entry, index)}"
         )
-        options = await browser.execute_js(js_code)
-        return ActionResult(extracted_content=str(options))
+        return ActionResult(extracted_content=extracted, long_term_memory=memory)
 
     async def _action_select_dropdown(self, params: dict, browser: BrowserSession) -> ActionResult:
         entry, error = await self._get_element_by_index(params["index"], browser)
