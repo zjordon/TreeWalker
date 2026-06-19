@@ -355,18 +355,7 @@ class BrowserSession:
         except Exception:
             pass
 
-        tabs: list[TabInfo] = []
-        try:
-            targets = await self.client.send.Target.getTargets({})
-            for t in targets.get("targetInfos", []):
-                if t.get("type") == "page":
-                    tabs.append(TabInfo(
-                        target_id=t["targetId"],
-                        url=t.get("url", ""),
-                        title=t.get("title", ""),
-                    ))
-        except Exception:
-            pass
+        tabs = await self.get_tabs()
 
         dom_state = None
         if self._dom_circuit_breaker.is_open:
@@ -1251,6 +1240,26 @@ class BrowserSession:
         await asyncio.sleep(0.3)
 
     # ── Tabs ───────────────────────────────────────────────────────────
+
+    async def get_tabs(self) -> list[TabInfo]:
+        """List page targets only — 1 个 CDP 调用（Target.getTargets），不抓 DOM/截图。
+
+        抽自 get_state 的标签页抓取逻辑，供 switch_tab / close_tab 等只需标签页列表、
+        无需 DOM/截图的路径调用，避免全量 get_state 开销。
+        """
+        tabs: list[TabInfo] = []
+        try:
+            targets = await self.client.send.Target.getTargets({})
+            for t in targets.get("targetInfos", []):
+                if t.get("type") == "page":
+                    tabs.append(TabInfo(
+                        target_id=t["targetId"],
+                        url=t.get("url", ""),
+                        title=t.get("title", ""),
+                    ))
+        except Exception:
+            pass
+        return tabs
 
     async def switch_tab(self, target_id: str) -> None:
         """Switch to a different tab by target ID."""

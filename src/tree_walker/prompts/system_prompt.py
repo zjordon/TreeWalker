@@ -133,7 +133,7 @@ def build_state_message(
         parts.append("[Open Tabs]")
         for tab in browser_state.tabs:
             marker = " (active)" if tab.target_id == current_target_id else ""
-            parts.append(f"  [{tab.target_id[-4:]}] {tab.title}{marker}")
+            parts.append(f"  [{tab.target_id[-4:]}] {tab.title} - {tab.url}{marker}")
         parts.append("")
 
     # DOM tree

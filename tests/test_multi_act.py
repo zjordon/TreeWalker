@@ -660,7 +660,7 @@ class TestPhase2Guards:
 		agent = _make_agent([ActionResult(), ActionResult()])
 		model_output = {
 			"actions": [
-				{"name": "switch_tab", "params": {"target_id": "abc"}},
+				{"name": "switch_tab", "params": {"tab_id": "abcd"}},
 				{"name": "click", "params": {}},
 			],
 		}

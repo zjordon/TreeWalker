@@ -402,6 +402,7 @@ def _make_mock_browser_session():
 	browser._clear_text_field = AsyncMock(return_value=True)
 	browser.execute_js = AsyncMock(return_value=[{"value": "opt1", "text": "Option 1"}])
 	browser.set_file_input = AsyncMock()
+	browser.get_tabs = AsyncMock(return_value=[])  # _action_click snapshots tabs (G7)
 	browser.current_session_id = "test-session"
 	browser.current_target_id = "test-target"
 	return browser
