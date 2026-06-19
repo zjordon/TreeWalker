@@ -937,38 +937,56 @@
 
   | 字段 | 类型 | 描述 |
   |---|---|---|
-  | `keys` | `str` | e.g. 'Enter', 'Control+a', 'Tab' |
+  | `keys` | `str`（`min_length=1`） | 组合键/命名键/纯文本。组合用 `+`：`Control+a`、`Shift+T`、`Alt+F4`；命名键：`Enter`、`Tab`、`Escape`、`ArrowUp`、`F5` 等；纯文本（如 `hello`）逐字符输入 |
 
-- **主要逻辑**（[actions.py:255-257](../../src/tree_walker/tools/actions.py)）：
+- **主要逻辑**（[actions.py:640-653](../../src/tree_walker/tools/actions.py)）：成功回显 + try/except 软降级（非幂等 → error）。
 
   ```python
   async def _action_send_keys(self, params: dict, browser: BrowserSession) -> ActionResult:
-      await browser.send_keys(params["keys"])
-      return ActionResult()
+      keys = params["keys"]
+      try:
+          await browser.send_keys(keys)
+      except Exception as e:
+          # send_keys 非幂等（按键可能提交表单/触发导航），CDP 失败即报 error
+          logger.warning("send_keys(%r) failed: %s", keys, e)
+          return ActionResult(error=f"Send keys failed: {e}")
+      memory = f"Sent keys '{keys}'"
+      logger.info(memory)
+      return ActionResult(extracted_content=memory, long_term_memory=memory)
   ```
 
-  委托给 `BrowserSession.send_keys()`（[session.py:671-721](../../src/tree_walker/browser/session.py)），支持以下组合：
+  委托给 `BrowserSession.send_keys()`（[session.py:1227-1337](../../src/tree_walker/browser/session.py)），按"组合键 / 单特殊键 / 文本逐字符"三条路由派发。别名归一化（`_normalize_key`，[session.py:127](../../src/tree_walker/browser/session.py)）大小写不敏感：
 
-  | 输入 | 解析为 |
-  |---|---|
-  | `"Enter"` | Enter 键 |
-  | `"Control+a"` | Ctrl + A |
-  | `"Shift+T"` | Shift + T |
-  | `"Alt+F4"` | Alt + F4 |
-  | `"Escape"` | Esc 键 |
+  | 输入 | 解析为 | 路由 |
+  |---|---|---|
+  | `"Control+a"` | Ctrl+A（带 modifiers） | 组合键：单字符主键经 `_send_combo_char_key`（保留 Ctrl 位掩码，全选生效） |
+  | `"Shift+T"` | Shift+T | 组合键：keyDown `key='t'`（base 小写）+ Shift，char `text='T'` |
+  | `"Alt+F4"` | Alt+F4 | 组合键：特殊键主键经 `_send_single_special_key` |
+  | `"Enter"` | Enter（keyDown/char `\r`/keyUp） | 单特殊键 |
+  | `"up"` / `"ArrowUp"` | ArrowUp（vk=38） | 别名归一化 → 单特殊键 |
+  | `"return"` | Enter | 别名 → 单特殊键 |
+  | `"F5"` | F5（vk=0x74） | 单特殊键 |
+  | `"space"` | 空格 `" "`（code=Space, vk=32） | 文本/char 分支（经 `_type_char`） |
+  | `"hello"` | 逐字符 h/e/l/l/o | 文本分支（复用 `_type_char`） |
 
 - **CDP 调用清单**：
 
   | CDP 命令 | 主要参数 | 行号 |
   |---|---|---|
-  | `Input.dispatchKeyEvent` (keyDown) | `{type:keyDown, key, code, modifiers, windowsVirtualKeyCode}` | session.py:692 |
-  | `Input.dispatchKeyEvent` (char, 仅 Enter/Tab) | `{type:char, text, key}` | session.py:706 |
-  | `Input.dispatchKeyEvent` (keyUp) | `{type:keyUp, key, code, modifiers, windowsVirtualKeyCode}` | session.py:711 |
+  | `Input.dispatchKeyEvent`（keyDown/char/keyUp，单特殊键） | `{type, key, code, modifiers, windowsVirtualKeyCode}` + char `{type:char, text, key}` | `_send_single_special_key` session.py:1304 |
+  | `Input.dispatchKeyEvent`（keyDown/char/keyUp，组合键单字符主键） | 同上，主键事件带 modifiers | `_send_combo_char_key` session.py:1276 |
+  | 文本分支（复用 `_type_char`） | 每字符 keyDown/char/keyUp；CJK 走 `Input.insertText` | `_type_char` session.py:1062 |
 
 - **注意事项**：
-  - 修饰符映射：control=2, alt=1, shift=8, meta=4
-  - Enter/Tab 额外发 char 事件，否则 React 表单提交不触发
-  - 完成后 `sleep(0.1)`
+  - **修饰符位掩码**（`_MODIFIER_VK`，[session.py:111](../../src/tree_walker/browser/session.py)）：alt=1, control=2, meta=4, shift=8；只在主键事件里带 `modifiers`，浏览器据此设 ctrlKey/altKey 状态（CDP 设计如此，对齐 `_type_char`/`input_text`）。
+  - **别名归一化**：ctrl/control、return、esc、cmd/command、up/down/left/right、pageup/pagedown、home/end、del、space→`" "`、F1-F12 等大小写不敏感（`_KEY_ALIASES`，[session.py:78](../../src/tree_walker/browser/session.py)）。
+  - **特殊键覆盖**：`_KEY_VK_MAP`（[session.py:62](../../src/tree_walker/browser/session.py)）补全 Arrow/Home/End/PageUp/PageDown/Delete/F1-F12 的 windowsVirtualKeyCode（旧实现除 enter/tab/escape/backspace/arrow 外 vk=0）。
+  - **组合键单字符主键**（核心修正）：`Control+a` 的 `a` 经 `_send_combo_char_key` 带 modifiers，否则 fallback 文本分支会丢 modifiers 导致 Ctrl+A 全选失效。
+  - **文本分支**：纯文本逐字符复用 `_type_char`；`space` 归一化为 `" "` 后也走此分支（对齐 browser-use，其 special_keys 不含空格）。
+  - **Enter/Tab 补 char**：Enter 发 `\r`、Tab 发 `\t`，否则 React 表单提交不触发；仅 Enter 后 `sleep(0.1)` 等可能导航（其余键不 sleep）。
+  - **未知修饰键软降级**：组合键中未知修饰键（如 `Foo+a`）warning + 跳过，不硬失败（组合键空间无限）。
+  - **异常处理**：send_keys 非幂等，CDP 失败 → `ActionResult(error="Send keys failed: ...")`（对齐 scroll，区别于幂等的 close_tab 软成功）。
+  - **`+` 文本歧义**：`+` 既是修饰键分隔符也是合法字符，`"a+b"` 被当组合键（修饰 a 忽略、主键 b）；长文本应改用 `input_text`。
 
 ---
 
@@ -1392,9 +1410,9 @@ async def set_file_input(
 | `dispatchMouseEvent(mousePressed)` | `{x, y, button:left, clickCount:1}` | click, input_text | session.py:498 |
 | `dispatchMouseEvent(mouseReleased)` | 同上 | click, input_text | session.py:511 |
 | `dispatchMouseEvent(mouseWheel)` | `{x, y, deltaX:0, deltaY}` | scroll | session.py:737 |
-| `dispatchKeyEvent(keyDown)` | `{key, code, modifiers, windowsVirtualKeyCode}` | input_text, send_keys | session.py:539, 575, 692 |
-| `dispatchKeyEvent(char)` | `{text, key}` | input_text, send_keys | session.py:587, 706 |
-| `dispatchKeyEvent(keyUp)` | `{key, code, modifiers, windowsVirtualKeyCode}` | input_text, send_keys | session.py:593, 711 |
+| `dispatchKeyEvent(keyDown)` | `{key, code, modifiers, windowsVirtualKeyCode}` | input_text, send_keys | session.py:539, 575, 1312 |
+| `dispatchKeyEvent(char)` | `{text, key}` | input_text, send_keys | session.py:587, 1322 |
+| `dispatchKeyEvent(keyUp)` | `{key, code, modifiers, windowsVirtualKeyCode}` | input_text, send_keys | session.py:593, 1326 |
 
 #### `DOM.*` 域
 
