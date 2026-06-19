@@ -30,6 +30,24 @@ logger = logging.getLogger(__name__)
 # ── Helpers ───────────────────────────────────────────────────────────
 
 
+def _xpath_string_literal(text: str) -> str:
+    """Build an XPath 1.0 string literal safe for contains().
+
+    XPath 1.0 string literals cannot escape a quote inside their own
+    delimiter, so: no double-quote -> wrap in "..."; no single-quote ->
+    wrap in '...'; both present -> splice with concat(..., '"', ...).
+    Mirrors browser-use's find_text intent but fixes its f-string injection
+    bug (default_action_watchdog.py injects text into "..." verbatim, which
+    breaks when the text contains a double-quote).
+    """
+    if '"' not in text:
+        return f'"{text}"'
+    if "'" not in text:
+        return f"'{text}'"
+    parts = text.split('"')
+    return "concat(" + ", '\"', ".join(f'"{p}"' for p in parts) + ")"
+
+
 def _walk_for_file_inputs(node: dict) -> list[int]:
     """Recursively walk a CDP DOM Node tree to find file input backendNodeIds."""
     results: list[int] = []
@@ -1479,6 +1497,121 @@ class BrowserSession:
             err = result["exceptionDetails"]
             raise RuntimeError(f"JS error: {err.get('text', err)}")
         return result.get("result", {}).get("value")
+
+    async def find_text(self, text: str) -> dict:
+        """Find text on the page and scroll the first match into view.
+
+        Mirrors browser-use ``on_ScrollToTextEvent``
+        (default_action_watchdog.py:2682-2774) — a 3-query XPath chain via
+        ``DOM.performSearch`` with a JS TreeWalker fallback — with four bug
+        fixes: (1) XPath-safe string literal via ``_xpath_string_literal``
+        (browser-use f-string-injects and breaks on ``"``); (2)
+        ``discardSearchResults`` in a ``finally`` (browser-use skips it on
+        the winning query, leaking the searchId); (3)
+        ``includeUserAgentShadowDOM`` pierce (browser-use omits it); (4) no
+        unused ``DOM.getDocument`` (``performSearch`` already searches the
+        whole document).
+
+        Returns ``{found, method, tag}`` where ``method`` is one of
+        ``xpath-text`` / ``xpath-content`` / ``xpath-attr`` /
+        ``js-treewalker`` / ``none``. A clean miss returns ``found=False``
+        and never raises; the action layer builds the soft echo. Unexpected
+        CDP errors propagate to the action layer's try/except.
+        """
+        sid = self.current_session_id
+        lit = _xpath_string_literal(text)
+        queries = [
+            ("xpath-text", f"//*[contains(text(), {lit})]"),
+            ("xpath-content", f"//*[contains(., {lit})]"),
+            ("xpath-attr", f"//*[@*[contains(., {lit})]]"),
+        ]
+        for method, query in queries:
+            search_id: str | None = None
+            try:
+                search = await self.client.send.DOM.performSearch(
+                    {"query": query, "includeUserAgentShadowDOM": True},
+                    session_id=sid,
+                )
+                search_id = search.get("searchId")
+                if search.get("resultCount", 0) <= 0:
+                    continue
+                results = await self.client.send.DOM.getSearchResults(
+                    {"searchId": search_id, "fromIndex": 0, "toIndex": 1},
+                    session_id=sid,
+                )
+                node_ids = results.get("nodeIds", [])
+                if not node_ids:
+                    continue
+                node_id = node_ids[0]
+                await self.client.send.DOM.scrollIntoViewIfNeeded(
+                    {"nodeId": node_id}, session_id=sid,
+                )
+                tag = await self._highlight_search_node(node_id)
+                return {"found": True, "method": method, "tag": tag}
+            except Exception as e:
+                logger.debug("find_text query %s failed: %s", query, e)
+                continue
+            finally:
+                # Bug fix: browser-use puts this after `break`, so the winning
+                # query leaks its searchId. finally runs on return/continue/raise.
+                if search_id is not None:
+                    try:
+                        await self.client.send.DOM.discardSearchResults(
+                            {"searchId": search_id}, session_id=sid,
+                        )
+                    except Exception:
+                        pass
+        if await self._find_text_js_fallback(text):
+            return {"found": True, "method": "js-treewalker", "tag": None}
+        return {"found": False, "method": "none", "tag": None}
+
+    async def _find_text_js_fallback(self, text: str) -> bool:
+        """TreeWalker over text nodes under document.body; scrollIntoView the
+        first match's parentElement. ``text`` is injected via ``json.dumps``
+        (JS-safe; browser-use f-string-injects and breaks on quotes). Only
+        runs when all three XPath queries miss."""
+        js = (
+            "(() => {"
+            f"  const needle = {json.dumps(text)};"
+            "  const walker = document.createTreeWalker("
+            "    document.body, NodeFilter.SHOW_TEXT, null, false);"
+            "  let node;"
+            "  while ((node = walker.nextNode())) {"
+            "    const t = node.nodeValue || '';"
+            "    if (t.includes(needle) && t.trim()) {"
+            "      if (node.parentElement) {"
+            "        node.parentElement.scrollIntoView("
+            "          { behavior: 'smooth', block: 'center' });"
+            "      }"
+            "      return true;"
+            "    }"
+            "  }"
+            "  return false;"
+            "})()"
+        )
+        try:
+            return bool(await self.execute_js(js))
+        except Exception as e:
+            logger.debug("find_text JS fallback failed: %s", e)
+            return False
+
+    async def _highlight_search_node(self, node_id: int) -> str | None:
+        """Convert a performSearch nodeId to backendNodeId and highlight the
+        element box (visual feedback, best-effort — honors the "highlight"
+        promise in find_text's description). Returns the lowercased tag name
+        for the action echo, or None if describe/highlight failed."""
+        try:
+            desc = await self.client.send.DOM.describeNode(
+                {"nodeId": node_id}, session_id=self.current_session_id,
+            )
+            node = desc.get("node", {})
+            backend_id = node.get("backendNodeId")
+            tag = (node.get("nodeName") or "").lower() or None
+            if backend_id:
+                await self.highlight_element(backend_id)
+            return tag
+        except Exception:
+            return None
 
     async def fetch_select_options(self, backend_node_id: int) -> list[dict]:
         """Read all options of the <select> identified by backendNodeId.
