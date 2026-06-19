@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 import logging
+import mimetypes
 import os
 
 from tree_walker.agent.views import ActionResult
@@ -105,6 +106,41 @@ def _pick_nearest_file_input(
             best_id = fid
 
     return best_id if best_id is not None else file_input_ids[0]
+
+
+def _file_matches_accept(file_path: str, accept: str | None) -> bool:
+    """True if file_path is acceptable under the input's ``accept`` attribute.
+
+    Parses the HTML accept attribute (comma-separated tokens, each a file
+    extension like ``.png``, a wildcard MIME like ``image/*``, or a full MIME
+    like ``application/pdf``) and matches the file's extension / guessed MIME.
+    Empty/missing accept means "no restriction" (True).
+
+    Uses stdlib mimetypes to map the extension to a MIME, so wildcard and
+    full-MIME tokens work without a hard-coded table. Used by
+    Tools._action_upload_file to emit a soft ⚠️ Note on mismatch — it never
+    blocks the upload (CDP / browser-use do not either).
+    """
+    accept = (accept or "").strip()
+    if not accept:
+        return True
+    file_ext = os.path.splitext(file_path)[1].lower()
+    guessed_mime, _ = mimetypes.guess_type(file_path)
+    for token in accept.split(","):
+        token = token.strip().lower()
+        if not token:
+            continue
+        if token.startswith("."):
+            if file_ext == token:
+                return True
+        elif token.endswith("/*"):
+            prefix = token[:-1]  # "image/"
+            if guessed_mime and guessed_mime.startswith(prefix):
+                return True
+        else:
+            if guessed_mime == token:
+                return True
+    return False
 
 
 # ── Search engines ──────────────────────────────────────────────────
@@ -389,6 +425,55 @@ class Tools:
         return f"Typed {shown!r} into [{tag}] at index {index}"
 
     @staticmethod
+    def _describe_upload(entry: Any, index: int, file_path: str) -> str:
+        """Build a human-readable upload echo, mirroring _describe_click /
+        _describe_input / navigate / go_back style.
+
+        Shows the uploaded file's basename (not the full path — which is long
+        and noisy) plus an identifying attribute the LLM can also see in the
+        DOM tree (aria-label/title/name/placeholder), then node_value, then
+        just the tag. Skips 'value'/'alt': a file input's value is the
+        browser-faked 'C:\\fakepath\\<name>' (not useful) and alt is irrelevant
+        here. Bounded to ~60 chars per field so the echo fits the LLM context.
+        """
+        shown = os.path.basename(file_path)
+        if len(shown) > 60:
+            shown = shown[:60] + "..."
+        tag = entry.tag_name.upper()
+        attrs = getattr(entry, "attributes", {}) or {}
+        for key in ("aria-label", "title", "name", "placeholder"):
+            v = attrs.get(key)
+            if v:
+                v = v.strip()
+                if len(v) > 60:
+                    v = v[:60] + "..."
+                return f"Uploaded {shown!r} to [{tag}] {v!r} at index {index}"
+        node_value = (getattr(entry, "node_value", "") or "").strip()
+        if node_value:
+            if len(node_value) > 60:
+                node_value = node_value[:60] + "..."
+            return f"Uploaded {shown!r} to [{tag}] {node_value!r} at index {index}"
+        return f"Uploaded {shown!r} to [{tag}] at index {index}"
+
+    @staticmethod
+    def _find_node_by_backend_id(
+        backend_node_id: int | None,
+        dom_state: SerializedDOMState | None,
+    ) -> EnhancedDOMTreeNode | None:
+        """Look up the DOM node whose backend_node_id matches in the cached
+        selector_map. Returns None if not found (e.g. the file input is hidden
+        and excluded from the interactive selector_map). Used by
+        _action_upload_file to read the resolved file input's ``accept``
+        attribute for soft validation.
+        """
+        if not dom_state or backend_node_id is None:
+            return None
+        for node in dom_state.selector_map.values():
+            if getattr(node, "backend_node_id", None) == backend_node_id:
+                return node
+        return None
+
+    @staticmethod
     def _is_autocomplete_field(entry: Any) -> tuple[bool, bool]:
         """Detect combobox/autocomplete fields. Returns (is_combo, needs_js_wait).
 
@@ -651,6 +736,8 @@ class Tools:
 
     async def _action_upload_file(self, params: dict, browser: BrowserSession) -> ActionResult:
         file_path = params["path"]
+
+        # 1. 路径白名单 + 文件存在/非空校验（保持原逻辑）
         allowed = self._allowed_upload_paths
         if allowed:
             if not any(file_path.startswith(p) for p in allowed):
@@ -662,31 +749,18 @@ class Tools:
         if os.path.getsize(file_path) == 0:
             return ActionResult(error=f"File is empty: {file_path}")
 
+        # 2. 元素查找（保持原逻辑）
         entry, error = await self._get_element_by_index(params["index"], browser)
         if error:
             return error
 
-        # Check if the element itself is a file input
+        # 3. 判定目标是否本身 file input；非 file input 时定位最近 file input
         tag = entry.tag_name.upper()
         attrs = entry.attributes
         is_file_input = tag == "INPUT" and attrs.get("type", "").lower() == "file"
 
-        available_ids = (
-            self._cached_browser_state.dom_state.file_input_backend_ids
-            if self._cached_browser_state and self._cached_browser_state.dom_state
-            else []
-        )
-        logger.info(
-            "upload_file: index=%d, tag=%s, type=%s, backend_node_id=%s, "
-            "is_file_input=%s, available_file_inputs=%s",
-            params["index"], tag, attrs.get("type", ""), entry.backend_node_id,
-            is_file_input, available_ids,
-        )
-
         backend_id = entry.backend_node_id
         file_input_ids: list[int] = []
-
-        # If not a file input, try to find one from DOM state
         if not is_file_input:
             if self._cached_browser_state and self._cached_browser_state.dom_state:
                 file_input_ids = list(
@@ -702,6 +776,14 @@ class Tools:
                 self._cached_browser_state.dom_state if self._cached_browser_state else None,
             )
 
+        logger.info(
+            "upload_file: index=%d, tag=%s, type=%s, backend_node_id=%s, "
+            "is_file_input=%s, resolved_backend_id=%s, available_file_inputs=%s",
+            params["index"], tag, attrs.get("type", ""), entry.backend_node_id,
+            is_file_input, backend_id, file_input_ids,
+        )
+
+        # 4. 高亮 + 上传（对齐 _action_click：共用 try，统一映射；highlight best-effort）
         try:
             await browser.highlight_element(backend_id)
             await browser.set_file_input(
@@ -711,7 +793,33 @@ class Tools:
             )
         except Exception as e:
             return ActionResult(error=f"File upload failed: {e}")
-        return ActionResult(extracted_content=f"Uploaded {file_path}")
+
+        # 5. 成功回显（G1）+ 目标替换提示（G2）+ accept 软校验（G3）
+        memory = self._describe_upload(entry, params["index"], file_path)
+        if not is_file_input:
+            memory += (
+                f"  ⚠️ Note: index {params['index']} is not an <input type='file'>; "
+                f"uploaded to the nearest file input on the page instead."
+            )
+
+        if is_file_input:
+            file_input_entry = entry
+        else:
+            file_input_entry = self._find_node_by_backend_id(
+                backend_id,
+                self._cached_browser_state.dom_state if self._cached_browser_state else None,
+            )
+        accept_attr = None
+        if file_input_entry is not None:
+            accept_attr = (getattr(file_input_entry, "attributes", {}) or {}).get("accept")
+        if accept_attr and not _file_matches_accept(file_path, accept_attr):
+            memory += (
+                f"  ⚠️ Note: the file extension does not match this input's "
+                f"accept={accept_attr!r} — the site may reject the upload."
+            )
+
+        logger.info(memory)
+        return ActionResult(extracted_content=memory, long_term_memory=memory)
 
     async def _action_write_file(self, params: dict, browser: BrowserSession) -> ActionResult:
         path = params["path"]
