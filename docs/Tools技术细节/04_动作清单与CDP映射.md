@@ -17,7 +17,7 @@
 | 5 | [evaluate](#45-evaluate) | 是 | `code: str` | Runtime | 执行任意 JS，返回结果 |
 | 6 | [extract](#46-extract) | 否 | `goal: str` | Runtime + LLM | 二次 LLM 抽取页面信息 |
 | 7 | [find_elements](#47-find_elements) | 否 | `selector: str` | Runtime (JS) | CSS 选择器查找元素 |
-| 8 | [find_text](#48-find_text) | 否 | `text: str` | Runtime (JS) | window.find() 滚动到文本 |
+| 8 | [find_text](#48-find_text) | 否 | `text: str` | DOM + Overlay (+ Runtime) | CDP performSearch 滚动到文本并高亮 |
 | 9 | [go_back](#49-go_back) | 是 | (无) | Page | 浏览器后退 |
 | 10 | [input_text](#410-input_text) | 否 | `index, text, clear` | DOM + Input + Runtime | 点击+输入文本+触发框架事件 |
 | 11 | [navigate](#411-navigate) | 是 | `url: str, new_tab?: bool` | Page + Target | 导航到 URL（支持 new_tab、健康检查、错误映射） |
@@ -376,31 +376,51 @@
 
   | 字段 | 类型 | 描述 |
   |---|---|---|
-  | `text` | `str` | Text to search for on the page |
+  | `text` | `str` (`min_length=1`) | Text to search for on the page |
 
-- **主要逻辑**（[actions.py:304-314](../../src/tree_walker/tools/actions.py)）：
+- **主要逻辑**（[actions.py:787](../../src/tree_walker/tools/actions.py)，薄包装委托 session 层 `find_text`）：
 
   ```python
   async def _action_find_text(self, params: dict, browser: BrowserSession) -> ActionResult:
       text = params["text"]
       try:
-          found = await browser.execute_js(f"window.find({repr(text)})")
-          if found:
-              return ActionResult()
-          return ActionResult(error=f"Text '{text}' not found on page")
+          info = await browser.find_text(text)
       except Exception as e:
-          return ActionResult(error=str(e))
+          logger.warning("find_text(%r) failed: %s", text, e)
+          return ActionResult(error=f"Find text failed: {e}")
+      if not info.get("found"):
+          # 软回显：「文本不在页面上」是可操作信息而非工具失败（对齐 browser-use + search_page）
+          msg = f"Text '{text}' not found on page"
+          return ActionResult(extracted_content=msg, long_term_memory=msg)
+      method, tag = info.get("method"), info.get("tag")
+      if tag:
+          memory = f"Scrolled to text '{text}' into view (found in <{tag}>, via {method})"
+      else:
+          memory = f"Scrolled to text '{text}' into view (via {method})"
+      return ActionResult(extracted_content=memory, long_term_memory=memory)
   ```
 
-  利用浏览器原生的 `window.find()` 文本搜索（Ctrl+F 等价）。
+  委托给 `BrowserSession.find_text()`（[session.py:1501](../../src/tree_walker/browser/session.py)）：CDP `DOM.performSearch` **三段 XPath 查询链**（直接文本 `contains(text(), L)` → 全文本内容 `contains(., L)` → 属性值 `@*[contains(., L)]`），每段命中即 `DOM.scrollIntoViewIfNeeded` 滚入视口；三段全空走 JS TreeWalker 兜底（经 `execute_js` → `Runtime.evaluate`）。参照 browser-use `default_action_watchdog.py:2682-2774` 的 `on_ScrollToTextEvent`（**实际代码**，非其文档 §11 描述），并修复其 4 个 bug：① XPath 引号转义 `_xpath_string_literal`（[session.py:33](../../src/tree_walker/browser/session.py)——browser-use 用 f-string 直插，text 含 `"` 即语法错误）；② `discardSearchResults` 放 `try/finally`（命中也清理，修 searchId 泄漏）；③ `performSearch` 传 `includeUserAgentShadowDOM:True`（穿透 Shadow DOM）；④ 不调无用的 `getDocument`（`performSearch` 自带全文检索）。命中后经 `DOM.describeNode` 取 `backendNodeId` → `highlight_element`（`Overlay.highlightNode`）兑现 highlight，best-effort。
 
 - **CDP 调用清单**：
 
   | CDP 命令 | 主要参数 | 行号 |
   |---|---|---|
-  | `Runtime.evaluate` | `{expression: "window.find('...')"}` | session.py:785 |
+  | `DOM.performSearch` | `{query, includeUserAgentShadowDOM:True}` → `{searchId, resultCount}` | session.py:1531（`find_text`） |
+  | `DOM.getSearchResults` | `{searchId, fromIndex:0, toIndex:1}` → `{nodeIds}` | session.py:1538 |
+  | `DOM.scrollIntoViewIfNeeded` | `{nodeId}` | session.py:1546 |
+  | `DOM.discardSearchResults` | `{searchId}`（finally，含命中路径） | session.py:1559 |
+  | `DOM.describeNode` | `{nodeId}` → `{node:{backendNodeId, nodeName}}`（nodeId→backendNodeId） | session.py:1604（`_highlight_search_node`） |
+  | `Overlay.highlightNode` | `{highlightConfig, backendNodeId}`（经 `highlight_element`，best-effort） | highlight.py:35 |
+  | `Runtime.evaluate` | TreeWalker 兜底 JS（XPath 全空时，经 `execute_js`） | session.py:1593 |
 
-- **注意事项**：`window.find()` 是非标准 API，Chrome 支持；某些浏览器版本行为略有差异。
+- **注意事项**：
+  - 已弃用非标准 `window.find()`：改用标准 CDP `DOM.performSearch` 三段 XPath，覆盖直接文本 / 跨元素分裂文本 / 属性文本 / Shadow DOM。
+  - **未找到软回显**（非 error）：返回 `extracted_content="Text '...' not found on page"`，对齐 browser-use + `search_page`；仅 CDP 层异常返回 `error="Find text failed: ..."`。
+  - **引号安全**：`_xpath_string_literal` 把任意 text（含 `"`/`'`）转成 XPath 安全字面量（双引号 / 单引号 / `concat()`）；browser-use 实现遇到含引号文本会崩。
+  - **nodeId 与 backendNodeId**：`performSearch`/`getSearchResults` 返回前端 `nodeId`（`scrollIntoViewIfNeeded` 直接吃）；`highlight_element` 需 `backendNodeId`，经 `DOM.describeNode` 转换。
+  - 高亮落在元素框层级（大容器命中时框较粗）；精确文本高亮（原生选区）留待后续。
+  - `text` 加 `min_length=1`：空串会让 `contains(text(), "")` 命中全部元素，无意义。
 
 ---
 

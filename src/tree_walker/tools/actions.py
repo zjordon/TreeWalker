@@ -787,14 +787,29 @@ class Tools:
     async def _action_find_text(self, params: dict, browser: BrowserSession) -> ActionResult:
         text = params["text"]
         try:
-            found = await browser.execute_js(
-                f"window.find({repr(text)})"
-            )
-            if found:
-                return ActionResult()
-            return ActionResult(error=f"Text '{text}' not found on page")
+            info = await browser.find_text(text)
         except Exception as e:
-            return ActionResult(error=str(e))
+            # CDP layer failure (connection drop / DOM domain error) = tool
+            # execution failure; surface a find_text-specific error rather
+            # than the generic Tools.execute fallback.
+            logger.warning("find_text(%r) failed: %s", text, e)
+            return ActionResult(error=f"Find text failed: {e}")
+        if not info.get("found"):
+            # Soft echo: "text not on the page" is actionable info (the LLM
+            # can scroll / switch tab / accept the text is absent), not a tool
+            # failure — aligns with browser-use and the sibling search_page
+            # action (both return extracted_content, not error, on a miss).
+            msg = f"Text '{text}' not found on page"
+            logger.info(msg)
+            return ActionResult(extracted_content=msg, long_term_memory=msg)
+        method = info.get("method")
+        tag = info.get("tag")
+        if tag:
+            memory = f"Scrolled to text '{text}' into view (found in <{tag}>, via {method})"
+        else:
+            memory = f"Scrolled to text '{text}' into view (via {method})"
+        logger.info(memory)
+        return ActionResult(extracted_content=memory, long_term_memory=memory)
 
     async def _action_screenshot(self, params: dict, browser: BrowserSession) -> ActionResult:
         screenshot_bytes = await browser.take_screenshot()

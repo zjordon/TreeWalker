@@ -98,7 +98,7 @@ class FindElementsParams(BaseModel):
 
 class FindTextParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    text: str = Field(description="Text to search for on the page")
+    text: str = Field(min_length=1, description="Text to search for on the page")
 
 
 class ScreenshotParams(BaseModel):
