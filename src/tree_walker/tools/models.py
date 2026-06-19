@@ -56,7 +56,10 @@ class SwitchTabParams(BaseModel):
 
 class CloseTabParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    tab_id: str = Field(default="", description="Tab ID to close. Empty string closes current tab")
+    tab_id: str = Field(
+        default="",
+        description="Tab ID (last 4 characters) to close. Empty string closes the current tab.",
+    )
 
 
 class WaitParams(BaseModel):
