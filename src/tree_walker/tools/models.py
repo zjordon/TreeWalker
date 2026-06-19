@@ -51,7 +51,7 @@ class SendKeysParams(BaseModel):
 
 class SwitchTabParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    tab_id: str = Field(description="Tab ID (last 4 characters) to switch to")
+    tab_id: str = Field(min_length=1, description="Tab ID (last 4 characters) to switch to")
 
 
 class CloseTabParams(BaseModel):

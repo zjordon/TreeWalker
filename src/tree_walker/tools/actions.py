@@ -350,6 +350,7 @@ class Tools:
             return ActionResult(extracted_content=str(options))
 
         # 3. 普通点击：highlight -> click_element，映射 bool 信号
+        tabs_before = tuple(t.target_id for t in await browser.get_tabs())  # G7 新页检测快照
         try:
             await browser.highlight_element(backend_id)
             clicked = await browser.click_element(backend_id)
@@ -367,8 +368,9 @@ class Tools:
                 ),
             )
 
-        # 4. 成功回显（对齐 navigate/go_back 风格）
+        # 4. 成功回显（对齐 navigate/go_back 风格）+ 新标签页检测（G7）
         memory = self._describe_click(entry, params["index"])
+        memory += await self._detect_new_tab_opened(browser, tabs_before)
         logger.info(memory)
         return ActionResult(extracted_content=memory, long_term_memory=memory)
 
@@ -395,6 +397,33 @@ class Tools:
                 node_value = node_value[:60] + "..."
             return f"Clicked [{tag}] {node_value!r} at index {index}"
         return f"Clicked [{tag}] at index {index}"
+
+    async def _detect_new_tab_opened(
+        self, browser: BrowserSession, tabs_before: tuple[str, ...],
+    ) -> str:
+        """点击若打开了新标签页，自动切过去并返回给 LLM 的提示串。
+
+        对齐 browser-use _detect_new_tab_opened：click 前快照 target_id 集合，
+        click 后 diff，命中新页则 switch_tab 并回显；切换失败软降级为提示。
+        常态点击（未开新页）返回空串，不影响原有回显。
+        """
+        try:
+            await asyncio.sleep(0.05)  # 等 Target.attachedToTarget 事件传播
+            tabs_after = await browser.get_tabs()
+            new_tabs = [t for t in tabs_after if t.target_id not in tabs_before]
+            if not new_tabs:
+                return ""
+            new_tab = new_tabs[0]
+            new_id = new_tab.target_id[-4:]
+            try:
+                await browser.switch_tab(new_tab.target_id)
+                return (f"  ℹ️ Click opened a new tab [{new_id}] {new_tab.title}; "
+                        f"auto-switched to it.")
+            except Exception:
+                return (f"  ℹ️ Click opened a new tab [{new_id}] {new_tab.title}; "
+                        f"use switch_tab to focus it.")
+        except Exception:
+            return ""
 
     @staticmethod
     def _describe_input(entry: Any, index: int, text: str) -> str:
@@ -598,12 +627,34 @@ class Tools:
 
     async def _action_switch_tab(self, params: dict, browser: BrowserSession) -> ActionResult:
         tab_id_suffix = params["tab_id"]
-        state = await browser.get_state(include_screenshot=False)
-        for tab in state.tabs:
-            if tab.target_id.endswith(tab_id_suffix):
-                await browser.switch_tab(tab.target_id)
-                return ActionResult()
-        return ActionResult(error=f"Tab ending with '{tab_id_suffix}' not found")
+        tabs = await browser.get_tabs()
+        matches = [t for t in tabs if t.target_id.endswith(tab_id_suffix)]
+        if not matches:
+            return ActionResult(
+                error=f"No tab ending with '{tab_id_suffix}'. "
+                      f"Open tabs: {self._summarize_tabs(tabs)}",
+            )
+        if len(matches) > 1:  # 后缀撞车：切错页风险，要求更长后缀/完整 target_id
+            return ActionResult(
+                error=f"Multiple tabs match '{tab_id_suffix}' ({len(matches)}). "
+                      f"Use more characters or the full target_id. "
+                      f"Matches: {self._summarize_tabs(matches)}",
+            )
+        target = matches[0]
+        await browser.switch_tab(target.target_id)
+        memory = f"Switched to tab [{tab_id_suffix}] {target.title} ({target.url})"
+        logger.info(memory)
+        return ActionResult(extracted_content=memory, long_term_memory=memory)
+
+    @staticmethod
+    def _summarize_tabs(tabs: list) -> str:
+        """把标签页列表摘要成短串，供 switch_tab 的 error/回显复用。"""
+        items = []
+        for t in tabs:
+            title = (t.title or "").strip()[:40]
+            url = (t.url or "").strip()[:60]
+            items.append(f"[{t.target_id[-4:]}] {title} - {url}")
+        return "; ".join(items)
 
     async def _action_close_tab(self, params: dict, browser: BrowserSession) -> ActionResult:
         tab_id = params.get("tab_id", "")

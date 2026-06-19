@@ -927,29 +927,41 @@
 
   | 字段 | 类型 | 描述 |
   |---|---|---|
-  | `tab_id` | `str` | Tab ID (last 4 characters) to switch to |
+  | `tab_id` | `str` (`min_length=1`) | Tab ID (last 4 characters) to switch to |
 
-- **主要逻辑**（[actions.py:259-266](../../src/tree_walker/tools/actions.py)）：
+- **主要逻辑**（[actions.py:628-648](../../src/tree_walker/tools/actions.py)，helper `_summarize_tabs` 在 [actions.py:650](../../src/tree_walker/tools/actions.py)）：
 
   ```python
   async def _action_switch_tab(self, params: dict, browser: BrowserSession) -> ActionResult:
       tab_id_suffix = params["tab_id"]
-      state = await browser.get_state(include_screenshot=False)
-      for tab in state.tabs:
-          if tab.target_id.endswith(tab_id_suffix):
-              await browser.switch_tab(tab.target_id)
-              return ActionResult()
-      return ActionResult(error=f"Tab ending with '{tab_id_suffix}' not found")
+      tabs = await browser.get_tabs()
+      matches = [t for t in tabs if t.target_id.endswith(tab_id_suffix)]
+      if not matches:
+          return ActionResult(error=f"No tab ending with '{tab_id_suffix}'. Open tabs: {self._summarize_tabs(tabs)}")
+      if len(matches) > 1:  # 后缀撞车：要求更长后缀/完整 target_id
+          return ActionResult(error=f"Multiple tabs match '{tab_id_suffix}' ({len(matches)}). Use more characters or the full target_id. Matches: {self._summarize_tabs(matches)}")
+      target = matches[0]
+      await browser.switch_tab(target.target_id)
+      memory = f"Switched to tab [{tab_id_suffix}] {target.title} ({target.url})"
+      logger.info(memory)
+      return ActionResult(extracted_content=memory, long_term_memory=memory)
   ```
+
+  用轻量 `browser.get_tabs()`（单 `Target.getTargets`，[session.py:1244](../../src/tree_walker/browser/session.py)）枚举标签页，不再为读列表调全量 `get_state`。匹配改为收集全部 `matches`：空 → error 列出现有标签页；多于一个 → error 提示用更长后缀/完整 target_id（**比 browser-use 取首个匹配更严**，避免切错页）；唯一 → 切换并回显。
 
 - **CDP 调用清单**：
 
   | CDP 命令 | 主要参数 | 行号 |
   |---|---|---|
-  | `Target.activateTarget` | `{targetId}` | session.py:755 |
-  | `Target.attachToTarget` | `{targetId, flatten:True}` | session.py:756 |
+  | `Target.getTargets`（经 `get_tabs`） | `{}` | session.py:1249 |
+  | `Target.activateTarget` | `{targetId}` | session.py:1268 |
+  | `Target.attachToTarget` | `{targetId, flatten:True}` | session.py:1269 |
 
-- **注意事项**：切换后 `current_target_id` 和 `current_session_id` 都会更新；同时清空缓存。
+- **注意事项**：
+  - 成功回显 `Switched to tab [{id}] title (url)`（对齐 navigate/click/go_back），写入 `extracted_content` + `long_term_memory`；title/url 取自匹配到的 `TabInfo`，零额外 CDP 调用。
+  - 后缀撞车直接报错（`len(matches) > 1`），不取首个匹配，避免切错页；未命中时 error 列出现有标签页（`_summarize_tabs`）便于 LLM 重选。
+  - `tab_id` 校验 `min_length=1`（保留接受完整 `target_id` 的灵活性；browser-use 用 `min_length=4, max_length=4` 强约束）。
+  - 切换后 `current_target_id` / `current_session_id` 都会更新，并清空两层 selector_map 缓存（对齐 navigate / go_back）。
 
 ---
 

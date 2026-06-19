@@ -91,6 +91,7 @@ def _make_browser(
 			else [{"value": "a", "text": "A", "selected": False}],
 		)
 	bs.get_state = AsyncMock(return_value=_make_state({}))
+	bs.get_tabs = AsyncMock(return_value=[])  # _action_click snapshots tabs (G7)
 	return bs
 
 
