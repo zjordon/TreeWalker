@@ -60,8 +60,10 @@ def _walk_for_file_inputs(node: dict) -> list[int]:
 
 # Virtual key codes for send_keys
 _KEY_VK_MAP: dict[str, int] = {
-    "enter": 13, "tab": 9, "escape": 27, "backspace": 8,
+    "enter": 13, "tab": 9, "escape": 27, "backspace": 8, "delete": 46,
     "arrowup": 38, "arrowdown": 40, "arrowleft": 37, "arrowright": 39,
+    "pageup": 33, "pagedown": 34, "home": 36, "end": 35,
+    **{f"f{i}": 0x70 + (i - 1) for i in range(1, 13)},  # F1=0x70 ... F12=0x7B
 }
 
 # Char text for keys that need it
@@ -69,6 +71,67 @@ _KEY_CHAR_TEXT: dict[str, str] = {
     "enter": "\r",
     "tab": "\t",
 }
+
+# Key aliases → canonical DOM key names (matched case-insensitively via .lower()).
+# Mirrors browser-use default_action_watchdog.py key_aliases: lets callers write
+# 'ctrl'/'control', 'return', 'esc', 'cmd', 'up'/'arrowup', 'pgup', 'f5', etc.
+_KEY_ALIASES: dict[str, str] = {
+    "ctrl": "Control", "control": "Control",
+    "alt": "Alt", "option": "Alt",
+    "meta": "Meta", "cmd": "Meta", "command": "Meta",
+    "shift": "Shift",
+    "enter": "Enter", "return": "Enter",
+    "esc": "Escape", "escape": "Escape",
+    "backspace": "Backspace",
+    "delete": "Delete", "del": "Delete",
+    "tab": "Tab",
+    "space": " ",
+    "up": "ArrowUp", "arrowup": "ArrowUp",
+    "down": "ArrowDown", "arrowdown": "ArrowDown",
+    "left": "ArrowLeft", "arrowleft": "ArrowLeft",
+    "right": "ArrowRight", "arrowright": "ArrowRight",
+    "pageup": "PageUp", "pgup": "PageUp",
+    "pagedown": "PageDown", "pgdn": "PageDown",
+    "home": "Home", "end": "End",
+    **{f"f{i}": f"F{i}" for i in range(1, 13)},
+}
+
+# Keys dispatched as discrete keyDown/char/keyUp events (vs. typed char-by-char).
+# A normalized key in this set routes to the "special key" branch; otherwise the
+# input is treated as plain text and fed through _type_char.
+_SPECIAL_KEYS: frozenset[str] = frozenset({
+    "Enter", "Tab", "Delete", "Backspace", "Escape",
+    "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
+    "PageUp", "PageDown", "Home", "End",
+    "Control", "Alt", "Meta", "Shift",
+}) | {f"F{i}" for i in range(1, 13)}
+
+# Modifier bitmask for Input.dispatchKeyEvent.modifiers (CDP spec):
+# Alt=1, Control=2, Meta=4, Shift=8.
+_MODIFIER_VK: dict[str, int] = {"alt": 1, "control": 2, "meta": 4, "shift": 8}
+
+# DOM `code` strings for multi-char special keys (single chars use _get_key_code_for_char).
+_KEY_CODE_FOR_SPECIAL: dict[str, str] = {
+    "enter": "Enter", "tab": "Tab", "escape": "Escape",
+    "backspace": "Backspace", "delete": "Delete",
+    "arrowup": "ArrowUp", "arrowdown": "ArrowDown",
+    "arrowleft": "ArrowLeft", "arrowright": "ArrowRight",
+    "pageup": "PageUp", "pagedown": "PageDown",
+    "home": "Home", "end": "End",
+    "control": "ControlLeft", "alt": "AltLeft",
+    "shift": "ShiftLeft", "meta": "MetaLeft",
+    **{f"f{i}": f"F{i}" for i in range(1, 13)},
+}
+
+
+def _normalize_key(raw: str) -> str:
+    """Normalize a single key token: alias → canonical DOM key name.
+
+    Case-insensitive (table is queried with .lower()). Single chars and unknown
+    names are returned unchanged so the caller can route via _SPECIAL_KEYS.
+    Mirrors browser-use default_action_watchdog.py alias normalization.
+    """
+    return _KEY_ALIASES.get(raw.lower(), raw)
 
 
 def _get_char_modifiers_and_vk(char: str) -> tuple[int, int, str]:
@@ -1162,56 +1225,113 @@ class BrowserSession:
             logger.debug("Framework event trigger failed (non-critical): %s", e)
 
     async def send_keys(self, keys: str) -> None:
-        """Send key combinations like 'Enter', 'Control+a', etc."""
+        """Send keys: a combination ('Control+a'), a single special key
+        ('Enter'/'ArrowUp'/'F5'), or plain text typed char-by-char ('hello').
+
+        Three routes mirror browser-use default_action_watchdog.on_SendKeysEvent:
+          - '+' present      → combination (modifiers bitmask + main key)
+          - named special key → keyDown/char/keyUp
+          - otherwise        → text, reusing _type_char per character
+        Aliases (ctrl/return/esc/up/f5/...) are normalized via _normalize_key.
+        """
         sid = self.current_session_id
-        key_map = {
-            "enter": ("Enter", "Enter"),
-            "tab": ("Tab", "Tab"),
-            "escape": ("Escape", "Escape"),
-            "backspace": ("Backspace", "Backspace"),
-        }
-        modifier_map = {"control": 2, "alt": 1, "shift": 8, "meta": 4}
+        if "+" in keys:
+            await self._send_combination(keys, sid)
+            return
+        normalized = _normalize_key(keys)
+        if normalized in _SPECIAL_KEYS:
+            await self._send_single_special_key(normalized, sid)
+        else:
+            # Plain text: type each char via _type_char (handles keyDown→char→keyUp
+            # and CJK insertText). Iterate the normalized string so an alias that
+            # maps to a printable char (e.g. 'space' -> ' ') types correctly; for
+            # ordinary text normalized == keys. Small inter-char delay keeps pace
+            # ~browser-use.
+            for ch in normalized:
+                await self._type_char(ch, sid=sid)
+                await asyncio.sleep(0.005)
 
-        parts = keys.replace("+", "+").split("+")
+    async def _send_combination(self, keys: str, sid: str) -> None:
+        """Dispatch a modifier+key combination ('Control+a', 'Alt+F4', ...)."""
+        parts = [p.strip() for p in keys.split("+")]
         modifiers = 0
-        main_key = parts[-1].strip()
-
         for part in parts[:-1]:
-            mod = modifier_map.get(part.strip().lower(), 0)
-            modifiers |= mod
+            norm = _normalize_key(part)
+            vk = _MODIFIER_VK.get(norm.lower())
+            if vk is None:
+                # Unknown modifier → soft-degrade (warn + skip); the combination
+                # space is unbounded, so we never hard-fail on a bad modifier.
+                logger.warning("send_keys: ignoring unknown modifier '%s' in '%s'", part, keys)
+                continue
+            modifiers |= vk
 
-        mapped = key_map.get(main_key.lower(), (main_key, f"Key{main_key.upper()}" if len(main_key) == 1 else main_key))
+        main = _normalize_key(parts[-1])
+        if len(main) == 1 and main not in _SPECIAL_KEYS:
+            # Single-char main key (Control+a) MUST go through the key event path
+            # carrying `modifiers`, otherwise Ctrl+A select-all would be dropped.
+            await self._send_combo_char_key(main, sid, modifiers)
+        else:
+            await self._send_single_special_key(main, sid, modifiers=modifiers)
 
+    async def _send_combo_char_key(self, char: str, sid: str, modifiers: int) -> None:
+        """Dispatch a single-char main key under modifiers (e.g. the 'a' in Ctrl+a).
+
+        Reuses _get_char_modifiers_and_vk / _get_key_code_for_char so Shift state
+        and code/vk match the existing per-char typing path.
+        """
+        char_mod, char_vk, base = _get_char_modifiers_and_vk(char)
+        code = _get_key_code_for_char(base)
+        total_mod = modifiers | char_mod
         await self.client.send.Input.dispatchKeyEvent(
             {
-                "type": "keyDown",
-                "key": mapped[0],
-                "code": mapped[1],
-                "modifiers": modifiers,
-                "windowsVirtualKeyCode": _KEY_VK_MAP.get(mapped[0].lower(), 0),
+                "type": "keyDown", "key": base, "code": code,
+                "modifiers": total_mod, "windowsVirtualKeyCode": char_vk,
+            },
+            session_id=sid,
+        )
+        await self.client.send.Input.dispatchKeyEvent(
+            {"type": "char", "text": char, "key": char},
+            session_id=sid,
+        )
+        await self.client.send.Input.dispatchKeyEvent(
+            {
+                "type": "keyUp", "key": base, "code": code,
+                "modifiers": total_mod, "windowsVirtualKeyCode": char_vk,
             },
             session_id=sid,
         )
 
-        # Enter and Tab need a char event for proper event handling
-        char_text = _KEY_CHAR_TEXT.get(mapped[0].lower())
+    async def _send_single_special_key(
+        self, key: str, sid: str, *, modifiers: int = 0,
+    ) -> None:
+        """Dispatch a named special key as keyDown → (char) → keyUp."""
+        key_lower = key.lower()
+        code = _KEY_CODE_FOR_SPECIAL.get(key_lower, key)
+        vk = _KEY_VK_MAP.get(key_lower, 0)
+
+        await self.client.send.Input.dispatchKeyEvent(
+            {
+                "type": "keyDown", "key": key, "code": code,
+                "modifiers": modifiers, "windowsVirtualKeyCode": vk,
+            },
+            session_id=sid,
+        )
+        # Enter/Tab need a char event for proper event handling (React form submit)
+        char_text = _KEY_CHAR_TEXT.get(key_lower)
         if char_text:
             await self.client.send.Input.dispatchKeyEvent(
-                {"type": "char", "text": char_text, "key": mapped[0]},
+                {"type": "char", "text": char_text, "key": key},
                 session_id=sid,
             )
-
         await self.client.send.Input.dispatchKeyEvent(
             {
-                "type": "keyUp",
-                "key": mapped[0],
-                "code": mapped[1],
-                "modifiers": modifiers,
-                "windowsVirtualKeyCode": _KEY_VK_MAP.get(mapped[0].lower(), 0),
+                "type": "keyUp", "key": key, "code": code,
+                "modifiers": modifiers, "windowsVirtualKeyCode": vk,
             },
             session_id=sid,
         )
-        await asyncio.sleep(0.1)
+        if key_lower == "enter":
+            await asyncio.sleep(0.1)  # let any navigation triggered by Enter settle
 
     # ── Scrolling ──────────────────────────────────────────────────────
 
