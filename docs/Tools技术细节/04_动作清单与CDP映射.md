@@ -450,42 +450,73 @@
 
   | 字段 | 类型 | 默认 | 描述 |
   |---|---|---|---|
-  | `index` | `int` | (必填) | ID of the element to type into |
+  | `index` | `int` | (必填) | ID of the element to type into, shown in brackets in the DOM tree |
   | `text` | `str` | (必填) | Text to type into the element |
   | `clear` | `bool` | `True` | Whether to clear existing text first |
 
-- **主要逻辑**（[actions.py:219-227](../../src/tree_walker/tools/actions.py)）：
+- **主要逻辑**（[actions.py:415](../../src/tree_walker/tools/actions.py) 的 `_action_input_text` + [`_describe_input`](../../src/tree_walker/tools/actions.py)/`_is_autocomplete_field`（actions.py:364/392）；session 层判定 `_requires_direct_value_assignment` 在 [session.py:147](../../src/tree_walker/browser/session.py)）：
 
   ```python
-  async def _action_input_text(self, params: dict, browser: BrowserSession) -> ActionResult:
+  async def _action_input_text(self, params, browser):
       entry, error = await self._get_element_by_index(params["index"], browser)
       if error:
           return error
-      await browser.highlight_element(entry.backend_node_id)
-      await browser.click_element(entry.backend_node_id)  # 聚焦元素
+      text, clear = params["text"], params.get("clear", True)
+      # 1. 聚焦：highlight -> click_element，映射 bool（对齐 _action_click）
+      try:
+          await browser.highlight_element(entry.backend_node_id)
+          clicked = await browser.click_element(entry.backend_node_id)
+      except Exception as e:
+          return ActionResult(error=f"Input focus failed: {e}")
+      if not clicked:
+          return ActionResult(error=f"Could not focus element {params['index']} ...")
       await asyncio.sleep(0.1)
-      await browser.type_text(params["text"], clear=params.get("clear", True))
-      return ActionResult()
+      # 2. 输入：date/time 等特殊输入走直写，否则逐字符 type_text
+      try:
+          if _requires_direct_value_assignment(entry):
+              if clear:
+                  await browser._clear_text_field()
+              await browser._force_set_value(text)
+          else:
+              await browser.type_text(text, clear=clear)
+      except Exception as e:
+          return ActionResult(error=f"Failed to type text into element {params['index']}: {e}")
+      # 3. autocomplete/combobox：JS 驱动型睡 0.4s 等下拉
+      is_combo, needs_js_wait = self._is_autocomplete_field(entry)
+      if needs_js_wait:
+          await asyncio.sleep(0.4)
+      # 4. 值校验 + 成功回显
+      memory = self._describe_input(entry, params["index"], text)
+      actual = await browser._read_active_text()
+      if actual and actual != text:
+          memory += "  ⚠️ Note: the field's actual value '...' differs from ..."
+      if is_combo:
+          memory += "  💡 autocomplete field — select from the dropdown ..."
+      logger.info(memory)
+      return ActionResult(extracted_content=memory, long_term_memory=memory)
   ```
 
-  先点击聚焦元素，再用 `type_text` 逐字符输入。
+  四阶段：① 点击聚焦（`click_element` 返回 `bool`，失败/异常 → 明确 `error`，对齐 click，不再静默成功）→ ② 输入（date/time 等特殊输入走 `_force_set_value` 直写，否则逐字符 `type_text`）→ ③ combobox 检测（JS 驱动型睡 0.4s 等下拉）→ ④ 读回值校验（不匹配追加 `⚠️ Note`）+ 回显 `Typed '...' into [TAG] ...`。
 
-- **CDP 调用清单**：
+- **CDP 调用清单**（聚焦/清空/逐字符/框架事件/值读回，均委托 session 层方法）：
 
-  | CDP 命令 | 主要参数 | 行号 |
+  | CDP 命令 | 主要参数 | 委托方法 / 行号 |
   |---|---|---|
-  | `DOM.scrollIntoViewIfNeeded` | `{backendNodeId}` | session.py:511 |
-  | `DOM.getContentQuads` (坐标) | `{backendNodeId}` | session.py:439 |
-  | `Input.dispatchMouseEvent` × 2 | `{mousePressed/mouseReleased, x, y}` | session.py:413 |
-  | `Input.dispatchKeyEvent` (Ctrl+A 模拟 clear) | `{keyDown/keyUp, key:a, modifiers:2}` | session.py:539-546 |
-  | `Input.dispatchKeyEvent` (Backspace 清空) | `{keyDown/keyUp, key:Backspace}` | session.py:547-554 |
-  | `Input.dispatchKeyEvent` × 3 (每字符) | `{keyDown/char/keyUp, key, code, windowsVirtualKeyCode}` | session.py:575-602 |
-  | `Runtime.evaluate` (框架事件) | `{expression: _trigger_framework_events JS}` | session.py:612 |
+  | `DOM.scrollIntoViewIfNeeded` + `getContentQuads` + `Input.dispatchMouseEvent`×3 | 聚焦点击（mouseMoved→mousePressed→mouseReleased） | `click_element` session.py:702（内部与 4.1 click 共用，详见 4.3.1）|
+  | `Input.dispatchKeyEvent` (clear 三层策略) | Ctrl+A / Delete / Backspace 等 | `_clear_text_field` session.py:947 |
+  | `Input.dispatchKeyEvent` × 3 (每字符) | `{keyDown/char/keyUp, key, code, windowsVirtualKeyCode}` | `_type_char` session.py:1073 |
+  | `Runtime.evaluate` (框架事件) | `{expression: _trigger_framework_events JS}` | session.py:1114 |
+  | `Runtime.evaluate` (值读回) | 读 `activeElement.value`/`textContent` | `_read_active_text` session.py:876 |
+  | `Runtime.evaluate` (date 直写) | React 原生 setter + input/change | `_force_set_value` session.py:897（date/time 路径）|
 
 - **注意事项**：
-  - 非 ASCII 字符（CJK）只发 `char` 事件，跳过 keyDown/keyUp（[session.py:572-590](../../src/tree_walker/browser/session.py)）
-  - 输入完成后通过 `_trigger_framework_events` 触发 Vue/React 兼容事件，详见 4.3.2
-  - 每字符间隔 1ms 避免事件丢失
+  - **成功回显** `Typed '...' into [TAG] {aria-label|placeholder|title|node_value} at index N`（`_describe_input`，对齐 click/navigate/go_back，text 与 label 各截断 60 字）；不设 `success=True`（`ActionResult` 校验器对非 done 动作拒绝）。
+  - **聚焦失败 → 明确 error**：`click_element` 返回 `False`（坐标拿不到 + JS 回退失败）或抛异常 → `ActionResult(error=...)`，不再静默成功。
+  - **值校验**：输入后读回 `activeElement.value`（或 `textContent`），与预期不符时追加 `⚠️ Note: the field's actual value '...' differs ...`，提示 LLM 重新观察（读回为空说明读失败，静默不打扰）。
+  - **date/time/特殊输入走直写**：`_requires_direct_value_assignment` 检测 `<input type=date|time|datetime-local|month|week|color|range>` 与 jQuery/Bootstrap 日期选择器（class 含 `datepicker`/`daterangepicker`/`datetimepicker`/`bootstrap-datepicker` 或有 `data-datepicker`/`data-date-format`/`data-provide` 属性），改用 `_force_set_value`（React 原生 setter + input/change，对齐 browser-use `_set_value_directly`）而非逐字符——这类输入拒收 per-char key 事件，逐字符只会留下残值。
+  - **autocomplete/combobox**：`_is_autocomplete_field` 检测后给 LLM 追加 `💡 autocomplete field` 提示；JS 驱动型（`role=combobox` 或非 `none` 的 `aria-autocomplete`）额外睡 0.4s 等下拉填充，原生 `<datalist>`（`list` 属性）与松散 `aria-haspopup`+`aria-controls` 即时渲染不等待（对齐 browser-use service.py:404-417）。
+  - 非 ASCII 字符（CJK）只发 `char` 事件，跳过 keyDown/keyUp（`_type_char` session.py:1073）；每字符间隔 1ms 避免事件丢失。
+  - 输入完成后 `_trigger_framework_events` 触发 Vue/React 兼容事件，详见 4.3.2；`type_text` 末尾还有拼接自愈（读回发现 OLD+NEW 拼接则 `_force_set_value` 强写，对齐 browser-use auto-retry）。
 
 ---
 

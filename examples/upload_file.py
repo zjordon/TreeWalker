@@ -36,7 +36,7 @@ async def main():
     browser = BrowserSession(settings.browser)
 
     task = (
-        "帮我到抖音创作者中心发一个视频，信息如下，先暂存为草稿不要直接发布\n"
+        "帮我到抖音创作者中心发一个视频，信息如下，先暂存为草稿不要直接发布，发布完后回到发布视频界面就算完成了不要再点继续编辑进去重复编辑\n"
         "\n"
         "抖音创作者中心网址:https://creator.douyin.com/\n"
         "我要发的视频在'D:\\Videos\\test\\final\\2026-04-29-20-41-59.mp4'\n"

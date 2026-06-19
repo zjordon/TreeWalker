@@ -122,6 +122,57 @@ def _get_key_code_for_char(char: str) -> str:
     return key_codes.get(char, f"Key{char.upper()}")
 
 
+# ── Direct-value-assignment detection (date/time/special inputs) ─────────────
+# These inputs reject per-character key events and must be set via the native
+# value setter (_force_set_value) instead of _type_char. Mirrors browser-use
+# default_action_watchdog.py:1589-1639 (_requires_direct_value_assignment).
+_DIRECT_VALUE_INPUT_TYPES: frozenset[str] = frozenset(
+	{"date", "time", "datetime-local", "month", "week", "color", "range"}
+)
+# jQuery / Bootstrap datepicker class markers on <input type="text"|''>.
+_DATEPICKER_CLASS_MARKERS: tuple[str, ...] = (
+	"datepicker",
+	"daterangepicker",
+	"datetimepicker",
+	"bootstrap-datepicker",
+)
+# datepicker data-* attributes on <input type="text"|''>.
+_DATEPICKER_DATA_ATTRS: tuple[str, ...] = (
+	"data-datepicker",
+	"data-date-format",
+	"data-provide",
+)
+
+
+def _requires_direct_value_assignment(entry: Any) -> bool:
+	"""True if the element won't accept per-character key events and must be
+	set via a direct value assignment (native setter).
+
+	Mirrors browser-use default_action_watchdog.py:1589-1639:
+	  - <input type> in {date, time, datetime-local, month, week, color, range}
+	    (HTML5 compound inputs that require ISO/hex formatted values)
+	  - <input type='text'|''> whose class contains a known datepicker marker
+	  - <input type='text'|''> carrying a known datepicker data-* attribute
+
+	Used by Tools._action_input_text to route date/special inputs to
+	BrowserSession._force_set_value instead of per-char typing.
+	"""
+	tag = (getattr(entry, "tag_name", "") or "").lower()
+	if tag != "input":
+		return False
+	attrs = getattr(entry, "attributes", {}) or {}
+	itype = (attrs.get("type", "") or "").lower()
+	if itype in _DIRECT_VALUE_INPUT_TYPES:
+		return True
+	if itype in ("", "text"):
+		cls = (attrs.get("class", "") or "").lower()
+		if any(marker in cls for marker in _DATEPICKER_CLASS_MARKERS):
+			return True
+		if any(attrs.get(attr) for attr in _DATEPICKER_DATA_ATTRS):
+			return True
+	return False
+
+
 class BrowserSession:
     """Manages browser connection and provides high-level page operations."""
 
