@@ -222,30 +222,48 @@
   |---|---|---|
   | `index` | `int` | ID of the select element, shown in brackets in the DOM tree |
 
-- **主要逻辑**（[actions.py:337-346](../../src/tree_walker/tools/actions.py)）：
+- **主要逻辑**（[actions.py:860-910](../../src/tree_walker/tools/actions.py)，回显 helper `_describe_dropdown` 在 `actions.py:489`）：
+
+  复用 session 层 `fetch_select_options(backend_node_id)`（`DOM.resolveNode` + `Runtime.callFunctionOn`），精确绑定到 index 指定的那个 `<select>`，修掉此前 `document.querySelectorAll('select option')` 全页扫描、与 index 无关的范围 bug。先做 tag 校验（非 `<select>` 早退报错），再读 option，最后用 json 编码 text/value 格式化输出 + 追加 `select_dropdown` 用法提示。
 
   ```python
   async def _action_dropdown_options(self, params: dict, browser: BrowserSession) -> ActionResult:
-      entry, error = await self._get_element_by_index(params["index"], browser)
+      index = params["index"]
+      entry, error = await self._get_element_by_index(index, browser)
       if error:
           return error
-      js_code = (
-          "Array.from(document.querySelectorAll('select option'))"
-          ".map(o => ({value: o.value, text: o.textContent.trim(), selected: o.selected}))"
-      )
-      options = await browser.execute_js(js_code)
-      return ActionResult(extracted_content=str(options))
+      # tag 校验：非 <select> 早退，不返回全页 select 数据
+      tag = (getattr(entry, "tag_name", "") or "").upper()
+      if tag != "SELECT":
+          return ActionResult(error=f"Index {index} is a [{tag}] element, not a <select>. ...")
+      # 复用 fetch_select_options，精确绑定到目标 select（与 click SELECT 分支一致）
+      try:
+          raw_options = await browser.fetch_select_options(entry.backend_node_id)
+      except Exception as e:
+          return ActionResult(error=f"Failed to read select options: {e}")
+      # json 编码 text/value + 末尾用法提示（本项目 select_dropdown 参数名是 value）
+      lines = [
+          f"{i}: text={json.dumps(o.get('text', ''))}, value={json.dumps(o.get('value', ''))}"
+          f"{' (selected)' if o.get('selected') else ''}"
+          for i, o in enumerate(raw_options)
+      ]
+      hint = f"Use the value in select_dropdown(index={index}, value=...)"
+      extracted = hint if not lines else "\n".join(lines) + "\n" + hint
+      memory = f"Got {len(raw_options)} options from {self._describe_dropdown(entry, index)}"
+      return ActionResult(extracted_content=extracted, long_term_memory=memory)
   ```
 
-  注意：JS 实际查询的是**页面上所有 select**，而非指定 index 的那一个。这是一个已知限制，LLM 需要根据上下文判断。
-
-- **CDP 调用清单**：
+- **CDP 调用清单**（经 `session.fetch_select_options`，`session.py:1616-1652`）：
 
   | CDP 命令 | 主要参数 | 行号 |
   |---|---|---|
-  | `Runtime.evaluate` | `{expression, returnByValue:True, awaitPromise:True, timeout:30000}` | session.py:785 |
+  | `DOM.resolveNode` | `{backendNodeId}` | session.py:1628 |
+  | `Runtime.callFunctionOn` | `{objectId, functionDeclaration: function(){return Array.from(this.options).map(...)}, returnByValue:True}` | session.py:1633 |
 
-- **注意事项**：返回的 `options` 是 Python 字符串形式（`str(list)`），LLM 需要自行解析。
+- **注意事项**：
+  - 仅支持原生 `<select>`；非 select（ARIA menu/listbox、custom class、combobox）走 tag 校验 error 分支，提示用 click 手动展开（P1 蓝图见 `docs/tools-optimize/dropdown_options.md`）。
+  - 输出每行 `序号: text=<json>, value=<json> (selected)`，json 编码保证含引号/特殊字符的文本可被 LLM 精确复制到 `select_dropdown(index=N, value=...)`。
+  - 成功回显 short/long 分离：`extracted_content` 为紧凑选项列表（靠 `ActionResult.__str__` 的 500 字符截断自然兜底，工具只读幂等可重调），`long_term_memory` 为简短摘要 `Got N options from [SELECT] {label} at index N`。
 
 ---
 
