@@ -35,7 +35,7 @@ async def main():
     browser = BrowserSession(settings.browser)
 
     agent = Agent(
-        task="Go to https://www.google.com and search for 'Python async tutorial', then return the title of the first result.",
+        task="帮我到'https://www.google.com/'搜索与'浏览器自动化'相关的信息然后获取前三条的标题告诉我",
         llm=llm,
         browser=browser,
         settings=settings.agent,
