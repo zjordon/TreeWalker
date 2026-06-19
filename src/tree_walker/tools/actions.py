@@ -638,8 +638,18 @@ class Tools:
         return ActionResult(extracted_content=page_text[:self._truncation.extract_fallback_max_chars])
 
     async def _action_send_keys(self, params: dict, browser: BrowserSession) -> ActionResult:
-        await browser.send_keys(params["keys"])
-        return ActionResult()
+        keys = params["keys"]
+        try:
+            await browser.send_keys(keys)
+        except Exception as e:
+            # send_keys is NOT idempotent (a key can submit a form / trigger
+            # navigation), so a CDP failure must surface as error — mirrors the
+            # scroll pattern, unlike close_tab's soft-success degradation.
+            logger.warning("send_keys(%r) failed: %s", keys, e)
+            return ActionResult(error=f"Send keys failed: {e}")
+        memory = f"Sent keys '{keys}'"
+        logger.info(memory)
+        return ActionResult(extracted_content=memory, long_term_memory=memory)
 
     async def _action_switch_tab(self, params: dict, browser: BrowserSession) -> ActionResult:
         tab_id_suffix = params["tab_id"]

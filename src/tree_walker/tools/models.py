@@ -58,7 +58,15 @@ class ExtractParams(BaseModel):
 
 class SendKeysParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    keys: str = Field(description="Key combination to send, e.g. 'Enter', 'Control+a', 'Tab'")
+    keys: str = Field(
+        min_length=1,
+        description=(
+            "Key combination or text to send. "
+            "Combos use '+': 'Control+a', 'Shift+T', 'Alt+F4'. "
+            "Named keys: 'Enter', 'Tab', 'Escape', 'ArrowUp', 'F5', etc. "
+            "Plain text (e.g. 'hello') is typed character by character."
+        ),
+    )
 
 
 class SwitchTabParams(BaseModel):
