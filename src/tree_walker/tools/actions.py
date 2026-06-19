@@ -8,7 +8,7 @@ import logging
 import os
 
 from tree_walker.agent.views import ActionResult
-from tree_walker.browser.session import BrowserSession
+from tree_walker.browser.session import BrowserSession, _requires_direct_value_assignment
 from tree_walker.browser.views import BrowserStateSummary, EnhancedDOMTreeNode, SerializedDOMState
 from tree_walker.config import TruncationSettings
 from tree_walker.tools.models import ACTION_DEFINITIONS
@@ -360,15 +360,121 @@ class Tools:
             return f"Clicked [{tag}] {node_value!r} at index {index}"
         return f"Clicked [{tag}] at index {index}"
 
+    @staticmethod
+    def _describe_input(entry: Any, index: int, text: str) -> str:
+        """Build a human-readable input echo, mirroring _describe_click /
+        navigate / go_back style.
+
+        Prefers an identifying attribute the LLM can also see in the DOM tree
+        (aria-label/placeholder/title), then node_value, then just the tag.
+        Both the label and the typed text are bounded to ~60 chars so the echo
+        fits the LLM context. Skips 'value'/'alt' (unlike _describe_click) since
+        for an input the typed text itself is what matters.
+        """
+        shown = text if len(text) <= 60 else text[:60] + "..."
+        tag = entry.tag_name.upper()
+        attrs = getattr(entry, "attributes", {}) or {}
+        for key in ("aria-label", "placeholder", "title"):
+            v = attrs.get(key)
+            if v:
+                v = v.strip()
+                if len(v) > 60:
+                    v = v[:60] + "..."
+                return f"Typed {shown!r} into [{tag}] {v!r} at index {index}"
+        node_value = (getattr(entry, "node_value", "") or "").strip()
+        if node_value:
+            if len(node_value) > 60:
+                node_value = node_value[:60] + "..."
+            return f"Typed {shown!r} into [{tag}] {node_value!r} at index {index}"
+        return f"Typed {shown!r} into [{tag}] at index {index}"
+
+    @staticmethod
+    def _is_autocomplete_field(entry: Any) -> tuple[bool, bool]:
+        """Detect combobox/autocomplete fields. Returns (is_combo, needs_js_wait).
+
+        Mirrors browser-use tools/service.py:404-417. ``is_combo`` is True for any
+        combobox-shaped field (drives the LLM hint); ``needs_js_wait`` is True only
+        for the JS-driven subset (role=combobox or non-none aria-autocomplete) whose
+        dropdowns populate asynchronously and need a ~0.4s settle before the next
+        click — native <datalist> (list attr) and loose aria-haspopup render
+        synchronously and are excluded from the wait.
+        """
+        attrs = getattr(entry, "attributes", {}) or {}
+        if attrs.get("role") == "combobox":
+            return True, True
+        aria_ac = attrs.get("aria-autocomplete", "")
+        if aria_ac and aria_ac != "none":
+            return True, True
+        if attrs.get("list"):
+            return True, False  # native <datalist>: instant, no wait
+        haspopup = attrs.get("aria-haspopup", "")
+        if haspopup and haspopup != "false" and (attrs.get("aria-controls") or attrs.get("aria-owns")):
+            return True, False
+        return False, False
+
     async def _action_input_text(self, params: dict, browser: BrowserSession) -> ActionResult:
         entry, error = await self._get_element_by_index(params["index"], browser)
         if error:
             return error
-        await browser.highlight_element(entry.backend_node_id)
-        await browser.click_element(entry.backend_node_id)
-        await asyncio.sleep(0.1)
-        await browser.type_text(params["text"], clear=params.get("clear", True))
-        return ActionResult()
+        backend_id = entry.backend_node_id
+        text = params["text"]
+        clear = params.get("clear", True)
+
+        # 1. Focus: highlight -> click_element, mapping the bool signal
+        #    (mirrors _action_click — no silent success on focus failure).
+        try:
+            await browser.highlight_element(backend_id)
+            clicked = await browser.click_element(backend_id)
+        except Exception as e:
+            return ActionResult(error=f"Input focus failed: {e}")
+        if not clicked:
+            return ActionResult(
+                error=(
+                    f"Could not focus element {params['index']} for input "
+                    f"(no coordinates and JS click fallback failed; "
+                    f"the element may be detached, hidden, or in a cross-origin iframe)"
+                ),
+            )
+        await asyncio.sleep(0.1)  # retain the original focus settle
+
+        # 2. Type: date/time/special inputs reject per-char key events, so
+        #    assign directly via the native setter (_force_set_value) instead
+        #    of _type_char. Mirrors browser-use _requires_direct_value_assignment
+        #    / _set_value_directly.
+        try:
+            if _requires_direct_value_assignment(entry):
+                if clear:
+                    await browser._clear_text_field()
+                await browser._force_set_value(text)
+            else:
+                await browser.type_text(text, clear=clear)
+        except Exception as e:
+            return ActionResult(error=f"Failed to type text into element {params['index']}: {e}")
+
+        # 3. autocomplete/combobox: sleep ~0.4s on the JS-driven subset so the
+        #    dropdown populates before the next action (browser-use service.py:812-819).
+        is_combo, needs_js_wait = self._is_autocomplete_field(entry)
+        if needs_js_wait:
+            await asyncio.sleep(0.4)
+
+        # 4. Value verification: read back activeElement and append a ⚠️ Note when
+        #    it differs from the intended text (browser-use service.py:804-810).
+        #    _read_active_text swallows exceptions and returns "" — safe to call.
+        memory = self._describe_input(entry, params["index"], text)
+        actual = await browser._read_active_text()
+        if actual and actual != text:
+            memory += (
+                f"  ⚠️ Note: the field's actual value {actual!r} differs from "
+                f"the intended {text!r}. The site may have reformatted, truncated, "
+                f"or rejected the input — re-observe before continuing."
+            )
+        if is_combo:
+            memory += (
+                "  💡 autocomplete field — select from the JS-populated dropdown "
+                "if applicable instead of typing the full value."
+            )
+        logger.info(memory)
+        return ActionResult(extracted_content=memory, long_term_memory=memory)
 
     async def _action_scroll(self, params: dict, browser: BrowserSession) -> ActionResult:
         await browser.scroll(params.get("direction", "down"), int(params.get("amount", 3)))

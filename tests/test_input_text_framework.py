@@ -9,7 +9,9 @@ import pytest
 from tree_walker.browser.session import (
 	_get_char_modifiers_and_vk,
 	_get_key_code_for_char,
+	_requires_direct_value_assignment,
 )
+from tree_walker.browser.views import EnhancedDOMTreeNode, NodeType
 
 
 # ── Unit tests for _get_char_modifiers_and_vk ──
@@ -254,3 +256,50 @@ class TestTypeChar:
 		calls = browser.client.send.Input.dispatchKeyEvent.call_args_list
 		for c in calls:
 			assert c[1]["session_id"] == "custom-sid"
+
+
+# ── Tests for _requires_direct_value_assignment ──
+
+
+def _dv_entry(tag: str = "input", **attrs) -> EnhancedDOMTreeNode:
+	"""Build an EnhancedDOMTreeNode with a tag and attributes for the predicate."""
+	return EnhancedDOMTreeNode(
+		node_id=1,
+		backend_node_id=1,
+		node_type=NodeType.ELEMENT_NODE,
+		node_name=tag.upper(),
+		node_value="",
+		attributes=dict(attrs),
+	)
+
+
+class TestRequiresDirectValueAssignment:
+	def test_each_special_type_returns_true(self):
+		for t in ("date", "time", "datetime-local", "month", "week", "color", "range"):
+			assert _requires_direct_value_assignment(_dv_entry(type=t)) is True
+
+	def test_datepicker_class_markers_return_true(self):
+		for cls in ("my-datepicker", "foo daterangepicker bar", "x-datetimepicker", "bootstrap-datepicker"):
+			assert _requires_direct_value_assignment(_dv_entry(type="text", **{"class": cls})) is True
+
+	def test_datepicker_class_on_no_type_returns_true(self):
+		assert _requires_direct_value_assignment(_dv_entry(**{"class": "datepicker"})) is True
+
+	def test_datepicker_data_attrs_return_true(self):
+		for attr in ("data-datepicker", "data-date-format", "data-provide"):
+			assert _requires_direct_value_assignment(_dv_entry(type="text", **{attr: "1"})) is True
+
+	@pytest.mark.parametrize("t", ["text", "email", "password", "search", "url", "number", "checkbox", ""])
+	def test_plain_types_return_false(self, t):
+		assert _requires_direct_value_assignment(_dv_entry(type=t)) is False
+
+	def test_textarea_returns_false(self):
+		assert _requires_direct_value_assignment(_dv_entry(tag="textarea", type="text")) is False
+
+	def test_datepicker_class_on_non_input_returns_false(self):
+		# tag guard: only <input> qualifies
+		assert _requires_direct_value_assignment(_dv_entry(tag="div", **{"class": "datepicker"})) is False
+
+	def test_none_entry_is_safe(self):
+		# getattr defaults make the predicate robust to malformed entries
+		assert _requires_direct_value_assignment(None) is False

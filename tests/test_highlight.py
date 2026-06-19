@@ -397,6 +397,9 @@ def _make_mock_browser_session():
 	browser.highlight_element = AsyncMock()
 	browser.click_element = AsyncMock()
 	browser.type_text = AsyncMock()
+	browser._read_active_text = AsyncMock(return_value="")
+	browser._force_set_value = AsyncMock()
+	browser._clear_text_field = AsyncMock(return_value=True)
 	browser.execute_js = AsyncMock(return_value=[{"value": "opt1", "text": "Option 1"}])
 	browser.set_file_input = AsyncMock()
 	browser.current_session_id = "test-session"
