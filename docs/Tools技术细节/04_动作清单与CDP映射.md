@@ -964,58 +964,71 @@
   | `index` | `int` | ID of the file input element |
   | `path` | `str` | Path to the file to upload |
 
-- **主要逻辑**（[actions.py:359-421](../../src/tree_walker/tools/actions.py)）：
+- **主要逻辑**（[actions.py:737](../../src/tree_walker/tools/actions.py)）：
 
   ```python
   async def _action_upload_file(self, params: dict, browser: BrowserSession) -> ActionResult:
       file_path = params["path"]
-      allowed = self._allowed_upload_paths
-      if allowed:
-          if not any(file_path.startswith(p) for p in allowed):
-              return ActionResult(error=f"File path not in allowed upload paths: {file_path}")
+      # 1. 路径白名单 + 文件存在/非空校验
+      if self._allowed_upload_paths and not any(
+          file_path.startswith(p) for p in self._allowed_upload_paths
+      ):
+          return ActionResult(error=f"File path not in allowed upload paths: {file_path}")
       if not os.path.isfile(file_path):
           return ActionResult(error=f"File not found: {file_path}")
       if os.path.getsize(file_path) == 0:
           return ActionResult(error=f"File is empty: {file_path}")
 
+      # 2. 元素查找
       entry, error = await self._get_element_by_index(params["index"], browser)
       if error:
           return error
 
-      tag = entry.tag_name.upper()
-      attrs = entry.attributes
+      # 3. 非 file input 时定位最近 file input
+      tag, attrs = entry.tag_name.upper(), entry.attributes
       is_file_input = tag == "INPUT" and attrs.get("type", "").lower() == "file"
-
-      # ... (查 DOM 缓存中的 file_input_backend_ids)
       backend_id = entry.backend_node_id
       file_input_ids: list[int] = []
-
       if not is_file_input:
-          # 从 DOM 状态找最近 file input
           file_input_ids = list(self._cached_browser_state.dom_state.file_input_backend_ids)
           if not file_input_ids:
               return ActionResult(error="Element is not a file input and no file input found on page")
           backend_id = _pick_nearest_file_input(entry, file_input_ids, ...)
 
+      # 4. 高亮 + 上传（共用 try，highlight best-effort，对齐 _action_click）
       try:
           await browser.highlight_element(backend_id)
           await browser.set_file_input(backend_node_id=backend_id, file_path=file_path, ...)
       except Exception as e:
           return ActionResult(error=f"File upload failed: {e}")
-      return ActionResult(extracted_content=f"Uploaded {file_path}")
+
+      # 5. 成功回显（G1）+ 目标替换提示（G2）+ accept 软校验（G3）
+      memory = self._describe_upload(entry, params["index"], file_path)
+      if not is_file_input:
+          memory += (f"  ⚠️ Note: index {params['index']} is not an <input type='file'>; "
+                     f"uploaded to the nearest file input on the page instead.")
+      fin_entry = entry if is_file_input else self._find_node_by_backend_id(backend_id, ...)
+      accept_attr = (getattr(fin_entry, "attributes", {}) or {}).get("accept") if fin_entry else None
+      if accept_attr and not _file_matches_accept(file_path, accept_attr):
+          memory += (f"  ⚠️ Note: the file extension does not match this input's "
+                     f"accept={accept_attr!r} — the site may reject the upload.")
+      return ActionResult(extracted_content=memory, long_term_memory=memory)
   ```
 
 - **CDP 调用清单**：
 
   | CDP 命令 | 主要参数 | 行号 |
   |---|---|---|
-  | `DOM.setFileInputFiles` | `{backendNodeId, files:[file_path]}` | session.py:861 |
-  | `DOM.getDocument` (shadow DOM 兜底) | `{depth:-1, pierce:True}` | session.py:807 |
+  | `DOM.setFileInputFiles` | `{backendNodeId, files:[file_path]}`（单文件列表） | session.py:1365 |
+  | `DOM.getDocument` (shadow DOM 兜底) | `{depth:-1, pierce:True}` | session.py:1344 |
 
 - **注意事项**：
   - `_allowed_upload_paths` 是白名单，未配置时不限制（生产环境强烈建议配置）
   - 不直接调用系统文件选择器，避免阻塞
-  - `_pick_nearest_file_input` 用 DOM 树遍历 + 坐标距离双策略找最近的 file input（[actions.py:69-107](../../src/tree_walker/tools/actions.py)）
+  - `_pick_nearest_file_input` 用 DOM 树遍历 + 坐标距离双策略找最近的 file input（[actions.py:70-108](../../src/tree_walker/tools/actions.py)）
+  - 成功回显 `Uploaded 'name' to [TAG] {label} at index N`（`_describe_upload`，[actions.py:428](../../src/tree_walker/tools/actions.py)），写入 `extracted_content` + `long_term_memory`
+  - 非 file input 时自动上传到最近 file input，回显追加 `⚠️ Note` 告知 LLM 实际目标被替换（不再静默）
+  - 解析 file input 的 `accept`，扩展名不符时追加 `⚠️ Note`（`_file_matches_accept`，[actions.py:111](../../src/tree_walker/tools/actions.py)；软校验，不阻断上传）
 
 ---
 
