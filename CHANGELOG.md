@@ -5,6 +5,26 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.0] - 2026-06-19
+
+### Added
+
+- **search：支持多搜索引擎**（#8）：baidu / google / bing / duckduckgo 四引擎可选
+- **navigate 工具完善**（#10）：errorText 检查 + new_tab 新标签页导航 + 健康检查
+- **go_back 工具完善**（#12）：历史缓存修正 + 健康检查 + 结果回显
+- **click 工具完善**（#14）：坐标失败纠错 + 遮挡回退 + 视口对齐 + 结果回显
+- **input_text 工具完善**（#16）：成功回显 + 聚焦失败纠错 + 值校验反馈 + 日期时间直写 + autocomplete 延迟
+- **upload_file 工具完善**（#18）：成功回显 + 目标替换提示 + accept 类型软校验
+
+### Fixed
+
+- 可观测性测试中 `ActionResult(success=True)` 触发的 Pydantic 校验错误
+
+### Docs
+
+- 新增各工具完善方案文档：search 多引擎、navigate、go_back、click、input_text
+- 修改 upload_file 示例提示词
+
 ## [0.2.0] - 2026-06-17
 
 ### Added
@@ -62,5 +82,6 @@
 - 编程接口（`Agent`、`LLMClient`、`BrowserSession` 可独立使用）
 - 498 项单元测试
 
+[0.3.0]: https://github.com/zjordon/TreeWalker/releases/tag/v0.3.0
 [0.2.0]: https://github.com/zjordon/TreeWalker/releases/tag/v0.2.0
 [0.1.0]: https://github.com/zjordon/TreeWalker/releases/tag/v0.1.0
