@@ -735,52 +735,84 @@
 
 ### 4.16 `scroll`
 
-- **description**：`Scroll the page up or down by a number of increments` / 上下滚动页面若干增量
+- **description**：`Scroll the page up or down by a number of viewport-heights` / 上下滚动页面若干视口高度
 - **terminates_sequence**：False
 - **Pydantic 参数**：
 
   | 字段 | 类型 | 默认 | 描述 |
   |---|---|---|---|
-  | `amount` | `int` | `3` | Number of scroll increments (page heights) |
-  | `direction` | `Literal["up","down"]` | `"down"` | Scroll direction |
+  | `amount` | `int`（`ge=1, le=10`） | `3` | 滚动视口高度数；参照 DOM 树可滚动元素的滚动信息（如 `3.4 pages below`）判断剩余量 |
+  | `direction` | `Literal["up","down"]` | `"down"` | 滚动方向：`down`（默认）或 `up` |
 
-- **主要逻辑**（[actions.py:229-231](../../src/tree_walker/tools/actions.py)）：
+- **主要逻辑**（[actions.py:593-610](../../src/tree_walker/tools/actions.py)）：成功回显 + 当轮位置/边界提示 + try/except 软降级。
 
   ```python
   async def _action_scroll(self, params: dict, browser: BrowserSession) -> ActionResult:
-      await browser.scroll(params.get("direction", "down"), int(params.get("amount", 3)))
-      return ActionResult()
+      direction = params.get("direction", "down")
+      amount = int(params.get("amount", 3))
+      try:
+          position = await browser.scroll(direction, amount)  # {vertical_percentage, at_edge}
+      except Exception as e:
+          logger.warning("scroll(%s, %d) failed: %s", direction, amount, e)
+          return ActionResult(error=f"Scroll failed: {e}")  # scroll 非幂等 → error
+      memory = f"Scrolled {direction} {amount} viewport-heights"
+      if position.get("vertical_percentage") is not None:
+          memory += f" ({position['vertical_percentage']}% down)"
+      if position.get("at_edge"):
+          memory += f" (already at {direction}, no further content)"
+      logger.info(memory)
+      return ActionResult(extracted_content=memory, long_term_memory=memory)
   ```
 
-  委托给 `BrowserSession.scroll()`（[session.py:725-747](../../src/tree_walker/browser/session.py)）：
+  委托给 `BrowserSession.scroll()`（[session.py:1218-1289](../../src/tree_walker/browser/session.py)）：返回 `{vertical_percentage, at_edge}`，末尾追加 1 次 `Runtime.evaluate` 读 scrollY/scrollHeight/clientHeight 判边界（documentElement/body 取 max 兼容 quirks 模式）；读取失败退化为 `{None, False}` 不影响滚动。
 
   ```python
-  async def scroll(self, direction="down", amount=3) -> None:
+  async def scroll(self, direction="down", amount=3) -> dict:
       sid = self.current_session_id
       metrics = await self.client.send.Page.getLayoutMetrics({}, session_id=sid)
       viewport = metrics.get("cssVisualViewport", {})
-      viewport_height = viewport.get("clientHeight", 800)
+      viewport_height = viewport.get("clientHeight", 1000)  # fallback 对齐 browser-use
       delta = amount * viewport_height
       if direction == "up":
           delta = -delta
       await self.client.send.Input.dispatchMouseEvent({
           "type": "mouseWheel",
           "x": viewport.get("clientWidth", 1280) / 2,
-          "y": viewport.get("clientHeight", 800) / 2,
+          "y": viewport_height / 2,
           "deltaX": 0,
           "deltaY": delta,
       }, session_id=sid)
-      await asyncio.sleep(0.3)
+      await asyncio.sleep(0.2)  # 不用 _wait_for_page_settle（轮询 readyState，scroll 不改）
+      position = {"vertical_percentage": None, "at_edge": False}
+      try:
+          result = await self.client.send.Runtime.evaluate({
+              "expression": "(()=>{const d=document.documentElement,b=document.body;const sy=Math.max(d.scrollTop||0,b?b.scrollTop||0:0);const sh=Math.max(d.scrollHeight||0,b?b.scrollHeight||0:0);const ch=d.clientHeight||window.innerHeight||0;const m=sh-ch;return JSON.stringify({sy,sh,ch,pct:m>0?(sy/m)*100:100});})()",
+              "returnByValue": True,
+          }, session_id=sid)
+          val = json.loads(result.get("result", {}).get("value") or "{}")
+          sy, sh, ch = val.get("sy", 0), val.get("sh", 0), val.get("ch", 0)
+          max_top = sh - ch
+          position["vertical_percentage"] = round((sy / max_top) * 100, 1) if max_top > 0 else 100.0
+          position["at_edge"] = (sy + ch >= sh - 1) if direction == "down" else (sy <= 1)
+      except Exception:
+          pass
+      return position
   ```
 
 - **CDP 调用清单**：
 
   | CDP 命令 | 主要参数 | 行号 |
   |---|---|---|
-  | `Page.getLayoutMetrics` | `{}` | session.py:728 |
-  | `Input.dispatchMouseEvent` | `{type:mouseWheel, x, y, deltaX:0, deltaY}` | session.py:737 |
+  | `Page.getLayoutMetrics` | `{}` | session.py:1221 |
+  | `Input.dispatchMouseEvent` | `{type:mouseWheel, x, y, deltaX:0, deltaY}` | session.py:1233 |
+  | `Runtime.evaluate`（G2 新增，读 scrollY/scrollHeight/clientHeight 判边界） | `{expression, returnByValue:True}` | session.py:1252 |
 
-- **注意事项**：滚动量单位是**视口高度**而非像素；鼠标位置固定在视口中心。
+- **注意事项**：
+  - 滚动量单位是**视口高度**而非像素；鼠标位置固定在视口中心。
+  - **当轮到底提示**：`scroll` 返回 `{vertical_percentage, at_edge}`，action 层据此回显百分比并在已到边界时追加 `(already at ...)`，比"完全靠 DOM 层 `pages_below` 下一轮告知"早一轮；边界完整信号（pages_below/total_pages）仍由 DOM 滚动信息层（`browser/views.py` 的 `get_scroll_info_text`）提供，action 层不重复。
+  - **异常处理**：scroll 非幂等，CDP 失败 → `ActionResult(error="Scroll failed: ...")`（区别于幂等的 close_tab 软成功）。
+  - **等待机制**：用固定 `sleep(0.2)`，不用 `_wait_for_page_settle`（它轮询 readyState，而 scroll 不改 readyState）。
+  - **G2 局限**：虚拟滚动列表 / SPA 路由切换 / 主滚动在 iframe 内时 `at_edge` 可能误判，仅作提示非权威，DOM 层兜底；元素内滚动（`index` 参数）与平滑滚动留待 P1。
 
 ---
 

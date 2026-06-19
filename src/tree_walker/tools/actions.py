@@ -591,8 +591,24 @@ class Tools:
         return ActionResult(extracted_content=memory, long_term_memory=memory)
 
     async def _action_scroll(self, params: dict, browser: BrowserSession) -> ActionResult:
-        await browser.scroll(params.get("direction", "down"), int(params.get("amount", 3)))
-        return ActionResult()
+        direction = params.get("direction", "down")
+        amount = int(params.get("amount", 3))
+        try:
+            # G5: scroll 现在返回 {vertical_percentage, at_edge}（G2 位置读取）
+            position = await browser.scroll(direction, amount)
+        except Exception as e:
+            # G4: scroll 非幂等，CDP 失败=没滚，必须报 error（区别于 close_tab 的软成功）
+            logger.warning("scroll(%s, %d) failed: %s", direction, amount, e)
+            return ActionResult(error=f"Scroll failed: {e}")
+        # G1 + G2: 回显方向/量 + 当前位置；已到边界则当轮提示
+        memory = f"Scrolled {direction} {amount} viewport-heights"
+        pct = position.get("vertical_percentage")
+        if pct is not None:
+            memory += f" ({pct}% down)"
+        if position.get("at_edge"):
+            memory += f" (already at {direction}, no further content)"
+        logger.info(memory)
+        return ActionResult(extracted_content=memory, long_term_memory=memory)
 
     async def _action_search(self, params: dict, browser: BrowserSession) -> ActionResult:
         import urllib.parse
