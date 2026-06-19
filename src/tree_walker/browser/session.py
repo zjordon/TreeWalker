@@ -1275,7 +1275,7 @@ class BrowserSession:
         await self._wait_for_page_settle()
 
     async def close_tab(self, target_id: str) -> None:
-        """Close a tab. If it's the current tab, switch to another."""
+        """Close a tab. If it's the current tab, switch to another; create about:blank if none."""
         was_current = target_id == self.current_target_id
         await self.client.send.Target.closeTarget({"targetId": target_id})
         if was_current:
@@ -1284,6 +1284,7 @@ class BrowserSession:
                 if t.get("type") == "page" and t["targetId"] != target_id:
                     await self.switch_tab(t["targetId"])
                     return
+            await self.create_tab("about:blank")  # G9: 无其他 page，避免 current_* 悬挂
 
     async def create_tab(self, url: str = "about:blank") -> str:
         """Create a new tab and return its target ID."""

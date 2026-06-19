@@ -127,36 +127,57 @@
 
   | 字段 | 类型 | 默认 | 描述 |
   |---|---|---|---|
-  | `tab_id` | `str` | `""` | Tab ID to close. Empty string closes current tab |
+  | `tab_id` | `str` | `""` | Tab ID (last 4 characters) to close. Empty string closes the current tab |
 
-- **主要逻辑**（[actions.py:268-279](../../src/tree_walker/tools/actions.py)）：
+- **主要逻辑**（[actions.py:659-698](../../src/tree_walker/tools/actions.py)）：
 
   ```python
   async def _action_close_tab(self, params: dict, browser: BrowserSession) -> ActionResult:
-      tab_id = params.get("tab_id", "")
-      if tab_id:
-          state = await browser.get_state(include_screenshot=False)
-          for tab in state.tabs:
-              if tab.target_id.endswith(tab_id):
-                  await browser.close_tab(tab.target_id)
-                  return ActionResult()
-          return ActionResult(error=f"Tab ending with '{tab_id}' not found")
-      if browser.current_target_id:
-          await browser.close_tab(browser.current_target_id)
-      return ActionResult()
+      tab_id_suffix = params.get("tab_id", "")
+      tabs = await browser.get_tabs()  # 轻量枚举（单 Target.getTargets），不再 get_state
+      if tab_id_suffix:
+          matches = [t for t in tabs if t.target_id.endswith(tab_id_suffix)]
+          if not matches:
+              return ActionResult(error=f"No tab ending with '{tab_id_suffix}'. "
+                                        f"Open tabs: {self._summarize_tabs(tabs)}")
+          if len(matches) > 1:  # 后缀撞车：关错页风险，要求更长后缀/完整 target_id
+              return ActionResult(error=f"Multiple tabs match '{tab_id_suffix}' ...")
+          target = matches[0]
+          target_id, id_echo, title, url = (target.target_id, tab_id_suffix, target.title, target.url)
+      else:  # 空 tab_id = 关当前页
+          if not browser.current_target_id:
+              return ActionResult(error="No current tab to close")
+          target_id = browser.current_target_id
+          ...
+      try:
+          await browser.close_tab(target_id)
+      except Exception as e:  # 失效 target 软降级（关闭幂等），对齐 browser-use
+          logger.warning("close_tab(%s) failed: %s", target_id, e)
+          memory = f"Tab [{id_echo}] {title} ({url}) was already closed or invalid"
+          return ActionResult(extracted_content=memory, long_term_memory=memory)
+      memory = f"Closed tab [{id_echo}] {title} ({url})"
+      logger.info(memory)
+      return ActionResult(extracted_content=memory, long_term_memory=memory)
   ```
 
-  `tab_id` 是 target ID 的后缀匹配（通常是末 4 个字符），方便 LLM 短输入。
+  四路径：① 指定 `tab_id` 经轻量 `get_tabs()`（[session.py:1244](../../src/tree_walker/browser/session.py)）后缀匹配，撞车报错（`len(matches) > 1`，**比 browser-use 取首个匹配更严**），未命中 error 列出现有标签页（复用 `_summarize_tabs`）；② 空 `tab_id` 关 `current_target_id`（保留原"空=关当前页"语义，补回显）；③ 关闭成功回显 `Closed tab [{id}] {title} ({url})`（写入 `extracted_content` + `long_term_memory`，对齐 navigate/click/go_back/switch_tab）；④ `browser.close_tab` 抛异常（target 已被外部关闭/失效）→ 软成功回显 `was already closed or invalid`（非 error，对齐 browser-use `service.py:1011-1018`）。
 
 - **CDP 调用清单**：
 
   | CDP 命令 | 主要参数 | 行号 |
   |---|---|---|
-  | `Target.closeTarget` | `{targetId}` | session.py:766 |
-  | `Target.getTargets` (如关闭当前 tab) | `{}` | session.py:768 |
-  | `Target.activateTarget` + `Target.attachToTarget` (切换到其他 tab) | `{targetId, flatten:True}` | session.py:755-756 |
+  | `Target.getTargets`（经 `get_tabs`，枚举标签页） | `{}` | session.py:1252 |
+  | `Target.closeTarget` | `{targetId}` | session.py:1280 |
+  | `Target.getTargets` (关闭当前 tab 后找剩余页) | `{}` | session.py:1282 |
+  | `Target.activateTarget` + `Target.attachToTarget` (切到其他 tab，经 `switch_tab`) | `{targetId, flatten:True}` | session.py:1268-1269 |
+  | `Target.createTarget` (无剩余 page 时建 about:blank 兜底，经 `create_tab`) | `{url:"about:blank"}` | session.py:1290 |
 
-- **注意事项**：关闭当前 tab 时，自动切换到第一个剩余的 page target，避免 `current_target_id` 失效。
+- **注意事项**：
+  - 成功回显 `Closed tab [{id}] {title} ({url})`（对齐 navigate/click/go_back/switch_tab），title/url 取自 `get_tabs()` 快照，零额外 CDP 调用。
+  - 后缀撞车直接报错（`len(matches) > 1`），不取首个匹配，避免关错页；未命中时 error 列出现有标签页（`_summarize_tabs`）便于 LLM 重选（对齐 switch_tab）。
+  - 失效 target 软降级：`browser.close_tab` 抛异常时返回软成功回显（关闭幂等），不外抛 error，对齐 browser-use。
+  - 关闭当前 tab 时，自动切换到第一个剩余的 page target（经 `switch_tab`，已清两层 selector_map 缓存）；**无其他 page 时建 `about:blank` 兜底**（G9），避免 `current_target_id`/`current_session_id` 悬挂指向已死页。
+  - 保留 `tab_id` 默认空（空=关当前页，本项目自有便利语义，区别于 browser-use 的 `min_length=4,max_length=4`）；`terminates_sequence` 保持 False（对齐 browser-use；关当前页时 auto-switch 路径已清缓存）。
 
 ---
 

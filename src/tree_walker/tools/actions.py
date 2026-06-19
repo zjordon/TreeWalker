@@ -657,17 +657,45 @@ class Tools:
         return "; ".join(items)
 
     async def _action_close_tab(self, params: dict, browser: BrowserSession) -> ActionResult:
-        tab_id = params.get("tab_id", "")
-        if tab_id:
-            state = await browser.get_state(include_screenshot=False)
-            for tab in state.tabs:
-                if tab.target_id.endswith(tab_id):
-                    await browser.close_tab(tab.target_id)
-                    return ActionResult()
-            return ActionResult(error=f"Tab ending with '{tab_id}' not found")
-        if browser.current_target_id:
-            await browser.close_tab(browser.current_target_id)
-        return ActionResult()
+        tab_id_suffix = params.get("tab_id", "")
+        tabs = await browser.get_tabs()  # G2: 轻量枚举，取代 get_state(include_screenshot=False)
+        if tab_id_suffix:
+            # 指定 tab_id：后缀匹配 + 冲突检测（G3）+ 未命中列出（G4）
+            matches = [t for t in tabs if t.target_id.endswith(tab_id_suffix)]
+            if not matches:
+                return ActionResult(
+                    error=f"No tab ending with '{tab_id_suffix}'. "
+                          f"Open tabs: {self._summarize_tabs(tabs)}",
+                )
+            if len(matches) > 1:  # 后缀撞车：关错页风险，要求更长后缀/完整 target_id
+                return ActionResult(
+                    error=f"Multiple tabs match '{tab_id_suffix}' ({len(matches)}). "
+                          f"Use more characters or the full target_id. "
+                          f"Matches: {self._summarize_tabs(matches)}",
+                )
+            target = matches[0]
+            target_id, id_echo, title, url = (
+                target.target_id, tab_id_suffix, target.title, target.url,
+            )
+        else:
+            # G6: 空 tab_id = 关当前页（保留原语义，补回显）
+            if not browser.current_target_id:
+                return ActionResult(error="No current tab to close")
+            target_id = browser.current_target_id
+            cur = next((t for t in tabs if t.target_id == target_id), None)
+            id_echo = target_id[-4:]
+            title = cur.title if cur else ""
+            url = cur.url if cur else ""
+        # 关闭（G1 回显 + G5 软降级，对齐 browser-use service.py:1011-1018）
+        try:
+            await browser.close_tab(target_id)
+        except Exception as e:
+            logger.warning("close_tab(%s) failed: %s", target_id, e)
+            memory = f"Tab [{id_echo}] {title} ({url}) was already closed or invalid"
+            return ActionResult(extracted_content=memory, long_term_memory=memory)
+        memory = f"Closed tab [{id_echo}] {title} ({url})"
+        logger.info(memory)
+        return ActionResult(extracted_content=memory, long_term_memory=memory)
 
     async def _action_wait(self, params: dict, browser: BrowserSession) -> ActionResult:
         await asyncio.sleep(float(params.get("seconds", 3)))
