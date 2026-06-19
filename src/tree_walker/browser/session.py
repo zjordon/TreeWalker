@@ -1215,14 +1215,25 @@ class BrowserSession:
 
     # ── Scrolling ──────────────────────────────────────────────────────
 
-    async def scroll(self, direction: str = "down", amount: int = 3) -> None:
-        """Scroll the page by a number of viewport heights."""
+    async def scroll(
+        self, direction: str = "down", amount: int = 3,
+    ) -> dict:
+        """Scroll the page by a number of viewport heights.
+
+        Returns ``{vertical_percentage, at_edge}`` from a post-scroll
+        ``Runtime.evaluate`` so the action layer can echo the current position
+        and signal "already at edge" in the same turn, avoiding wasted scroll
+        rounds when the LLM scrolls past the bottom. Degrades to
+        ``{vertical_percentage: None, at_edge: False}`` on read failure without
+        affecting the scroll itself.
+        """
         sid = self.current_session_id
         metrics = await self.client.send.Page.getLayoutMetrics(
             {}, session_id=sid,
         )
         viewport = metrics.get("cssVisualViewport", {})
-        viewport_height = viewport.get("clientHeight", 800)
+        viewport_height = viewport.get("clientHeight", 1000)  # fallback 对齐 browser-use
+        viewport_width = viewport.get("clientWidth", 1280)
         delta = amount * viewport_height
         if direction == "up":
             delta = -delta
@@ -1230,14 +1241,52 @@ class BrowserSession:
         await self.client.send.Input.dispatchMouseEvent(
             {
                 "type": "mouseWheel",
-                "x": viewport.get("clientWidth", 1280) / 2,
-                "y": viewport.get("clientHeight", 800) / 2,
+                "x": viewport_width / 2,
+                "y": viewport_height / 2,
                 "deltaX": 0,
                 "deltaY": delta,
             },
             session_id=sid,
         )
-        await asyncio.sleep(0.3)
+        # 滚动动画 + 懒加载触发的渲染窗口；不用 _wait_for_page_settle——
+        # 它轮询 readyState，而 scroll 不改 readyState，会立即返回等于无等待。
+        await asyncio.sleep(0.2)
+
+        # G2: 一次 Runtime.evaluate 读当前位置 + 判边界
+        # （documentElement/body 取 max，兼容 quirks 模式滚动挂在 body 的页面）
+        position = {"vertical_percentage": None, "at_edge": False}
+        try:
+            result = await self.client.send.Runtime.evaluate(
+                {
+                    "expression": (
+                        "(() => {"
+                        "  const d = document.documentElement, b = document.body;"
+                        "  const sy = Math.max(d.scrollTop || 0, b ? b.scrollTop || 0 : 0);"
+                        "  const sh = Math.max(d.scrollHeight || 0, b ? b.scrollHeight || 0 : 0);"
+                        "  const ch = d.clientHeight || window.innerHeight || 0;"
+                        "  const max = sh - ch;"
+                        "  const pct = max > 0 ? (sy / max) * 100 : 100;"
+                        "  return JSON.stringify({ sy, sh, ch, pct });"
+                        "})()"
+                    ),
+                    "returnByValue": True,
+                },
+                session_id=sid,
+            )
+            val = json.loads(result.get("result", {}).get("value") or "{}")
+            sy, sh, ch = val.get("sy", 0), val.get("sh", 0), val.get("ch", 0)
+            max_top = sh - ch
+            position["vertical_percentage"] = (
+                round((sy / max_top) * 100, 1) if max_top > 0 else 100.0
+            )
+            if direction == "down":
+                position["at_edge"] = sy + ch >= sh - 1
+            else:
+                position["at_edge"] = sy <= 1
+        except Exception:
+            # 位置读取失败不影响滚动本身——回显退化为基础文案
+            pass
+        return position
 
     # ── Tabs ───────────────────────────────────────────────────────────
 

@@ -26,8 +26,20 @@ class InputTextParams(BaseModel):
 
 class ScrollParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    amount: int = Field(default=3, description="Number of scroll increments (page heights)")
-    direction: Literal["up", "down"] = Field(default="down")
+    amount: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description=(
+            "Number of viewport-heights to scroll (1-10). Check the scroll info on "
+            "scrollable elements in the DOM tree (e.g. '3.4 pages below') to judge "
+            "how much remains before scrolling."
+        ),
+    )
+    direction: Literal["up", "down"] = Field(
+        default="down",
+        description="Scroll direction: 'down' (default) or 'up'.",
+    )
 
 
 class SearchParams(BaseModel):
