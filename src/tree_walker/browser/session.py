@@ -254,6 +254,83 @@ def _requires_direct_value_assignment(entry: Any) -> bool:
 	return False
 
 
+# Native <select> selection script (ported from browser-use
+# default_action_watchdog.py:3273-3344). Matches option.text OR option.value
+# (case-insensitive, exact); on hit: focus -> set value three ways
+# (element.value / option.selected / element.selectedIndex) -> dispatch
+# input+change+blur -> read back element.value to detect framework reversion.
+# Returns availableOptions on miss/revert so the action layer can echo them
+# back to the LLM for self-correction.
+_SELECT_OPTION_JS = """
+function(targetText) {
+    const element = this;
+    if (!element || element.tagName.toLowerCase() !== 'select') {
+        return { success: false, error: 'Element is not a <select>' };
+    }
+    const targetLower = (targetText || '').toLowerCase();
+    const options = Array.from(element.options);
+    for (const option of options) {
+        const textLower = (option.text || '').trim().toLowerCase();
+        const valueLower = (option.value || '').toLowerCase();
+        if (textLower === targetLower || valueLower === targetLower) {
+            const expectedValue = option.value;
+            element.focus();
+            element.value = expectedValue;
+            option.selected = true;
+            element.selectedIndex = option.index;
+            element.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+            element.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+            element.blur();
+            if (element.value !== expectedValue) {
+                return {
+                    success: false,
+                    error: 'Selection was set but reverted by page framework. The dropdown may require clicking.',
+                    selectionReverted: true,
+                    targetOption: { text: (option.text || '').trim(), value: expectedValue, index: option.index },
+                    availableOptions: options.map(o => ({ text: (o.text || '').trim(), value: o.value })),
+                };
+            }
+            return {
+                success: true,
+                message: `Selected option: ${(option.text || '').trim()} (value: ${option.value})`,
+                value: option.value,
+            };
+        }
+    }
+    return {
+        success: false,
+        error: `Option with text or value '${targetText}' not found in select element`,
+        availableOptions: options.map(o => ({ text: (o.text || '').trim(), value: o.value })),
+    };
+}
+"""
+
+# Click fallback script (ported from browser-use default_action_watchdog.py:3556-3607).
+# Run only when selectionReverted=true: simulates a full gesture
+# mousedown/click-on-option/mouseup/change to bypass frameworks that intercept
+# programmatic value assignment.
+_SELECT_OPTION_CLICK_FALLBACK_JS = """
+function(optionIndex) {
+    const select = this;
+    if (!select || select.tagName.toLowerCase() !== 'select') return { success: false, error: 'Not a select element' };
+    const option = select.options[optionIndex];
+    if (!option) return { success: false, error: `Option not found at index ${optionIndex}` };
+    select.focus();
+    select.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+    select.selectedIndex = optionIndex;
+    option.selected = true;
+    option.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+    select.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+    select.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+    select.blur();
+    if (select.value === option.value || select.selectedIndex === optionIndex) {
+        return { success: true, message: `Selected via click fallback: ${(option.text || '').trim()}`, value: option.value };
+    }
+    return { success: false, error: 'Click fallback also failed - framework may block all programmatic selection', finalValue: select.value, expectedValue: option.value };
+}
+"""
+
+
 class BrowserSession:
     """Manages browser connection and provides high-level page operations."""
 
@@ -1650,6 +1727,61 @@ class BrowserSession:
         )
         value = result.get("result", {}).get("value")
         return value if isinstance(value, list) else []
+
+    async def set_select_option(self, backend_node_id: int, value: str) -> dict:
+        """Set the option of the <select> identified by backendNodeId.
+
+        Mirrors browser-use on_SelectDropdownOptionEvent (default_action_watchdog.py
+        3241-3695): DOM.resolveNode + Runtime.callFunctionOn running the native
+        <select> selection script — focus -> set value three ways (element.value /
+        option.selected / element.selectedIndex) -> dispatch input+change+blur ->
+        read back element.value to detect framework reversion. On reversion, runs
+        a click fallback (mousedown/click-on-option/mouseup/change). Matches an
+        option by text OR value, case-insensitively (exact).
+
+        Scoped to the target select via backendNodeId (NOT querySelectorAll('select')[0],
+        which writes the first select on the page regardless of index — the bug fixed
+        here). Returns a dict shaped like browser-use's:
+          success: True|False, message?, value?, selectionReverted?, availableOptions?, error?
+        Raises on CDP/JS error (caller wraps with a friendly message).
+        """
+        resolve = await self.client.send.DOM.resolveNode(
+            {"backendNodeId": backend_node_id},
+            session_id=self.current_session_id,
+        )
+        object_id = resolve["object"]["objectId"]
+
+        result = await self.client.send.Runtime.callFunctionOn(
+            {
+                "objectId": object_id,
+                "functionDeclaration": _SELECT_OPTION_JS,
+                "arguments": [{"value": value}],
+                "returnByValue": True,
+            },
+            session_id=self.current_session_id,
+        )
+        selection = result.get("result", {}).get("value", {}) or {}
+
+        # Framework reverted the programmatic value set -> click fallback
+        # (mirrors browser-use default_action_watchdog.py:3550-3617).
+        if selection.get("selectionReverted"):
+            option_index = selection.get("targetOption", {}).get("index", 0)
+            fallback = await self.client.send.Runtime.callFunctionOn(
+                {
+                    "objectId": object_id,
+                    "functionDeclaration": _SELECT_OPTION_CLICK_FALLBACK_JS,
+                    "arguments": [{"value": option_index}],
+                    "returnByValue": True,
+                },
+                session_id=self.current_session_id,
+            )
+            fb = fallback.get("result", {}).get("value", {}) or {}
+            if fb.get("success"):
+                return {"success": True, "message": fb.get("message"), "value": fb.get("value", value)}
+            # Fallback also failed -> fall through and return the original
+            # structured error (carries availableOptions for the action layer
+            # to echo back to the LLM).
+        return selection
 
     # ── File operations (via CDP) ──────────────────────────────────────
 
