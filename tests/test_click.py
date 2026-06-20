@@ -124,6 +124,30 @@ class TestClickElementLookup:
 		browser.click_element.assert_not_awaited()
 
 
+# ── file-input guard (issue #34, Bug 1) ───────────────────────────────────────
+
+
+class TestClickFileInputGuard:
+	"""Clicking an <input type='file'> would pop the OS native picker. The guard
+	redirects the agent to upload_file instead and does NOT dispatch a real click.
+	"""
+
+	@pytest.mark.asyncio
+	async def test_clicking_file_input_returns_error_directing_to_upload(self):
+		entry = _make_entry(tag="INPUT", backend_node_id=42, attributes={"type": "file"})
+		state = _make_state({5: entry})
+		browser = _make_browser()
+
+		result = await Tools().execute("click", {"index": 5}, browser, browser_state=state)
+
+		assert result.error is not None
+		assert "upload_file" in result.error
+		assert "5" in result.error
+		# must NOT dispatch a real click (which would open the native picker)
+		browser.highlight_element.assert_not_awaited()
+		browser.click_element.assert_not_awaited()
+
+
 # ── Success echo ──────────────────────────────────────────────────────────────
 
 

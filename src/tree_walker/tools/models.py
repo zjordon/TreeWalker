@@ -124,7 +124,7 @@ class SelectDropdownParams(BaseModel):
 
 class UploadFileParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    index: int = Field(description="ID of the file input element, shown in brackets in the DOM tree")
+    index: int = Field(description="ID of the file input element (or its labeled upload area / dropzone), shown in brackets in the DOM tree")
     path: str = Field(description="Path to the file to upload")
 
 
@@ -216,7 +216,7 @@ ACTION_DEFINITIONS: dict[str, tuple[type[BaseModel], str, bool]] = {
         "Select an option in a dropdown element",
         False,
     ),
-    "upload_file": (UploadFileParams, "Upload a file to a file input element", False),
+    "upload_file": (UploadFileParams, "Upload a file to a file input element. Do NOT click the input or an upload button first — upload_file sets the file directly without opening the OS file picker", False),
     "write_file": (WriteFileParams, "Write content to a local file", False),
     "read_file": (ReadFileParams, "Read content from a local file", False),
     "replace_file": (ReplaceFileParams, "Replace text within a local file", False),

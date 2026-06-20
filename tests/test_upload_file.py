@@ -1,13 +1,19 @@
 """Tests for upload_file: element lookup, path validation, success echo,
-target-substitution note, accept-attribute soft check, and error mapping.
+target-resolution (single input / page-selected / honest dialog error),
+accept-attribute soft check, and error mapping.
 
 Covers the action layer (Tools._action_upload_file), mirroring tests/test_input_text.py:
 - success echo: returns 'Uploaded 'name' to [TAG] ...' in extracted_content +
-  long_term_memory (mirrors navigate/go_back/click/input_text style)
-- target substitution: when the indexed element is not an <input type='file'>,
-  the echo describes the picked element and appends a ⚠️ Note that the upload
-  went to the nearest file input instead (no longer silent)
-- accept soft check: extension not matching the input's accept appends a ⚠️ Note
+  long_term_memory
+- target resolution — when the indexed element is not an <input type='file'>:
+  * exactly one file input on the page -> use it directly, note 'only file input'
+  * several file inputs -> click the target and capture Page.fileChooserOpened's
+    backendNodeId (browser.discover_file_input_via_click); upload there, note
+    'the file input the page opened'
+  * several inputs but no chooser fired (custom dialog) -> honest, actionable
+    error guiding the agent to drive the dialog (issue #34 Bug 2: never guess
+    among indistinguishable hidden inputs)
+- accept soft check: extension not matching the input's accept appends a ℹ️ Note
   (non-blocking; covers extension / wildcard MIME / full MIME branches)
 - error mapping: set_file_input raising -> friendly 'File upload failed:'
 """
@@ -25,7 +31,7 @@ from tree_walker.browser.views import (
 	NodeType,
 	SerializedDOMState,
 )
-from tree_walker.tools.actions import Tools, _file_matches_accept
+from tree_walker.tools.actions import Tools, _file_matches_accept, _find_upload_label_near
 
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
@@ -67,8 +73,14 @@ def _make_state(
 	)
 
 
-def _make_browser(*, set_side_effect=None) -> MagicMock:
-	"""Stub BrowserSession for action-layer tests (does NOT touch CDP)."""
+def _make_browser(
+	*, set_side_effect=None, discover_return: int | None = None,
+) -> MagicMock:
+	"""Stub BrowserSession for action-layer tests (does NOT touch CDP).
+
+	discover_return seeds browser.discover_file_input_via_click's return value
+	(None by default -> the multi-input 'no chooser' honest-error path).
+	"""
 	bs = MagicMock()
 	bs.current_session_id = "sid"
 	bs.current_target_id = "tid"
@@ -77,8 +89,31 @@ def _make_browser(*, set_side_effect=None) -> MagicMock:
 		bs.set_file_input = AsyncMock(side_effect=set_side_effect)
 	else:
 		bs.set_file_input = AsyncMock()
+	bs.discover_file_input_via_click = AsyncMock(return_value=discover_return)
 	bs.get_state = AsyncMock(return_value=_make_state({}))
 	return bs
+
+
+def _node(
+	*, bid: int, name: str, attributes: dict[str, str] | None = None,
+	node_value: str = "", children=None, parent=None,
+) -> EnhancedDOMTreeNode:
+	"""Build a tree-shaped EnhancedDOMTreeNode (tag_name derives from node_name).
+
+	Used for _find_upload_label_near tests: the helper walks children_nodes /
+	parent_node, which _make_entry leaves empty.
+	"""
+	n = EnhancedDOMTreeNode(
+		node_id=bid,
+		backend_node_id=bid,
+		node_type=NodeType.ELEMENT_NODE,
+		node_name=name,
+		node_value=node_value,
+		attributes=attributes or {},
+		parent_node=parent,
+		children_nodes=list(children) if children else None,
+	)
+	return n
 
 
 @pytest.fixture
@@ -244,16 +279,17 @@ class TestUploadFileEcho:
 		assert result.extracted_content == f"Uploaded {bn!r} to [INPUT] 'Choose file' at index 5"
 
 
-# ── Target substitution ───────────────────────────────────────────────────────
+# ── Target resolution: single / page-selected / honest dialog error ───────────
 
 
-class TestUploadFileSubstitution:
+class TestUploadFileResolution:
 	@pytest.mark.asyncio
-	async def test_non_file_input_appends_substitution_note(self, tmp_upload):
+	async def test_single_file_input_used_directly_no_discover(self, tmp_upload):
+		# Exactly one file input on the page -> use it directly; discover NOT called.
 		btn = _make_entry(tag="BUTTON", backend_node_id=3)
 		fin = _make_entry(backend_node_id=9, attributes={"type": "file"})
 		state = _make_state({3: btn}, file_input_backend_ids=[9])
-		state.dom_state.selector_map[9] = fin  # resolvable for accept lookup
+		state.dom_state.selector_map[9] = fin
 		browser = _make_browser()
 
 		result = await Tools().execute(
@@ -261,17 +297,16 @@ class TestUploadFileSubstitution:
 		)
 
 		assert result.error is None
-		# echo describes the picked BUTTON, plus a substitution note
 		assert "[BUTTON]" in result.extracted_content
-		assert "not an <input type='file'>" in result.extracted_content
-		assert "index 3" in result.extracted_content
-		# upload went to the resolved file input (9), not the button (3)
+		assert "only file input on the page" in result.extracted_content
+		assert "backendNodeId=9" in result.extracted_content
+		browser.discover_file_input_via_click.assert_not_awaited()
 		browser.set_file_input.assert_awaited_once()
 		assert browser.set_file_input.call_args.kwargs["backend_node_id"] == 9
 		assert browser.set_file_input.call_args.kwargs["file_input_backend_ids"] == [9]
 
 	@pytest.mark.asyncio
-	async def test_non_file_input_no_candidates_returns_error(self, tmp_upload):
+	async def test_no_file_inputs_returns_error(self, tmp_upload):
 		btn = _make_entry(tag="BUTTON", backend_node_id=3)
 		state = _make_state({3: btn}, file_input_backend_ids=[])
 		browser = _make_browser()
@@ -284,17 +319,196 @@ class TestUploadFileSubstitution:
 		browser.set_file_input.assert_not_awaited()
 
 	@pytest.mark.asyncio
-	async def test_substitution_unresolvable_target_skips_accept_note(self, tmp_upload):
-		# file input backend id is NOT in the interactive selector_map (e.g. hidden):
-		# _find_node_by_backend_id returns None -> no accept note, substitution note remains
+	async def test_single_input_unresolvable_skips_accept_note(self, tmp_upload):
+		# file input backend id not in selector_map -> accept lookup misses,
+		# resolution note still present, no accept note.
 		btn = _make_entry(tag="BUTTON", backend_node_id=3)
 		state = _make_state({3: btn}, file_input_backend_ids=[9])  # 9 not in selector_map
 		result = await Tools().execute(
 			"upload_file", {"index": 3, "path": tmp_upload}, _make_browser(), browser_state=state,
 		)
 		assert result.error is None
-		assert "not an <input type='file'>" in result.extracted_content
+		assert "only file input on the page" in result.extracted_content
 		assert "accept=" not in result.extracted_content
+
+
+# ── Multi-input discovery (issue #34 Bug 2) ───────────────────────────────────
+
+
+class TestUploadFileDiscover:
+	"""When several (indistinguishable) file inputs exist, upload_file does not
+	guess: it clicks the target and uploads to whatever input the page opens
+	(Page.fileChooserOpened). No chooser -> honest, actionable error."""
+
+	@pytest.mark.asyncio
+	async def test_multi_input_discover_hit_uses_discovered(self, tmp_upload):
+		btn = _make_entry(tag="BUTTON", backend_node_id=3)
+		state = _make_state({3: btn}, file_input_backend_ids=[10, 9])
+		# page wiring reveals input 9 (e.g. the vertical cover slot)
+		browser = _make_browser(discover_return=9)
+
+		result = await Tools().execute(
+			"upload_file", {"index": 3, "path": tmp_upload}, browser, browser_state=state,
+		)
+
+		assert result.error is None
+		browser.discover_file_input_via_click.assert_awaited_once_with(3)
+		browser.set_file_input.assert_awaited_once()
+		assert browser.set_file_input.call_args.kwargs["backend_node_id"] == 9
+		assert "the file input the page opened" in result.extracted_content
+		assert "backendNodeId=9" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_multi_input_discover_miss_returns_honest_error(self, tmp_upload):
+		# Custom dialog opened (no chooser) -> do NOT guess; guide the agent.
+		btn = _make_entry(tag="BUTTON", backend_node_id=3)
+		state = _make_state({3: btn}, file_input_backend_ids=[10, 9])
+		browser = _make_browser(discover_return=None)
+
+		result = await Tools().execute(
+			"upload_file", {"index": 3, "path": tmp_upload}, browser, browser_state=state,
+		)
+
+		assert result.error is not None
+		assert "custom upload dialog" in result.error
+		assert "upload_file again" in result.error  # actionable guidance
+		browser.set_file_input.assert_not_awaited()
+		browser.discover_file_input_via_click.assert_awaited_once_with(3)
+
+	@pytest.mark.asyncio
+	async def test_multi_input_discover_clips_guessing_on_miss(self, tmp_upload):
+		# Regression guard for Bug 2: on a discover miss, we must NOT fall back to
+		# file_input_ids[0] (the old behavior that always picked the first input).
+		btn = _make_entry(tag="BUTTON", backend_node_id=3)
+		state = _make_state({3: btn}, file_input_backend_ids=[10, 9])
+		browser = _make_browser(discover_return=None)
+
+		result = await Tools().execute(
+			"upload_file", {"index": 3, "path": tmp_upload}, browser, browser_state=state,
+		)
+
+		assert result.error is not None
+		browser.set_file_input.assert_not_awaited()
+
+	@pytest.mark.asyncio
+	async def test_multi_input_clicks_upload_label_not_the_target(self, tmp_upload):
+		# issue #34 root mechanism: clicking a <label> (native semantics) fires
+		# Page.fileChooserOpened; clicking the drag-area/div/button does not. So
+		# discover must be called with the nearby <label>'s bid, not the target's.
+		label = _node(bid=77, name="LABEL",
+		              attributes={"class": "upload-btn-xyz"}, node_value="选择文件")
+		drag = _node(bid=3, name="DIV", attributes={"class": "semi-upload-drag-area"})
+		container = _node(bid=200, name="DIV", children=[drag, label])
+		drag.parent_node = container
+		label.parent_node = container
+		state = _make_state({3: drag}, file_input_backend_ids=[10, 9])
+		browser = _make_browser(discover_return=9)
+
+		result = await Tools().execute(
+			"upload_file", {"index": 3, "path": tmp_upload}, browser, browser_state=state,
+		)
+
+		assert result.error is None
+		# discover called with the LABEL bid (77), not the drag-area bid (3)
+		browser.discover_file_input_via_click.assert_awaited_once_with(77)
+		browser.set_file_input.assert_awaited_once()
+		assert browser.set_file_input.call_args.kwargs["backend_node_id"] == 9
+
+	@pytest.mark.asyncio
+	async def test_file_input_target_among_many_warns_but_uploads(self, tmp_upload):
+		# Several file inputs + the agent targeted one directly -> still upload to it
+		# (trust the agent's index), but attach a soft warning: cover editors like
+		# Douyin have unrelated inputs (收藏封面 favorite-cover); if the site reacts
+		# wrongly the agent retries on the correct visible area. Hard-refusing caused
+		# 0% success on Douyin (no <label>, so "click visible button" never worked).
+		hidden = _make_entry(backend_node_id=7, attributes={"type": "file"})
+		state = _make_state({7: hidden}, file_input_backend_ids=[7, 8, 9])
+		browser = _make_browser()
+
+		result = await Tools().execute(
+			"upload_file", {"index": 7, "path": tmp_upload}, browser, browser_state=state,
+		)
+
+		# Upload still happens, to the agent-specified input.
+		assert result.error is None
+		browser.set_file_input.assert_awaited_once()
+		assert browser.set_file_input.call_args.kwargs["backend_node_id"] == 7
+		browser.discover_file_input_via_click.assert_not_awaited()
+		# ...but with a soft warning about multiple file inputs.
+		assert result.extracted_content is not None
+		assert "file inputs" in result.extracted_content
+		assert "⚠️" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_file_input_target_when_only_one_sets_directly(self, tmp_upload):
+		# Single file input on the page + agent targeted it -> direct set (normal
+		# site; the multi-input guard must not regress the common case).
+		entry = _make_entry(backend_node_id=7, attributes={"type": "file"})
+		state = _make_state({7: entry}, file_input_backend_ids=[7])
+		browser = _make_browser()
+
+		result = await Tools().execute(
+			"upload_file", {"index": 7, "path": tmp_upload}, browser, browser_state=state,
+		)
+
+		assert result.error is None
+		browser.set_file_input.assert_awaited_once()
+		assert browser.set_file_input.call_args.kwargs["backend_node_id"] == 7
+		browser.discover_file_input_via_click.assert_not_awaited()
+
+
+# ── _find_upload_label_near predicate ─────────────────────────────────────────
+
+
+class TestFindUploadLabelNear:
+	"""Direct unit tests for _find_upload_label_near: locating the <label> upload
+	trigger whose native click fires Page.fileChooserOpened (issue #34)."""
+
+	def test_finds_sibling_upload_label_by_class(self):
+		label = _node(bid=77, name="LABEL", attributes={"class": "upload-btn-PdfuUv"})
+		drag = _node(bid=3, name="DIV", attributes={"class": "semi-upload-drag-area"})
+		container = _node(bid=200, name="DIV", children=[drag, label])
+		drag.parent_node = container
+		label.parent_node = container
+		assert _find_upload_label_near(drag) == 77
+
+	def test_finds_upload_label_by_text(self):
+		label = _node(bid=77, name="LABEL", node_value="选择文件")
+		drag = _node(bid=3, name="DIV")
+		container = _node(bid=200, name="DIV", children=[drag, label])
+		drag.parent_node = container
+		label.parent_node = container
+		assert _find_upload_label_near(drag) == 77
+
+	def test_returns_node_bid_when_target_is_the_label(self):
+		label = _node(bid=77, name="LABEL", attributes={"class": "upload-btn"})
+		assert _find_upload_label_near(label) == 77
+
+	def test_finds_label_deeper_in_subtree(self):
+		label = _node(bid=77, name="LABEL", attributes={"class": "upload"})
+		inner = _node(bid=50, name="SPAN", children=[label])
+		label.parent_node = inner
+		drag = _node(bid=3, name="DIV")
+		container = _node(bid=200, name="DIV", children=[drag, inner])
+		drag.parent_node = container
+		inner.parent_node = container
+		assert _find_upload_label_near(drag) == 77
+
+	def test_no_label_returns_none(self):
+		drag = _node(bid=3, name="DIV")
+		container = _node(bid=200, name="DIV", children=[drag])
+		drag.parent_node = container
+		assert _find_upload_label_near(drag) is None
+
+	def test_ignores_unrelated_plain_label(self):
+		# A <label> without upload class/text is not an upload trigger.
+		plain = _node(bid=77, name="LABEL", attributes={"class": "form-field"},
+		              node_value="用户名")
+		drag = _node(bid=3, name="DIV")
+		container = _node(bid=200, name="DIV", children=[drag, plain])
+		drag.parent_node = container
+		plain.parent_node = container
+		assert _find_upload_label_near(drag) is None
 
 
 # ── accept soft check ─────────────────────────────────────────────────────────
@@ -340,7 +554,10 @@ class TestUploadFileAccept:
 		)
 		assert result.error is None
 		assert "accept='.pdf'" in result.extracted_content
-		assert "may reject" in result.extracted_content
+		# neutral informational wording — explicitly NOT alarmist ("may reject"
+		# is gone) so the agent isn't nudged into retrying on another index.
+		assert "may reject" not in result.extracted_content
+		assert "do not enforce accept" in result.extracted_content
 
 	@pytest.mark.asyncio
 	async def test_no_accept_attr_no_note(self, tmp_upload):
@@ -352,7 +569,8 @@ class TestUploadFileAccept:
 		assert "accept=" not in result.extracted_content
 
 	@pytest.mark.asyncio
-	async def test_substitution_and_accept_both_notes(self, tmp_path):
+	async def test_resolution_and_accept_both_notes(self, tmp_path):
+		# non-file-input (single) + accept mismatch -> resolution note + accept note
 		p = tmp_path / "notes.txt"
 		p.write_bytes(b"x")
 		btn = _make_entry(tag="BUTTON", backend_node_id=3)
@@ -365,7 +583,7 @@ class TestUploadFileAccept:
 			"upload_file", {"index": 3, "path": str(p)}, _make_browser(), browser_state=state,
 		)
 		assert result.error is None
-		assert "not an <input type='file'>" in result.extracted_content
+		assert "only file input on the page" in result.extracted_content
 		assert "accept='.pdf'" in result.extracted_content
 
 
@@ -410,3 +628,26 @@ class TestFileMatchesAccept:
 
 	def test_no_match_returns_false(self):
 		assert _file_matches_accept("notes.txt", ".png,.jpg") is False
+
+
+# ── accept never blocks the upload ────────────────────────────────────────────
+
+
+class TestAcceptNeverBlocks:
+	"""The accept soft-check NEVER blocks the upload: on mismatch the file is still
+	set on the input and no error is returned — only an informational note."""
+
+	@pytest.mark.asyncio
+	async def test_mismatch_still_calls_set_file_input(self, tmp_path):
+		p = tmp_path / "notes.txt"
+		p.write_bytes(b"x")
+		entry = _make_entry(attributes={"type": "file", "accept": ".pdf"})
+		state = _make_state({1: entry})
+		browser = _make_browser()
+		result = await Tools().execute(
+			"upload_file", {"index": 1, "path": str(p)}, browser, browser_state=state,
+		)
+		assert result.error is None
+		browser.set_file_input.assert_awaited_once()
+		assert browser.set_file_input.call_args.kwargs["backend_node_id"] == entry.backend_node_id
+		assert "do not enforce accept" in result.extracted_content

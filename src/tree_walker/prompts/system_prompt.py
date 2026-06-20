@@ -68,6 +68,27 @@ If any check fails, call done(success=false) with a partial result summary. Neve
 """
 
 
+# Appended to the prompt ONLY when upload_file is available for the current page
+# (URL filters may drop the action — don't advertise guidance for an action the
+# agent can't call). See build_system_prompt.
+FILE_UPLOAD_RULES = """\
+
+## File Upload Rules
+
+1. To upload a file, call `upload_file(index=<file input's ID>, path=<absolute path>)` directly.
+2. NEVER click an upload button or an `<input type='file'>` first — that opens the OS \
+native file picker, which this runtime cannot drive. `upload_file` sets the file \
+programmatically and needs no click. (If you click a file input by mistake, you'll \
+get an error telling you to use `upload_file`.)
+3. When the DOM shows a labeled upload area (e.g. "竖封面" / "横封面") instead of the \
+raw `<input type='file'>`, the input nearest that area is chosen automatically. When \
+several cover/upload slots exist, target the slot whose label matches your file \
+(portrait/竖 → vertical slot; landscape/横 → horizontal slot).
+4. A `ℹ️ Note` about `accept` mismatch is informational ONLY — the file was uploaded \
+successfully. Do NOT retry on a different index just because of it.
+"""
+
+
 def build_system_prompt(
     action_descriptions: str,
     task: str = "",
@@ -79,6 +100,10 @@ def build_system_prompt(
         task=task,
         max_actions=max_actions,
     )
+    # Upload guidance only when upload_file is available for this page (URL
+    # filters may drop it — don't advertise an action the agent can't call).
+    if "upload_file" in action_descriptions:
+        prompt += FILE_UPLOAD_RULES
     if enable_decision_attribution:
         from tree_walker.observability.decision_prompt import get_decision_attribution_prompt
         prompt += get_decision_attribution_prompt()

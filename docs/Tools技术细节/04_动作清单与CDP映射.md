@@ -97,6 +97,8 @@
 
   特殊分支：点击 `<select>` 时不真正点击，而是经 `fetch_select_options(backend_id)` **精确读取该 select 的所有 option**（旧实现用 `document.querySelectorAll('select option')` 扫描全页 select，多 select 页面会返回错误 option），让 LLM 接下来用 `select_dropdown`。普通点击成功时回显 `Clicked [TAG] {text} at index N`（`_describe_click` 优先取 aria-label/placeholder/title/alt/value，再取 node_value，再退化为 `[TAG] at index N`）。
 
+  **file-input 守卫（issue #34, Bug 1）**：点击 `<input type='file'>` 时**不派发真实点击**，直接返回 error 引导 LLM 改用 `upload_file(index=…, path=…)`——因为 click file input 只会弹原生文件框（即便会话已开 `Page.setInterceptFileChooserDialog` 拦截不弹框，click 仍对上传无用且可能触发页面 JS 混乱）。只拦 input 本身，外层 label/按钮不受影响（走 upload_file 的目标替换路径）。
+
 - **CDP 调用清单**：
 
   | CDP 命令 | 主要参数 | 行号 |
@@ -1128,16 +1130,28 @@
       if error:
           return error
 
-      # 3. 非 file input 时定位最近 file input
+      # 3. 非 file input 时确定正确的 file input（issue #34 Bug 2）
       tag, attrs = entry.tag_name.upper(), entry.attributes
       is_file_input = tag == "INPUT" and attrs.get("type", "").lower() == "file"
       backend_id = entry.backend_node_id
       file_input_ids: list[int] = []
+      upload_note = ""
       if not is_file_input:
           file_input_ids = list(self._cached_browser_state.dom_state.file_input_backend_ids)
           if not file_input_ids:
-              return ActionResult(error="Element is not a file input and no file input found on page")
-          backend_id = _pick_nearest_file_input(entry, file_input_ids, ...)
+              return ActionResult(error="...no file input found on page")
+          if len(file_input_ids) == 1:
+              backend_id = file_input_ids[0]            # 唯一 input，无歧义，直接用
+              upload_note = "  ℹ️ ...only file input on the page..."
+          else:
+              # 多个隐藏/不可区分 input（如抖音横/竖封面槽）→ 让页面揭示关联：
+              # 点击目标，捕获 Page.fileChooserOpened.backendNodeId（拦截已开，不弹原生框）
+              discovered = await browser.discover_file_input_via_click(entry.backend_node_id)
+              if discovered is None:
+                  return ActionResult(error="...clicking opened no file chooser; likely a "
+                      "custom upload dialog — drive it, then upload_file again")
+              backend_id = discovered
+              upload_note = "  ℹ️ ...the file input the page opened..."
 
       # 4. 高亮 + 上传（共用 try，highlight best-effort，对齐 _action_click）
       try:
@@ -1146,16 +1160,16 @@
       except Exception as e:
           return ActionResult(error=f"File upload failed: {e}")
 
-      # 5. 成功回显（G1）+ 目标替换提示（G2）+ accept 软校验（G3）
+      # 5. 成功回显 + 目标来源说明（直选/页面选中）+ accept 软校验
       memory = self._describe_upload(entry, params["index"], file_path)
-      if not is_file_input:
-          memory += (f"  ⚠️ Note: index {params['index']} is not an <input type='file'>; "
-                     f"uploaded to the nearest file input on the page instead.")
+      if upload_note:
+          memory += upload_note   # "only file input" / "the file input the page opened"
       fin_entry = entry if is_file_input else self._find_node_by_backend_id(backend_id, ...)
       accept_attr = (getattr(fin_entry, "attributes", {}) or {}).get("accept") if fin_entry else None
       if accept_attr and not _file_matches_accept(file_path, accept_attr):
-          memory += (f"  ⚠️ Note: the file extension does not match this input's "
-                     f"accept={accept_attr!r} — the site may reject the upload.")
+          memory += (f"  ℹ️ Note: file extension does not match this input's "
+                     f"accept={accept_attr!r}. Uploaded successfully regardless — "
+                     f"browsers do not enforce accept (advisory only). No retry needed.")
       return ActionResult(extracted_content=memory, long_term_memory=memory)
   ```
 
@@ -1163,16 +1177,16 @@
 
   | CDP 命令 | 主要参数 | 行号 |
   |---|---|---|
-  | `DOM.setFileInputFiles` | `{backendNodeId, files:[file_path]}`（单文件列表） | session.py:1365 |
-  | `DOM.getDocument` (shadow DOM 兜底) | `{depth:-1, pierce:True}` | session.py:1344 |
+  | `DOM.setFileInputFiles` | `{backendNodeId, files:[file_path]}`（单文件列表） | session.py:1848 |
+  | `DOM.getDocument` (shadow DOM 兜底) | `{depth:-1, pierce:True}` | session.py |
 
 - **注意事项**：
   - `_allowed_upload_paths` 是白名单，未配置时不限制（生产环境强烈建议配置）
-  - 不直接调用系统文件选择器，避免阻塞
-  - `_pick_nearest_file_input` 用 DOM 树遍历 + 坐标距离双策略找最近的 file input（[actions.py:70-108](../../src/tree_walker/tools/actions.py)）
-  - 成功回显 `Uploaded 'name' to [TAG] {label} at index N`（`_describe_upload`，[actions.py:428](../../src/tree_walker/tools/actions.py)），写入 `extracted_content` + `long_term_memory`
-  - 非 file input 时自动上传到最近 file input，回显追加 `⚠️ Note` 告知 LLM 实际目标被替换（不再静默）
-  - 解析 file input 的 `accept`，扩展名不符时追加 `⚠️ Note`（`_file_matches_accept`，[actions.py:111](../../src/tree_walker/tools/actions.py)；软校验，不阻断上传）
+  - 不直接调用系统文件选择器，避免阻塞；click 落到 file input 也由 `Page.setInterceptFileChooserDialog` 拦截（见 4.1 click / §CDP 映射表），原生框不再弹出
+  - 非 file input 目标的解析（issue #34 Bug 2）：**1 个 input→直接用；多个→`discover_file_input_via_click` 点击目标捕获 `Page.fileChooserOpened.backendNodeId`（页面真正关联的 input）；未命中（自定义弹窗）→ 诚实 error 引导 agent 驱动弹窗**（[actions.py](../../src/tree_walker/tools/actions.py) + [session.py](../../src/tree_walker/browser/session.py)）。**不再用启发式猜测**——实证证明抖音的隐藏 input 无任何可区分的客户端信号（自身/容器/LCA/坐标全失效），旧"取最近"恒选首个=Bug 2 根因
+  - 成功回显 `Uploaded 'name' to [TAG] {label} at index N`（`_describe_upload`），写入 `extracted_content` + `long_term_memory`
+  - 多 input 场景：`discover_file_input_via_click` 点击目标（拦截已开，不弹原生框），命中→上传到页面选中的 input + `ℹ️` 回显；未命中→**不瞎猜**，返回诚实 error 引导进弹窗（避免静默误传到错误槽位）
+  - 解析 file input 的 `accept`，扩展名不符时追加 `ℹ️ Note`（`_file_matches_accept`；**中性 informational，明示"已成功/勿重试"，软校验不阻断上传**——避免诱导 LLM 换 index 重传）
 
 ---
 
@@ -1496,6 +1510,8 @@ async def set_file_input(
 | `captureScreenshot` | `{format:png}` | screenshot | session.py:372 |
 | `printToPDF` | `{printBackground:True}` | save_as_pdf | actions.py:327 |
 | `getLayoutMetrics` | `{}` | scroll, click（`_get_viewport_size` 取视口用于 quad 选择 + 中心裁剪） | session.py:642, 728 |
+| `setInterceptFileChooserDialog` | `{enabled:True}` | 会话初始化（`_connect`/`switch_tab`）：拦截原生文件框，click file input 不再弹 OS 选择器（issue #34） | session.py（`_enable_file_chooser_intercept`） |
+| `fileChooserOpened` *(事件)* | `{frameId, mode, backendNodeId?}` | 拦截已抑制原生框；`_on_file_chooser_opened` 记日志 **并** 存 `_last_file_chooser`，供 `discover_file_input_via_click` 读取（upload_file 多 input 时点 dropzone 揭示页面关联的 input，issue #34 Bug 2） | session.py（`_on_file_chooser_opened` / `discover_file_input_via_click`） |
 
 #### `Target.*` 域
 
