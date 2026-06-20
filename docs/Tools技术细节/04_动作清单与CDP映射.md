@@ -940,30 +940,53 @@
   | `index` | `int` | ID of the select element |
   | `value` | `str` | Option value to select |
 
-- **主要逻辑**（[actions.py:348-357](../../src/tree_walker/tools/actions.py)）：
+- **主要逻辑**（[actions.py:912](../../src/tree_walker/tools/actions.py)）：
+
+  action 层瘦壳：先 tag 校验（非 `<select>` 早退报错），再委托 session 层 `set_select_option(backend_node_id, value)`（`DOM.resolveNode` + `Runtime.callFunctionOn`），精确绑定到 index 指定的那个 `<select>`，修掉此前 `document.querySelectorAll('select')[0]` 全页写第一个 select、与 index 无关的范围 bug。成功回显 message；选项未命中或框架拦截时软回显可用选项供 LLM 自纠（对齐 dropdown_options 的 try/except 软降级 + short/long 分离规范）。
 
   ```python
   async def _action_select_dropdown(self, params: dict, browser: BrowserSession) -> ActionResult:
-      entry, error = await self._get_element_by_index(params["index"], browser)
+      index = params["index"]
+      entry, error = await self._get_element_by_index(index, browser)
       if error:
           return error
+      # tag 校验：非 <select> 早退报错
+      tag = (getattr(entry, "tag_name", "") or "").upper()
+      if tag != "SELECT":
+          return ActionResult(error=f"Index {index} is a [{tag}] element, not a <select>. ...")
+      backend_id = getattr(entry, "backend_node_id", None)
       value = params["value"]
-      await browser.execute_js(
-          f"document.querySelectorAll('select')[0].value = {repr(value)}; "
-          f"document.querySelectorAll('select')[0].dispatchEvent(new Event('change'))"
-      )
-      return ActionResult()
+      try:
+          result = await browser.set_select_option(backend_id, value)
+      except Exception as e:
+          return ActionResult(error=f"Failed to select option: {e}")
+      desc = self._describe_dropdown(entry, index)
+      if result.get("success"):
+          message = result.get("message", f"Selected option: {value}")
+          return ActionResult(extracted_content=message, long_term_memory=f"Selected {json.dumps(value)} in {desc}")
+      # 选项未命中 / 框架拦截（点击回退也失败）→ 软回显可用选项供 LLM 自纠
+      available = result.get("availableOptions") or []
+      if available:
+          lines = [f"{i}: text={json.dumps(o.get('text', ''))}, value={json.dumps(o.get('value', ''))}" for i, o in enumerate(available)]
+          extracted = "\n".join(lines) + "\n" + f"Use the value in select_dropdown(index={index}, value=...)"
+          return ActionResult(extracted_content=extracted, long_term_memory=f"Couldn't select {json.dumps(value)} in {desc} (not an available option)")
+      return ActionResult(error=result.get("error", f"Failed to select option: {value}"))
   ```
 
-  注意：`entry` 仅做了存在性校验，实际操作的是**页面上第一个 select**（`querySelectorAll('select')[0]`），可能与 `index` 不一致。这是已知限制。
+  > session 层 `set_select_option`（[session.py:1731](../../src/tree_walker/browser/session.py)）移植 browser-use `on_SelectDropdownOptionEvent`（`default_action_watchdog.py:3241-3695`）的 native `<select>` 完整选择链：focus → 三方式设值（`element.value`/`option.selected`/`selectedIndex`）→ dispatch `input`+`change`+`blur` → 读回 `element.value` 验证框架回退 → 回退时点击回退（`mousedown`/`click-on-option`/`mouseup`/`change`）。匹配策略：`option.text` 或 `option.value`，大小写不敏感精确匹配（参数名仍是 `value`，但传 text 也能命中）。
 
 - **CDP 调用清单**：
 
   | CDP 命令 | 主要参数 | 行号 |
   |---|---|---|
-  | `Runtime.evaluate` | `{expression: "select.value=...; dispatchEvent('change')"}` | session.py:785 |
+  | `DOM.resolveNode` | `{backendNodeId}` | session.py:1731（`set_select_option`） |
+  | `Runtime.callFunctionOn` | `{objectId, functionDeclaration: _SELECT_OPTION_JS, arguments:[{value}], returnByValue:True}` | 同上 |
+  | `Runtime.callFunctionOn`（回退） | `{objectId, functionDeclaration: _SELECT_OPTION_CLICK_FALLBACK_JS, arguments:[{value:optionIndex}], returnByValue:True}`（仅 `selectionReverted` 时） | 同上 |
 
-- **注意事项**：必须手动 dispatch `change` 事件，否则 Vue/React 框架不会响应。
+- **注意事项**：
+  - 仅支持 native `<select>`；非 select 下拉（ARIA menu/listbox、custom class、combobox）走 tag 校验 error，提示用 click 手动展开（P1 蓝图见 [`docs/tools-optimize/select_dropdown.md`](../tools-optimize/select_dropdown.md)）。
+  - 框架兼容：`input`+`change`+`blur` 三事件 + 三方式设值 + 读回验证 + 点击回退，覆盖 Vue/React/Svelte 等拦截程序化赋值的场景。
+  - 选项未命中不抛错，软回显可用选项（json 编码）+ `select_dropdown(index=N, value=...)` 用法提示。
 
 ---
 
@@ -1459,7 +1482,7 @@ async def set_file_input(
 | `scrollIntoViewIfNeeded` | `{backendNodeId}` | click, input_text | session.py:670 |
 | `getContentQuads` | `{backendNodeId}` | click, input_text (坐标方法 1，取最大交集 quad) | session.py:545 |
 | `getBoxModel` | `{backendNodeId}` | click, input_text (坐标方法 2) | session.py:562 |
-| `resolveNode` | `{backendNodeId}` | click, input_text (坐标方法 3 / 遮挡检查 / JS 回退 / SELECT option) | session.py:580, 721, 769, 1265 |
+| `resolveNode` | `{backendNodeId}` | click, input_text (坐标方法 3 / 遮挡检查 / JS 回退 / SELECT option), select_dropdown | session.py:580, 721, 769, 1265, 1731 |
 | `getDocument` | `{depth:-1, pierce:True}` | upload_file (shadow DOM) | session.py:807 |
 | `setFileInputFiles` | `{backendNodeId, files:[path]}` | upload_file | session.py:861 |
 
@@ -1488,8 +1511,8 @@ async def set_file_input(
 
 | CDP 命令 | 参数 | 用于 action | 行号 |
 |---|---|---|---|
-| `evaluate` | `{expression, returnByValue, awaitPromise, timeout:30000}` | evaluate, find_elements, find_text, dropdown_options, select_dropdown, search_page, extract | session.py:785, 612 |
-| `callFunctionOn` | `{objectId, functionDeclaration, returnByValue[, arguments]}` | click（坐标方法 3 / 遮挡检查 `elementFromPoint` / JS 回退 `this.click()` / SELECT `this.options`） | session.py:587, 728, 776, 1272 |
+| `evaluate` | `{expression, returnByValue, awaitPromise, timeout:30000}` | evaluate, find_elements, find_text, dropdown_options, search_page, extract | session.py:785, 612 |
+| `callFunctionOn` | `{objectId, functionDeclaration, returnByValue[, arguments]}` | click（坐标方法 3 / 遮挡检查 `elementFromPoint` / JS 回退 `this.click()` / SELECT `this.options`）、select_dropdown（native 选择链 + 点击回退） | session.py:587, 728, 776, 1272, 1731 |
 
 #### `Overlay.*` 域（可选视觉反馈）
 

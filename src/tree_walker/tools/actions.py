@@ -910,15 +910,63 @@ class Tools:
         return ActionResult(extracted_content=extracted, long_term_memory=memory)
 
     async def _action_select_dropdown(self, params: dict, browser: BrowserSession) -> ActionResult:
-        entry, error = await self._get_element_by_index(params["index"], browser)
+        """Select an option in the <select> at the given index.
+
+        Delegates to session.set_select_option (DOM.resolveNode + Runtime.
+        callFunctionOn), scoped to the target select via backend_node_id — fixing
+        the global querySelectorAll('select')[0] bug that wrote the first select
+        on the page regardless of index. Ports browser-use's native selection
+        chain (focus -> set value three ways -> input/change/blur -> readback
+        verify -> click fallback on framework reversion). On a miss, echoes the
+        available options back for the LLM to self-correct. Mirrors the
+        _describe_dropdown + try/except soft-degrade convention of dropdown_options.
+        """
+        index = params["index"]
+        entry, error = await self._get_element_by_index(index, browser)
         if error:
             return error
+
+        # Tag guard: native <select> only (mirrors dropdown_options early return).
+        tag = (getattr(entry, "tag_name", "") or "").upper()
+        if tag != "SELECT":
+            return ActionResult(
+                error=(
+                    f"Index {index} is a [{tag}] element, not a <select>. "
+                    f"select_dropdown only supports native <select>. "
+                    f"For ARIA menu/listbox or custom dropdowns, use click to expand and select manually."
+                ),
+            )
+
+        # Scope to the target select's backend_node_id (fixes the [0] global bug).
+        backend_id = getattr(entry, "backend_node_id", None)
         value = params["value"]
-        await browser.execute_js(
-            f"document.querySelectorAll('select')[0].value = {repr(value)}; "
-            f"document.querySelectorAll('select')[0].dispatchEvent(new Event('change'))"
-        )
-        return ActionResult()
+        try:
+            result = await browser.set_select_option(backend_id, value)
+        except Exception as e:
+            return ActionResult(error=f"Failed to select option: {e}")
+
+        # Success echo (short/long split, mirrors _describe_dropdown + json.dumps).
+        desc = self._describe_dropdown(entry, index)
+        if result.get("success"):
+            message = result.get("message", f"Selected option: {value}")
+            memory = f"Selected {json.dumps(value)} in {desc}"
+            return ActionResult(extracted_content=message, long_term_memory=memory)
+
+        # Miss / framework block (and click fallback also failed): echo the
+        # available options so the LLM can retry with a correct value.
+        available = result.get("availableOptions") or []
+        if available:
+            lines = [
+                f"{i}: text={json.dumps(o.get('text', ''))}, value={json.dumps(o.get('value', ''))}"
+                for i, o in enumerate(available)
+            ]
+            extracted = "\n".join(lines) + "\n" + f"Use the value in select_dropdown(index={index}, value=...)"
+            memory = f"Couldn't select {json.dumps(value)} in {desc} (not an available option)"
+            return ActionResult(extracted_content=extracted, long_term_memory=memory)
+
+        # Bare failure with no available options (e.g. a JS-returned pure error).
+        err = result.get("error", f"Failed to select option: {value}")
+        return ActionResult(error=err)
 
     async def _action_upload_file(self, params: dict, browser: BrowserSession) -> ActionResult:
         file_path = params["path"]
