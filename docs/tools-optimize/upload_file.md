@@ -420,6 +420,8 @@ class TestUploadFileErrorMapping:
 
 ## 已知限制（本次不处理，留作未来）
 
+> **后续修复（issue #34）已落地**，见 [`upload_file_fix.md`](./upload_file_fix.md)：① `Page.setInterceptFileChooserDialog` 拦截原生文件框（click file input 不再弹 OS 选择器）；② **`_pick_nearest_file_input` 被 4 个实证探针证伪并删除**——抖音隐藏 input 无任何可区分的客户端信号（自身/容器/LCA/坐标全失效，恒选首个=Bug 2 根因），改为 **click 发现 + 诚实回退**（`discover_file_input_via_click` 点 dropzone 捕获 `fileChooserOpened.backendNodeId`=页面真正关联的 input；未命中→诚实 error 引导 agent 驱动弹窗，绝不瞎猜）；③ accept 软校验 note 改为**中性 informational**（`⚠️`→`ℹ️`，明示"已成功/勿重试"），消除诱导 LLM 换 index 重传。下述为本次（#18）未处理的其余限制。
+
 - **多文件上传（multiple）**：browser-use 也不支持；需改 `models.py` 把 `path` 改为 `str | list[str]` + session 层 files 列表 + 回显/accept/读回适配多文件，LLM schema 变化较大，留待明确需求后做。
 - **上传后读回校验**：browser-use 也未做；需 `DOM.resolveNode` + `Runtime.callFunctionOn` 读 `input.files.length`，CDP 编排较重、价值边际（`setFileInputFiles` 失败一般直接抛异常），待遥测确认有"静默失败"案例再做。
 - **超时机制**：browser-use 有 30s 事件超时；本项目 CDP 调用走 `client.send`，暂无统一超时封装，留待全局 CDP 超时改造时一并加。

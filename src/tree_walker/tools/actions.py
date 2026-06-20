@@ -26,89 +26,6 @@ def _is_file_input_node(node: EnhancedDOMTreeNode) -> bool:
     return node.tag_name.upper() == "INPUT" and node.attributes.get("type", "").lower() == "file"
 
 
-def _find_file_input_in_descendants(
-    node: EnhancedDOMTreeNode, depth: int,
-) -> EnhancedDOMTreeNode | None:
-    if depth < 0:
-        return None
-    if _is_file_input_node(node):
-        return node
-    for child in node.children:
-        result = _find_file_input_in_descendants(child, depth - 1)
-        if result:
-            return result
-    return None
-
-
-def _find_file_input_near_element(
-    target: EnhancedDOMTreeNode,
-    max_height: int = 3,
-    max_descendant_depth: int = 3,
-) -> EnhancedDOMTreeNode | None:
-    """Walk DOM tree (parent/children/siblings) to find the nearest file input."""
-    current: EnhancedDOMTreeNode | None = target
-    for _ in range(max_height + 1):
-        if current is None:
-            break
-        if _is_file_input_node(current):
-            return current
-        result = _find_file_input_in_descendants(current, max_descendant_depth)
-        if result:
-            return result
-        if current.parent:
-            for sibling in current.parent.children:
-                if sibling is current:
-                    continue
-                if _is_file_input_node(sibling):
-                    return sibling
-                result = _find_file_input_in_descendants(sibling, max_descendant_depth)
-                if result:
-                    return result
-        current = current.parent
-    return None
-
-
-def _pick_nearest_file_input(
-    target: Any,
-    file_input_ids: list[int],
-    dom_state: SerializedDOMState | None,
-) -> int | None:
-    """Pick the file input backendNodeId nearest to the target element.
-
-    First tries DOM tree traversal, then falls back to coordinate distance.
-    """
-    if not file_input_ids:
-        return None
-    if len(file_input_ids) == 1:
-        return file_input_ids[0]
-
-    # Try DOM tree traversal first
-    found = _find_file_input_near_element(target)
-    if found and found.backend_node_id in file_input_ids:
-        return found.backend_node_id
-
-    # Fallback: coordinate distance
-    id_to_pos: dict[int, tuple[int, int]] = {}
-    if dom_state:
-        for elem in dom_state.selector_map.values():
-            if elem.backend_node_id is not None and elem.backend_node_id in file_input_ids:
-                id_to_pos[elem.backend_node_id] = (elem.x, elem.y)
-
-    if not id_to_pos:
-        return file_input_ids[0]
-
-    tx, ty = target.x, target.y
-    best_id: int | None = None
-    best_dist = float("inf")
-    for fid, (fx, fy) in id_to_pos.items():
-        dist = (tx - fx) ** 2 + (ty - fy) ** 2
-        if dist < best_dist:
-            best_dist = dist
-            best_id = fid
-
-    return best_id if best_id is not None else file_input_ids[0]
-
-
 def _file_matches_accept(file_path: str, accept: str | None) -> bool:
     """True if file_path is acceptable under the input's ``accept`` attribute.
 
@@ -142,6 +59,62 @@ def _file_matches_accept(file_path: str, accept: str | None) -> bool:
             if guessed_mime == token:
                 return True
     return False
+
+
+def _find_upload_label_near(
+    node: EnhancedDOMTreeNode, max_ancestor: int = 4, max_depth: int = 3,
+) -> int | None:
+    """Locate the nearest ``<label>`` upload trigger relative to ``node``.
+
+    A ``<label for=input>`` click is dispatched by the BROWSER straight to its
+    associated input — this native label semantics preserves the transient
+    user-activation that opening a file chooser requires. By contrast, the JS
+    ``input.click()`` that upload frameworks (Semi-UI / AntD Upload) fire from a
+    drag-area or button click loses that activation (usually across an async
+    gap), so no ``Page.fileChooserOpened`` ever fires. This is the crux of issue
+    #34: on Douyin's cover editor, clicking the drag-area / a button never opens
+    a chooser, but clicking the sibling ``<label class*="upload">`` (选择文件)
+    does, and ``setFileInputFiles`` on the input it opens sets the cover cleanly
+    (empirically verified).
+
+    Such uploaders render the label as a sibling of the drag-area inside one
+    Upload container, so we climb from the target to that container and return
+    its upload label. Returns the label's ``backend_node_id`` or ``None``.
+    """
+    def _is_upload_label(n: EnhancedDOMTreeNode | None) -> bool:
+        if n is None or (n.tag_name or "").upper() != "LABEL":
+            return False
+        cls = ((n.attributes or {}).get("class") or "").lower()
+        parts = [(n.node_value or "")]
+        for c in (n.children_nodes or [])[:6]:
+            parts.append((c.node_value or "") if c is not None else "")
+        txt = " ".join(p for p in parts if p)
+        return "upload" in cls or "选择文件" in txt or "上传" in txt
+
+    def _search_subtree(root, depth):
+        if root is None or depth < 0:
+            return None
+        if _is_upload_label(root) and root.backend_node_id is not None:
+            return root.backend_node_id
+        for c in (root.children_nodes or []):
+            found = _search_subtree(c, depth - 1)
+            if found:
+                return found
+        for sr in (root.shadow_roots or []):
+            found = _search_subtree(sr, depth - 1)
+            if found:
+                return found
+        return None
+
+    cur = node
+    depth = 0
+    while cur is not None and depth <= max_ancestor:
+        found = _search_subtree(cur, max_depth)
+        if found:
+            return found
+        cur = cur.parent_node
+        depth += 1
+    return None
 
 
 # ── Search engines ──────────────────────────────────────────────────
@@ -341,6 +314,17 @@ class Tools:
             return error
 
         backend_id = entry.backend_node_id
+
+        # 1.5 file-input 守卫：点 <input type=file> 只会弹原生文件框（拦截已兜底不弹框，
+        # 但 click 仍会派发到页面、且对上传无任何有用效果）。引导 LLM 改用 upload_file。
+        if _is_file_input_node(entry):
+            return ActionResult(
+                error=(
+                    f"Element {params['index']} is an <input type='file'>. Clicking it "
+                    f"would open the OS file picker. Use upload_file(index={params['index']}, "
+                    f"path=<absolute path>) instead to set the file programmatically."
+                ),
+            )
 
         # 2. SELECT 分支：精确查"指定 index 的那个 select"，不再全页 querySelectorAll
         if entry.tag_name.upper() == "SELECT":
@@ -988,27 +972,68 @@ class Tools:
         if error:
             return error
 
-        # 3. 判定目标是否本身 file input；非 file input 时定位最近 file input
+        # 3. 判定目标是否本身 file input；确定正确的 file input
         tag = entry.tag_name.upper()
         attrs = entry.attributes
         is_file_input = tag == "INPUT" and attrs.get("type", "").lower() == "file"
 
         backend_id = entry.backend_node_id
         file_input_ids: list[int] = []
+        if self._cached_browser_state and self._cached_browser_state.dom_state:
+            file_input_ids = list(
+                self._cached_browser_state.dom_state.file_input_backend_ids,
+            )
+        upload_note = ""
+
+        if is_file_input and len(file_input_ids) > 1:
+            # 多个 file input 共存（抖音式封面编辑器：除真实封面 input 外还有"收藏
+            # 封面"等无关 input）。但仍信任 agent 指定的 index 直接 setFileInputFiles——
+            # 抖音封面无 <label>（issue #34），"改点可见上传按钮"这条路走不通，硬拒绝
+            # 反而导致 0% 成功率（实测 master 直接 set 能传）。改为软警告：仍上传到
+            # agent 指定的 index，若命中错误 input（如收藏封面弹出收藏框）由 agent 重试。
+            upload_note = (
+                f"  ⚠️ Page has {len(file_input_ids)} file inputs; uploaded to the one "
+                f"you specified (index {params['index']}). If the site reacted wrongly "
+                f"(e.g. a 收藏封面/favorite-cover modal popped), the index was wrong — "
+                f"retry upload_file on the correct visible upload area."
+            )
+
         if not is_file_input:
-            if self._cached_browser_state and self._cached_browser_state.dom_state:
-                file_input_ids = list(
-                    self._cached_browser_state.dom_state.file_input_backend_ids,
-                )
             if not file_input_ids:
                 return ActionResult(
                     error="Element is not a file input and no file input found on page",
                 )
-            # Pick the file input nearest to the target element
-            backend_id = _pick_nearest_file_input(
-                entry, file_input_ids,
-                self._cached_browser_state.dom_state if self._cached_browser_state else None,
-            )
+            if len(file_input_ids) == 1:
+                # Exactly one file input on the page — unambiguous, use it directly.
+                backend_id = file_input_ids[0]
+                upload_note = (
+                    f"  ℹ️ index {params['index']} is not a file input; uploaded to the "
+                    f"only file input on the page (backendNodeId={backend_id})."
+                )
+            else:
+                # 多个 file input 且目标是 dropzone/按钮：点其附近的 <label> 上传触发器
+                # 而非目标本身。<label for=input> 是浏览器原生行为，保留 user-gesture，
+                # 能触发 Page.fileChooserOpened；而 drag-area/div/button 的 JS
+                # input.click() 会丢失 gesture、不触发 chooser（issue #34 抖音封面）。
+                # 命中 chooser 的瞬态 input 才是页面真正为这次上传关联的 input。
+                label_bid = _find_upload_label_near(entry) or entry.backend_node_id
+                discovered = await browser.discover_file_input_via_click(label_bid)
+                if discovered is not None:
+                    backend_id = discovered
+                    upload_note = (
+                        f"  ℹ️ index {params['index']} is not a file input; clicked its "
+                        f"upload button and uploaded to the file input the page opened "
+                        f"(backendNodeId={backend_id})."
+                    )
+                else:
+                    return ActionResult(error=(
+                        f"Element {params['index']} is not a file input, and clicking its "
+                        f"upload button did not open a file chooser — it likely uses a "
+                        f"custom upload dialog. Open that dialog and click its 上传图片/"
+                        f"选择文件 button first, then call upload_file again on that button "
+                        f"so the correct file input is used."
+                    ))
+        # else: is_file_input（无论唯一还是多 input）→ backend_id 已是 entry.backend_node_id，直传（多 input 时上面已附软警告）
 
         logger.info(
             "upload_file: index=%d, tag=%s, type=%s, backend_node_id=%s, "
@@ -1028,13 +1053,10 @@ class Tools:
         except Exception as e:
             return ActionResult(error=f"File upload failed: {e}")
 
-        # 5. 成功回显（G1）+ 目标替换提示（G2）+ accept 软校验（G3）
+        # 5. 成功回显 + 目标来源说明（直选/页面选中）+ accept 软校验
         memory = self._describe_upload(entry, params["index"], file_path)
-        if not is_file_input:
-            memory += (
-                f"  ⚠️ Note: index {params['index']} is not an <input type='file'>; "
-                f"uploaded to the nearest file input on the page instead."
-            )
+        if upload_note:
+            memory += upload_note
 
         if is_file_input:
             file_input_entry = entry
@@ -1048,8 +1070,9 @@ class Tools:
             accept_attr = (getattr(file_input_entry, "attributes", {}) or {}).get("accept")
         if accept_attr and not _file_matches_accept(file_path, accept_attr):
             memory += (
-                f"  ⚠️ Note: the file extension does not match this input's "
-                f"accept={accept_attr!r} — the site may reject the upload."
+                f"  ℹ️ Note: file extension does not match this input's "
+                f"accept={accept_attr!r}. The file was uploaded successfully regardless "
+                f"— browsers do not enforce accept (it is advisory only). No retry needed."
             )
 
         logger.info(memory)

@@ -366,6 +366,16 @@ class BrowserSession:
             session_id=None,
         )
         self._highlight_settings = _settings.highlight
+        # Last intercepted Page.fileChooserOpened event (set by
+        # _on_file_chooser_opened, read by discover_file_input_via_click so
+        # upload_file can learn which <input type=file> a clicked dropzone is
+        # wired to). None when no chooser has fired since the last clear.
+        self._last_file_chooser: dict | None = None
+        # Whether Page.setInterceptFileChooserDialog is confirmed on for the
+        # current session. discover_file_input_via_click must NOT click when
+        # this is False — without interception a click on a file input pops the
+        # blocking native OS dialog (the Bug-1 regression).
+        self._file_chooser_intercept_enabled: bool = False
 
     async def start(self, *, track_downloads: bool = False) -> None:
         """Connect to the browser via CDP WebSocket."""
@@ -403,11 +413,125 @@ class BrowserSession:
         except Exception:
             pass
 
+        # Intercept the OS file-chooser dialog on this session: clicking an
+        # <input type='file'> (or an upload button proxying one) then emits a
+        # Page.fileChooserOpened event instead of popping the native picker,
+        # which would block automation. Uploads themselves go through
+        # DOM.setFileInputFiles (set_file_input), independent of this. Best-effort
+        # (older Chrome without the command degrades silently — mirrors setAutoAttach).
+        await self._enable_file_chooser_intercept()
+
         logger.info("Browser connected: target=%s", self.current_target_id)
 
         # Wire up highlight manager with live CDP client
         self._highlight._client = self.client
         self._highlight._session_id = self.current_session_id
+
+    async def _enable_file_chooser_intercept(self) -> None:
+        """Enable OS file-chooser interception on the current CDP session.
+
+        With interception on, a click that would open the native file picker
+        (an <input type='file'>, or a button whose handler calls input.click())
+        instead emits ``Page.fileChooserOpened`` — the modal OS dialog is never
+        shown, so automation cannot get stuck behind it. Real uploads use
+        ``DOM.setFileInputFiles`` (``set_file_input``), which is independent of
+        this and unaffected. Best-effort: an older Chrome lacking the command
+        degrades silently (the upload path still works without interception).
+
+        Per-session setting, so every new session (_connect / switch_tab) must
+        re-enable it — otherwise tab switches lose native-dialog suppression
+        (the Bug-1 regression source). The event handler registration is
+        client-level and idempotent (overwrites the same handler).
+        """
+        try:
+            await self.client.send.Page.setInterceptFileChooserDialog(
+                {"enabled": True},
+                session_id=self.current_session_id,
+            )
+            self.client.register.Page.fileChooserOpened(self._on_file_chooser_opened)
+            self._file_chooser_intercept_enabled = True
+        except Exception as e:
+            logger.debug("setInterceptFileChooserDialog unavailable/failed: %s", e)
+
+    def _on_file_chooser_opened(self, event: dict, session_id: str | None = None) -> None:
+        """Handle an intercepted file-chooser event (log + record).
+
+        Interception already suppresses the native dialog; this records the
+        event so ``discover_file_input_via_click`` can learn which
+        ``<input type='file'>`` a clicked dropzone/button is wired to
+        (upload_file uses this to pick the right input among several
+        indistinguishable ones — issue #34 Bug 2). ``backendNodeId`` is present
+        only for choosers opened via an ``<input type='file'>``.
+        """
+        backend_node_id = event.get("backendNodeId")
+        logger.info(
+            "Native file chooser intercepted (suppressed): mode=%s, "
+            "backendNodeId=%s, frameId=%s, session=%s",
+            event.get("mode"),
+            backend_node_id,
+            event.get("frameId"),
+            session_id,
+        )
+        self._last_file_chooser = {
+            "backendNodeId": backend_node_id,
+            "mode": event.get("mode"),
+            "frameId": event.get("frameId"),
+            "session_id": session_id,
+            "ts": time.time(),
+        }
+
+    async def discover_file_input_via_click(
+        self, backend_node_id: int, timeout: float = 2.5,
+    ) -> int | None:
+        """Click an element and capture which ``<input type='file'>`` opens.
+
+        Used by upload_file when the target is a dropzone/button (not a file
+        input) among several indistinguishable file inputs (e.g. Douyin's
+        horizontal vs vertical cover slots — hidden, no orientation label,
+        coordinates collapsed to (0,0)). Instead of guessing, let the page's
+        own wiring reveal the associated input: clicking it fires
+        ``Page.fileChooserOpened`` carrying the input's backendNodeId. With
+        file-chooser interception on (Bug-1 fix) the native OS dialog is never
+        shown, so this never blocks automation.
+
+        Returns the discovered backendNodeId, or None when:
+
+        * interception is off — clicking would pop the blocking native dialog,
+          so we refuse to click (Bug-1 guard); or
+        * no chooser fired within ``timeout`` — the click opened a custom
+          upload dialog (common on Douyin/Bilibili cover editors) or did
+          nothing; upload_file then surfaces an honest, actionable error
+          instead of mis-uploading to a guessed input.
+        """
+        if not self._file_chooser_intercept_enabled:
+            logger.debug(
+                "discover_file_input_via_click: interception not enabled, "
+                "refusing to click (would pop native dialog)",
+            )
+            return None
+        self._last_file_chooser = None
+        try:
+            await self.click_element(backend_node_id)
+        except Exception as e:
+            logger.debug("discover_file_input_via_click: click failed: %s", e)
+            return None
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._last_file_chooser is not None:
+                bid = self._last_file_chooser.get("backendNodeId")
+                logger.info(
+                    "discover_file_input_via_click: click on backendNodeId=%d "
+                    "opened file input backendNodeId=%s",
+                    backend_node_id, bid,
+                )
+                return bid
+            await asyncio.sleep(0.05)
+        logger.info(
+            "discover_file_input_via_click: click on backendNodeId=%d opened no "
+            "file chooser within %.1fs (custom dialog?)",
+            backend_node_id, timeout,
+        )
+        return None
 
     @property
     def is_connected(self) -> bool:
@@ -1535,6 +1659,9 @@ class BrowserSession:
         )
         self.current_target_id = target_id
         self.current_session_id = result["sessionId"]
+        # File-chooser interception is per-session: re-enable on the new tab so
+        # the native picker stays suppressed after switching (regression guard).
+        await self._enable_file_chooser_intercept()
         logger.info("Switched to tab: %s", target_id)
         await self._wait_for_page_settle()
 
