@@ -52,6 +52,123 @@ def _xpath_string_literal(text: str) -> str:
     return "concat(" + ", '\"', ".join(f'"{p}"' for p in parts) + ")"
 
 
+# ── search_page (grep-style page text search) ────────────────────────
+
+# JS body for search_page: a TreeWalker over text nodes builds an offset-
+# indexed text buffer, then a g-flag RegExp.exec loop collects matches with
+# context + element path, returning {matches, total, has_more} (or {error}).
+# Mirrors browser-use _SEARCH_PAGE_JS_BODY (service.py:181-255). User values
+# are injected as `var` declarations by _build_search_page_js (never
+# f-string-interpolated into the expression), so this body only references
+# those vars (PATTERN/IS_REGEX/CASE_SENSITIVE/CONTEXT_CHARS/CSS_SCOPE/
+# MAX_RESULTS) by name. Stored raw so JS backslashes survive verbatim.
+_SEARCH_PAGE_JS_BODY = r"""
+    function _getPath(el) {
+        if (!el || el === document.body) return '';
+        var parts = [];
+        while (el && el !== document.body) {
+            var tag = (el.tagName || '').toLowerCase();
+            if (!tag) break;
+            var part = tag;
+            if (el.id) {
+                part += '#' + el.id;
+            } else if (el.className && typeof el.className === 'string') {
+                var cls = el.className.trim().split(/\s+/).slice(0, 2).join('.');
+                if (cls) part += '.' + cls;
+            }
+            parts.unshift(part);
+            el = el.parentElement;
+        }
+        return parts.join(' > ');
+    }
+    try {
+        var scope = CSS_SCOPE ? document.querySelector(CSS_SCOPE) : document.body;
+        if (!scope) {
+            return {error: 'CSS scope selector not found: ' + CSS_SCOPE, matches: [], total: 0};
+        }
+        var walker = document.createTreeWalker(scope, NodeFilter.SHOW_TEXT);
+        var fullText = '';
+        var nodeOffsets = [];
+        while (walker.nextNode()) {
+            var node = walker.currentNode;
+            var text = node.textContent;
+            if (text && text.trim()) {
+                nodeOffsets.push({offset: fullText.length, length: text.length, node: node});
+                fullText += text;
+            }
+        }
+        var flags = CASE_SENSITIVE ? 'g' : 'gi';
+        var re;
+        try {
+            if (IS_REGEX) {
+                re = new RegExp(PATTERN, flags);
+            } else {
+                re = new RegExp(PATTERN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags);
+            }
+        } catch (e) {
+            return {error: 'Invalid regex pattern: ' + (e && e.message ? e.message : e), matches: [], total: 0};
+        }
+        var matches = [];
+        var total = 0;
+        var match;
+        while ((match = re.exec(fullText)) !== null) {
+            total++;
+            if (matches.length < MAX_RESULTS) {
+                var start = Math.max(0, match.index - CONTEXT_CHARS);
+                var end = Math.min(fullText.length, match.index + match[0].length + CONTEXT_CHARS);
+                var context = fullText.slice(start, end);
+                var elementPath = '';
+                for (var i = 0; i < nodeOffsets.length; i++) {
+                    var no = nodeOffsets[i];
+                    if (no.offset <= match.index && no.offset + no.length > match.index) {
+                        elementPath = _getPath(no.node.parentElement);
+                        break;
+                    }
+                }
+                matches.push({
+                    match_text: match[0],
+                    context: (start > 0 ? '...' : '') + context + (end < fullText.length ? '...' : ''),
+                    element_path: elementPath,
+                    char_position: match.index
+                });
+            }
+            if (match[0].length === 0) re.lastIndex++;
+        }
+        return {matches: matches, total: total, has_more: total > MAX_RESULTS};
+    } catch (e) {
+        return {error: String((e && e.message) || e), matches: [], total: 0};
+    }
+"""
+
+
+def _build_search_page_js(
+    pattern: str,
+    regex: bool,
+    case_sensitive: bool,
+    context_chars: int,
+    css_scope: str | None,
+    max_results: int,
+) -> str:
+    """Build the search_page IIFE expression.
+
+    Each user value is serialized via ``json.dumps`` into a ``var``
+    declaration and the body references those vars by name — the body is a
+    constant string with NO f-string interpolation of user text. This is the
+    safe-injection pattern (mirrors browser-use service.py:301-318) and
+    matches the project's existing _find_text_js_fallback (json.dumps at
+    session.py:1899).
+    """
+    params_js = (
+        f"var PATTERN = {json.dumps(pattern)};\n"
+        f"var IS_REGEX = {json.dumps(regex)};\n"
+        f"var CASE_SENSITIVE = {json.dumps(case_sensitive)};\n"
+        f"var CONTEXT_CHARS = {json.dumps(context_chars)};\n"
+        f"var CSS_SCOPE = {json.dumps(css_scope)};\n"
+        f"var MAX_RESULTS = {json.dumps(max_results)};\n"
+    )
+    return "(function() {\n" + params_js + _SEARCH_PAGE_JS_BODY + "\n})()"
+
+
 def _walk_for_file_inputs(node: dict) -> list[int]:
     """Recursively walk a CDP DOM Node tree to find file input backendNodeIds."""
     results: list[int] = []
@@ -1936,6 +2053,42 @@ class BrowserSession:
             return tag
         except Exception:
             return None
+
+    async def search_page(
+        self,
+        pattern: str,
+        *,
+        regex: bool = False,
+        case_sensitive: bool = False,
+        context_chars: int = 150,
+        css_scope: str | None = None,
+        max_results: int = 25,
+    ) -> dict:
+        """Grep-style page text search via a single Runtime.evaluate.
+
+        Mirrors browser-use ``search_page`` (``service.py:1260-1295`` + JS body
+        ``:181-255``): a TreeWalker over text nodes builds an offset-indexed
+        text buffer, a ``g``-flag RegExp exec loop collects matches with context
+        + element path, and ``{matches, total, has_more}`` is returned.
+
+        Raises ``RuntimeError`` on a JS exception (via ``execute_js``), on a
+        null return, or when the JS layer reports ``{error: ...}`` (invalid
+        regex / css_scope not found) — the action layer maps these to a hard
+        ``ActionResult(error=...)``. A clean miss returns ``total=0`` and never
+        raises; the action layer builds the soft echo.
+
+        Limitations (same as browser-use): top-document text nodes only; does
+        not traverse into iframes or pierce shadow DOM.
+        """
+        js = _build_search_page_js(
+            pattern, regex, case_sensitive, context_chars, css_scope, max_results,
+        )
+        data = await self.execute_js(js)  # returnByValue=True -> dict; RuntimeError on exceptionDetails
+        if data is None:
+            raise RuntimeError("search_page returned no result")
+        if isinstance(data, dict) and data.get("error"):
+            raise RuntimeError(f"search_page: {data['error']}")
+        return data
 
     async def fetch_select_options(self, backend_node_id: int) -> list[dict]:
         """Read all options of the <select> identified by backendNodeId.

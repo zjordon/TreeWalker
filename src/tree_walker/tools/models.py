@@ -175,7 +175,21 @@ class EvaluateParams(BaseModel):
 
 class SearchPageParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    query: str = Field(description="Text to search for within the current page")
+    query: str = Field(
+        min_length=1,
+        description="Text or regex pattern to search for within the current page",
+    )
+    regex: bool = Field(default=False, description="Treat query as a regex (default: literal text match).")
+    case_sensitive: bool = Field(default=False, description="Case-sensitive match (default: case-insensitive).")
+    context_chars: int = Field(default=150, ge=0, description="Characters of surrounding context per match.")
+    css_scope: str | None = Field(
+        default=None,
+        description="CSS selector to limit search scope (e.g. 'div#main'). Selector not matching anything is an error.",
+    )
+    max_results: int = Field(
+        default=25, ge=1, le=200,
+        description="Maximum matches to return (total count is always reported even when truncated).",
+    )
 
 
 class DoneParams(BaseModel):
@@ -255,7 +269,12 @@ ACTION_DEFINITIONS: dict[str, tuple[type[BaseModel], str, bool]] = {
     ),
     "search_page": (
         SearchPageParams,
-        "Search for text within the current page content",
+        (
+            "Search page text for a pattern (like grep). Zero LLM cost, instant. "
+            "Returns matches with surrounding context, element path, and a total count. "
+            "Set regex=True for regex patterns; use css_scope to search within a section. "
+            "Read-only — does not scroll or highlight (use find_text for that)."
+        ),
         False,
     ),
     "done": (DoneParams, "Signal that the task is complete with a summary", False),
