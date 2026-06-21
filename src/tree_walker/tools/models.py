@@ -124,7 +124,13 @@ class ScreenshotParams(BaseModel):
 
 class SaveAsPdfParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    path: str = Field(description="File path to save the PDF")
+    path: str = Field(description="File path to save the PDF (parent dirs auto-created).")
+    paper_format: Literal["letter", "legal", "a4", "a3", "tabloid"] = Field(
+        default="letter", description="Paper size."
+    )
+    landscape: bool = Field(default=False, description="Landscape orientation.")
+    print_background: bool = Field(default=True, description="Include background graphics/colors.")
+    scale: float = Field(default=1.0, ge=0.1, le=2.0, description="Render scale (0.1-2.0).")
 
 
 class DropdownOptionsParams(BaseModel):
@@ -222,7 +228,12 @@ ACTION_DEFINITIONS: dict[str, tuple[type[BaseModel], str, bool]] = {
         "or full page. Saves to save_path if given.",
         False,
     ),
-    "save_as_pdf": (SaveAsPdfParams, "Save the current page as a PDF file", False),
+    "save_as_pdf": (
+        SaveAsPdfParams,
+        "Save the current page as a PDF. Supports paper_format (letter/legal/a4/a3/tabloid), "
+        "landscape, scale (0.1-2.0), print_background.",
+        False,
+    ),
     "dropdown_options": (
         DropdownOptionsParams,
         "Get all options from a select dropdown element",

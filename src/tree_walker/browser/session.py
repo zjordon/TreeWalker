@@ -763,6 +763,62 @@ class BrowserSession:
 
         return base64.b64decode(result["data"])
 
+    async def print_to_pdf(
+        self,
+        paper_format: str = "letter",
+        landscape: bool = False,
+        print_background: bool = True,
+        scale: float = 1.0,
+        wait_settle: bool = False,
+    ) -> bytes:
+        """Render the current page to PDF bytes via CDP Page.printToPDF.
+
+        Args:
+            paper_format: 'letter' | 'legal' | 'a4' | 'a3' | 'tabloid'.
+            landscape: landscape orientation.
+            print_background: include background graphics/colors.
+            scale: render scale (0.1-2.0).
+            wait_settle: poll document.readyState to 'complete' before printing.
+
+        Raises:
+            RuntimeError: if CDP returns no 'data' field.
+        """
+        paper_sizes = {  # 英寸 (width, height)
+            "letter": (8.5, 11.0),
+            "legal": (8.5, 14.0),
+            "a4": (8.27, 11.69),
+            "a3": (11.69, 16.54),
+            "tabloid": (11.0, 17.0),
+        }
+        paper_width, paper_height = paper_sizes.get(paper_format.lower(), (8.5, 11.0))
+
+        if wait_settle:
+            try:
+                await self._wait_for_page_settle()
+            except Exception as e:
+                logger.warning("Pre-pdf wait_settle failed: %s", e)
+
+        params: dict = {
+            "printBackground": print_background,
+            "landscape": landscape,
+            "scale": scale,
+            "paperWidth": paper_width,
+            "paperHeight": paper_height,
+            "preferCSSPageSize": True,
+        }
+        try:
+            result = await self.client.send.Page.printToPDF(
+                params,
+                session_id=self.current_session_id,
+            )
+        except Exception as e:
+            logger.warning("Page.printToPDF failed: %s", e)
+            raise
+
+        if not isinstance(result, dict) or "data" not in result:
+            raise RuntimeError("printToPDF failed - no data returned")
+        return base64.b64decode(result["data"])
+
     # ── Navigation ─────────────────────────────────────────────────────
 
     async def navigate(self, url: str, new_tab: bool = False) -> str | None:

@@ -704,39 +704,63 @@
 
 ### 4.14 `save_as_pdf`
 
-- **description**：`Save the current page as a PDF file` / 将当前页面保存为 PDF
+- **description**：`Save the current page as a PDF. Supports paper_format (letter/legal/a4/a3/tabloid), landscape, scale (0.1-2.0), print_background.` / 将当前页面保存为 PDF
 - **terminates_sequence**：False
-- **Pydantic 参数**：
+- **Pydantic 参数**（`SaveAsPdfParams`，`extra="forbid"`）：
 
-  | 字段 | 类型 | 描述 |
-  |---|---|---|
-  | `path` | `str` | File path to save the PDF |
+  | 字段 | 类型 | 默认 | 描述 |
+  |---|---|---|---|
+  | `path` | `str` | （必填） | File path to save the PDF（父目录自动创建） |
+  | `paper_format` | `Literal["letter","legal","a4","a3","tabloid"]` | `letter` | 纸张尺寸 |
+  | `landscape` | `bool` | `False` | 横向打印 |
+  | `print_background` | `bool` | `True` | 包含背景图形和颜色 |
+  | `scale` | `float` | `1.0` | 渲染缩放（0.1-2.0） |
 
-- **主要逻辑**（[actions.py:325-335](../../src/tree_walker/tools/actions.py)）：
+- **主要逻辑**（[actions.py:854](../../src/tree_walker/tools/actions.py)）：action 层只负责解包参数、委托 `BrowserSession.print_to_pdf`、写盘与回显；CDP 调用收敛进 session 封装（与 `screenshot`→`take_screenshot` 一致）。
 
   ```python
   async def _action_save_as_pdf(self, params: dict, browser: BrowserSession) -> ActionResult:
-      import base64
-      result = await browser.client.send.Page.printToPDF(
-          {"printBackground": True},
-          session_id=browser.current_session_id,
-      )
-      pdf_data = base64.b64decode(result["data"])
-      path = params["path"]
-      with open(path, "wb") as f:
-          f.write(pdf_data)
-      return ActionResult(extracted_content=f"PDF saved to {path}")
+      path: str = params["path"]
+      paper_format: str = params.get("paper_format", "letter")
+      landscape: bool = params.get("landscape", False)
+      print_background: bool = params.get("print_background", True)
+      scale: float = params.get("scale", 1.0)
+
+      try:
+          pdf_bytes = await browser.print_to_pdf(
+              paper_format=paper_format, landscape=landscape,
+              print_background=print_background, scale=scale,
+          )
+      except Exception as e:
+          logger.warning("save_as_pdf action failed: %s", e)
+          return ActionResult(error=f"Failed to generate PDF: {e}")
+
+      try:
+          os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+          with open(path, "wb") as f:
+              f.write(pdf_bytes)
+      except OSError as e:
+          return ActionResult(error=f"Failed to save PDF to {path}: {e}")
+
+      meta = f"paper={paper_format}, {len(pdf_bytes)} bytes"
+      if landscape:
+          meta += ", landscape"
+      return ActionResult(extracted_content=f"PDF saved to {path} ({meta})")
   ```
 
-  注意：这里直接调底层 CDP，而非通过 `BrowserSession` 封装方法（PDF 没有专门封装）。
+- **Session 封装**（[session.py:766](../../src/tree_walker/browser/session.py) `print_to_pdf`）：纸张英寸查表（letter 8.5×11 / legal 8.5×14 / a4 8.27×11.69 / a3 11.69×16.54 / tabloid 11×17）→ 组装 CDP params → 调 `Page.printToPDF` → base64 解码返回 bytes。`RuntimeError` on no data；CDP 异常 `logger.warning` 后 re-raise。形状对齐 `take_screenshot`。
 
 - **CDP 调用清单**：
 
   | CDP 命令 | 主要参数 | 行号 |
   |---|---|---|
-  | `Page.printToPDF` | `{printBackground: True}` | actions.py:327 |
+  | `Page.printToPDF` | `{printBackground, landscape, scale, paperWidth, paperHeight, preferCSSPageSize: True}` | session.py:810 |
 
-- **注意事项**：`printBackground=True` 保留背景色；返回的 `data` 是 base64 字符串，需手动解码为字节再写文件。
+- **注意事项**：
+  - `preferCSSPageSize=True` 硬编码（与 browser-use 一致）——带 `@page` CSS 的页面会覆盖所选纸张。
+  - `print_background=True` 保留背景色；CDP 返回的 `data` 是 base64 字符串，`print_to_pdf` 内部解码为 bytes。
+  - 写盘前 `os.makedirs` 父目录；CDP 失败与写盘 `OSError` 分级捕获，各自返回明确 `ActionResult(error=...)`。
+  - 详细优化方案见 [`docs/tools-optimize/save_as_pdf.md`](../tools-optimize/save_as_pdf.md)。
 
 ---
 
@@ -1508,7 +1532,7 @@ async def set_file_input(
 | `getNavigationHistory` | `{}` | go_back | session.py:391 |
 | `navigateToHistoryEntry` | `{entryId}` | go_back | session.py:397 |
 | `captureScreenshot` | `{format:png}` | screenshot | session.py:372 |
-| `printToPDF` | `{printBackground:True}` | save_as_pdf | actions.py:327 |
+| `printToPDF` | `{printBackground, landscape, scale, paperWidth, paperHeight, preferCSSPageSize:True}` | save_as_pdf（经 `BrowserSession.print_to_pdf` 封装） | session.py:810 |
 | `getLayoutMetrics` | `{}` | scroll, click（`_get_viewport_size` 取视口用于 quad 选择 + 中心裁剪） | session.py:642, 728 |
 | `setInterceptFileChooserDialog` | `{enabled:True}` | 会话初始化（`_connect`/`switch_tab`）：拦截原生文件框，click file input 不再弹 OS 选择器（issue #34） | session.py（`_enable_file_chooser_intercept`） |
 | `fileChooserOpened` *(事件)* | `{frameId, mode, backendNodeId?}` | 拦截已抑制原生框；`_on_file_chooser_opened` 记日志 **并** 存 `_last_file_chooser`，供 `discover_file_input_via_click` 读取（upload_file 多 input 时点 dropzone 揭示页面关联的 input，issue #34 Bug 2） | session.py（`_on_file_chooser_opened` / `discover_file_input_via_click`） |
