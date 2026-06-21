@@ -634,17 +634,29 @@ class Tools:
         goal = params["goal"]
         try:
             page_text = await browser.execute_js("document.body.innerText")
-        except Exception:
+        except Exception as e:
+            logger.warning("extract: document.body.innerText failed: %s", e)
             page_text = ""
         if not page_text:
             return ActionResult(extracted_content="(empty page)")
-        # Simple extraction: return first 2000 chars with goal context
-        from tree_walker.llm.client import LLMClient
+
         llm = getattr(self, "_extract_llm", None)
-        if llm:
-            result = await llm.extract(goal, page_text[:self._truncation.extract_page_max_chars])
-            return ActionResult(extracted_content=result)
-        return ActionResult(extracted_content=page_text[:self._truncation.extract_fallback_max_chars])
+        if llm is None:
+            # 未接 LLM（如脱离 Agent 直接用 Tools）——显式降级为截断原文
+            return ActionResult(extracted_content=page_text[:self._truncation.extract_fallback_max_chars])
+
+        schema = getattr(self, "_extraction_schema", None)
+        try:
+            result = await llm.extract(
+                goal,
+                page_text,
+                max_content_chars=self._truncation.extract_page_max_chars,
+                output_schema=schema,
+            )
+        except Exception as e:
+            logger.warning("extract: LLM call failed: %s", e)
+            return ActionResult(error=f"Extract failed: {e}")
+        return ActionResult(extracted_content=result)
 
     async def _action_send_keys(self, params: dict, browser: BrowserSession) -> ActionResult:
         keys = params["keys"]

@@ -57,6 +57,13 @@ class Agent(StepPipeline):
         self.tools = tools or Tools(truncation=_settings.truncation, allowed_upload_paths=_settings.allowed_upload_paths)
         if _settings.action_page_filters:
             self.tools.apply_page_filters(_settings.action_page_filters)
+
+        # extract 工具接线（对齐 browser-use：page_extraction_llm 默认=主 llm；extraction_schema 注入）
+        if _settings.extract_llm is not None:
+            self.tools._extract_llm = LLMClient(_settings.extract_llm)
+        else:
+            self.tools._extract_llm = self.llm
+        self.tools._extraction_schema = _settings.extraction_schema
         ActionResult.display_max_chars = _settings.truncation.display_max_chars
         self.max_steps = _settings.max_steps
         self.max_failures = _settings.max_failures

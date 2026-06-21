@@ -292,21 +292,82 @@ class LLMClient:
 
         return result
 
-    async def extract(self, prompt: str, content: str, *, max_content_chars: int = 8000) -> str:
-        """Secondary LLM call for page data extraction."""
+    async def extract(
+        self,
+        prompt: str,
+        content: str,
+        *,
+        max_content_chars: int = 8000,
+        output_schema: dict[str, Any] | None = None,
+    ) -> str:
+        """Secondary LLM call for page data extraction.
+
+        When ``output_schema`` is a JSON Schema dict (top-level type=object with
+        properties), forces structured output via an Anthropic tool and returns
+        the validated JSON as a string. Otherwise returns free-text extraction.
+        """
+        # 最低限度校验 schema；不可用则降级 free-text（对齐 browser-use try/except 降级）
+        if output_schema is not None and (
+            not isinstance(output_schema, dict)
+            or output_schema.get("type") != "object"
+            or not output_schema.get("properties")
+        ):
+            logger.warning("Invalid output_schema, falling back to free-text extraction")
+            output_schema = None
+
+        content = content[:max_content_chars]
+
+        if output_schema is not None:
+            system_prompt = (
+                "You are an expert at extracting structured data from a webpage. "
+                "Extract exactly what the query asks for and return it via the "
+                "extract_result tool, conforming strictly to the provided JSON Schema. "
+                "Omit fields you cannot find rather than guessing."
+            )
+            tool = {
+                "name": "extract_result",
+                "description": "Structured extraction result conforming to the given schema.",
+                "input_schema": output_schema,
+            }
+            try:
+                response = self.client.messages.create(
+                    model=self.model,
+                    max_tokens=2048,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": f"{prompt}\n\n---\n{content}"}],
+                    tools=[tool],
+                    tool_choice={"type": "tool", "name": "extract_result"},
+                )
+            except (RateLimitError, APIError) as e:
+                if self._try_switch_to_fallback(e):
+                    return await self.extract(
+                        prompt, content, max_content_chars=max_content_chars, output_schema=output_schema,
+                    )
+                raise
+            for block in response.content:
+                if getattr(block, "type", None) == "tool_use" and getattr(block, "name", None) == "extract_result":
+                    if isinstance(block.input, dict):
+                        return json.dumps(block.input, ensure_ascii=False)
+            # 模型未用工具 → 同一响应里取 text 兜底
+            logger.warning("LLM did not use extract_result tool; falling back to free-text")
+            text_parts = [b.text for b in response.content if hasattr(b, "text")]
+            return "\n".join(text_parts)
+
+        # free-text 路径（goal 进 user message）
         try:
             response = self.client.messages.create(
                 model=self.model,
                 max_tokens=2048,
                 messages=[
-                    {"role": "user", "content": f"{prompt}\n\n---\n{content[:max_content_chars]}"},
+                    {"role": "user", "content": f"{prompt}\n\n---\n{content}"},
                 ],
             )
         except (RateLimitError, APIError) as e:
             if self._try_switch_to_fallback(e):
-                return await self.extract(prompt, content, max_content_chars=max_content_chars)
+                return await self.extract(
+                    prompt, content, max_content_chars=max_content_chars, output_schema=output_schema,
+                )
             raise
-
         text_parts = [b.text for b in response.content if hasattr(b, "text")]
         return "\n".join(text_parts)
 

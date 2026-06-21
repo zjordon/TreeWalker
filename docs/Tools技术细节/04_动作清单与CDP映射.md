@@ -314,36 +314,52 @@
   |---|---|---|
   | `goal` | `str` | What information to extract from the current page |
 
-- **主要逻辑**（[actions.py:239-253](../../src/tree_walker/tools/actions.py)）：
+- **主要逻辑**（[actions.py:633](../../src/tree_walker/tools/actions.py)）：
 
   ```python
   async def _action_extract(self, params: dict, browser: BrowserSession) -> ActionResult:
       goal = params["goal"]
       try:
           page_text = await browser.execute_js("document.body.innerText")
-      except Exception:
+      except Exception as e:
+          logger.warning("extract: document.body.innerText failed: %s", e)
           page_text = ""
       if not page_text:
           return ActionResult(extracted_content="(empty page)")
-      from tree_walker.llm.client import LLMClient
+
       llm = getattr(self, "_extract_llm", None)
-      if llm:
-          result = await llm.extract(goal, page_text[:self._truncation.extract_page_max_chars])
-          return ActionResult(extracted_content=result)
-      return ActionResult(extracted_content=page_text[:self._truncation.extract_fallback_max_chars])
+      if llm is None:
+          return ActionResult(extracted_content=page_text[:self._truncation.extract_fallback_max_chars])
+
+      schema = getattr(self, "_extraction_schema", None)
+      try:
+          result = await llm.extract(
+              goal,
+              page_text,
+              max_content_chars=self._truncation.extract_page_max_chars,
+              output_schema=schema,
+          )
+      except Exception as e:
+          logger.warning("extract: LLM call failed: %s", e)
+          return ActionResult(error=f"Extract failed: {e}")
+      return ActionResult(extracted_content=result)
   ```
 
-  二次调用 LLM 进行抽取（注入的 `_extract_llm` 通常是低成本小模型）。如未配置则降级返回前 N 个字符。
+  二次调用 LLM 进行抽取。`_extract_llm` 与 `_extraction_schema` 由 `Agent.__init__` 接线注入（默认 `_extract_llm` 复用主 llm；`extraction_schema` 来自 `AgentSettings`）。传 `output_schema` 时走结构化抽取，否则走 free-text；LLM 异常分级为 `ActionResult(error=...)`，不冒泡通用 catch。脱离 Agent 直接用 `Tools()` 时 `_extract_llm` 为 None → 降级返回前 N 个字符。
 
 - **CDP 调用清单**：
 
   | CDP 命令 | 主要参数 | 行号 |
   |---|---|---|
-  | `Runtime.evaluate` | `{expression: "document.body.innerText"}` | session.py:785 (经 execute_js) |
+  | `Runtime.evaluate` | `{expression: "document.body.innerText"}` | session.py:1809 (经 execute_js) |
 
-  二次 LLM 调用走 Anthropic `messages.create`（[client.py:262-278](../../src/tree_walker/llm/client.py)）。
+  二次 LLM 调用走 Anthropic `messages.create`（[client.py:295](../../src/tree_walker/llm/client.py)）：free-text 为普通补全；结构化为 tool-use 强约束（工具 `extract_result`、`input_schema=output_schema`、`tool_choice` 强制）。
 
-- **注意事项**：`_extract_llm` 默认未设置，需要在 `Tools` 构造后手动注入；否则走 fallback 路径。
+- **注意事项**：
+  - `_extract_llm` 默认在 `Agent.__init__` 接线为复用主 `llm`（对齐 browser-use `page_extraction_llm = llm`）；可经 `AgentSettings.extract_llm` 配专用小模型。
+  - `extraction_schema` 经 `AgentSettings.extraction_schema` 注入、对 LLM 隐藏（不进 `ExtractParams`）。传给 `LLMClient.extract` 后用 Anthropic tool-use 强约束产出结构化 JSON；schema 非法（非 object / 无 properties）自动降级 free-text。
+  - 结构化结果以 JSON 字符串进 `ActionResult.extracted_content`（与 free-text 类型一致）。
+  - 不加内层超时，依赖 `action_timeout`（默认 30s）。
 
 ---
 
