@@ -930,44 +930,58 @@
 
 ### 4.18 `search_page`
 
-- **description**：`Search for text within the current page content` / 在当前页面内容中搜索文本
+- **description**：`Search page text for a pattern (like grep). Zero LLM cost, instant. Returns matches with surrounding context, element path, and a total count. Set regex=True for regex patterns; use css_scope to search within a section. Read-only — does not scroll or highlight (use find_text for that).` / grep 式页面文本搜索：零 LLM 成本、瞬时返回带上下文与元素路径的匹配及总数；只读不滚动
 - **terminates_sequence**：False
 - **Pydantic 参数**：
 
   | 字段 | 类型 | 描述 |
   |---|---|---|
-  | `query` | `str` | Text to search within the current page |
+  | `query` | `str`（`min_length=1`） | Text or regex pattern to search for |
+  | `regex` | `bool`（默认 `False`） | Treat query as a regex（默认按字面量匹配，自动转义元字符） |
+  | `case_sensitive` | `bool`（默认 `False`） | Case-sensitive match（默认大小写不敏感） |
+  | `context_chars` | `int`（默认 `150`，`ge=0`） | 每条匹配的上下文字符数 |
+  | `css_scope` | `str \| None`（默认 `None`） | CSS 选择器限定搜索范围；未命中报错 |
+  | `max_results` | `int`（默认 `25`，`ge=1, le=200`） | 返回匹配上限（`total` 始终报真实总数） |
 
-- **主要逻辑**（[actions.py:460-475](../../src/tree_walker/tools/actions.py)）：
+- **主要逻辑**（action 层 [actions.py `_action_search_page`](../../src/tree_walker/tools/actions.py) + session 层 [session.py `BrowserSession.search_page`](../../src/tree_walker/browser/session.py)）：
+
+  action 层是薄编排 + 分级错误：硬错误（CDP 失败 / 非法 regex / `css_scope` 未命中）返回 `ActionResult(error="Search page failed: ...")`；软 miss（`total==0`）返回 `extracted_content == long_term_memory == "No matches for '...'"`（非 error，对齐 `find_text`）；命中则 `extracted_content` 为格式化清单、`long_term_memory` 为紧凑摘要 `Searched page for "...": N match(es) found.`。
 
   ```python
   async def _action_search_page(self, params: dict, browser: BrowserSession) -> ActionResult:
       query = params["query"]
-      js_code = (
-          "(function() {"
-          "  const body = document.body.innerText;"
-          f"  const lines = body.split('\\n').filter(l => l.toLowerCase().includes({repr(query.lower())}));"
-          "  return lines.slice(0, 20).join('\\n');"
-          "})()"
-      )
       try:
-          result = await browser.execute_js(js_code)
-          if result:
-              return ActionResult(extracted_content=str(result))
-          return ActionResult(extracted_content=f"No matches for '{query}'")
+          data = await browser.search_page(
+              query,
+              regex=params.get("regex", False),
+              case_sensitive=params.get("case_sensitive", False),
+              context_chars=params.get("context_chars", 150),
+              css_scope=params.get("css_scope"),
+              max_results=params.get("max_results", 25),
+          )
       except Exception as e:
-          return ActionResult(error=str(e))
+          logger.warning("search_page(%r) failed: %s", query, e)
+          return ActionResult(error=f"Search page failed: {e}")
+      total = data.get("total", 0)
+      if total == 0:
+          msg = f"No matches for '{query}'"
+          return ActionResult(extracted_content=msg, long_term_memory=msg)
+      formatted = _format_search_results(data, query)
+      memory = f'Searched page for "{query}": {total} match{"es" if total != 1 else ""} found.'
+      return ActionResult(extracted_content=formatted, long_term_memory=memory)
   ```
 
-  返回最多 20 行匹配，大小写不敏感。
+  session 层 `BrowserSession.search_page` 组装一个 TreeWalker-TextNodes IIFE（移植自 browser-use `service.py:181-255`）：把范围内所有文本节点拼成带 `{offset, length, node}` 偏移索引的大字符串，用 `g`-flag `RegExp.exec` 循环（含零宽匹配保护）收集匹配，每条回填 `{match_text, context, element_path, char_position}`，返回 `{matches, total, has_more}`。用户值经 `json.dumps` 注入成 `var` 声明（绝不 f-string 拼用户串）；JS 层 `{error:...}` / null 翻译成 `RuntimeError` 上抛。
 
 - **CDP 调用清单**：
 
   | CDP 命令 | 主要参数 | 行号 |
   |---|---|---|
-  | `Runtime.evaluate` | `{expression: js_code}` | session.py:785 |
+  | `Runtime.evaluate` | `{expression, returnByValue: True, awaitPromise: True, timeout: 30000}`（经 `BrowserSession.execute_js`） | session.py `search_page` → `execute_js` |
 
-- **注意事项**：与 `find_text` 区别：`find_text` 用浏览器内置 `window.find()` 视觉滚动+高亮；`search_page` 是文本搜索返回匹配行。
+- **注意事项**：
+  - 与 `find_text` 的分工：`find_text` 用 `DOM.performSearch` 链路**滚动 + 高亮**首条匹配到视口；`search_page` 是**只读**的 grep 式全文检索，返回带上下文 / 元素路径 / 总数的匹配清单，不滚动、不高亮。
+  - 局限（与 browser-use 一致）：仅顶层文档文本节点；不进 iframe、不穿 shadow DOM。
 
 ---
 

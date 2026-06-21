@@ -43,8 +43,8 @@ async def main():
         "作品描述中的主标题为：ai浏览器第五期-browse-use,副标题为:'browse-use体验及技术原理'\n"
         "添加合集到'AI浏览器合集'\n"
         "自主声明选择'无需添加自主声明'\n"
-        "横封面图片在'D:\\dev\\git\\claude\\skills-deom\\ppt\\browser-use\\横封面.png'\n"
-        "竖封面图片在'D:\\dev\\git\\claude\\skills-deom\\ppt\\browser-use\\竖封面.png'"
+        "横封面图片在'D:\\dev\\git\\claude\\skills-deom\\ppt\\browser-use\\heng.png'\n"
+        "竖封面图片在'D:\\dev\\git\\claude\\skills-deom\\ppt\\browser-use\\shu.png'"
     )
 
     agent_settings = AgentSettings(
@@ -57,8 +57,8 @@ async def main():
         enable_planning=True,
         allowed_upload_paths=[
             r"D:\Videos\test\final\2026-04-29-20-41-59.mp4",
-            r"D:\dev\git\claude\skills-deom\ppt\browser-use\横封面.png",
-            r"D:\dev\git\claude\skills-deom\ppt\browser-use\竖封面.png",
+            r"D:\dev\git\claude\skills-deom\ppt\browser-use\heng.png",
+            r"D:\dev\git\claude\skills-deom\ppt\browser-use\shu.png",
         ],
     )
 

@@ -61,6 +61,31 @@ def _file_matches_accept(file_path: str, accept: str | None) -> bool:
     return False
 
 
+def _format_search_results(data: dict, query: str) -> str:
+    """Format search_page {matches, total, has_more} as LLM-readable text.
+
+    Mirrors browser-use ``_format_search_results`` (service.py:337-360). Caller
+    guarantees total > 0 (the total==0 soft-miss path is handled in
+    _action_search_page).
+    """
+    matches = data.get("matches", [])
+    total = data.get("total", 0)
+    has_more = data.get("has_more", False)
+
+    lines = [f'Found {total} match{"es" if total != 1 else ""} for "{query}" on page:', ""]
+    for i, m in enumerate(matches):
+        context = m.get("context", "")
+        path = m.get("element_path", "")
+        loc = f" (in {path})" if path else ""
+        lines.append(f"[{i + 1}] {context}{loc}")
+    if has_more:
+        lines.append(
+            f"\n... showing {len(matches)} of {total} total matches. "
+            f"Increase max_results to see more."
+        )
+    return "\n".join(lines)
+
+
 def _find_upload_label_near(
     node: EnhancedDOMTreeNode, max_ancestor: int = 4, max_depth: int = 3,
 ) -> int | None:
@@ -1183,20 +1208,34 @@ class Tools:
 
     async def _action_search_page(self, params: dict, browser: BrowserSession) -> ActionResult:
         query = params["query"]
-        js_code = (
-            "(function() {"
-            "  const body = document.body.innerText;"
-            f"  const lines = body.split('\\n').filter(l => l.toLowerCase().includes({repr(query.lower())}));"
-            "  return lines.slice(0, 20).join('\\n');"
-            "})()"
-        )
         try:
-            result = await browser.execute_js(js_code)
-            if result:
-                return ActionResult(extracted_content=str(result))
-            return ActionResult(extracted_content=f"No matches for '{query}'")
+            data = await browser.search_page(
+                query,
+                regex=params.get("regex", False),
+                case_sensitive=params.get("case_sensitive", False),
+                context_chars=params.get("context_chars", 150),
+                css_scope=params.get("css_scope"),
+                max_results=params.get("max_results", 25),
+            )
         except Exception as e:
-            return ActionResult(error=str(e))
+            # Hard error: CDP failure / invalid regex / css_scope not found —
+            # surface a search_page-specific error rather than bubbling to the
+            # generic Tools.execute catch (mirrors _action_find_text).
+            logger.warning("search_page(%r) failed: %s", query, e)
+            return ActionResult(error=f"Search page failed: {e}")
+        total = data.get("total", 0)
+        if total == 0:
+            # Soft miss: "text not on the page" is actionable info (the LLM can
+            # scroll / switch tab / accept the text is absent), not a tool
+            # failure — aligns with browser-use and _action_find_text (both
+            # return extracted_content, not error, on a miss).
+            msg = f"No matches for '{query}'"
+            logger.info(msg)
+            return ActionResult(extracted_content=msg, long_term_memory=msg)
+        formatted = _format_search_results(data, query)
+        memory = f'Searched page for "{query}": {total} match{"es" if total != 1 else ""} found.'
+        logger.info(memory)
+        return ActionResult(extracted_content=formatted, long_term_memory=memory)
 
     async def _action_done(self, params: dict, browser: BrowserSession) -> ActionResult:
         return ActionResult(
