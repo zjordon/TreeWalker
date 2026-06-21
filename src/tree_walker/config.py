@@ -77,6 +77,9 @@ class AgentSettings:
     action_page_filters: dict[str, list[str]] | None = None
     allowed_upload_paths: list[str] | None = None
     judge: JudgeSettings = field(default_factory=JudgeSettings)
+    # extract 工具：专用 LLM（None=复用主 llm）+ 结构化抽取的 JSON Schema（None=free-text）
+    extract_llm: LLMSettings | None = None
+    extraction_schema: dict | None = None
 
 
 @dataclass
