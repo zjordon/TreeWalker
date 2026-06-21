@@ -196,7 +196,11 @@ class TestCollectFileInputs:
 			],
 		}
 		result = _collect_file_inputs(dom_tree)
-		assert result == [3]
+		assert [fi.backend_node_id for fi in result] == [3]
+		# 无 snapshot_lookup 时 visible 保守为 True；无 accept / 无 upload 祖先
+		assert result[0].visible is True
+		assert result[0].accept == ""
+		assert result[0].upload_ancestor is False
 
 	def test_includes_shadow_dom(self):
 		dom_tree = {
@@ -220,7 +224,7 @@ class TestCollectFileInputs:
 			],
 		}
 		result = _collect_file_inputs(dom_tree)
-		assert 11 in result
+		assert 11 in [fi.backend_node_id for fi in result]
 
 	def test_includes_content_document(self):
 		dom_tree = {
@@ -263,7 +267,77 @@ class TestCollectFileInputs:
 			],
 		}
 		result = _collect_file_inputs(dom_tree)
-		assert 6 in result
+		assert 6 in [fi.backend_node_id for fi in result]
+
+	def test_collects_accept_and_upload_ancestor(self):
+		# 父 DIV class 含 semi-upload → input 的 upload_ancestor=True；accept 被记录
+		dom_tree = {
+			'nodeType': 1,
+			'nodeName': 'DIV',
+			'backendNodeId': 1,
+			'attributes': ['class', 'semi-upload semi-upload-choose'],
+			'children': [
+				{
+					'nodeType': 1,
+					'nodeName': 'INPUT',
+					'backendNodeId': 7,
+					'attributes': ['type', 'file', 'accept', 'image/png,image/jpeg'],
+				},
+			],
+		}
+		result = _collect_file_inputs(dom_tree)
+		assert len(result) == 1
+		fi = result[0]
+		assert fi.backend_node_id == 7
+		assert fi.accept == 'image/png,image/jpeg'
+		assert fi.upload_ancestor is True
+
+	def test_visible_false_when_display_none(self):
+		from types import SimpleNamespace
+		dom_tree = {
+			'nodeType': 1,
+			'nodeName': 'INPUT',
+			'backendNodeId': 9,
+			'attributes': ['type', 'file'],
+		}
+		snapshot_lookup = {9: SimpleNamespace(computed_styles={'display': 'none'})}
+		result = _collect_file_inputs(dom_tree, snapshot_lookup=snapshot_lookup)
+		assert result[0].visible is False
+
+	def test_visible_true_when_styles_ok(self):
+		from types import SimpleNamespace
+		dom_tree = {
+			'nodeType': 1,
+			'nodeName': 'INPUT',
+			'backendNodeId': 9,
+			'attributes': ['type', 'file'],
+		}
+		snapshot_lookup = {
+			9: SimpleNamespace(computed_styles={'display': 'block', 'visibility': 'visible', 'opacity': '1'}),
+		}
+		result = _collect_file_inputs(dom_tree, snapshot_lookup=snapshot_lookup)
+		assert result[0].visible is True
+
+	def test_visible_branches(self):
+		from types import SimpleNamespace
+		base = {
+			'nodeType': 1,
+			'nodeName': 'INPUT',
+			'backendNodeId': 9,
+			'attributes': ['type', 'file'],
+		}
+		# visibility:hidden
+		r = _collect_file_inputs(base, snapshot_lookup={9: SimpleNamespace(computed_styles={'visibility': 'hidden'})})
+		assert r[0].visible is False
+		# opacity:0
+		r = _collect_file_inputs(base, snapshot_lookup={9: SimpleNamespace(computed_styles={'opacity': '0'})})
+		assert r[0].visible is False
+		# opacity 非数字（except 分支）→ 保守视为可见
+		r = _collect_file_inputs(base, snapshot_lookup={9: SimpleNamespace(computed_styles={'opacity': ''})})
+		assert r[0].visible is True
+		# bid 不在 snapshot_lookup（snap is None）→ 保守视为可见
+		r = _collect_file_inputs(base, snapshot_lookup={999: SimpleNamespace(computed_styles={'display': 'none'})})
+		assert r[0].visible is True
 
 
 # ── TestEmptyDomState ────────────────────────────────────────────────────

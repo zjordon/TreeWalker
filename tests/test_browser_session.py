@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -240,3 +241,82 @@ class TestDiscoverFileInputViaClick:
         )
         assert session._last_file_chooser is not None
         assert session._last_file_chooser["backendNodeId"] == 55
+
+
+class TestSetFileInputAsciiSafe:
+	"""set_file_input 透明转 ASCII 文件名（抖音中文封面被前端误判「不支持的图片格式」）。"""
+
+	@pytest.mark.asyncio
+	async def test_non_ascii_defers_temp_cleanup_to_stop(self, tmp_path):
+		src = tmp_path / "横封面.png"
+		src.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+		client = _make_mock_cdp_client()
+		client.send.DOM.setFileInputFiles = AsyncMock(return_value={})
+		session = BrowserSession(ws_url="ws://localhost:9222")
+		session.client = client
+		session.current_session_id = "sid"
+
+		# 临时副本落在 tmp_path（隔离、便于断言清理）
+		with patch(
+			"tree_walker.browser.session.tempfile.gettempdir", return_value=str(tmp_path)
+		):
+			await session.set_file_input(backend_node_id=123, file_path=str(src))
+
+		sent = client.send.DOM.setFileInputFiles.call_args.args[0]
+		sent_path = sent["files"][0]
+		assert os.path.basename(sent_path).isascii()  # 传给浏览器的名是 ASCII
+		assert sent_path.endswith(".png")  # 保留扩展名
+		assert sent["backendNodeId"] == 123
+		assert src.exists()  # 原文件不动
+		# 关键：CDP 返回后临时副本仍存在（浏览器按路径惰性读盘），并已登记待清理
+		assert os.path.exists(sent_path)
+		assert session._upload_temp_paths == [sent_path]
+		# stop() 时才统一清理
+		await session.stop()
+		assert not os.path.exists(sent_path)
+		assert list(tmp_path.glob("tw_upload_*")) == []
+		assert session._upload_temp_paths == []
+
+	@pytest.mark.asyncio
+	async def test_ascii_filename_passthrough_no_temp_copy(self, tmp_path):
+		src = tmp_path / "cover.png"
+		src.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+		client = _make_mock_cdp_client()
+		client.send.DOM.setFileInputFiles = AsyncMock(return_value={})
+		session = BrowserSession(ws_url="ws://localhost:9222")
+		session.client = client
+		session.current_session_id = "sid"
+
+		await session.set_file_input(backend_node_id=7, file_path=str(src))
+
+		sent = client.send.DOM.setFileInputFiles.call_args.args[0]
+		assert sent["files"][0] == str(src)  # 原路径透传，无临时副本
+		assert sent["backendNodeId"] == 7
+		assert src.exists()
+		assert list(tmp_path.glob("tw_upload_*")) == []
+		assert session._upload_temp_paths == []  # ASCII 不复制临时副本
+
+	@pytest.mark.asyncio
+	async def test_temp_persists_after_cdp_failure_then_cleaned_at_stop(self, tmp_path):
+		src = tmp_path / "横封面.png"
+		src.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+		client = _make_mock_cdp_client()
+		client.send.DOM.setFileInputFiles = AsyncMock(side_effect=RuntimeError("CDP down"))
+		session = BrowserSession(ws_url="ws://localhost:9222")
+		session.client = client
+		session.current_session_id = "sid"
+
+		with patch(
+			"tree_walker.browser.session.tempfile.gettempdir", return_value=str(tmp_path)
+		):
+			with pytest.raises(RuntimeError):
+				await session.set_file_input(backend_node_id=123, file_path=str(src))
+
+		assert src.exists()  # 原文件不动
+		# 即使 CDP 抛错，临时副本也已登记（登记在 await 之前），仍存活、由 stop() 清理
+		assert len(session._upload_temp_paths) == 1
+		pending = session._upload_temp_paths[0]
+		assert os.path.exists(pending)
+		await session.stop()
+		assert not os.path.exists(pending)
+		assert list(tmp_path.glob("tw_upload_*")) == []

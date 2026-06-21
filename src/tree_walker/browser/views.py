@@ -675,6 +675,20 @@ class PropagatingBounds:
 
 
 @dataclass
+class FileInputInfo:
+	"""单个 <input type=file> 的元数据：帮 LLM 在多 input 页面锁定正确的上传入口。
+
+	抖音封面编辑器有多个 file input，多数是隐藏「诱饵」（无 handler）。
+	accept / visible / upload_ancestor 让 LLM 优先选可见且在 upload 容器内的 live input。
+	"""
+
+	backend_node_id: int
+	accept: str = ""
+	visible: bool = True
+	upload_ancestor: bool = False
+
+
+@dataclass
 class SerializedDOMState:
 	"""Final serialized DOM state for LLM consumption."""
 
@@ -682,6 +696,7 @@ class SerializedDOMState:
 	selector_map: DOMSelectorMap
 	element_tree_text: str
 	file_input_backend_ids: list[int] = field(default_factory=list)
+	file_inputs_meta: list[FileInputInfo] = field(default_factory=list)
 
 	def llm_representation(self, include_attributes: list[str] | None = None) -> str:
 		if not self._root:

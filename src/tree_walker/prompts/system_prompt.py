@@ -168,6 +168,21 @@ def build_state_message(
     else:
         parts.append("[Page DOM] (empty or not available)")
 
+    # File inputs (help pick the right one when several exist, e.g. 抖音 cover editor)
+    if browser_state.dom_state and len(browser_state.dom_state.file_inputs_meta) > 1:
+        parts.append("[File Inputs]")
+        parts.append(
+            "Multiple file inputs on this page. Prefer one that is visible and inside an "
+            "upload container (upload-ancestor=yes); hidden inputs are often decoys with no "
+            "handler (upload reports success but the page does not change)."
+        )
+        for fi in browser_state.dom_state.file_inputs_meta:
+            vis = "visible" if fi.visible else "hidden"
+            up = "yes" if fi.upload_ancestor else "no"
+            acc = f" accept={fi.accept}" if fi.accept else ""
+            parts.append(f"  [{fi.backend_node_id}] {vis}, upload-ancestor={up}{acc}")
+        parts.append("")
+
     # Download notifications
     if download_notice:
         parts.append("")

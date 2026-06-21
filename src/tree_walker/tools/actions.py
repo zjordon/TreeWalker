@@ -979,9 +979,13 @@ class Tools:
 
         backend_id = entry.backend_node_id
         file_input_ids: list[int] = []
+        file_inputs_meta: list = []
         if self._cached_browser_state and self._cached_browser_state.dom_state:
             file_input_ids = list(
                 self._cached_browser_state.dom_state.file_input_backend_ids,
+            )
+            file_inputs_meta = list(
+                self._cached_browser_state.dom_state.file_inputs_meta,
             )
         upload_note = ""
 
@@ -990,12 +994,22 @@ class Tools:
             # 封面"等无关 input）。但仍信任 agent 指定的 index 直接 setFileInputFiles——
             # 抖音封面无 <label>（issue #34），"改点可见上传按钮"这条路走不通，硬拒绝
             # 反而导致 0% 成功率（实测 master 直接 set 能传）。改为软警告：仍上传到
-            # agent 指定的 index，若命中错误 input（如收藏封面弹出收藏框）由 agent 重试。
+            # agent 指定的 index，同时点名「可见 + upload 容器内」的候选 input；
+            # 若本次未生效（页面无变化 = 命中隐藏诱饵，或弹出收藏框）就改试这些候选。
+            live_candidates = [
+                fi.backend_node_id for fi in file_inputs_meta
+                if getattr(fi, "visible", False) and getattr(fi, "upload_ancestor", False)
+            ]
+            cand_hint = (
+                f" Likely-live candidates (visible + upload container): {live_candidates}."
+                if live_candidates else ""
+            )
             upload_note = (
                 f"  ⚠️ Page has {len(file_input_ids)} file inputs; uploaded to the one "
-                f"you specified (index {params['index']}). If the site reacted wrongly "
-                f"(e.g. a 收藏封面/favorite-cover modal popped), the index was wrong — "
-                f"retry upload_file on the correct visible upload area."
+                f"you specified (index {params['index']}).{cand_hint} If the site reacted "
+                f"wrongly (a 收藏封面/favorite-cover modal popped, or nothing changed = "
+                f"you hit a hidden decoy input), retry upload_file on the correct visible "
+                f"upload area."
             )
 
         if not is_file_input:
