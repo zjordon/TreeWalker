@@ -5,6 +5,30 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.4.0] - 2026-06-21
+
+### Added
+
+- **switch_tab 工具完善**（#21）：成功回显 + 后缀冲突检测 + 轻量枚举 + 点击开新页自动切换
+- **close_tab 工具完善**（#23）：成功回显 + 后缀冲突检测 + 轻量枚举 + 失效 target 软降级
+- **scroll 工具完善**（#25）：成功回显 + 当轮到底提示 + 参数校验 + 异常软降级
+- **send_keys 工具完善**（#27）：成功回显 + 异常处理 + 别名归一化 + 完整特殊键映射 + 文本逐字符分支 + 参数校验
+- **find_text 工具完善**（#29）：CDP 文本搜索替换 window.find + 成功回显 + 软未找到回显 + 兑现 highlight + 修复 browser-use 4 个 bug
+- **dropdown_options 工具完善**（#31）：修复范围 bug + tag 校验 + 成功回显 + json 编码输出
+- **select_dropdown 工具完善**（#33）：修复范围 bug + tag 校验 + native 完整选择链 + 读回验证 + 点击回退 + 选项未命中软回显
+- **screenshot 工具优化阶段一**（#39）：参数化 + 降采样 + 断路止血
+- **save_as_pdf 工具优化阶段一**（#41）：参数化 + BrowserSession 封装 + 错误分级捕获
+
+### Fixed
+
+- **upload_file 抖音封面上传修复**（#35）：CDP label-gesture 上传链 + 多 file input 软警告
+- **upload_file 抖音中文封面被拒 + Bilibili 封面假成功**（#37）：ASCII 临时名 + 延迟清理 + file-input 元数据
+
+### Docs
+
+- 新增 / 同步各工具完善方案文档：send_keys、find_text、dropdown_options、select_dropdown
+- 修改基础示例提示词
+
 ## [0.3.0] - 2026-06-19
 
 ### Added
@@ -82,6 +106,7 @@
 - 编程接口（`Agent`、`LLMClient`、`BrowserSession` 可独立使用）
 - 498 项单元测试
 
+[0.4.0]: https://github.com/zjordon/TreeWalker/releases/tag/v0.4.0
 [0.3.0]: https://github.com/zjordon/TreeWalker/releases/tag/v0.3.0
 [0.2.0]: https://github.com/zjordon/TreeWalker/releases/tag/v0.2.0
 [0.1.0]: https://github.com/zjordon/TreeWalker/releases/tag/v0.1.0
