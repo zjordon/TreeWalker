@@ -821,13 +821,35 @@ class Tools:
         return ActionResult(extracted_content=memory, long_term_memory=memory)
 
     async def _action_screenshot(self, params: dict, browser: BrowserSession) -> ActionResult:
-        screenshot_bytes = await browser.take_screenshot()
-        save_path = params.get("save_path", "")
+        fmt: str = params.get("format", "png")
+        quality = params.get("quality")
+        clip = params.get("clip")
+        full_page: bool = params.get("full_page", False)
+        save_path: str = params.get("save_path", "")
+
+        try:
+            screenshot_bytes = await browser.take_screenshot(
+                format=fmt, quality=quality, clip=clip,
+                full_page=full_page, wait_settle=full_page,
+            )
+        except Exception as e:
+            logger.warning("screenshot action failed: %s", e)
+            return ActionResult(error=f"Screenshot failed: {e}")
+
         if save_path:
-            with open(save_path, "wb") as f:
-                f.write(screenshot_bytes)
-            return ActionResult(extracted_content=f"Screenshot saved to {save_path}")
-        return ActionResult()
+            try:
+                with open(save_path, "wb") as f:
+                    f.write(screenshot_bytes)
+            except OSError as e:
+                return ActionResult(error=f"Failed to save screenshot to {save_path}: {e}")
+            return ActionResult(extracted_content=f"Screenshot saved to {save_path} ({len(screenshot_bytes)} bytes)")
+
+        meta = f"format={fmt}, {len(screenshot_bytes)} bytes"
+        if full_page:
+            meta += ", full_page"
+        if clip:
+            meta += f", clip={clip.get('width')}x{clip.get('height')}"
+        return ActionResult(extracted_content=f"Screenshot captured ({meta}) but not saved (no save_path).")
 
     async def _action_save_as_pdf(self, params: dict, browser: BrowserSession) -> ActionResult:
         import base64
