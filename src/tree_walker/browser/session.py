@@ -169,6 +169,84 @@ def _build_search_page_js(
     return "(function() {\n" + params_js + _SEARCH_PAGE_JS_BODY + "\n})()"
 
 
+# ── find_elements (CSS selector element query) ──────────────────────
+
+# JS body for find_elements: querySelectorAll + per-element extraction
+# (tag, text, attributes, children_count), returning {elements, total,
+# showing} (or {error}). Mirrors browser-use _FIND_ELEMENTS_JS_BODY
+# (service.py:257-298). User values are injected as `var` declarations by
+# _build_find_elements_js (never f-string-interpolated), so this body only
+# references SELECTOR/ATTRIBUTES/MAX_RESULTS/INCLUDE_TEXT by name. Stored
+# raw so JS backslashes survive verbatim.
+_FIND_ELEMENTS_JS_BODY = r"""
+    try {
+        var elements;
+        try {
+            elements = document.querySelectorAll(SELECTOR);
+        } catch (e) {
+            return {error: 'Invalid CSS selector: ' + (e && e.message ? e.message : e), elements: [], total: 0};
+        }
+        var total = elements.length;
+        var limit = Math.min(total, MAX_RESULTS);
+        var results = [];
+        for (var i = 0; i < limit; i++) {
+            var el = elements[i];
+            var item = {index: i, tag: el.tagName.toLowerCase()};
+            if (INCLUDE_TEXT) {
+                var text = (el.textContent || '').trim();
+                item.text = text.length > 300 ? text.slice(0, 300) + '...' : text;
+            }
+            if (ATTRIBUTES && ATTRIBUTES.length > 0) {
+                item.attrs = {};
+                for (var j = 0; j < ATTRIBUTES.length; j++) {
+                    var attrName = ATTRIBUTES[j];
+                    var val;
+                    // src/href: use the resolved DOM property (absolute URL),
+                    // not getAttribute (raw authored value, often relative).
+                    if ((attrName === 'src' || attrName === 'href')
+                        && typeof el[attrName] === 'string' && el[attrName] !== '') {
+                        val = el[attrName];
+                    } else {
+                        val = el.getAttribute(attrName);
+                    }
+                    if (val !== null) {
+                        item.attrs[attrName] = val.length > 500 ? val.slice(0, 500) + '...' : val;
+                    }
+                }
+            }
+            item.children_count = el.children.length;
+            results.push(item);
+        }
+        return {elements: results, total: total, showing: limit};
+    } catch (e) {
+        return {error: 'find_elements error: ' + (e && e.message ? e.message : e), elements: [], total: 0};
+    }
+"""
+
+
+def _build_find_elements_js(
+    selector: str,
+    attributes: list[str] | None,
+    max_results: int,
+    include_text: bool,
+) -> str:
+    """Build the find_elements IIFE expression.
+
+    Each user value is serialized via ``json.dumps`` into a ``var``
+    declaration and the body references those vars by name — the body is a
+    constant string with NO f-string interpolation of user text. This is the
+    safe-injection pattern (mirrors browser-use service.py:321-334) and
+    matches the project's ``_build_search_page_js`` above.
+    """
+    params_js = (
+        f"var SELECTOR = {json.dumps(selector)};\n"
+        f"var ATTRIBUTES = {json.dumps(attributes)};\n"
+        f"var MAX_RESULTS = {json.dumps(max_results)};\n"
+        f"var INCLUDE_TEXT = {json.dumps(include_text)};\n"
+    )
+    return "(function() {\n" + params_js + _FIND_ELEMENTS_JS_BODY + "\n})()"
+
+
 def _walk_for_file_inputs(node: dict) -> list[int]:
     """Recursively walk a CDP DOM Node tree to find file input backendNodeIds."""
     results: list[int] = []
@@ -2088,6 +2166,39 @@ class BrowserSession:
             raise RuntimeError("search_page returned no result")
         if isinstance(data, dict) and data.get("error"):
             raise RuntimeError(f"search_page: {data['error']}")
+        return data
+
+    async def find_elements(
+        self,
+        selector: str,
+        *,
+        attributes: list[str] | None = None,
+        max_results: int = 50,
+        include_text: bool = True,
+    ) -> dict:
+        """Query DOM elements by CSS selector via a single Runtime.evaluate.
+
+        Mirrors browser-use ``find_elements`` (``service.py:1297-1330`` + JS
+        body ``:257-298``): ``document.querySelectorAll`` + per-element
+        extraction (tag, text, attributes, children_count), returning
+        ``{elements, total, showing}``. ``src``/``href`` resolve to absolute
+        URLs.
+
+        Raises ``RuntimeError`` on a JS exception (via ``execute_js``), on a
+        null return, or when the JS layer reports ``{error: ...}`` (invalid
+        CSS selector) — the action layer maps these to a hard
+        ``ActionResult(error=...)``. A clean miss returns ``total=0`` and
+        never raises; the action layer builds the soft echo.
+
+        Limitations (same as browser-use): top-document elements only; does
+        not pierce shadow DOM or traverse into iframes.
+        """
+        js = _build_find_elements_js(selector, attributes, max_results, include_text)
+        data = await self.execute_js(js)  # returnByValue=True -> dict; RuntimeError on exceptionDetails
+        if data is None:
+            raise RuntimeError("find_elements returned no result")
+        if isinstance(data, dict) and data.get("error"):
+            raise RuntimeError(f"find_elements: {data['error']}")
         return data
 
     async def fetch_select_options(self, backend_node_id: int) -> list[dict]:

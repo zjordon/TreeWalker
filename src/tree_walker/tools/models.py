@@ -93,7 +93,19 @@ class GoBackParams(BaseModel):
 
 class FindElementsParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    selector: str = Field(description="CSS selector to find elements on the page")
+    selector: str = Field(
+        description='CSS selector to query elements (e.g. "table tr", "a.link", "div.product")'
+    )
+    attributes: list[str] | None = Field(
+        default=None,
+        description='Specific attributes to extract (e.g. ["href", "src", "class"]). '
+        'If not set, returns tag and text only. src/href are resolved to absolute URLs.',
+    )
+    max_results: int = Field(
+        default=50, ge=1, le=200,
+        description="Maximum elements to return (total count is always reported even when truncated).",
+    )
+    include_text: bool = Field(default=True, description="Include text content of each element")
 
 
 class FindTextParams(BaseModel):
@@ -232,7 +244,12 @@ ACTION_DEFINITIONS: dict[str, tuple[type[BaseModel], str, bool]] = {
     "go_back": (GoBackParams, "Navigate back to the previous page in history", True),
     "find_elements": (
         FindElementsParams,
-        "Find elements on the page using a CSS selector",
+        "Query DOM elements by CSS selector (zero LLM cost, instant). Returns "
+        "matching elements with tag, text, and attributes. Use "
+        "attributes=['href','src'] to extract specific attributes (src/href "
+        "resolve to absolute URLs). max_results caps the returned list; the total "
+        "count is always reported. Use to explore page structure, count items, "
+        "get links/attributes.",
         False,
     ),
     "find_text": (FindTextParams, "Scroll to and highlight text on the page", False),
