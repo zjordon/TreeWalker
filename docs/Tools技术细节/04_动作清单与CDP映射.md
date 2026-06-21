@@ -16,7 +16,7 @@
 | 4 | [dropdown_options](#44-dropdown_options) | 否 | `index: int` | Runtime (JS) | 读取 select 所有 option |
 | 5 | [evaluate](#45-evaluate) | 是 | `code: str` | Runtime | 执行任意 JS，返回结果 |
 | 6 | [extract](#46-extract) | 否 | `goal: str` | Runtime + LLM | 二次 LLM 抽取页面信息 |
-| 7 | [find_elements](#47-find_elements) | 否 | `selector: str` | Runtime (JS) | CSS 选择器查找元素 |
+| 7 | [find_elements](#47-find_elements) | 否 | `selector, attributes?, max_results?, include_text?` | Runtime (JS) | CSS 选择器查询元素（tag/text/attrs/children_count + 总数） |
 | 8 | [find_text](#48-find_text) | 否 | `text: str` | DOM + Overlay (+ Runtime) | CDP performSearch 滚动到文本并高亮 |
 | 9 | [go_back](#49-go_back) | 是 | (无) | Page | 浏览器后退 |
 | 10 | [input_text](#410-input_text) | 否 | `index, text, clear` | DOM + Input + Runtime | 点击+输入文本+触发框架事件 |
@@ -365,42 +365,58 @@
 
 ### 4.7 `find_elements`
 
-- **description**：`Find elements on the page using a CSS selector` / 使用 CSS 选择器查找页面元素
+- **description**：`Query DOM elements by CSS selector (zero LLM cost, instant). Returns matching elements with tag, text, and attributes...` / 按 CSS 选择器查询元素（瞬时、零 LLM 成本），返回 tag / text / 指定 attributes / children_count + 总数
 - **terminates_sequence**：False
-- **Pydantic 参数**：
+- **Pydantic 参数**（[models.py `FindElementsParams`](../../src/tree_walker/tools/models.py)）：
 
-  | 字段 | 类型 | 描述 |
-  |---|---|---|
-  | `selector` | `str` | CSS selector to find elements on the page |
+  | 字段 | 类型 | 默认 | 描述 |
+  |---|---|---|---|
+  | `selector` | `str` | （必填） | CSS selector to query elements（如 `"table tr"`、`"a.link"`、`"div.product"`） |
+  | `attributes` | `list[str] \| None` | `None` | 指定要提取的属性（如 `["href","src","class"]`）；不传则只返回 tag + text；`src`/`href` 解析为绝对 URL |
+  | `max_results` | `int` (`ge=1, le=200`) | `50` | 返回元素上限（`total` 始终回真实命中数，即使被截断） |
+  | `include_text` | `bool` | `True` | 是否包含元素文本 |
 
-- **主要逻辑**（[actions.py:289-302](../../src/tree_walker/tools/actions.py)）：
+- **封装分层**：
+  - **session 层**（[session.py `_build_find_elements_js` / `BrowserSession.find_elements`](../../src/tree_walker/browser/session.py)）：单次 `Runtime.evaluate` 执行 `querySelectorAll` IIFE（两层 try/catch），逐元素取 `{index, tag, text?, attrs?, children_count}`，返回 `{elements, total, showing}`；`src`/`href` 走 DOM 属性（`el.href`）拿绝对 URL、其余走 `getAttribute`，null 属性跳过；text 截 300、attr 值截 500。JS 层 `{error:...}`（非法选择器）/ 空返回 → `RuntimeError`，由 action 捕获。
+  - **action 层**（[actions.py `_action_find_elements` / `_format_find_results`](../../src/tree_walker/tools/actions.py)）：薄编排 + 三层分流 —— 硬错误（`RuntimeError`）→ `ActionResult(error="Find elements failed: ...")` + `logger.warning`；软 miss（`total==0`）→ `extracted_content == long_term_memory == 'No elements found matching "..."'`；命中 → `_format_find_results` 渲染多行文本进 `extracted_content`、紧凑摘要 `'Found N element(s) matching "..."'` 进 `long_term_memory`。
+
+- **主要逻辑**（[actions.py](../../src/tree_walker/tools/actions.py)）：
 
   ```python
   async def _action_find_elements(self, params: dict, browser: BrowserSession) -> ActionResult:
       selector = params["selector"]
-      js_code = (
-          f"Array.from(document.querySelectorAll({repr(selector)}))"
-          ".map((e, i) => ({"
-          "index: i, tag: e.tagName, text: (e.textContent || '').substring(0, 100).trim(),"
-          "href: e.href || '', visible: e.offsetParent !== null"
-          "}))"
-      )
+      attributes = params.get("attributes")
+      max_results = params.get("max_results", 50)
+      include_text = params.get("include_text", True)
       try:
-          result = await browser.execute_js(js_code)
-          return ActionResult(extracted_content=str(result))
+          data = await browser.find_elements(
+              selector, attributes=attributes, max_results=max_results, include_text=include_text,
+          )
       except Exception as e:
-          return ActionResult(error=str(e))
+          logger.warning("find_elements(%r) failed: %s", selector, e)
+          return ActionResult(error=f"Find elements failed: {e}")
+      total = data.get("total", 0)
+      if total == 0:
+          msg = f'No elements found matching "{selector}"'
+          logger.info(msg)
+          return ActionResult(extracted_content=msg, long_term_memory=msg)
+      formatted = _format_find_results(data, selector)
+      memory = f'Found {total} element{"s" if total != 1 else ""} matching "{selector}".'
+      logger.info(memory)
+      return ActionResult(extracted_content=formatted, long_term_memory=memory)
   ```
 
-  返回每个匹配元素的索引、tag、文本（截断 100 字符）、href、是否可见。
+  返回每个匹配元素的索引、tag、text（截断 300 字符）、指定 attributes（值截断 500）、children_count；并回显真实命中总数 `total`（即使被 `max_results` 截断，尾注提示 `Showing K of N total elements`）。
 
 - **CDP 调用清单**：
 
   | CDP 命令 | 主要参数 | 行号 |
   |---|---|---|
-  | `Runtime.evaluate` | `{expression: js_code}` | session.py:785 |
+  | `Runtime.evaluate` | `{expression, returnByValue, awaitPromise, timeout:30000}` | session.py（`execute_js`） |
 
-- **注意事项**：`repr(selector)` 会用 Python 字符串字面量包装，避免 JS 注入风险。
+- **错误分级**：非法 CSS 选择器（`querySelectorAll` 抛 `DOMException`）→ JS 内层 try/catch 捕获 → `{error}` → session `RuntimeError` → action 硬错误 `Find elements failed: ...`；零命中（`total==0`）不是错误，走软回显；JS 执行异常（`exceptionDetails`）由 `execute_js` 翻译成 `RuntimeError("JS error: ...")` 上抛。
+- **安全**：用户值（selector / attributes / max_results / include_text）经 `json.dumps` 注入成 `var` 声明（绝不 f-string 拼用户串），含 `"` / `\` / 中文的选择器安全转义。
+- **限制**（同 browser-use）：仅顶层文档 light-DOM 元素；不进 iframe、不穿 shadow DOM。
 
 ---
 

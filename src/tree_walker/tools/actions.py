@@ -86,6 +86,44 @@ def _format_search_results(data: dict, query: str) -> str:
     return "\n".join(lines)
 
 
+def _format_find_results(data: dict, selector: str) -> str:
+    """Format find_elements {elements, total, showing} as LLM-readable text.
+
+    Mirrors browser-use ``_format_find_results`` (``service.py:363-401``).
+    Caller guarantees total > 0 (the total==0 soft-miss path is handled in
+    _action_find_elements).
+    """
+    elements = data.get("elements", [])
+    total = data.get("total", 0)
+    showing = data.get("showing", 0)
+
+    lines = [f'Found {total} element{"s" if total != 1 else ""} matching "{selector}":', ""]
+    for el in elements:
+        idx = el.get("index", 0)
+        tag = el.get("tag", "?")
+        text = el.get("text", "")
+        attrs = el.get("attrs", {})
+        children = el.get("children_count", 0)
+
+        parts = [f"[{idx}] <{tag}>"]
+        if text:
+            display_text = " ".join(text.split())
+            if len(display_text) > 120:
+                display_text = display_text[:120] + "..."
+            parts.append(f'"{display_text}"')
+        if attrs:
+            attr_strs = [f'{k}="{v}"' for k, v in attrs.items()]
+            parts.append("{" + ", ".join(attr_strs) + "}")
+        parts.append(f"({children} children)")
+        lines.append(" ".join(parts))
+
+    if showing < total:
+        lines.append(
+            f"\nShowing {showing} of {total} total elements. Increase max_results to see more."
+        )
+    return "\n".join(lines)
+
+
 def _find_upload_label_near(
     node: EnhancedDOMTreeNode, max_ancestor: int = 4, max_depth: int = 3,
 ) -> int | None:
@@ -817,18 +855,35 @@ class Tools:
 
     async def _action_find_elements(self, params: dict, browser: BrowserSession) -> ActionResult:
         selector = params["selector"]
-        js_code = (
-            f"Array.from(document.querySelectorAll({repr(selector)}))"
-            ".map((e, i) => ({"
-            "index: i, tag: e.tagName, text: (e.textContent || '').substring(0, 100).trim(),"
-            "href: e.href || '', visible: e.offsetParent !== null"
-            "}))"
-        )
+        attributes = params.get("attributes")
+        max_results = params.get("max_results", 50)
+        include_text = params.get("include_text", True)
         try:
-            result = await browser.execute_js(js_code)
-            return ActionResult(extracted_content=str(result))
+            data = await browser.find_elements(
+                selector,
+                attributes=attributes,
+                max_results=max_results,
+                include_text=include_text,
+            )
         except Exception as e:
-            return ActionResult(error=str(e))
+            # CDP layer failure (connection drop / invalid selector surfaced as
+            # {error} -> RuntimeError) = tool execution failure; surface a
+            # find_elements-specific error rather than the generic Tools.execute
+            # fallback. Aligns with _action_find_text / _action_search_page.
+            logger.warning("find_elements(%r) failed: %s", selector, e)
+            return ActionResult(error=f"Find elements failed: {e}")
+        total = data.get("total", 0)
+        if total == 0:
+            # Soft echo: "selector matched nothing" is actionable info (LLM can
+            # fix the selector / wait / accept absence), not a tool failure —
+            # aligns with find_text / search_page / browser-use.
+            msg = f'No elements found matching "{selector}"'
+            logger.info(msg)
+            return ActionResult(extracted_content=msg, long_term_memory=msg)
+        formatted = _format_find_results(data, selector)
+        memory = f'Found {total} element{"s" if total != 1 else ""} matching "{selector}".'
+        logger.info(memory)
+        return ActionResult(extracted_content=formatted, long_term_memory=memory)
 
     async def _action_find_text(self, params: dict, browser: BrowserSession) -> ActionResult:
         text = params["text"]
