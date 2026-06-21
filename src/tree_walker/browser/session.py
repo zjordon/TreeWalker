@@ -690,8 +690,9 @@ class BrowserSession:
         if include_screenshot:
             try:
                 screenshot = await self.take_screenshot()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("get_state: take_screenshot failed: %s", e)
+                screenshot = None
 
         # Re-inject debug highlights after screenshot (visible in browser, not in screenshot)
         if self._highlight_settings.enabled and self._highlight_settings.debug_mode and self._cached_selector_map:
@@ -708,12 +709,58 @@ class BrowserSession:
             screenshot=screenshot,
         )
 
-    async def take_screenshot(self) -> bytes:
-        """Capture a PNG screenshot of the current viewport."""
-        result = await self.client.send.Page.captureScreenshot(
-            {"format": "png"},
-            session_id=self.current_session_id,
-        )
+    async def take_screenshot(
+        self,
+        format: str = "png",
+        quality: int | None = None,
+        clip: dict | None = None,
+        full_page: bool = False,
+        wait_settle: bool = False,
+    ) -> bytes:
+        """Capture a screenshot of the current viewport.
+
+        Args:
+            format: 'png' | 'jpeg' | 'webp'.
+            quality: 0-100, only effective when format == 'jpeg' (CDP constraint).
+            clip: optional rect {'x','y','width','height'} in CSS px (scale forced to 1).
+            full_page: capture the full scrollable page (captureBeyondViewport=True).
+            wait_settle: poll document.readyState to 'complete' before capturing.
+
+        Raises:
+            RuntimeError: if CDP returns no 'data' field.
+        """
+        if wait_settle:
+            try:
+                await self._wait_for_page_settle()
+            except Exception as e:
+                logger.warning("Pre-screenshot wait_settle failed: %s", e)
+
+        params: dict = {"format": format}
+        if full_page:
+            params["captureBeyondViewport"] = True
+        if quality is not None and format == "jpeg":
+            params["quality"] = int(quality)
+        if clip is not None:
+            params["clip"] = {
+                "x": clip.get("x", 0.0),
+                "y": clip.get("y", 0.0),
+                "width": clip.get("width", 0.0),
+                "height": clip.get("height", 0.0),
+                "scale": 1,
+            }
+
+        try:
+            result = await self.client.send.Page.captureScreenshot(
+                params,
+                session_id=self.current_session_id,
+            )
+        except Exception as e:
+            logger.warning("Page.captureScreenshot failed: %s", e)
+            raise
+
+        if not isinstance(result, dict) or "data" not in result:
+            raise RuntimeError("Screenshot failed - no data returned")
+
         return base64.b64decode(result["data"])
 
     # ── Navigation ─────────────────────────────────────────────────────

@@ -101,9 +101,25 @@ class FindTextParams(BaseModel):
     text: str = Field(min_length=1, description="Text to search for on the page")
 
 
+class ScreenshotClipParams(BaseModel):
+    """Viewport rectangle for a clipped screenshot, in CSS pixels."""
+    model_config = ConfigDict(extra="forbid")
+    x: float = Field(default=0.0, ge=0.0, description="Left offset in CSS pixels")
+    y: float = Field(default=0.0, ge=0.0, description="Top offset in CSS pixels")
+    width: float = Field(gt=0.0, description="Rectangle width in CSS pixels")
+    height: float = Field(gt=0.0, description="Rectangle height in CSS pixels")
+
+
 class ScreenshotParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    save_path: str = Field(default="", description="Optional file path to save the screenshot")
+    format: Literal["png", "jpeg", "webp"] = Field(
+        default="png",
+        description="Image format. 'jpeg' supports quality; 'png' is lossless.",
+    )
+    quality: int | None = Field(default=None, ge=0, le=100, description="0-100, only effective when format='jpeg'.")
+    clip: ScreenshotClipParams | None = Field(default=None, description="Optional viewport rect {x,y,width,height} (CSS px).")
+    full_page: bool = Field(default=False, description="Capture the full scrollable page instead of the viewport.")
+    save_path: str = Field(default="", description="Optional file path to save the screenshot bytes to disk.")
 
 
 class SaveAsPdfParams(BaseModel):
@@ -202,7 +218,8 @@ ACTION_DEFINITIONS: dict[str, tuple[type[BaseModel], str, bool]] = {
     "find_text": (FindTextParams, "Scroll to and highlight text on the page", False),
     "screenshot": (
         ScreenshotParams,
-        "Take a screenshot of the current viewport",
+        "Take a screenshot with optional format, quality (jpeg), clip region, "
+        "or full page. Saves to save_path if given.",
         False,
     ),
     "save_as_pdf": (SaveAsPdfParams, "Save the current page as a PDF file", False),

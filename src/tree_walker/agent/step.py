@@ -126,7 +126,8 @@ class StepPipeline:
     async def _prepare_context(self) -> tuple[BrowserStateSummary, str]:
         """Gather browser state and build the state message for the LLM."""
         # 1. Get browser state
-        browser_state = await self.browser.get_state(include_screenshot=True)
+        # 断路止血：每步截图暂不取（LLM 视觉通道尚未打通，见 docs/tools-optimize/screenshot.md 阶段二）
+        browser_state = await self.browser.get_state(include_screenshot=False)
 
         # 2. Log step context
         self._log_step_context(browser_state)
