@@ -31,6 +31,7 @@ from tree_walker.browser.views import (
 	EnhancedAXProperty,
 	EnhancedDOMTreeNode,
 	EnhancedSnapshotNode,
+	FileInputInfo,
 	NodeType,
 	SerializedDOMState,
 )
@@ -57,6 +58,7 @@ EMPTY_DOM_STATE = SerializedDOMState(
 	selector_map={},
 	element_tree_text="",
 	file_input_backend_ids=[],
+	file_inputs_meta=[],
 )
 
 # ── Helpers ────────────────────────────────────────────────────────────
@@ -466,22 +468,68 @@ def _build_snapshot_lookup(snapshot: dict, device_pixel_ratio: float = 1.0) -> d
 
 # ── File input scan from DOM tree ─────────────────────────────────────
 
-def _collect_file_inputs(node: dict) -> list[int]:
-	"""遍历 DOM.getDocument 树查找 file input 的 backendNodeId（包括 shadow DOM）。"""
-	results: list[int] = []
+def _node_has_upload_class(attrs: dict) -> bool:
+	"""节点的 class 是否含 upload / semi-upload（上传容器标识）。"""
+	cls = (attrs.get('class') or '').lower()
+	return 'upload' in cls or 'semi-upload' in cls
+
+
+def _file_input_visible(snapshot_lookup: dict | None, backend_node_id: int) -> bool:
+	"""按 computed_styles 判定 file input 是否可见（display/visibility/opacity）。
+
+	无 snapshot 数据时保守视为可见（不过度过滤）。判定口径等同
+	_is_element_visible_according_to_all_parents 的前 6 行，不含视口交集
+	（对「隐藏诱饵 input」判定已足够）。
+	"""
+	if not snapshot_lookup:
+		return True
+	snap = snapshot_lookup.get(backend_node_id)
+	if snap is None:
+		return True
+	styles = snap.computed_styles or {}
+	if str(styles.get('display', '')).lower() == 'none':
+		return False
+	if str(styles.get('visibility', '')).lower() == 'hidden':
+		return False
+	try:
+		if float(styles.get('opacity', '1')) <= 0:
+			return False
+	except (ValueError, TypeError):
+		pass
+	return True
+
+
+def _collect_file_inputs(
+	node: dict,
+	snapshot_lookup: dict | None = None,
+	upload_ancestor: bool = False,
+) -> list[FileInputInfo]:
+	"""遍历 DOM.getDocument 树收集 file input 元数据（含 shadow DOM / iframe）。
+
+	每个 file input 记录 backendNodeId / accept / visible / upload_ancestor，
+	帮 LLM 在多 input 页面（如抖音封面编辑器）锁定 live input 而非隐藏诱饵。
+	"""
+	results: list[FileInputInfo] = []
+	node_attrs = _parse_attrs(node.get('attributes'))
 	if node.get('nodeType') == 1 and node.get('nodeName', '').upper() == 'INPUT':
-		attrs = _parse_attrs(node.get('attributes'))
-		if attrs.get('type', '').lower() == 'file':
+		if node_attrs.get('type', '').lower() == 'file':
 			bid = node.get('backendNodeId')
 			if bid is not None:
-				results.append(bid)
+				results.append(FileInputInfo(
+					backend_node_id=bid,
+					accept=node_attrs.get('accept', ''),
+					visible=_file_input_visible(snapshot_lookup, bid),
+					upload_ancestor=upload_ancestor,
+				))
+	# 后代继承：当前节点自身是 upload 容器则置位
+	child_upload_ancestor = upload_ancestor or _node_has_upload_class(node_attrs)
 	for child in node.get('children', []):
-		results.extend(_collect_file_inputs(child))
+		results.extend(_collect_file_inputs(child, snapshot_lookup, child_upload_ancestor))
 	for shadow in node.get('shadowRoots', []):
-		results.extend(_collect_file_inputs(shadow))
+		results.extend(_collect_file_inputs(shadow, snapshot_lookup, child_upload_ancestor))
 	cd = node.get('contentDocument')
 	if cd:
-		results.extend(_collect_file_inputs(cd))
+		results.extend(_collect_file_inputs(cd, snapshot_lookup, child_upload_ancestor))
 	return results
 
 # ── Cross-origin iframe helpers ───────────────────────────────────────
@@ -657,7 +705,8 @@ async def _build_enhanced_dom_tree(
 	ax_lookup = _build_ax_lookup(ax_tree) if ax_tree else {}
 
 	root = dom_tree.get('root', {})
-	file_input_backend_ids = _collect_file_inputs(root)
+	file_input_infos = _collect_file_inputs(root, snapshot_lookup)
+	file_input_backend_ids = [fi.backend_node_id for fi in file_input_infos]
 	logger.info(
 		"DOM state: degradation=%s, snapshot_entries=%d, ax_nodes=%d, js_listeners=%d, file_inputs=%d, dpr=%.2f",
 		degradation.value, len(snapshot_lookup), len(ax_lookup), len(js_click_ids),
@@ -883,7 +932,7 @@ async def _build_enhanced_dom_tree(
 						iframe_sid = await _attach_to_iframe_target(client, iframe_target_id)
 						if iframe_sid:
 							try:
-								iframe_root, _, _iframe_metrics = await _build_enhanced_dom_tree(
+								iframe_root, _, _, _iframe_metrics = await _build_enhanced_dom_tree(
 									client, iframe_sid, viewport_threshold,
 									iframe_depth=iframe_depth + 1,
 									max_iframe_depth=max_iframe_depth,
@@ -946,7 +995,7 @@ async def _build_enhanced_dom_tree(
 	initial_offset = _initial_frame_offset or DOMRect(0.0, 0.0, 0.0, 0.0)
 	tree_root = await _construct_enhanced_node(root, [], initial_offset)
 
-	return tree_root, file_input_backend_ids, metrics
+	return tree_root, file_input_backend_ids, file_input_infos, metrics
 
 
 async def build_dom_state(
@@ -972,7 +1021,7 @@ async def build_dom_state(
 	"""
 	frame_target_map, url_target_map = await _build_frame_target_map(client)
 
-	tree_root, file_input_ids, metrics = await _build_enhanced_dom_tree(
+	tree_root, file_input_ids, file_input_infos, metrics = await _build_enhanced_dom_tree(
 		client, session_id, viewport_threshold,
 		_frame_target_map=frame_target_map,
 		_url_target_map=url_target_map,
@@ -999,5 +1048,6 @@ async def build_dom_state(
 	)
 	serialized_state, _timing = serializer.serialize_accessible_elements()
 	serialized_state.file_input_backend_ids = file_input_ids
+	serialized_state.file_inputs_meta = file_input_infos
 
 	return serialized_state, metrics

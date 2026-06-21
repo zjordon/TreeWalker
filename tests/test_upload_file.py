@@ -59,6 +59,7 @@ def _make_state(
 	selector_map: dict[int, EnhancedDOMTreeNode],
 	*,
 	file_input_backend_ids: list[int] | None = None,
+	file_inputs_meta: list | None = None,
 ) -> BrowserStateSummary:
 	"""Build a BrowserStateSummary with the given selector_map + file inputs."""
 	return BrowserStateSummary(
@@ -69,6 +70,7 @@ def _make_state(
 			selector_map=selector_map,
 			element_tree_text="",
 			file_input_backend_ids=file_input_backend_ids or [],
+			file_inputs_meta=file_inputs_meta or [],
 		),
 	)
 
@@ -438,6 +440,33 @@ class TestUploadFileDiscover:
 		assert result.extracted_content is not None
 		assert "file inputs" in result.extracted_content
 		assert "⚠️" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_file_input_target_among_many_names_live_candidates(self, tmp_upload):
+		# 多 file input 时，软警告应点名「可见 + upload 容器内」的候选 input，
+		# 让 agent 在命中隐藏诱饵后改试正确入口（抖音封面编辑器场景）。
+		from tree_walker.browser.views import FileInputInfo
+		hidden = _make_entry(backend_node_id=7, attributes={"type": "file"})
+		metas = [
+			FileInputInfo(backend_node_id=7, visible=False, upload_ancestor=False),  # agent 选的诱饵
+			FileInputInfo(backend_node_id=8, visible=True, upload_ancestor=True),    # live 候选
+			FileInputInfo(backend_node_id=9, visible=False, upload_ancestor=True),   # 非可见，不进候选
+		]
+		state = _make_state(
+			{7: hidden}, file_input_backend_ids=[7, 8, 9], file_inputs_meta=metas,
+		)
+		browser = _make_browser()
+
+		result = await Tools().execute(
+			"upload_file", {"index": 7, "path": tmp_upload}, browser, browser_state=state,
+		)
+
+		assert result.error is None
+		# 仍信任 agent 指定的 index（契约不变）
+		assert browser.set_file_input.call_args.kwargs["backend_node_id"] == 7
+		# 但点名了 live 候选 8（可见 + upload 容器），9 不在候选列表
+		assert "Likely-live candidates" in result.extracted_content
+		assert "[8]" in result.extracted_content
 
 	@pytest.mark.asyncio
 	async def test_file_input_target_when_only_one_sets_directly(self, tmp_upload):

@@ -6,6 +6,10 @@ import asyncio
 import base64
 import json
 import logging
+import os
+import secrets
+import shutil
+import tempfile
 import time
 from typing import Any
 
@@ -376,6 +380,10 @@ class BrowserSession:
         # this is False — without interception a click on a file input pops the
         # blocking native OS dialog (the Bug-1 regression).
         self._file_chooser_intercept_enabled: bool = False
+        # 非 ASCII 文件名上传时复制的 ASCII 临时副本路径。path 形式 setFileInputFiles
+        # 创建的是路径背书 File，浏览器会惰性读盘——临时副本必须存活到 session 结束，
+        # stop() 时统一清理（见 set_file_input / stop）。
+        self._upload_temp_paths: list[str] = []
 
     async def start(self, *, track_downloads: bool = False) -> None:
         """Connect to the browser via CDP WebSocket."""
@@ -595,6 +603,15 @@ class BrowserSession:
         """Disconnect from the browser."""
         self._cached_selector_map = None
         self._previous_cached_selector_map = None
+        # 清理本 session 为非 ASCII 文件名上传复制的 ASCII 临时副本。延迟到现在才删，
+        # 因为浏览器按路径惰性读盘，传完即删会导致假成功（Fix B 回归，issue #36）。
+        for p in getattr(self, "_upload_temp_paths", []):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except OSError:
+                logger.warning("failed to remove temp upload file %r", p)
+        self._upload_temp_paths.clear()
         if self.client:
             await self.client.stop()
             self.client = None
@@ -1971,8 +1988,32 @@ class BrowserSession:
                 "Ensure the page has an <input type='file'> element."
             )
 
-        logger.info("DOM.setFileInputFiles: backendNodeId=%d, file=%s", target_id, file_path)
+        # 部分站点（如抖音封面编辑器）的文件名校验是 ASCII-only 正则，中文文件名
+        # （横封面.png）会被误判为「不支持的图片格式」（已实证：文件本身是合法 PNG、
+        # 传输链 json.dumps 无损，唯独文件名含 CJK 被前端拒）。文件名含非 ASCII 时，
+        # 复制成 ASCII 临时名（保留扩展名）再上传，传完清理；纯 ASCII 路径直接透传。
+        upload_path = file_path
+        tmp_path: str | None = None
+        base_name = os.path.basename(file_path)
+        if not base_name.isascii():
+            _stem, ext = os.path.splitext(base_name)
+            tmp_path = os.path.join(
+                tempfile.gettempdir(), f"tw_upload_{secrets.token_hex(6)}{ext}",
+            )
+            shutil.copy2(file_path, tmp_path)
+            upload_path = tmp_path
+            # path 形式 setFileInputFiles 创建路径背书 File，页面惰性读盘（onchange→预览→
+            # 确认），临时副本在 CDP 返回后必须仍存活。这里只登记、延迟到 stop() 清理——
+            # 绝不能在 await 后立即删（页面读时文件已没 = 假成功，Fix B 回归，issue #36）。
+            # 登记放在 await 之前，保证 CDP 抛异常时也已记录、stop() 仍会清理。
+            self._upload_temp_paths.append(tmp_path)
+            logger.info(
+                "upload non-ASCII filename %r -> ASCII temp %r",
+                base_name, os.path.basename(tmp_path),
+            )
+
+        logger.info("DOM.setFileInputFiles: backendNodeId=%d, file=%s", target_id, upload_path)
         await self.client.send.DOM.setFileInputFiles(
-            {"backendNodeId": target_id, "files": [file_path]},
+            {"backendNodeId": target_id, "files": [upload_path]},
             session_id=self.current_session_id,
         )
