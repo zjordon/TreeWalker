@@ -852,16 +852,34 @@ class Tools:
         return ActionResult(extracted_content=f"Screenshot captured ({meta}) but not saved (no save_path).")
 
     async def _action_save_as_pdf(self, params: dict, browser: BrowserSession) -> ActionResult:
-        import base64
-        result = await browser.client.send.Page.printToPDF(
-            {"printBackground": True},
-            session_id=browser.current_session_id,
-        )
-        pdf_data = base64.b64decode(result["data"])
-        path = params["path"]
-        with open(path, "wb") as f:
-            f.write(pdf_data)
-        return ActionResult(extracted_content=f"PDF saved to {path}")
+        path: str = params["path"]
+        paper_format: str = params.get("paper_format", "letter")
+        landscape: bool = params.get("landscape", False)
+        print_background: bool = params.get("print_background", True)
+        scale: float = params.get("scale", 1.0)
+
+        try:
+            pdf_bytes = await browser.print_to_pdf(
+                paper_format=paper_format,
+                landscape=landscape,
+                print_background=print_background,
+                scale=scale,
+            )
+        except Exception as e:
+            logger.warning("save_as_pdf action failed: %s", e)
+            return ActionResult(error=f"Failed to generate PDF: {e}")
+
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(pdf_bytes)
+        except OSError as e:
+            return ActionResult(error=f"Failed to save PDF to {path}: {e}")
+
+        meta = f"paper={paper_format}, {len(pdf_bytes)} bytes"
+        if landscape:
+            meta += ", landscape"
+        return ActionResult(extracted_content=f"PDF saved to {path} ({meta})")
 
     async def _action_dropdown_options(self, params: dict, browser: BrowserSession) -> ActionResult:
         """读取指定 index 的 <select> 的全部 option。
