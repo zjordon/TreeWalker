@@ -714,37 +714,66 @@
 
 ### 4.13 `replace_file`
 
-- **description**：`Replace text within a local file` / 替换本地文件中的文本
+- **description**：`Replace every occurrence of an exact substring (old) with new text inside an existing local file, in place. Literal match, NOT a regex; case-sensitive; all non-overlapping occurrences are replaced. old must be non-empty and must already exist in the file (zero matches returns 'no occurrences' rather than silently succeeding). Prefer this over write_file for small edits to a large file you have already read.` / 替换本地文件中所有匹配的字面量子串（就地编辑）
 - **terminates_sequence**：False
-- **Pydantic 参数**：
+- **Pydantic 参数**（[models.py:191-200](../../src/tree_walker/tools/models.py)）：
 
   | 字段 | 类型 | 描述 |
   |---|---|---|
-  | `path` | `str` | File path |
-  | `old` | `str` | Text to find and replace |
-  | `new` | `str` | Replacement text |
+  | `path` | `str` | Path to an existing local file to edit in place |
+  | `old` | `str` (`min_length=1`) | Exact text to find（字面量子串，非正则；大小写敏感；非空） |
+  | `new` | `str` | Replacement text（可为空以删除匹配） |
 
-- **主要逻辑**（[actions.py:440-450](../../src/tree_walker/tools/actions.py)）：
+- **主要逻辑**（[actions.py:1286-1329](../../src/tree_walker/tools/actions.py)）：
 
   ```python
   async def _action_replace_file(self, params: dict, browser: BrowserSession) -> ActionResult:
       path = params["path"]
+      old = params["old"]
+      new = params["new"]
+      if not old:
+          # min_length=1 覆盖 schema；此运行时守卫兜底 execute 路径（registry 不校验 params）
+          return ActionResult(error="replace_file 'old' must be a non-empty string")
       try:
-          with open(path, "r", encoding="utf-8") as f:
+          # newline=""：读写均不翻译 \r\n <-> \n，原 LF/CRLF 行尾字节级保持
+          with open(path, "r", encoding="utf-8", newline="") as f:
               content = f.read()
-          content = content.replace(params["old"], params["new"])
-          with open(path, "w", encoding="utf-8") as f:
+          count = content.count(old)
+          if count == 0:
+              # soft-miss：未命中不是失败，如实回报"文件未改"（修正静默成功缺陷）
+              msg = f"No occurrences of {old!r} found in {path}; file unchanged"
+              logger.info(msg)
+              return ActionResult(extracted_content=msg, long_term_memory=msg)
+          content = content.replace(old, new)
+          with open(path, "w", encoding="utf-8", newline="") as f:
               f.write(content)
-          return ActionResult()
       except FileNotFoundError:
           return ActionResult(error=f"File not found: {path}")
+      except UnicodeDecodeError as e:
+          logger.warning("replace_file(%r) decode failed: %s", path, e)
+          return ActionResult(error=f"Failed to decode {path} as UTF-8: {e}")
+      except OSError as e:
+          logger.warning("replace_file(%r) failed: %s", path, e)
+          return ActionResult(error=f"Failed to replace text in {path}: {e}")
+      final_bytes = len(content.encode("utf-8"))
+      memory = (
+          f"Replaced {count} occurrence{'s' if count != 1 else ''} of {old!r} with {new!r} "
+          f"in {path} ({final_bytes} bytes)"
+      )
+      logger.info(memory)
+      return ActionResult(extracted_content=memory, long_term_memory=memory)
   ```
 
-  简单的 `str.replace`，**全局替换**所有匹配。
+  字面量 `str.replace`，**全局替换**所有非重叠匹配；读写 `newline=""` 保证 Windows 下 `\r\n`/`\n` 不互相翻译。
 
-- **CDP 调用清单**：无
+- **返回 / 回显**：
+  - 命中：`extracted_content == long_term_memory`，形如 `Replaced N occurrence(s) of '<old>' with '<new>' in <path> (<bytes> bytes)`（含替换次数与最终字节数）。
+  - 零匹配（soft-miss）：`No occurrences of '<old>' found in <path>; file unchanged`——不假装成功、文件不重写（修正 browser-use 的静默成功缺陷）。
+  - 错误分级（均带 `logger.warning`，不冒泡到 `Tools.execute` 通用 catch）：`File not found` / `Failed to decode ... as UTF-8`（文件非 UTF-8）/ `Failed to replace text in ...`（权限/目录/IO）。
 
-- **注意事项**：替换所有匹配项；不保留备份；非原子操作（写到一半异常会导致数据损坏）。
+- **CDP 调用清单**：无（纯本地 fs）
+
+- **注意事项**：全局替换所有非重叠匹配；大小写敏感；纯字面量（非正则）；`old` 非空（schema `min_length=1` + handler 运行时守卫双层）；不保留备份；非原子操作（写到一半异常会损坏文件，阶段二再修）。
 
 ---
 

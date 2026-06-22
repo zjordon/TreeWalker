@@ -1285,15 +1285,48 @@ class Tools:
 
     async def _action_replace_file(self, params: dict, browser: BrowserSession) -> ActionResult:
         path = params["path"]
+        old = params["old"]
+        new = params["new"]
+        if not old:
+            # min_length=1 覆盖 schema + 直接构造；运行时 registry 不校验 params，
+            # 此守卫兜底 execute 路径，避免 str.replace("", x) 在每字符间插入而膨胀文件。
+            return ActionResult(error="replace_file 'old' must be a non-empty string")
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            # newline="" 关闭 universal-newline 翻译（对齐 write_file:1263）：
+            # 读时保留原始 \r\n，写时 \n 不被译成 \r\n。原 LF 保持 LF、原 CRLF 保持
+            # CRLF，行尾字节级不变；含 \r\n 字面量的 old/new 也不会被压缩成 \n。
+            with open(path, "r", encoding="utf-8", newline="") as f:
                 content = f.read()
-            content = content.replace(params["old"], params["new"])
-            with open(path, "w", encoding="utf-8") as f:
+            count = content.count(old)
+            if count == 0:
+                # Soft miss（对齐 search_page:1332-1340）：old 不在文件里是可操作信息
+                # （LLM 可调 old、或改用 write_file），不是工具失败。修正 browser-use
+                # 的静默"Successfully replaced"缺陷——绝不假装改了。
+                msg = f"No occurrences of {old!r} found in {path}; file unchanged"
+                logger.info(msg)
+                return ActionResult(extracted_content=msg, long_term_memory=msg)
+            content = content.replace(old, new)
+            with open(path, "w", encoding="utf-8", newline="") as f:
                 f.write(content)
-            return ActionResult()
         except FileNotFoundError:
             return ActionResult(error=f"File not found: {path}")
+        except UnicodeDecodeError as e:
+            # 读取侧特有（write_file 是写入不会有）：文件不是合法 UTF-8。
+            logger.warning("replace_file(%r) decode failed: %s", path, e)
+            return ActionResult(error=f"Failed to decode {path} as UTF-8: {e}")
+        except OSError as e:
+            # 分级错误：权限/目录(path 指向目录)/磁盘满/只读 → 明确 error + warning，
+            # 不冒泡到 Tools.execute 通用 catch（actions.py:260-262）。
+            logger.warning("replace_file(%r) failed: %s", path, e)
+            return ActionResult(error=f"Failed to replace text in {path}: {e}")
+
+        final_bytes = len(content.encode("utf-8"))
+        memory = (
+            f"Replaced {count} occurrence{'s' if count != 1 else ''} of {old!r} with {new!r} "
+            f"in {path} ({final_bytes} bytes)"
+        )
+        logger.info(memory)
+        return ActionResult(extracted_content=memory, long_term_memory=memory)
 
     async def _action_evaluate(self, params: dict, browser: BrowserSession) -> ActionResult:
         code = params["code"]

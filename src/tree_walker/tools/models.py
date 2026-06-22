@@ -190,9 +190,13 @@ class ReadFileParams(BaseModel):
 
 class ReplaceFileParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    path: str = Field(description="File path")
-    old: str = Field(description="Text to find and replace")
-    new: str = Field(description="Replacement text")
+    path: str = Field(description="Path to an existing local file to edit in place.")
+    old: str = Field(
+        min_length=1,
+        description="Exact text to find (literal substring, NOT a regex). All non-overlapping "
+        "occurrences are replaced. Case-sensitive. Must be non-empty.",
+    )
+    new: str = Field(description="Replacement text (literal; may be empty to delete matches).")
 
 
 class EvaluateParams(BaseModel):
@@ -311,7 +315,16 @@ ACTION_DEFINITIONS: dict[str, tuple[type[BaseModel], str, bool]] = {
         False,
     ),
     "read_file": (ReadFileParams, "Read content from a local file", False),
-    "replace_file": (ReplaceFileParams, "Replace text within a local file", False),
+    "replace_file": (
+        ReplaceFileParams,
+        "Replace every occurrence of an exact substring (old) with new text inside an "
+        "existing local file, in place. Literal match, NOT a regex; case-sensitive; "
+        "all non-overlapping occurrences are replaced. old must be non-empty and must "
+        "already exist in the file (zero matches returns 'no occurrences' rather than "
+        "silently succeeding). Prefer this over write_file for small edits to a large "
+        "file you have already read.",
+        False,
+    ),
     "evaluate": (
         EvaluateParams,
         "Execute arbitrary JavaScript in the page and return the result. Wrap in "
