@@ -124,6 +124,22 @@ def _format_find_results(data: dict, selector: str) -> str:
     return "\n".join(lines)
 
 
+_EVAL_MEMORY_ECHO_MAX = 200
+
+
+def _eval_long_term_memory(text: str) -> str:
+    """Build a compact long_term_memory for an evaluate result.
+
+    Short results are echoed verbatim (so ``return document.title`` is
+    remembered across steps); long results collapse to a length-only summary
+    to avoid bloating cross-step memory. Mirrors browser-use
+    service.py:1847-1853 (their threshold is 10000; ours is tighter).
+    """
+    if len(text) <= _EVAL_MEMORY_ECHO_MAX:
+        return text
+    return f"JavaScript executed successfully, result length: {len(text)} characters."
+
+
 def _find_upload_label_near(
     node: EnhancedDOMTreeNode, max_ancestor: int = 4, max_depth: int = 3,
 ) -> int | None:
@@ -1256,10 +1272,19 @@ class Tools:
     async def _action_evaluate(self, params: dict, browser: BrowserSession) -> ActionResult:
         code = params["code"]
         try:
-            result = await browser.execute_js(code)
-            return ActionResult(extracted_content=str(result)[:self._truncation.eval_result_max_chars])
+            text = await browser.evaluate(code)
         except Exception as e:
-            return ActionResult(error=str(e))
+            # Hard error: JS exception / wasThrown / CDP failure — surface an
+            # evaluate-specific error rather than the generic Tools.execute
+            # fallback. Aligns with _action_find_elements / _action_search_page.
+            logger.warning("evaluate(%r) failed: %s", code[:120], e)
+            return ActionResult(error=f"Evaluate failed: {e}")
+        limit = self._truncation.eval_result_max_chars
+        memory = _eval_long_term_memory(text)
+        return ActionResult(
+            extracted_content=text[:limit],
+            long_term_memory=memory[:limit],
+        )
 
     async def _action_search_page(self, params: dict, browser: BrowserSession) -> ActionResult:
         query = params["query"]

@@ -7,6 +7,7 @@ import base64
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import tempfile
@@ -245,6 +246,91 @@ def _build_find_elements_js(
         f"var INCLUDE_TEXT = {json.dumps(include_text)};\n"
     )
     return "(function() {\n" + params_js + _FIND_ELEMENTS_JS_BODY + "\n})()"
+
+
+# ── evaluate (arbitrary user JS execution) ──────────────────────────
+
+# Pre/post handlers for BrowserSession.evaluate. The preprocessor fixes common
+# LLM JavaScript quoting/escaping mistakes; the normalizer renders the CDP
+# return value as an LLM-friendly string (JSON for objects, JS literals for
+# bool/null/undefined); the exception formatter enriches CDP exceptionDetails.
+# Mirrors browser-use service.py:1759-1932.
+
+
+def _validate_and_fix_javascript(code: str) -> str:
+    """Fix common LLM JavaScript quoting/escaping mistakes before evaluation.
+
+    Mirrors browser-use ``_validate_and_fix_javascript`` (service.py:1869-1932).
+    Pure regex cleanup; never interpolates user values into JS.
+    """
+    # 1: undo double-escaped quotes (\" -> "), common when LLM emits JSON-stringified JS
+    fixed = re.sub(r'\\"', '"', code)
+    # 2: undo over-escaped regex classes (\\d -> \d, \\[ -> \[)
+    fixed = re.sub(r'\\\\([dDsSwWbBnrtfv])', r'\\\1', fixed)
+    fixed = re.sub(r'\\\\([.*+?^${}()|[\]])', r'\\\1', fixed)
+    # 3-6: mixed-quote selectors -> template literals (evaluate / querySelector / closest / matches)
+    fixed = re.sub(
+        r'document\.evaluate\s*\(\s*"([^"]*)"\s*,',
+        lambda m: f'document.evaluate(`{m.group(1)}`,',
+        fixed,
+    )
+    fixed = re.sub(
+        r'(querySelector(?:All)?)\s*\(\s*"([^"]*)"\s*\)',
+        lambda m: f'{m.group(1)}(`{m.group(2)}`)',
+        fixed,
+    )
+    fixed = re.sub(
+        r'\.closest\s*\(\s*"([^"]*)"\s*\)',
+        lambda m: f'.closest(`{m.group(1)}`)',
+        fixed,
+    )
+    fixed = re.sub(
+        r'\.matches\s*\(\s*"([^"]*)"\s*\)',
+        lambda m: f'.matches(`{m.group(1)}`)',
+        fixed,
+    )
+    return fixed
+
+
+def _normalize_eval_result(result_data: dict) -> str:
+    """Normalize a Runtime.evaluate result value to an LLM-friendly string.
+
+    Mirrors browser-use (service.py:1807-1819) with one fix: bool/null are
+    rendered as JS literals (``true``/``false``/``null``), not Python
+    ``True``/``None``, so output never carries Python repr semantics.
+    """
+    if "value" not in result_data:
+        # CDP omits `value` when the expression returned `undefined`.
+        return "undefined"
+    value = result_data["value"]
+    if isinstance(value, (dict, list)):
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(value)
+    if isinstance(value, bool):  # must precede int: bool is a subclass of int
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    # int / float / str
+    return str(value)
+
+
+def _format_eval_exception(exception: dict, validated_code: str) -> str:
+    """Build a debugging-rich error message from CDP exceptionDetails.
+
+    Mirrors browser-use (service.py:1784-1792) and goes one step further:
+    also surface ``exception.description`` (full message + stack), which
+    browser-use discards. Truncated to keep the message bounded.
+    """
+    text = exception.get("text", "Unknown error")
+    parts = [f"JavaScript execution error: {text}"]
+    description = exception.get("exception", {}).get("description")
+    if description and description != text:
+        parts.append(str(description)[:500])
+    snippet = validated_code[:500] + ("..." if len(validated_code) > 500 else "")
+    parts.append(f"Validated code (after quote fixing):\n{snippet}")
+    return "\n".join(parts)
 
 
 def _walk_for_file_inputs(node: dict) -> list[int]:
@@ -2016,6 +2102,43 @@ class BrowserSession:
             err = result["exceptionDetails"]
             raise RuntimeError(f"JS error: {err.get('text', err)}")
         return result.get("result", {}).get("value")
+
+    async def evaluate(self, code: str) -> str:
+        """Execute arbitrary user JavaScript and return a normalized result string.
+
+        Mirrors browser-use ``evaluate`` (service.py:1759-1867): preprocess the
+        code (fix common LLM quoting mistakes), run a single ``Runtime.evaluate``
+        with ``returnByValue=True, awaitPromise=True`` (+ ``timeout`` per project
+        convention), then normalize the value to an LLM-friendly string.
+
+        Raises ``RuntimeError`` (with a debugging-rich message) on a JS exception
+        (``exceptionDetails``) or the legacy ``wasThrown`` flag — the action
+        layer maps this to a hard ``ActionResult(error=...)``.
+
+        Does NOT reuse ``execute_js``: evaluate needs the full ``result`` dict
+        for null/undefined distinction, type-aware normalization, and exception
+        enrichment, which the shared ``execute_js`` discards.
+
+        Limitations (same as browser-use): top-document execution context; a
+        returned DOM node serializes to ``{}`` (no element-handle round-trip —
+        that needs ``Runtime.callFunctionOn`` + selector_map, see 阶段二).
+        """
+        validated_code = _validate_and_fix_javascript(code)
+        result = await self.client.send.Runtime.evaluate(
+            {
+                "expression": validated_code,
+                "returnByValue": True,
+                "awaitPromise": True,
+                "timeout": 30000,
+            },
+            session_id=self.current_session_id,
+        )
+        if result.get("exceptionDetails"):
+            raise RuntimeError(_format_eval_exception(result["exceptionDetails"], validated_code))
+        result_data = result.get("result", {})
+        if result_data.get("wasThrown"):
+            raise RuntimeError("JavaScript execution failed (wasThrown=true)")
+        return _normalize_eval_result(result_data)
 
     async def find_text(self, text: str) -> dict:
         """Find text on the page and scroll the first match into view.

@@ -271,36 +271,50 @@
 
 ### 4.5 `evaluate`
 
-- **description**：`Execute JavaScript code in the browser and return the result` / 在浏览器中执行 JavaScript 并返回结果
+- **description**：执行任意 JS 并返回归一化结果（详见 `ACTION_DEFINITIONS["evaluate"]`，`models.py`）；对齐 browser-use `service.py:1759-1867`
 - **terminates_sequence**：True（执行任意 JS 可能改变页面状态）
-- **Pydantic 参数**：
+- **Pydantic 参数**（`EvaluateParams`，`models.py:183-194`）：
 
   | 字段 | 类型 | 描述 |
   |---|---|---|
-  | `code` | `str` | JavaScript code to execute in the browser |
+  | `code` | `str` | JavaScript 源码（建议包 IIFE + try-catch、仅用浏览器 API、控制输出体积） |
 
-- **主要逻辑**（[actions.py:452-458](../../src/tree_walker/tools/actions.py)）：
+  > 阶段一保持 `code` 唯一参数（对齐 browser-use）；`args` / 元素句柄往返 / per-call `await_promise`/`timeout` 属阶段二（见 `docs/tools-optimize/evaluate.md`）。
 
-  ```python
-  async def _action_evaluate(self, params: dict, browser: BrowserSession) -> ActionResult:
-      code = params["code"]
-      try:
-          result = await browser.execute_js(code)
-          return ActionResult(extracted_content=str(result)[:self._truncation.eval_result_max_chars])
-      except Exception as e:
-          return ActionResult(error=str(e))
-  ```
+- **主要逻辑**：
+  - **action 层**（`_action_evaluate`，[actions.py:1272](../../src/tree_walker/tools/actions.py)）：两层分流——`browser.evaluate` 抛异常 → `ActionResult(error="Evaluate failed: ...")` + `logger.warning`（硬错误）；成功 → 归一化文本截断到 `eval_result_max_chars` 进 `extracted_content`、`_eval_long_term_memory`（短≤200 回显 / 长塌缩为长度摘要，`actions.py:130`）进 `long_term_memory`。
+  - **session 层**（`BrowserSession.evaluate`，[session.py:2106](../../src/tree_walker/browser/session.py)）：**不复用 `execute_js`**（evaluate 要完整 result dict 做 null/undefined 区分 + 归一化 + 异常富化）——`_validate_and_fix_javascript`（6 条 regex 预处理，`session.py:260`，移植 browser-use `service.py:1869-1932`）→ 单次 `Runtime.evaluate` → `_normalize_eval_result`（`session.py:295`）/ `_format_eval_exception`（`session.py:319`）。
 
+    ```python
+    async def evaluate(self, code: str) -> str:
+        validated_code = _validate_and_fix_javascript(code)
+        result = await self.client.send.Runtime.evaluate(
+            {"expression": validated_code, "returnByValue": True,
+             "awaitPromise": True, "timeout": 30000},
+            session_id=self.current_session_id,
+        )
+        if result.get("exceptionDetails"):
+            raise RuntimeError(_format_eval_exception(result["exceptionDetails"], validated_code))
+        result_data = result.get("result", {})
+        if result_data.get("wasThrown"):
+            raise RuntimeError("JavaScript execution failed (wasThrown=true)")
+        return _normalize_eval_result(result_data)
+    ```
+
+- **结果归一化**（`_normalize_eval_result`，对齐 browser-use `service.py:1807-1819`，bool/null 取 JS 字面量）：`value` 键缺失→`"undefined"`；`dict`/`list`→`json.dumps(ensure_ascii=False)`（告别旧版 `str(result)` 的 Python repr）；`bool`→`"true"`/`"false"`；`None`→`"null"`；`int`/`float`/`str`→`str()`。
+- **异常富化**（`_format_eval_exception`，适度超越 browser-use）：`exceptionDetails.text` + `exception.description`（含栈，browser-use 丢弃）+ `validated_code[:500]` 片段 → `RuntimeError`，action 包装为 `"Evaluate failed: ..."`。
 - **CDP 调用清单**：
 
   | CDP 命令 | 主要参数 | 行号 |
   |---|---|---|
-  | `Runtime.evaluate` | `{expression: code, returnByValue:True, awaitPromise:True, timeout:30000}` | session.py:785 |
+  | `Runtime.evaluate` | `{expression: validated_code, returnByValue:True, awaitPromise:True, timeout:30000}` | `BrowserSession.evaluate` → session.py:2106 |
 
 - **注意事项**：
-  - 超时硬编码 30 秒（`session.py:790`）
-  - JS 抛异常时返回 `RuntimeError`，被包装为 `ActionResult(error=...)`
-  - 结果字符串截断到 `eval_result_max_chars`，避免上下文爆炸
+  - `execute_js`（`session.py:2090`）**原样不动**，仍服务 `extract` / `search_page` / `find_elements` / scroll；evaluate 走专用 `BrowserSession.evaluate`，零回归。
+  - 超时硬编码 30 秒；JS 异常 / `wasThrown` → `RuntimeError` → `ActionResult(error="Evaluate failed: ...")` + `logger.warning`。
+  - `extracted_content` 截断到 `eval_result_max_chars`（默认 2000，env `AGENT_TRUNCATE_EVAL_RESULT`）；`long_term_memory` 短结果回显、长结果塌缩为长度摘要。
+  - 不移植 browser-use 的图片提取（`metadata['images']`）/`include_extracted_content_only_once`——本项目 `ActionResult` 无对应字段。
+  - 完整方案见 `docs/tools-optimize/evaluate.md`；测试见 `tests/test_evaluate.py`。
 
 ---
 
