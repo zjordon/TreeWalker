@@ -685,30 +685,64 @@
 
 ### 4.12 `read_file`
 
-- **description**：`Read content from a local file` / 读取本地文件内容
+- **description**：`Read content from a local UTF-8 text file.` / 读取本地 UTF-8 文本文件内容
 - **terminates_sequence**：False
-- **Pydantic 参数**：
+- **Pydantic 参数**（[models.py:186-188](../../src/tree_walker/tools/models.py)）：
 
   | 字段 | 类型 | 描述 |
   |---|---|---|
-  | `path` | `str` | File path to read |
+  | `path` | `str` | Path to a local UTF-8 text file to read |
 
-- **主要逻辑**（[actions.py:431-438](../../src/tree_walker/tools/actions.py)）：
+- **主要逻辑**（[actions.py:1277-1323](../../src/tree_walker/tools/actions.py)）：
 
   ```python
   async def _action_read_file(self, params: dict, browser: BrowserSession) -> ActionResult:
       path = params["path"]
       try:
-          with open(path, "r", encoding="utf-8") as f:
+          # newline=""：读时不翻译 \r\n -> \n，原 LF/CRLF 行尾字节级保持（对齐 replace_file / write_file）
+          with open(path, "r", encoding="utf-8", newline="") as f:
               content = f.read()
-          return ActionResult(extracted_content=content[:self._truncation.read_file_max_chars])
       except FileNotFoundError:
           return ActionResult(error=f"File not found: {path}")
+      except UnicodeDecodeError as e:
+          logger.warning("read_file(%r) decode failed: %s", path, e)
+          return ActionResult(error=f"Failed to decode {path} as UTF-8: {e}")
+      except OSError as e:
+          logger.warning("read_file(%r) failed: %s", path, e)
+          return ActionResult(error=f"Failed to read file {path}: {e}")
+      total_chars = len(content)
+      total_bytes = len(content.encode("utf-8"))
+      max_chars = self._truncation.read_file_max_chars
+      if not content:
+          # soft-miss：空文件不是错误，如实回报"文件为空"（避免 __str__ 兜底成 "OK" 的歧义）
+          msg = f"{path} is empty (0 bytes)"
+          logger.info(msg)
+          return ActionResult(extracted_content=msg, long_term_memory=msg)
+      if total_chars > max_chars:
+          # 截断必须告知（read_file 独有；browser-use 文本不限长仅截 memory，无此问题）
+          extracted = (
+              content[:max_chars]
+              + f"\n[...truncated: showing {max_chars} of {total_chars} chars ({total_bytes} bytes total)]"
+          )
+          memory = f"Read {path} ({total_chars} chars, {total_bytes} bytes; truncated to first {max_chars} chars)"
+      else:
+          extracted = content
+          memory = f"Read {path} ({total_chars} chars, {total_bytes} bytes)"
+      logger.info(memory)
+      return ActionResult(extracted_content=extracted, long_term_memory=memory)
   ```
 
-- **CDP 调用清单**：无（同步本地文件操作）
+  UTF-8 文本读取，`newline=""` 保证 Windows 下 `\r\n` 不被压成 `\n`；内容超 `read_file_max_chars`（默认 5000）时**显式截断并告知**，避免 LLM 把截断处误当文件结尾。
 
-- **注意事项**：内容截断到 `read_file_max_chars`；只处理 `FileNotFoundError`，其他异常会被外层 `execute` 兜底捕获。
+- **返回 / 回显**：
+  - 正常（未截断）：`extracted_content` 为文件原文；`long_term_memory` 形如 `Read <path> (<N> chars, <M> bytes)`。
+  - 截断：`extracted_content` = 前 `max_chars` 字符 + `\n[...truncated: showing N of M chars (B bytes total)]`；`long_term_memory` 带 `truncated` 标记——LLM 据此知道还有更多内容。
+  - 空文件（soft-miss）：`extracted_content == long_term_memory == "<path> is empty (0 bytes)"`——文件存在但为空，不是错误、也不是 `ActionResult.__str__` 兜底的 `"OK"`。
+  - 错误分级（均带 `logger.warning`，不冒泡到 `Tools.execute` 通用 catch）：`File not found` / `Failed to decode ... as UTF-8`（文件非 UTF-8）/ `Failed to read file ...`（权限/目录/IO）。
+
+- **CDP 调用清单**：无（纯本地 fs）
+
+- **注意事项**：仅支持 UTF-8 文本（图片/PDF/DOCX 等富文档、`offset`/`limit` 分页、`encoding` 参数均留阶段二）；`newline=""` 行尾字节保真；字节数用 `len(content.encode("utf-8"))`（CJK 准确，与 `os.path.getsize` 一致）；`read_file_max_chars` 默认 5000，env `AGENT_TRUNCATE_READ_FILE` 可覆盖。
 
 ---
 
