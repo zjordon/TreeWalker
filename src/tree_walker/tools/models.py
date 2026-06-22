@@ -182,7 +182,13 @@ class ReplaceFileParams(BaseModel):
 
 class EvaluateParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    code: str = Field(description="JavaScript code to execute in the browser")
+    code: str = Field(description=(
+        "JavaScript to execute in the page. Best practice: wrap in an IIFE "
+        "((function(){try{...}catch(e){return 'Error: '+e.message}})()) so a "
+        "thrown error becomes a return value, not a tool failure. Use ONLY "
+        "browser APIs (document, window, fetch); NO Node.js APIs. Return a "
+        "primitive or a JSON-serializable object/array. Keep output small."
+    ))
 
 
 class SearchPageParams(BaseModel):
@@ -281,7 +287,11 @@ ACTION_DEFINITIONS: dict[str, tuple[type[BaseModel], str, bool]] = {
     "replace_file": (ReplaceFileParams, "Replace text within a local file", False),
     "evaluate": (
         EvaluateParams,
-        "Execute JavaScript code in the browser and return the result",
+        "Execute arbitrary JavaScript in the page and return the result. Wrap in "
+        "an IIFE with try-catch so errors become return values; use only browser "
+        "APIs (no Node.js). Supports async (await / fetch). Result is normalized "
+        "to a string (objects -> JSON). Escape hatch when find_elements / "
+        "search_page / click cannot express the need.",
         True,
     ),
     "search_page": (
