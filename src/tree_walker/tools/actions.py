@@ -1277,11 +1277,50 @@ class Tools:
     async def _action_read_file(self, params: dict, browser: BrowserSession) -> ActionResult:
         path = params["path"]
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            # newline="" 关闭 universal-newline 翻译（对齐 replace_file / write_file）：
+            # 读时保留原始 \r\n，避免 CRLF 被压成 \n；行尾字节级不变，便于后续 replace_file
+            # 用含 \r\n 的 old 精确匹配。
+            with open(path, "r", encoding="utf-8", newline="") as f:
                 content = f.read()
-            return ActionResult(extracted_content=content[:self._truncation.read_file_max_chars])
         except FileNotFoundError:
             return ActionResult(error=f"File not found: {path}")
+        except UnicodeDecodeError as e:
+            # 读取侧特有（对齐 replace_file）：文件不是合法 UTF-8。
+            logger.warning("read_file(%r) decode failed: %s", path, e)
+            return ActionResult(error=f"Failed to decode {path} as UTF-8: {e}")
+        except OSError as e:
+            # 分级错误（对齐 replace_file）：path 指向目录(IsADirectoryError/
+            # PermissionError)、磁盘/只读/锁定 → 明确 error + warning，不冒泡到
+            # Tools.execute 通用 catch（actions.py:260-262）。
+            logger.warning("read_file(%r) failed: %s", path, e)
+            return ActionResult(error=f"Failed to read file {path}: {e}")
+
+        total_chars = len(content)
+        total_bytes = len(content.encode("utf-8"))
+        max_chars = self._truncation.read_file_max_chars
+        if not content:
+            # 软提示（对齐 replace_file soft-miss / search_page）：空文件不是错误，
+            # 但要让 LLM 知道"文件存在且为空"，而非 __str__ 兜底成 "OK"。
+            msg = f"{path} is empty (0 bytes)"
+            logger.info(msg)
+            return ActionResult(extracted_content=msg, long_term_memory=msg)
+        if total_chars > max_chars:
+            # 截断必须告知（read_file 独有，有意超越 browser-use：browser-use 文本不限长，
+            # 仅截 memory；TreeWalker 必须截内容本身，故须显式告诉 LLM 还有更多）。
+            extracted = (
+                content[:max_chars]
+                + f"\n[...truncated: showing {max_chars} of {total_chars} chars "
+                f"({total_bytes} bytes total)]"
+            )
+            memory = (
+                f"Read {path} ({total_chars} chars, {total_bytes} bytes; "
+                f"truncated to first {max_chars} chars)"
+            )
+        else:
+            extracted = content
+            memory = f"Read {path} ({total_chars} chars, {total_bytes} bytes)"
+        logger.info(memory)
+        return ActionResult(extracted_content=extracted, long_term_memory=memory)
 
     async def _action_replace_file(self, params: dict, browser: BrowserSession) -> ActionResult:
         path = params["path"]

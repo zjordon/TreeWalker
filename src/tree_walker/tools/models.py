@@ -185,7 +185,7 @@ class WriteFileParams(BaseModel):
 
 class ReadFileParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    path: str = Field(description="File path to read")
+    path: str = Field(description="Path to a local UTF-8 text file to read.")
 
 
 class ReplaceFileParams(BaseModel):
@@ -314,7 +314,7 @@ ACTION_DEFINITIONS: dict[str, tuple[type[BaseModel], str, bool]] = {
         "file you have already read.",
         False,
     ),
-    "read_file": (ReadFileParams, "Read content from a local file", False),
+    "read_file": (ReadFileParams, "Read content from a local UTF-8 text file.", False),
     "replace_file": (
         ReplaceFileParams,
         "Replace every occurrence of an exact substring (old) with new text inside an "
