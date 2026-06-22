@@ -1243,10 +1243,36 @@ class Tools:
     async def _action_write_file(self, params: dict, browser: BrowserSession) -> ActionResult:
         path = params["path"]
         content = params["content"]
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
-        return ActionResult(extracted_content=f"Written to {path}")
+        append = params.get("append", False)
+        trailing_newline = params.get("trailing_newline", True)
+        leading_newline = params.get("leading_newline", False)
+
+        # 换行簿记在 action 层（对齐 browser-use service.py:1691-1694），但 trailing
+        # 采用守卫式（幂等、不双换行、不破坏 CRLF —— "foo\r\n".endswith("\n") 为 True）。
+        if leading_newline:
+            content = "\n" + content
+        if trailing_newline and not content.endswith("\n"):
+            content = content + "\n"
+
+        mode = "a" if append else "w"
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            # newline="" 关闭文本模式换行翻译：Windows 默认会把 \n 译成 \r\n，导致
+            # ① 写出的字节与下方 written 字节数不符；② 显式 \r\n 内容被破坏成 \r\r\n。
+            # LF 行尾跨平台一致，且与 save_as_pdf 二进制写、browser-use（Linux LF）对齐。
+            with open(path, mode, encoding="utf-8", newline="") as f:
+                f.write(content)
+        except OSError as e:
+            # 分级错误：磁盘/权限/路径异常 → 明确 error + warning（对齐 save_as_pdf:980-985），
+            # 不冒泡到 Tools.execute 的通用 catch（actions.py:260-262）。
+            logger.warning("write_file(%r) failed: %s", path, e)
+            return ActionResult(error=f"Failed to write file {path}: {e}")
+
+        written = len(content.encode("utf-8"))
+        action_word = "Appended" if append else "Wrote"
+        memory = f"{action_word} {written} bytes to {path}"
+        logger.info(memory)
+        return ActionResult(extracted_content=memory, long_term_memory=memory)
 
     async def _action_read_file(self, params: dict, browser: BrowserSession) -> ActionResult:
         path = params["path"]
