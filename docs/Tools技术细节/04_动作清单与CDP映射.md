@@ -185,30 +185,42 @@
 
 ### 4.3 `done`
 
-- **description**：`Signal that the task is complete with a summary` / 表示任务完成，附总结
+- **description**：`Signal that the task is complete and stop the agent. Must be the only action in the step. Provide a final summary of what was accomplished; set success=False if any requirement was unmet or could not be verified.` / 表示任务完成并停止 agent，附总结
 - **terminates_sequence**：False（注意：本身不"终止序列"，但通过 `is_done=True` 触发 Agent Loop 退出）
 - **Pydantic 参数**：
 
   | 字段 | 类型 | 默认 | 描述 |
   |---|---|---|---|
-  | `text` | `str` | (必填) | Final summary. ONLY report data you directly observed in page state, tool outputs, or screenshots during this session. |
-  | `success` | `bool` | `True` | Whether the task was completed successfully |
+  | `text` | `str` | (必填，`min_length=1`) | Final message to the user. ONLY report data you directly observed in page state, tool outputs, or screenshots during this session.（含 anti-hallucination：禁止用训练知识补缺口、禁止引用压缩记忆里未亲验的步骤、不确定要明说；必须非空） |
+  | `success` | `bool` | `True` | Whether the task was completed successfully. 任何需求未满足 / 页面无预期数据 / 步骤无法核验 → 设 False |
 
-- **主要逻辑**（[actions.py:477-482](../../src/tree_walker/tools/actions.py)）：
+- **主要逻辑**（[actions.py:1418-1433](../../src/tree_walker/tools/actions.py)）：
 
   ```python
   async def _action_done(self, params: dict, browser: BrowserSession) -> ActionResult:
+      success = params.get("success", True)
+      text = (params.get("text") or "").strip()
+      if not text:
+          # done 必须终止（is_done=True 才退出循环），空 text 不能走 soft-miss
+          # （会变非终止循环）。兜底默认值保证终止 + 让退化情形在日志可见。
+          text = "(no summary provided)"
+          logger.warning("done called with empty text; substituting default summary")
+      memory = f"Task completed: {success} - {text[:100]}"
+      logger.info(memory)
       return ActionResult(
           is_done=True,
-          success=params.get("success", True),
-          extracted_content=params.get("text", ""),
+          success=success,
+          extracted_content=text,
+          long_term_memory=memory,
       )
   ```
 
-- **CDP 调用清单**：无（纯状态信号）
+- **CDP 调用清单**：无（纯状态信号，`browser` 形参未用）
 
 - **注意事项**：
-  - `text` 字段的描述强调"只能报告直接观察到的数据"，防止 LLM 编造结果
+  - `text` 字段描述强调"只能报告直接观察到的数据" + anti-hallucination，防止 LLM 编造结果；schema 层 `min_length=1` + handler 层 `text.strip()` 运行时守卫双层（`Tools.execute` 路径不经 param_model 校验）
+  - 双写回显：`extracted_content == text`（全文）、`long_term_memory == "Task completed: {success} - {text[:100]}"`（一行摘要，>100 字截断）、`logger.info(memory)`
+  - 空 / 纯空白 / 缺失 `text`：warn + 兜底 `"(no summary provided)"`，仍 `is_done=True`（done 必须终止，不走 soft-miss）
   - `_post_process` 通过 `any(r.is_done for r in results)` 检测并触发主循环退出
   - 在循环检测中豁免（`_LOOP_EXEMPT_ACTIONS`），即使连续 done 也不会触发循环警告
 

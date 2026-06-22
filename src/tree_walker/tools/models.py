@@ -231,11 +231,27 @@ class SearchPageParams(BaseModel):
 
 class DoneParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    text: str = Field(description=(
-        "Final summary. ONLY report data you directly observed in page state, "
-        "tool outputs, or screenshots during this session."
-    ))
-    success: bool = Field(default=True, description="Whether the task was completed successfully")
+    text: str = Field(
+        min_length=1,
+        description=(
+            "Final message to the user. ONLY report data you directly observed in "
+            "page state, tool outputs, or screenshots during this session. Do NOT "
+            "use training knowledge to fill gaps — if information was not found on "
+            "the page, say so explicitly. Do NOT claim completion of steps from "
+            "compacted_memory or prior session summaries unless you explicitly "
+            "verified them yourself. If uncertain whether a prior step completed, "
+            "say so explicitly. Must be non-empty."
+        ),
+    )
+    success: bool = Field(
+        default=True,
+        description=(
+            "Whether the task was completed successfully. Set to False if any "
+            "stated requirement was unmet, the page did not contain the expected "
+            "data, or a step could not be verified. Leave True only when every "
+            "requirement was directly confirmed this session."
+        ),
+    )
 
 
 # Mapping: action name → (param model, description, terminates_sequence)
@@ -344,5 +360,11 @@ ACTION_DEFINITIONS: dict[str, tuple[type[BaseModel], str, bool]] = {
         ),
         False,
     ),
-    "done": (DoneParams, "Signal that the task is complete with a summary", False),
+    "done": (
+        DoneParams,
+        "Signal that the task is complete and stop the agent. Must be the only action "
+        "in the step. Provide a final summary of what was accomplished; set success=False "
+        "if any requirement was unmet or could not be verified.",
+        False,
+    ),
 }

@@ -1416,10 +1416,20 @@ class Tools:
         return ActionResult(extracted_content=formatted, long_term_memory=memory)
 
     async def _action_done(self, params: dict, browser: BrowserSession) -> ActionResult:
+        success = params.get("success", True)
+        text = (params.get("text") or "").strip()
+        if not text:
+            # done 必须终止（is_done=True 才退出循环，step.py:103），空 text 不能走
+            # soft-miss（会变非终止循环）。兜底默认值保证终止 + 让退化情形在日志可见。
+            text = "(no summary provided)"
+            logger.warning("done called with empty text; substituting default summary")
+        memory = f"Task completed: {success} - {text[:100]}"
+        logger.info(memory)
         return ActionResult(
             is_done=True,
-            success=params.get("success", True),
-            extracted_content=params.get("text", ""),
+            success=success,
+            extracted_content=text,
+            long_term_memory=memory,
         )
 
     # ── Helpers ────────────────────────────────────────────────────────
