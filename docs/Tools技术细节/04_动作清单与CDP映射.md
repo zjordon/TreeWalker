@@ -1302,33 +1302,58 @@
 
 ### 4.24 `write_file`
 
-- **description**：`Write content to a local file` / 写入本地文件
+- **description**：`Write UTF-8 text to a local file (parent directories are auto-created). Default is overwrite... Set append=True to add... trailing_newline (default True)... Prefer replace_file for in-place edits...` / 写 UTF-8 文本到本地文件（父目录自动创建），默认覆盖；`append=True` 追加；小范围改动用 `replace_file`（详见 `ACTION_DEFINITIONS["write_file"]`，`models.py`）；对齐 browser-use `service.py:1682-1711`
 - **terminates_sequence**：False
-- **Pydantic 参数**：
+- **Pydantic 参数**（`WriteFileParams`，`models.py`，`extra="forbid"`）：
 
-  | 字段 | 类型 | 描述 |
-  |---|---|---|
-  | `path` | `str` | File path to write to |
-  | `content` | `str` | Content to write |
+  | 字段 | 类型 | 默认 | 描述 |
+  |---|---|---|---|
+  | `path` | `str` | （必填） | File path to write to（父目录自动创建） |
+  | `content` | `str` | （必填） | Text content to write（UTF-8） |
+  | `append` | `bool` | `False` | True 追加到既有文件末尾（文件不存在则自动创建）；默认 False 整体覆盖 |
+  | `trailing_newline` | `bool` | `True` | True（默认）确保内容以恰好一个换行结尾（已有则不变） |
+  | `leading_newline` | `bool` | `False` | True 在内容前补一个换行（追加到缺尾换行的文件时分隔新旧内容） |
 
-- **主要逻辑**（[actions.py:423-429](../../src/tree_walker/tools/actions.py)）：
+- **主要逻辑**（[actions.py:1243-1275](../../src/tree_walker/tools/actions.py)）：action 层做换行簿记 → `OSError` 分级捕获 → 字节数回显。无 session 封装（纯本地文件操作，不涉及 CDP）。
 
   ```python
   async def _action_write_file(self, params: dict, browser: BrowserSession) -> ActionResult:
       path = params["path"]
       content = params["content"]
-      os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-      with open(path, "w", encoding="utf-8") as f:
-          f.write(content)
-      return ActionResult(extracted_content=f"Written to {path}")
+      append = params.get("append", False)
+      trailing_newline = params.get("trailing_newline", True)
+      leading_newline = params.get("leading_newline", False)
+      # 换行簿记在 action 层；trailing 用守卫式（幂等、不双换行、不破坏 CRLF）
+      if leading_newline:
+          content = "\n" + content
+      if trailing_newline and not content.endswith("\n"):
+          content = content + "\n"
+      mode = "a" if append else "w"
+      try:
+          os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+          # newline="" 关闭 Windows 文本模式 \n→\r\n 翻译，保证写出字节 == 字节数回显
+          with open(path, mode, encoding="utf-8", newline="") as f:
+              f.write(content)
+      except OSError as e:
+          logger.warning("write_file(%r) failed: %s", path, e)
+          return ActionResult(error=f"Failed to write file {path}: {e}")
+      written = len(content.encode("utf-8"))
+      action_word = "Appended" if append else "Wrote"
+      memory = f"{action_word} {written} bytes to {path}"
+      logger.info(memory)
+      return ActionResult(extracted_content=memory, long_term_memory=memory)
   ```
 
-- **CDP 调用清单**：无
+- **CDP 调用清单**：无（纯本地文件操作）
 
 - **注意事项**：
-  - 自动创建父目录（`makedirs(exist_ok=True)`）
-  - 编码固定 UTF-8
-  - 整体覆盖（非追加）
+  - **分级错误**：`OSError`（含 `PermissionError`/`IsADirectoryError`——path 指向目录等）→ `ActionResult(error="Failed to write file {path}: {e}")` + `logger.warning`，不冒泡到 `Tools.execute` 通用 catch（对齐 `save_as_pdf:980-985`）。
+  - **追加模式沿用 Python `'a'` 自动创建**：append 到不存在的文件直接创建（与 browser-use `append_file` "要求文件已存在"相反，见 `docs/tools-optimize/write_file.md` "关键差异"第 5 条）。
+  - **`trailing_newline` 守卫式**：`not content.endswith("\n")`，幂等不双换行；CRLF（`"foo\r\n".endswith("\n")` 为 True）天然不被破坏。与 browser-use 无条件 `content += '\n'` 不同。
+  - **`newline=""` 写盘**：关闭 Windows `\n→\r\n` 翻译，跨平台一致 LF 行尾，且回显字节数（`len(content.encode("utf-8"))`，换行簿记**之后**计算）== 磁盘真实大小。
+  - 成功回显 `Wrote|Appended N bytes to {path}`，同时写 `extracted_content` + `long_term_memory`（对齐 navigate/click/find_elements/evaluate 主流约定）；`success` 保持 None（`ActionResult` 校验器拒绝非 done 的 `success=True`）。
+  - 自动创建父目录（`makedirs(exist_ok=True)`）；编码固定 UTF-8。
+  - 完整方案见 `docs/tools-optimize/write_file.md`；测试见 `tests/test_write_file.py`。
 
 ---
 

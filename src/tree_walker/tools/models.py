@@ -164,8 +164,23 @@ class UploadFileParams(BaseModel):
 
 class WriteFileParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    path: str = Field(description="File path to write to")
-    content: str = Field(description="Content to write")
+    path: str = Field(description="File path to write to (parent directories are auto-created).")
+    content: str = Field(description="Text content to write (UTF-8).")
+    append: bool = Field(
+        default=False,
+        description="If True, append to the end of an existing file instead of overwriting it. "
+        "Default False overwrites the entire file.",
+    )
+    trailing_newline: bool = Field(
+        default=True,
+        description="If True (default), ensure the written content ends with exactly one newline "
+        "(no-op if it already does).",
+    )
+    leading_newline: bool = Field(
+        default=False,
+        description="If True, prepend a newline before the content (useful when appending to a "
+        "file that lacks a trailing newline).",
+    )
 
 
 class ReadFileParams(BaseModel):
@@ -282,7 +297,19 @@ ACTION_DEFINITIONS: dict[str, tuple[type[BaseModel], str, bool]] = {
         False,
     ),
     "upload_file": (UploadFileParams, "Upload a file to a file input element. Do NOT click the input or an upload button first — upload_file sets the file directly without opening the OS file picker", False),
-    "write_file": (WriteFileParams, "Write content to a local file", False),
+    "write_file": (
+        WriteFileParams,
+        "Write UTF-8 text to a local file (parent directories are "
+        "auto-created). Default is overwrite: the file's previous content is "
+        "fully replaced. Set append=True to add to the end of an existing "
+        "file instead (it is created if missing). trailing_newline (default "
+        "True) ensures the content ends with exactly one newline — no-op if "
+        "it already does; set leading_newline=True only when appending to a "
+        "file you know lacks a trailing newline, to separate the new content. "
+        "Prefer replace_file for in-place edits to a small region of a large "
+        "file you have already read.",
+        False,
+    ),
     "read_file": (ReadFileParams, "Read content from a local file", False),
     "replace_file": (ReplaceFileParams, "Replace text within a local file", False),
     "evaluate": (
