@@ -18,6 +18,7 @@ from tree_walker.prompts.system_prompt import build_state_message, build_system_
 from tree_walker.tools.models import ACTION_DEFINITIONS
 
 if TYPE_CHECKING:
+    from tree_walker.config import TruncationSettings
     from tree_walker.agent.loop_detector import ActionLoopDetector
     from tree_walker.agent.message_compactor import MessageCompactor
     from tree_walker.agent.plan_manager import PlanManager
@@ -68,6 +69,7 @@ class StepPipeline:
     _replan_failure_threshold: int
     _obs_bus: EventBus | None
     _obs_session_id: str
+    _truncation: TruncationSettings
 
     # ── Orchestrator ──────────────────────────────────────────────────
 
@@ -734,6 +736,16 @@ class StepPipeline:
                     "title": browser_state.title,
                     "duration": time.time() - self._step_start_time,
                 }
+                # Only the done step carries a DOM excerpt — it's the
+                # independent page evidence the Judge uses to verify the final
+                # result is real (not hallucinated). Other steps stay light
+                # (url/title only) so a long session can't blow the token
+                # budget and force a truncation that drops the done step.
+                if any(r.is_done for r in results):
+                    dom_state = browser_state.dom_state
+                    state_summary["dom_excerpt"] = (
+                        dom_state.element_tree_text if dom_state else ""
+                    )[: self._truncation.dom_excerpt_max_chars]
             self.history.history.append(AgentHistory(
                 step_number=self.state.n_steps,
                 model_output=model_output,
