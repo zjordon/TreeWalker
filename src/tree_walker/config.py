@@ -47,13 +47,15 @@ class TruncationSettings:
     read_file_max_chars: int = 5000          # file read tool result
     eval_result_max_chars: int = 2000        # JavaScript eval result
     display_max_chars: int = 500             # ActionResult display string
+    dom_excerpt_max_chars: int = 2000        # DOM excerpt persisted per step for Judge review
 
 
 @dataclass
 class JudgeSettings:
-    enabled: bool = False
+    enabled: bool = True
     model: str = ""
     max_history_steps: int = 20
+    trace_max_chars: int = 40000
 
 
 @dataclass
@@ -236,6 +238,7 @@ def load_settings() -> Settings:
             read_file_max_chars=int(os.environ.get("AGENT_TRUNCATE_READ_FILE", "5000")),
             eval_result_max_chars=int(os.environ.get("AGENT_TRUNCATE_EVAL_RESULT", "2000")),
             display_max_chars=int(os.environ.get("AGENT_TRUNCATE_DISPLAY", "500")),
+            dom_excerpt_max_chars=int(os.environ.get("AGENT_TRUNCATE_DOM_EXCERPT", "2000")),
         ),
         enable_planning=os.environ.get("AGENT_ENABLE_PLANNING", "").lower() == "true",
         exploration_threshold=int(os.environ.get("AGENT_EXPLORATION_THRESHOLD", "5")),
@@ -246,9 +249,10 @@ def load_settings() -> Settings:
         action_page_filters=_load_action_page_filters(),
         allowed_upload_paths=_load_allowed_upload_paths(),
         judge=JudgeSettings(
-            enabled=os.environ.get("AGENT_JUDGE_ENABLED", "0") == "1",
+            enabled=os.environ.get("AGENT_JUDGE_ENABLED", "1") == "1",
             model=os.environ.get("AGENT_JUDGE_MODEL", ""),
             max_history_steps=int(os.environ.get("AGENT_JUDGE_MAX_HISTORY_STEPS", "20")),
+            trace_max_chars=int(os.environ.get("AGENT_JUDGE_TRACE_MAX_CHARS", "40000")),
         ),
     )
 

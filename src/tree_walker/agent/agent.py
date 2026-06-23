@@ -65,6 +65,7 @@ class Agent(StepPipeline):
             self.tools._extract_llm = self.llm
         self.tools._extraction_schema = _settings.extraction_schema
         ActionResult.display_max_chars = _settings.truncation.display_max_chars
+        self._truncation = _settings.truncation
         self.max_steps = _settings.max_steps
         self.max_failures = _settings.max_failures
         self.llm_timeout = _settings.llm_timeout
@@ -116,8 +117,7 @@ class Agent(StepPipeline):
         # Judge
         self._judge: JudgeEvaluator | None = None
         if _settings.judge and _settings.judge.enabled:
-            self._judge = JudgeEvaluator(llm=self.llm)
-            self._judge_max_history_steps = _settings.judge.max_history_steps
+            self._judge = JudgeEvaluator(llm=self.llm, settings=_settings.judge)
 
         # Observability
         self._obs_bus = None
@@ -313,7 +313,6 @@ class Agent(StepPipeline):
             task=self._safe_task,
             history=self.history,
             final_result=final_result,
-            max_history_steps=self._judge_max_history_steps,
         )
 
         if judgement and self.history.history:
