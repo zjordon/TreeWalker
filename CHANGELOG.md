@@ -5,6 +5,22 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.5.0] - 2026-06-24
+
+### Added
+
+**工具优化阶段一**（统一为各工具接通 LLM / 封装 / 错误分级捕获 / 结构化回显 + 单测）：
+
+- **extract 工具优化阶段一**（#42）：接通 LLM + 结构化输出 + 错误分级捕获
+- **search_page 工具优化阶段一**（#44）：grep 式全文检索 + 封装 + 错误分级捕获
+- **find_elements 工具优化阶段一**（#46）：CSS 选择器元素查询 + 封装 + 错误分级捕获
+- **evaluate 工具优化阶段一**（#48）：任意 JS 执行 + type-aware 结果归一化 + 封装 + 分级错误
+- **write_file 工具优化阶段一**（#50）：追加/换行控制 + 分级错误 + 字节回显
+- **replace_file 工具优化阶段一**（#52）：换行修复 + 分级错误 + 软提示 + 计数回显
+- **read_file 工具优化阶段一**（#54）：换行修复 + 分级错误 + 截断回显 + 空文件软提示
+- **done 工具优化阶段一**（#56）：description 富化 + long_term_memory 回显 + 空 text 守卫
+- **judge 复核器补全页面证据 + token 控制/截断保尾**（#58）
+
 ## [0.4.0] - 2026-06-21
 
 ### Added
@@ -106,6 +122,7 @@
 - 编程接口（`Agent`、`LLMClient`、`BrowserSession` 可独立使用）
 - 498 项单元测试
 
+[0.5.0]: https://github.com/zjordon/TreeWalker/releases/tag/v0.5.0
 [0.4.0]: https://github.com/zjordon/TreeWalker/releases/tag/v0.4.0
 [0.3.0]: https://github.com/zjordon/TreeWalker/releases/tag/v0.3.0
 [0.2.0]: https://github.com/zjordon/TreeWalker/releases/tag/v0.2.0
