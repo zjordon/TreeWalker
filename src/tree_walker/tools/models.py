@@ -111,6 +111,25 @@ class FindElementsParams(BaseModel):
 class FindTextParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
     text: str = Field(min_length=1, description="Text to search for on the page")
+    nth: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "Which match to scroll to, 1-based (default: 1st). The echo reports "
+            "total/visible counts so the caller can increment to navigate matches."
+        ),
+    )
+    case_sensitive: bool = Field(
+        default=False,
+        description="Case-sensitive match (default: case-insensitive, like Ctrl+F). Aligns with search_page.",
+    )
+    highlight: Literal["box", "selection", "none"] = Field(
+        default="box",
+        description=(
+            "Highlight style: box=element outline (default), selection=native blue "
+            "text selection (best-effort, Chromium-only), none=off."
+        ),
+    )
 
 
 class ScreenshotClipParams(BaseModel):
@@ -293,7 +312,7 @@ ACTION_DEFINITIONS: dict[str, tuple[type[BaseModel], str, bool]] = {
         "get links/attributes.",
         False,
     ),
-    "find_text": (FindTextParams, "Scroll to and highlight text on the page", False),
+    "find_text": (FindTextParams, "Scroll to and highlight the nth visible match of text on the page", False),
     "screenshot": (
         ScreenshotParams,
         "Take a screenshot with optional format, quality (jpeg), clip region, "

@@ -903,15 +903,30 @@ class Tools:
 
     async def _action_find_text(self, params: dict, browser: BrowserSession) -> ActionResult:
         text = params["text"]
+        nth = params.get("nth", 1)
+        case_sensitive = params.get("case_sensitive", False)
+        highlight = params.get("highlight", "box")
         try:
-            info = await browser.find_text(text)
+            info = await browser.find_text(
+                text, nth=nth, case_sensitive=case_sensitive, highlight=highlight,
+            )
         except Exception as e:
             # CDP layer failure (connection drop / DOM domain error) = tool
             # execution failure; surface a find_text-specific error rather
             # than the generic Tools.execute fallback.
-            logger.warning("find_text(%r) failed: %s", text, e)
+            logger.warning("find_text(%r, nth=%d) failed: %s", text, nth, e)
             return ActionResult(error=f"Find text failed: {e}")
         if not info.get("found"):
+            if info.get("reason") == "nth_exceeds":
+                # Text is on the page but nth exceeds the visible match count:
+                # actionable (caller can lower nth), not a tool failure.
+                msg = (
+                    f"Text '{text}' found but only {info.get('visible_total')} visible "
+                    f"match(es) ({info.get('total')} total via {info.get('method')}) "
+                    f"— asked for match {info.get('requested_nth')}, try a smaller nth"
+                )
+                logger.info(msg)
+                return ActionResult(extracted_content=msg, long_term_memory=msg)
             # Soft echo: "text not on the page" is actionable info (the LLM
             # can scroll / switch tab / accept the text is absent), not a tool
             # failure — aligns with browser-use and the sibling search_page
@@ -921,10 +936,23 @@ class Tools:
             return ActionResult(extracted_content=msg, long_term_memory=msg)
         method = info.get("method")
         tag = info.get("tag")
-        if tag:
-            memory = f"Scrolled to text '{text}' into view (found in <{tag}>, via {method})"
+        total = info.get("total")
+        if total and total > 1:
+            # Multi-match: report which match out of how many (G8).
+            counts = f"match {info.get('match_index')} of {info.get('visible_total')} visible, {total} total"
+            if tag:
+                memory = f"Scrolled to text '{text}' into view ({counts}, found in <{tag}>, via {method})"
+            else:
+                memory = f"Scrolled to text '{text}' into view ({counts}, via {method})"
         else:
-            memory = f"Scrolled to text '{text}' into view (via {method})"
+            # Single match (total==1) or JS fallback (no count): P0-style echo.
+            if tag:
+                memory = f"Scrolled to text '{text}' into view (found in <{tag}>, via {method})"
+            else:
+                memory = f"Scrolled to text '{text}' into view (via {method})"
+        info_highlight = info.get("highlight")
+        if info_highlight and info_highlight != "box":
+            memory += f" ({info_highlight} highlight)"
         logger.info(memory)
         return ActionResult(extracted_content=memory, long_term_memory=memory)
 

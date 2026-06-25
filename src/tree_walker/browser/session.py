@@ -12,7 +12,7 @@ import secrets
 import shutil
 import tempfile
 import time
-from typing import Any
+from typing import Any, Literal
 
 from cdp_use import CDPClient
 
@@ -51,6 +51,40 @@ def _xpath_string_literal(text: str) -> str:
         return f"'{text}'"
     parts = text.split('"')
     return "concat(" + ", '\"', ".join(f'"{p}"' for p in parts) + ")"
+
+
+# XPath alphabet constants for case-insensitive contains() (XPath 1.0 has no
+# native case-insensitive match): translate(., LOWER, UPPER) upper-cases both
+# haystack and needle so contains() compares case-insensitively. Used by
+# _text_queries when case_sensitive=False (G10).
+_XPATH_LOWER = "'abcdefghijklmnopqrstuvwxyz'"
+_XPATH_UPPER = "'ABCDEFGHIJKLMNOPQRSTUVWXYZ'"
+
+# Cap on how many matches find_text fetches per XPath query; the G9 visibility
+# probe and G8 nth selection operate on this batch. Large result sets are
+# truncated — the true total is still reported in the echo.
+_FIND_TEXT_CAP = 50
+
+
+def _text_queries(text: str, case_sensitive: bool) -> list[tuple[str, str]]:
+    """Build the 3-query XPath chain for find_text.
+
+    case_sensitive=False wraps both the haystack and the needle in
+    translate(., _XPATH_LOWER, _XPATH_UPPER) so contains() matches
+    case-insensitively (XPath 1.0 has no native case-insensitive contains).
+    The needle is still run through _xpath_string_literal first, so
+    quote-safety and case-folding are orthogonal.
+    """
+    lit = _xpath_string_literal(text)
+    needle = lit if case_sensitive else f"translate({lit}, {_XPATH_LOWER}, {_XPATH_UPPER})"
+    wrap = (lambda e: e) if case_sensitive else (
+        lambda e: f"translate({e}, {_XPATH_LOWER}, {_XPATH_UPPER})"
+    )
+    return [
+        ("xpath-text", f"//*[contains({wrap('text()')}, {needle})]"),
+        ("xpath-content", f"//*[contains({wrap('.')}, {needle})]"),
+        ("xpath-attr", f"//*[@*[contains({wrap('.')}, {needle})]]"),
+    ]
 
 
 # ── search_page (grep-style page text search) ────────────────────────
@@ -2140,33 +2174,31 @@ class BrowserSession:
             raise RuntimeError("JavaScript execution failed (wasThrown=true)")
         return _normalize_eval_result(result_data)
 
-    async def find_text(self, text: str) -> dict:
-        """Find text on the page and scroll the first match into view.
+    async def find_text(
+        self,
+        text: str,
+        *,
+        nth: int = 1,
+        case_sensitive: bool = False,
+        highlight: Literal["box", "selection", "none"] = "box",
+    ) -> dict:
+        """Find text on the page, scroll the nth visible match into view, highlight it.
 
-        Mirrors browser-use ``on_ScrollToTextEvent``
-        (default_action_watchdog.py:2682-2774) — a 3-query XPath chain via
-        ``DOM.performSearch`` with a JS TreeWalker fallback — with four bug
-        fixes: (1) XPath-safe string literal via ``_xpath_string_literal``
-        (browser-use f-string-injects and breaks on ``"``); (2)
-        ``discardSearchResults`` in a ``finally`` (browser-use skips it on
-        the winning query, leaking the searchId); (3)
-        ``includeUserAgentShadowDOM`` pierce (browser-use omits it); (4) no
-        unused ``DOM.getDocument`` (``performSearch`` already searches the
-        whole document).
+        Extends the P0 3-query XPath chain (``DOM.performSearch``) + JS
+        TreeWalker fallback with four P1 capabilities (see
+        find_text_follow_up.md): (G8) ``nth`` selects which match — stateless,
+        re-searches each call, no cross-call session state; (G9) visibility-
+        priority filtering (default on, only probes when >1 match, so single-
+        match behavior is unchanged from P0); (G10) case-insensitive by
+        default via XPath ``translate()``; (G11) ``highlight`` mode.
 
-        Returns ``{found, method, tag}`` where ``method`` is one of
-        ``xpath-text`` / ``xpath-content`` / ``xpath-attr`` /
-        ``js-treewalker`` / ``none``. A clean miss returns ``found=False``
-        and never raises; the action layer builds the soft echo. Unexpected
-        CDP errors propagate to the action layer's try/except.
+        Returns a dict. ``found=False`` covers both "text absent"
+        (``method="none"``) and "text present but nth exceeds the visible
+        count" (``reason="nth_exceeds"``); never raises on these — the action
+        layer builds the echo. Unexpected CDP errors propagate to it.
         """
         sid = self.current_session_id
-        lit = _xpath_string_literal(text)
-        queries = [
-            ("xpath-text", f"//*[contains(text(), {lit})]"),
-            ("xpath-content", f"//*[contains(., {lit})]"),
-            ("xpath-attr", f"//*[@*[contains(., {lit})]]"),
-        ]
+        queries = _text_queries(text, case_sensitive)
         for method, query in queries:
             search_id: str | None = None
             try:
@@ -2175,27 +2207,54 @@ class BrowserSession:
                     session_id=sid,
                 )
                 search_id = search.get("searchId")
-                if search.get("resultCount", 0) <= 0:
+                total = search.get("resultCount", 0)
+                if total <= 0:
                     continue
+                # G8: fetch a capped batch (shared with the G9 visibility probe).
                 results = await self.client.send.DOM.getSearchResults(
-                    {"searchId": search_id, "fromIndex": 0, "toIndex": 1},
+                    {"searchId": search_id, "fromIndex": 0, "toIndex": min(total, _FIND_TEXT_CAP)},
                     session_id=sid,
                 )
                 node_ids = results.get("nodeIds", [])
                 if not node_ids:
                     continue
-                node_id = node_ids[0]
+                # G9: visibility-priority (only probes when >1 match).
+                visible_ids = await self._visible_node_ids(node_ids, sid)
+                # G8: nth within the visible matches of THIS winning query
+                # (don't fall through to the next query — keeps method/total
+                # reporting clean and predictable).
+                if nth > len(visible_ids):
+                    return {
+                        "found": False,
+                        "reason": "nth_exceeds",
+                        "method": method,
+                        "requested_nth": nth,
+                        "visible_total": len(visible_ids),
+                        "total": total,
+                    }
+                node_id = visible_ids[nth - 1]
                 await self.client.send.DOM.scrollIntoViewIfNeeded(
                     {"nodeId": node_id}, session_id=sid,
                 )
-                tag = await self._highlight_search_node(node_id)
-                return {"found": True, "method": method, "tag": tag}
+                tag = await self._highlight_search_node(
+                    node_id, text, nth, case_sensitive, highlight,
+                )
+                return {
+                    "found": True,
+                    "method": method,
+                    "tag": tag,
+                    "match_index": nth,
+                    "visible_total": len(visible_ids),
+                    "total": total,
+                    "highlight": highlight,
+                }
             except Exception as e:
                 logger.debug("find_text query %s failed: %s", query, e)
                 continue
             finally:
-                # Bug fix: browser-use puts this after `break`, so the winning
-                # query leaks its searchId. finally runs on return/continue/raise.
+                # Bug fix: browser-use puts discardSearchResults after `break`,
+                # so the winning query leaks its searchId. finally runs on
+                # return/continue/raise — the nth_exceeds return also cleans up.
                 if search_id is not None:
                     try:
                         await self.client.send.DOM.discardSearchResults(
@@ -2203,24 +2262,30 @@ class BrowserSession:
                         )
                     except Exception:
                         pass
-        if await self._find_text_js_fallback(text):
+        if await self._find_text_js_fallback(text, case_sensitive):
             return {"found": True, "method": "js-treewalker", "tag": None}
         return {"found": False, "method": "none", "tag": None}
 
-    async def _find_text_js_fallback(self, text: str) -> bool:
+    async def _find_text_js_fallback(self, text: str, case_sensitive: bool = False) -> bool:
         """TreeWalker over text nodes under document.body; scrollIntoView the
         first match's parentElement. ``text`` is injected via ``json.dumps``
         (JS-safe; browser-use f-string-injects and breaks on quotes). Only
-        runs when all three XPath queries miss."""
+        runs when all three XPath queries miss. ``case_sensitive=False``
+        lowercases both sides (aligns with the XPath translate() path, G10)."""
+        needle_js = json.dumps(text)
+        if case_sensitive:
+            cond = "t.includes(needle)"
+        else:
+            cond = "t.toLowerCase().includes(needle.toLowerCase())"
         js = (
             "(() => {"
-            f"  const needle = {json.dumps(text)};"
+            f"  const needle = {needle_js};"
             "  const walker = document.createTreeWalker("
             "    document.body, NodeFilter.SHOW_TEXT, null, false);"
             "  let node;"
             "  while ((node = walker.nextNode())) {"
             "    const t = node.nodeValue || '';"
-            "    if (t.includes(needle) && t.trim()) {"
+            f"    if ({cond} && t.trim()) {{"
             "      if (node.parentElement) {"
             "        node.parentElement.scrollIntoView("
             "          { behavior: 'smooth', block: 'center' });"
@@ -2237,23 +2302,128 @@ class BrowserSession:
             logger.debug("find_text JS fallback failed: %s", e)
             return False
 
-    async def _highlight_search_node(self, node_id: int) -> str | None:
-        """Convert a performSearch nodeId to backendNodeId and highlight the
-        element box (visual feedback, best-effort — honors the "highlight"
-        promise in find_text's description). Returns the lowercased tag name
-        for the action echo, or None if describe/highlight failed."""
+    async def _highlight_search_node(
+        self,
+        node_id: int,
+        text: str,
+        nth: int,
+        case_sensitive: bool,
+        highlight: Literal["box", "selection", "none"],
+    ) -> str | None:
+        """Highlight the matched node per ``highlight`` mode (G11). Always
+        describes first to get the tag for the echo. ``box``=Overlay element
+        box (default); ``selection``=native blue text selection via
+        window.find (best-effort, Chromium-only); ``none``=skip. Returns the
+        tag or None."""
         try:
             desc = await self.client.send.DOM.describeNode(
                 {"nodeId": node_id}, session_id=self.current_session_id,
             )
-            node = desc.get("node", {})
+            node = desc.get("node") or {}
             backend_id = node.get("backendNodeId")
             tag = (node.get("nodeName") or "").lower() or None
-            if backend_id:
-                await self.highlight_element(backend_id)
-            return tag
         except Exception:
-            return None
+            backend_id = None
+            tag = None
+        if highlight == "box":
+            if backend_id:
+                try:
+                    await self.highlight_element(backend_id)
+                except Exception:
+                    pass
+        elif highlight == "selection":
+            await self._select_text_via_window_find(text, nth, case_sensitive)
+        # "none": no highlight.
+        return tag
+
+    async def _select_text_via_window_find(
+        self, text: str, nth: int, case_sensitive: bool,
+    ) -> None:
+        """Create a native browser text selection (blue highlight) at the nth
+        occurrence of ``text`` via ``window.find`` (G11, best-effort). The
+        element was already scrolled into view by the caller, so this only
+        affects the visual selection. ``window.find`` is non-standard
+        (Chromium-only, may drift); failure is silent. ``case_sensitive`` maps
+        to window.find's 2nd arg; looped nth times to reach the nth match."""
+        needle_js = json.dumps(text)
+        js = (
+            "(() => {"
+            f"  const needle = {needle_js};"
+            f"  const caseSensitive = {'true' if case_sensitive else 'false'};"
+            f"  const n = {int(nth)};"
+            "  let ok = false;"
+            "  for (let i = 0; i < n; i++) {"
+            "    ok = window.find(needle, caseSensitive, false, false, false, false, false);"
+            "    if (!ok) break;"
+            "  }"
+            "  return ok;"
+            "})()"
+        )
+        try:
+            await self.execute_js(js)
+        except Exception as e:
+            logger.debug("find_text window.find selection failed: %s", e)
+
+    async def _visible_node_ids(self, node_ids: list[int], sid: str) -> list[int]:
+        """Filter nodeIds to visible ones (G9), in DOM order. Returns the
+        visible subset; if none are visible, degrades to ``[node_ids[0]]``
+        (best-effort — scroll somewhere rather than fail). Skips the probe for
+        a single nodeId (single-match path is unchanged from P0). Visibility =
+        non-zero bounding rect + not visibility:hidden/display:none (NOT
+        offsetParent, which misclassifies position:fixed as hidden). Any CDP
+        error -> treat all as visible (don't block the search)."""
+        if len(node_ids) <= 1:
+            return list(node_ids)
+        try:
+            visible_flags = await self._probe_visibility(node_ids, sid)
+        except Exception as e:
+            logger.debug("find_text visibility probe failed: %s", e)
+            return list(node_ids)
+        visible = [nid for nid, ok in zip(node_ids, visible_flags) if ok]
+        if not visible:
+            # All hidden (e.g. collapsed region) — degrade to first, don't fail.
+            return [node_ids[0]]
+        return visible
+
+    async def _probe_visibility(self, node_ids: list[int], sid: str) -> list[bool]:
+        """Batch visibility probe (G9, path A): resolve each nodeId to an
+        objectId, then ONE ``Runtime.callFunctionOn`` over all of them
+        returns a ``bool[]`` in the same order. Caller handles errors /
+        degradation."""
+        # Resolve each nodeId -> objectId (caller caps node_ids at _FIND_TEXT_CAP).
+        object_ids: list[str] = []
+        for nid in node_ids:
+            resolved = await self.client.send.DOM.resolveNode(
+                {"nodeId": nid}, session_id=sid,
+            )
+            object_ids.append((resolved.get("object") or {}).get("objectId"))
+        # One callFunctionOn: this = first element, the rest as arguments.
+        decl = (
+            "function(...rest) {"
+            "  const els = [this].concat(rest);"
+            "  const vis = (el) => {"
+            "    if (!el) return false;"
+            "    const r = el.getBoundingClientRect();"
+            "    const s = getComputedStyle(el);"
+            "    return r.width > 0 && r.height > 0"
+            "      && s.visibility !== 'hidden' && s.display !== 'none';"
+            "  };"
+            "  return els.map(vis);"
+            "}"
+        )
+        res = await self.client.send.Runtime.callFunctionOn(
+            {
+                "functionDeclaration": decl,
+                "objectId": object_ids[0],
+                "arguments": [{"objectId": oid} for oid in object_ids[1:]],
+                "returnByValue": True,
+            },
+            session_id=sid,
+        )
+        value = (res.get("result") or {}).get("value")
+        if not isinstance(value, list) or len(value) != len(node_ids):
+            raise RuntimeError(f"visibility probe unexpected shape: {value!r}")
+        return [bool(v) for v in value]
 
     async def search_page(
         self,
