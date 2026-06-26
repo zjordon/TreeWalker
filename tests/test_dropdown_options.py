@@ -7,7 +7,7 @@ tests/test_upload_file.py:
   extracted_content lists each option json-encoded with a select_dropdown hint
 - non-select element: friendly error (no full-page select leak)
 - index absent from selector_map: returns error without touching CDP
-- fetch_select_options raising -> friendly 'Failed to read select options:'
+- fetch_select_options raising -> friendly 'Failed to read dropdown options:'
 - empty options: soft echo (just the hint line, no exception)
 - output format: text/value json-encoded (quotes preserved) + hint uses 'value'
 """
@@ -24,6 +24,7 @@ from tree_walker.browser.views import (
 	NodeType,
 	SerializedDOMState,
 )
+from tree_walker.browser.session import BrowserSession
 from tree_walker.tools.actions import Tools
 
 
@@ -62,10 +63,13 @@ def _make_state(selector_map: dict[int, EnhancedDOMTreeNode]) -> BrowserStateSum
 	)
 
 
-def _make_browser(*, options=None, raises=None) -> MagicMock:
+def _make_browser(*, options=None, raises=None, dispatch=None) -> MagicMock:
 	"""Stub BrowserSession for action-layer tests (does NOT touch CDP).
 
-	fetch_select_options is the only session method dropdown_options calls.
+	native <select> path calls fetch_select_options (options/raises); the
+	non-native dispatcher path calls fetch_dropdown_options (dispatch, default
+	true-negative {"options":[], "source": None}); the combobox path calls
+	expand_and_fetch_combobox_options.
 	"""
 	bs = MagicMock()
 	if raises is not None:
@@ -74,6 +78,10 @@ def _make_browser(*, options=None, raises=None) -> MagicMock:
 		bs.fetch_select_options = AsyncMock(
 			return_value=options if options is not None else []
 		)
+	bs.fetch_dropdown_options = AsyncMock(
+		return_value=dispatch if dispatch is not None else {"options": [], "source": None}
+	)
+	bs.expand_and_fetch_combobox_options = AsyncMock(return_value=[])
 	bs.get_state = AsyncMock(return_value=_make_state({}))
 	return bs
 
@@ -122,9 +130,10 @@ class TestDropdownOptionsAction:
 
 		assert result.error is not None
 		assert "[DIV]" in result.error
-		assert "not a <select>" in result.error
-		# G2: tag 校验早退，不碰 CDP
+		assert "not a recognized dropdown" in result.error
+		# 非 select 委托 session dispatcher（真阴性），不碰 native fetch
 		browser.fetch_select_options.assert_not_awaited()
+		browser.fetch_dropdown_options.assert_awaited_once_with(7)
 
 	@pytest.mark.asyncio
 	async def test_missing_index_returns_error_without_fetch(self):
@@ -149,7 +158,7 @@ class TestDropdownOptionsAction:
 		)
 
 		assert result.error is not None
-		assert "Failed to read select options" in result.error
+		assert "Failed to read dropdown options" in result.error
 		assert "CDP target detached" in result.error
 
 	@pytest.mark.asyncio
@@ -185,3 +194,252 @@ class TestDropdownOptionsAction:
 		assert result.extracted_content.rstrip().endswith(
 			"Use the value in select_dropdown(index=3, value=...)"
 		)
+
+
+# ── P1: dispatcher routing (ARIA / custom / combobox / subtree) ───────────────
+
+
+class TestDropdownOptionsDispatcher:
+	@pytest.mark.asyncio
+	async def test_aria_listbox_routes_through_session_dispatcher(self):
+		entry = _make_entry(tag="UL", backend_node_id=7, attributes={"role": "listbox"})
+		state = _make_state({3: entry})
+		browser = _make_browser(dispatch={"options": [
+			{"value": "a", "text": "Alpha", "selected": True},
+		], "source": "aria"})
+
+		result = await Tools().execute(
+			"dropdown_options", {"index": 3}, browser, browser_state=state,
+		)
+
+		# 范围绑定：dispatcher 用目标 backend_node_id
+		browser.fetch_dropdown_options.assert_awaited_once_with(7)
+		assert result.error is None
+		# source 折进 long_term_memory（诊断通道）
+		assert "Got 1 options" in result.long_term_memory
+		assert "via [ARIA]" in result.long_term_memory
+		# native fetch 未被调用（非 SELECT）
+		browser.fetch_select_options.assert_not_awaited()
+
+	@pytest.mark.asyncio
+	async def test_native_select_no_via_suffix_no_regression(self):
+		entry = _make_entry(tag="SELECT", backend_node_id=7, attributes={"aria-label": "Country"})
+		state = _make_state({3: entry})
+		browser = _make_browser(options=[{"value": "us", "text": "US", "selected": True}])
+
+		result = await Tools().execute(
+			"dropdown_options", {"index": 3}, browser, browser_state=state,
+		)
+
+		# native 路径零回归：仍调 fetch_select_options，source=native 无 "via" 后缀
+		browser.fetch_select_options.assert_awaited_once_with(7)
+		assert "Got 1 options" in result.long_term_memory
+		assert "via" not in result.long_term_memory
+		browser.fetch_dropdown_options.assert_not_awaited()
+
+	@pytest.mark.asyncio
+	async def test_empty_aria_options_emits_diagnostic_and_hint(self):
+		entry = _make_entry(tag="UL", backend_node_id=7, attributes={"role": "listbox"})
+		state = _make_state({3: entry})
+		browser = _make_browser(dispatch={"options": [], "source": "aria"})
+
+		result = await Tools().execute(
+			"dropdown_options", {"index": 3}, browser, browser_state=state,
+		)
+
+		assert result.error is None
+		assert "Got 0 options" in result.long_term_memory
+		assert "via [ARIA]" in result.long_term_memory
+		# G5 进阶：空选项诊断
+		assert "[role=option]" in result.extracted_content
+		assert "select_dropdown(index=3, value=...)" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_dispatcher_raises_maps_to_friendly_error(self):
+		entry = _make_entry(tag="UL", backend_node_id=7, attributes={"role": "listbox"})
+		state = _make_state({3: entry})
+		browser = _make_browser()
+		browser.fetch_dropdown_options = AsyncMock(side_effect=RuntimeError("CDP detached"))
+
+		result = await Tools().execute(
+			"dropdown_options", {"index": 3}, browser, browser_state=state,
+		)
+
+		assert result.error is not None
+		assert "Failed to read dropdown options" in result.error
+		assert "CDP detached" in result.error
+
+	@pytest.mark.asyncio
+	async def test_custom_dropdown_routes_with_custom_source(self):
+		entry = _make_entry(tag="DIV", backend_node_id=7, attributes={"class": "ui dropdown"})
+		state = _make_state({3: entry})
+		browser = _make_browser(dispatch={"options": [
+			{"value": "us", "text": "United States", "selected": True},
+		], "source": "custom"})
+
+		result = await Tools().execute(
+			"dropdown_options", {"index": 3}, browser, browser_state=state,
+		)
+
+		browser.fetch_dropdown_options.assert_awaited_once_with(7)
+		assert result.error is None
+		assert "Got 1 options" in result.long_term_memory
+		assert "via [CUSTOM]" in result.long_term_memory
+		browser.fetch_select_options.assert_not_awaited()
+
+
+# ── P1a: session layer (_fetch_aria_options + fetch_dropdown_options) ─────────
+
+
+class TestFetchAriaOptions:
+	"""Session-level coverage for BrowserSession._fetch_aria_options and the
+	fetch_dropdown_options dispatcher. Mirrors test_select_dropdown.py:
+	TestSetSelectOption — mocks the CDP boundary (client.send.DOM.resolveNode +
+	Runtime.callFunctionOn), NOT real browser behavior.
+	"""
+
+	def _make_session(self, value) -> tuple[BrowserSession, MagicMock]:
+		s = BrowserSession.__new__(BrowserSession)
+		s.current_session_id = "sid"
+		client = MagicMock()
+		client.send.DOM.resolveNode = AsyncMock(return_value={"object": {"objectId": "obj-1"}})
+		client.send.Runtime.callFunctionOn = AsyncMock(
+			return_value={"result": {"value": value}},
+		)
+		s.client = client
+		return s, client
+
+	@pytest.mark.asyncio
+	async def test_aria_returns_options_scoped_to_backend_id(self):
+		s, client = self._make_session([{"value": "a", "text": "Alpha", "selected": True}])
+		out = await s._fetch_aria_options(99)
+		assert out == [{"value": "a", "text": "Alpha", "selected": True}]
+		# 范围绑定：resolveNode 用目标 backendNodeId
+		client.send.DOM.resolveNode.assert_awaited_once_with(
+			{"backendNodeId": 99}, session_id="sid",
+		)
+		assert client.send.Runtime.callFunctionOn.await_count == 1
+		sent = client.send.Runtime.callFunctionOn.await_args.args[0]
+		assert sent["objectId"] == "obj-1"
+		assert sent["functionDeclaration"] is not None
+
+	@pytest.mark.asyncio
+	async def test_not_aria_returns_none(self):
+		s, _ = self._make_session(None)
+		assert await s._fetch_aria_options(7) is None
+
+	@pytest.mark.asyncio
+	async def test_dispatcher_returns_aria_source(self):
+		s, _ = self._make_session([{"value": "a", "text": "Alpha", "selected": False}])
+		out = await s.fetch_dropdown_options(99)
+		assert out == {"options": [{"value": "a", "text": "Alpha", "selected": False}], "source": "aria"}
+
+	@pytest.mark.asyncio
+	async def test_dispatcher_returns_none_source_when_not_aria(self):
+		s, _ = self._make_session(None)
+		out = await s.fetch_dropdown_options(99)
+		assert out == {"options": [], "source": None}
+
+
+# ── P1b: session layer (_fetch_custom_class_options + dispatcher fallback) ────
+
+
+class TestFetchCustomClassOptions:
+	def _make_session(self, value) -> tuple[BrowserSession, MagicMock]:
+		s = BrowserSession.__new__(BrowserSession)
+		s.current_session_id = "sid"
+		client = MagicMock()
+		client.send.DOM.resolveNode = AsyncMock(return_value={"object": {"objectId": "obj-1"}})
+		client.send.Runtime.callFunctionOn = AsyncMock(
+			return_value={"result": {"value": value}},
+		)
+		s.client = client
+		return s, client
+
+	@pytest.mark.asyncio
+	async def test_custom_returns_options_scoped_to_backend_id(self):
+		s, client = self._make_session([{"value": "us", "text": "United States", "selected": True}])
+		out = await s._fetch_custom_class_options(99)
+		assert out == [{"value": "us", "text": "United States", "selected": True}]
+		client.send.DOM.resolveNode.assert_awaited_once_with(
+			{"backendNodeId": 99}, session_id="sid",
+		)
+
+	@pytest.mark.asyncio
+	async def test_not_custom_returns_none(self):
+		s, _ = self._make_session(None)
+		assert await s._fetch_custom_class_options(7) is None
+
+	@pytest.mark.asyncio
+	async def test_dispatcher_falls_back_to_custom_when_aria_misses(self):
+		# aria 返回 None（callFunctionOn 第 1 次），custom 命中（第 2 次）。
+		s = BrowserSession.__new__(BrowserSession)
+		s.current_session_id = "sid"
+		client = MagicMock()
+		client.send.DOM.resolveNode = AsyncMock(return_value={"object": {"objectId": "obj-1"}})
+		client.send.Runtime.callFunctionOn = AsyncMock(side_effect=[
+			{"result": {"value": None}},  # aria miss
+			{"result": {"value": [{"value": "a", "text": "Alpha", "selected": False}]}},  # custom hit
+		])
+		s.client = client
+		out = await s.fetch_dropdown_options(99)
+		assert out == {"options": [{"value": "a", "text": "Alpha", "selected": False}], "source": "custom"}
+		assert client.send.Runtime.callFunctionOn.await_count == 2
+
+
+# ── P1d: session layer (search_children_for_dropdowns + dispatcher fallback) ──
+
+
+class TestSearchChildrenForDropdownOptions:
+	def _make_session(self, value) -> tuple[BrowserSession, MagicMock]:
+		s = BrowserSession.__new__(BrowserSession)
+		s.current_session_id = "sid"
+		client = MagicMock()
+		client.send.DOM.resolveNode = AsyncMock(return_value={"object": {"objectId": "obj-1"}})
+		client.send.Runtime.callFunctionOn = AsyncMock(
+			return_value={"result": {"value": value}},
+		)
+		s.client = client
+		return s, client
+
+	@pytest.mark.asyncio
+	async def test_subtree_hit_returns_options_and_depth_source(self):
+		s, client = self._make_session({
+			"options": [{"value": "a", "text": "Alpha", "selected": False}],
+			"source": "child-depth-2",
+		})
+		out = await s.search_children_for_dropdowns(99)
+		assert out == {"options": [{"value": "a", "text": "Alpha", "selected": False}], "source": "child-depth-2"}
+		# max_depth 经 arguments 传入（默认 4）
+		sent = client.send.Runtime.callFunctionOn.await_args.args[0]
+		assert sent["arguments"] == [{"value": 4}]
+
+	@pytest.mark.asyncio
+	async def test_subtree_miss_returns_none_source(self):
+		s, _ = self._make_session({"options": [], "source": None})
+		out = await s.search_children_for_dropdowns(99)
+		assert out == {"options": [], "source": None}
+
+	@pytest.mark.asyncio
+	async def test_subtree_value_none_defaults_to_empty(self):
+		# JS 返回 null/undefined -> 默认 {"options":[], "source": None}
+		s, _ = self._make_session(None)
+		out = await s.search_children_for_dropdowns(99)
+		assert out == {"options": [], "source": None}
+
+	@pytest.mark.asyncio
+	async def test_dispatcher_falls_back_to_subtree_when_aria_custom_miss(self):
+		# aria None（call 1）-> custom None（call 2）-> subtree 命中（call 3）
+		s = BrowserSession.__new__(BrowserSession)
+		s.current_session_id = "sid"
+		client = MagicMock()
+		client.send.DOM.resolveNode = AsyncMock(return_value={"object": {"objectId": "obj-1"}})
+		client.send.Runtime.callFunctionOn = AsyncMock(side_effect=[
+			{"result": {"value": None}},  # aria miss
+			{"result": {"value": None}},  # custom miss
+			{"result": {"value": {"options": [{"value": "a", "text": "A", "selected": False}], "source": "child-depth-1"}}},
+		])
+		s.client = client
+		out = await s.fetch_dropdown_options(99)
+		assert out == {"options": [{"value": "a", "text": "A", "selected": False}], "source": "child-depth-1"}
+		assert client.send.Runtime.callFunctionOn.await_count == 3

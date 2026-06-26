@@ -649,6 +649,131 @@ function(optionIndex) {
 }
 """
 
+# ARIA menu/listbox options reader (ported from browser-use default_action_watchdog.py
+# type='aria'). Returns null when the element is not aria-shaped (no listbox/menu/
+# menubar/tree/grid role AND no [role=option]/[role=menuitem] descendants) so the
+# dispatcher can try the next type; returns a list (possibly empty) when it IS
+# aria-shaped. Options hard-capped to 200 (D4); a synthetic truncation row is
+# appended when there are more.
+_ARIA_OPTIONS_JS = """
+function() {
+    const root = this;
+    const role = root.getAttribute('role');
+    const isAriaContainer = ['listbox', 'menu', 'menubar', 'tree', 'grid'].indexOf(role) !== -1;
+    const hasAriaOptions = !!root.querySelector('[role="option"],[role="menuitem"]');
+    if (!isAriaContainer && !hasAriaOptions) return null;
+    const all = Array.from(root.querySelectorAll('[role="menuitem"],[role="option"]'));
+    const capped = all.slice(0, 200);
+    const mapped = capped.map(function(n) {
+        return {
+            text: (n.textContent || '').trim(),
+            value: n.getAttribute('data-value') || n.getAttribute('value') || (n.textContent || '').trim(),
+            selected: n.getAttribute('aria-selected') === 'true' || n.classList.contains('selected') || n.classList.contains('active'),
+        };
+    });
+    if (all.length > 200) {
+        mapped.push({text: '... (showing 200 of ' + all.length + ', use scroll/search_page for more)', value: '', selected: false});
+    }
+    return mapped;
+}
+"""
+
+# Custom-class dropdown options reader (ported from browser-use type='custom':
+# Semantic UI / Foundation / etc.). Returns null when the element is not
+# custom-shaped (no 'dropdown'/'ui' class) so the dispatcher can try the next
+# type; a list (possibly empty) when it IS custom-shaped. Options hard-capped
+# to 200 (D4); a synthetic truncation row is appended when there are more.
+_CUSTOM_CLASS_OPTIONS_JS = """
+function() {
+    const root = this;
+    if (!(root.classList.contains('dropdown') || root.classList.contains('ui'))) {
+        return null;
+    }
+    const all = Array.from(root.querySelectorAll('.item, .option, [data-value]'));
+    const capped = all.slice(0, 200);
+    const mapped = capped.map(function(n) {
+        return {
+            text: (n.textContent || '').trim(),
+            value: n.getAttribute('data-value') || n.getAttribute('value') || (n.textContent || '').trim(),
+            selected: n.classList.contains('selected') || n.classList.contains('active'),
+        };
+    });
+    if (all.length > 200) {
+        mapped.push({text: '... (showing 200 of ' + all.length + ', use scroll/search_page for more)', value: '', selected: false});
+    }
+    return mapped;
+}
+"""
+
+# Combobox options reader: uses getElementById(aria-controls/aria-owns) to locate
+# the standalone listbox (React Portal-friendly — the listbox often renders outside
+# the combobox's subtree, so querySelectorAll from the combobox would miss it).
+# Returns {options, listboxFound, error}. Options hard-capped to 200 (D4).
+_COMBOBOX_OPTIONS_JS = """
+function() {
+    const combo = this;
+    const controlsId = combo.getAttribute('aria-controls') || combo.getAttribute('aria-owns');
+    if (!controlsId) return {options: [], listboxFound: false, error: 'no aria-controls/aria-owns'};
+    const listbox = document.getElementById(controlsId);
+    if (!listbox) return {options: [], listboxFound: false, error: 'listbox not found'};
+    const all = Array.from(listbox.querySelectorAll('[role="option"], li'));
+    const capped = all.slice(0, 200);
+    const mapped = capped.map(function(n) {
+        return {
+            text: (n.textContent || '').trim(),
+            value: n.getAttribute('data-value') || n.getAttribute('value') || (n.textContent || '').trim(),
+            selected: n.getAttribute('aria-selected') === 'true' || n.classList.contains('selected'),
+        };
+    });
+    if (all.length > 200) {
+        mapped.push({text: '... (showing 200 of ' + all.length + ', use scroll/search_page for more)', value: '', selected: false});
+    }
+    return {options: mapped, listboxFound: true};
+}
+"""
+
+# Subtree search: when the target itself matches no known dropdown type, BFS up
+# to maxDepth levels for a dropdown-shaped descendant and read its options in
+# place (avoids a second resolveNode round-trip). The start node itself is NOT
+# re-classified (depth 0 is skipped) — the dispatcher already tried aria/custom
+# on it; only descendants are probed. Returns {options, source} where source is
+# "child-depth-N" on hit, or {options: [], source: null} on miss.
+_SUBTREE_SEARCH_JS = """
+function(maxDepth) {
+    const start = this;
+    function readAria(el) {
+        const ns = Array.from(el.querySelectorAll('[role="menuitem"],[role="option"]')).slice(0, 200);
+        return ns.map(function(n) {
+            return {text: (n.textContent||'').trim(), value: n.getAttribute('data-value')||n.getAttribute('value')||(n.textContent||'').trim(), selected: n.getAttribute('aria-selected')==='true'||n.classList.contains('selected')};
+        });
+    }
+    function readCustom(el) {
+        const ns = Array.from(el.querySelectorAll('.item, .option, [data-value]')).slice(0, 200);
+        return ns.map(function(n) {
+            return {text: (n.textContent||'').trim(), value: n.getAttribute('data-value')||n.getAttribute('value')||(n.textContent||'').trim(), selected: n.classList.contains('selected')||n.classList.contains('active')};
+        });
+    }
+    function classify(el) {
+        if (el.querySelector('[role="option"],[role="menuitem"]')) return 'aria';
+        if ((el.classList.contains('dropdown') || el.classList.contains('ui')) && el.querySelector('.item,.option,[data-value]')) return 'custom';
+        return null;
+    }
+    var queue = [[start, 0]];
+    while (queue.length) {
+        var pair = queue.shift(); var el = pair[0]; var d = pair[1];
+        if (d > 0) {
+            var t = classify(el);
+            if (t === 'aria') return {options: readAria(el), source: 'child-depth-' + d};
+            if (t === 'custom') return {options: readCustom(el), source: 'child-depth-' + d};
+        }
+        if (d < maxDepth) {
+            for (var i = 0; i < el.children.length; i++) queue.push([el.children[i], d + 1]);
+        }
+    }
+    return {options: [], source: null};
+}
+"""
+
 
 class BrowserSession:
     """Manages browser connection and provides high-level page operations."""
@@ -2586,6 +2711,149 @@ class BrowserSession:
             # structured error (carries availableOptions for the action layer
             # to echo back to the LLM).
         return selection
+
+    async def _fetch_aria_options(self, backend_node_id: int) -> list[dict] | None:
+        """Read options of an ARIA menu/listbox scoped to backendNodeId.
+
+        Mirrors fetch_select_options' resolveNode + callFunctionOn shape (only
+        the JS differs). Returns None when the element is not aria-shaped (lets
+        the dispatcher try the next type); a list (possibly empty) when it IS
+        aria-shaped. Capped to 200 options. Raises on CDP/JS error (caller wraps).
+        """
+        resolve = await self.client.send.DOM.resolveNode(
+            {"backendNodeId": backend_node_id},
+            session_id=self.current_session_id,
+        )
+        object_id = resolve["object"]["objectId"]
+        result = await self.client.send.Runtime.callFunctionOn(
+            {
+                "objectId": object_id,
+                "functionDeclaration": _ARIA_OPTIONS_JS,
+                "returnByValue": True,
+            },
+            session_id=self.current_session_id,
+        )
+        value = result.get("result", {}).get("value")
+        return value  # None | list[dict]
+
+    async def _fetch_custom_class_options(self, backend_node_id: int) -> list[dict] | None:
+        """Read options of a custom-class dropdown (Semantic UI etc.) scoped to
+        backendNodeId. None = not custom-shaped; list = is custom (possibly
+        empty). Capped to 200 (D4). Raises on CDP/JS error (caller wraps).
+        """
+        resolve = await self.client.send.DOM.resolveNode(
+            {"backendNodeId": backend_node_id},
+            session_id=self.current_session_id,
+        )
+        object_id = resolve["object"]["objectId"]
+        result = await self.client.send.Runtime.callFunctionOn(
+            {
+                "objectId": object_id,
+                "functionDeclaration": _CUSTOM_CLASS_OPTIONS_JS,
+                "returnByValue": True,
+            },
+            session_id=self.current_session_id,
+        )
+        value = result.get("result", {}).get("value")
+        return value  # None | list[dict]
+
+    async def fetch_dropdown_options(self, backend_node_id: int) -> dict:
+        """Dispatcher: try each non-native dropdown type in turn, return the
+        first hit. Returns {"options": list[dict], "source": str | None};
+        source None means the element is not a recognized non-native dropdown
+        (true negative). Raises on CDP/JS error (caller wraps with a friendly
+        message).
+
+        Tries ARIA -> custom-class -> subtree search (depth 4); first hit wins.
+        """
+        aria = await self._fetch_aria_options(backend_node_id)
+        if aria is not None:
+            return {"options": aria, "source": "aria"}
+        custom = await self._fetch_custom_class_options(backend_node_id)
+        if custom is not None:
+            return {"options": custom, "source": "custom"}
+        found = await self.search_children_for_dropdowns(backend_node_id)
+        if found["options"]:
+            return {"options": found["options"], "source": found["source"]}
+        return {"options": [], "source": None}
+
+    async def expand_and_fetch_combobox_options(self, backend_node_id: int) -> list[dict]:
+        """Expand a combobox (real click), read its aria-controls listbox, then
+        ALWAYS collapse (finally). Python flow — a combobox needs a real click +
+        Escape (await on session methods), not a single callFunctionOn. Options
+        capped to 200 (D4). Raises RuntimeError when the listbox isn't found, or
+        re-raises CDP/JS errors; collapse still runs in finally (D3 — a combobox
+        left expanded overlays the page and breaks subsequent clicks).
+
+        Uses getElementById(aria-controls) (not subtree querySelectorAll) so a
+        React Portal-rendered listbox (attached at document.body) is still found.
+        """
+        # 1. 展开（真实 click，复用 click_element：scrollIntoView + occlusion + JS 回退）
+        await self.click_element(backend_node_id)
+        # 2. 固定等懒加载（D4；poll-until-stable 推迟到 P1c-2，按真实 flake 反馈再开）
+        await asyncio.sleep(0.5)
+        # 3. 读（一次 callFunctionOn）
+        object_id = None
+        try:
+            resolve = await self.client.send.DOM.resolveNode(
+                {"backendNodeId": backend_node_id},
+                session_id=self.current_session_id,
+            )
+            object_id = resolve["object"]["objectId"]
+            result = await self.client.send.Runtime.callFunctionOn(
+                {
+                    "objectId": object_id,
+                    "functionDeclaration": _COMBOBOX_OPTIONS_JS,
+                    "returnByValue": True,
+                },
+                session_id=self.current_session_id,
+            )
+            payload = result.get("result", {}).get("value") or {}
+            if not payload.get("listboxFound"):
+                raise RuntimeError(
+                    "combobox listbox not found: " + str(payload.get("error", ""))
+                )
+            return payload.get("options", [])
+        finally:
+            # 4. 强制收起（即便第 3 步抛错也收起 —— D3 load-bearing，非装饰）
+            try:
+                await self.send_keys("Escape")
+                if object_id is not None:
+                    await self.client.send.Runtime.callFunctionOn(
+                        {
+                            "objectId": object_id,
+                            "functionDeclaration": "function(){ try{ this.blur(); } catch(e){} }",
+                            "returnByValue": True,
+                        },
+                        session_id=self.current_session_id,
+                    )
+            except Exception as e:
+                logger.debug("combobox collapse failed: %s", e)
+
+    async def search_children_for_dropdowns(self, backend_node_id: int, max_depth: int = 4) -> dict:
+        """BFS the subtree (max_depth levels) for a dropdown-shaped descendant
+        and read its options in place. JS-side recursion (the Python-side
+        serialized tree may be pruned, so Python can't walk it reliably). The
+        start node itself is skipped (depth 0). Returns
+        {"options": list[dict], "source": "child-depth-N" | None}. Raises on
+        CDP/JS error (caller wraps).
+        """
+        resolve = await self.client.send.DOM.resolveNode(
+            {"backendNodeId": backend_node_id},
+            session_id=self.current_session_id,
+        )
+        object_id = resolve["object"]["objectId"]
+        result = await self.client.send.Runtime.callFunctionOn(
+            {
+                "objectId": object_id,
+                "functionDeclaration": _SUBTREE_SEARCH_JS,
+                "arguments": [{"value": max_depth}],
+                "returnByValue": True,
+            },
+            session_id=self.current_session_id,
+        )
+        value = result.get("result", {}).get("value") or {"options": [], "source": None}
+        return value
 
     # ── File operations (via CDP) ──────────────────────────────────────
 
