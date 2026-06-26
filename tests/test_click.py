@@ -238,6 +238,30 @@ class TestClickSelectBranch:
 
 		assert result.error == "Failed to read select options: CDP down"
 
+	@pytest.mark.asyncio
+	async def test_select_branch_uses_shared_format_not_str_repr(self):
+		"""G9：click SELECT 分支输出应与 dropdown_options 同格式（json 编码 +
+		序号 + select_dropdown hint），而非 str(options) 的 Python repr。"""
+		entry = _make_entry(tag="SELECT", backend_node_id=99, attributes={"aria-label": "Country"})
+		state = _make_state({2: entry})
+		browser = _make_browser(fetch_options_return=[
+			{"value": "us", "text": 'US "North"', "selected": True},
+		])
+
+		result = await Tools().execute("click", {"index": 2}, browser, browser_state=state)
+
+		assert result.error is None
+		# 非 str(options) repr，而是 json 编码（双引号保留）
+		assert '"US \\"North\\""' in result.extracted_content
+		assert "0: text=" in result.extracted_content
+		assert " (selected)" in result.extracted_content
+		assert result.extracted_content.rstrip().endswith(
+			"Use the value in select_dropdown(index=2, value=...)"
+		)
+		# source=click-select 折进 long_term_memory（诊断通道）
+		assert "via [CLICK-SELECT]" in result.long_term_memory
+		assert "Got 1 options" in result.long_term_memory
+
 
 # ── Session-layer: mouseMoved sequence ────────────────────────────────────────
 

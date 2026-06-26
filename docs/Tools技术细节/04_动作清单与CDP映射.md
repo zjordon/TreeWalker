@@ -236,48 +236,56 @@
   |---|---|---|
   | `index` | `int` | ID of the select element, shown in brackets in the DOM tree |
 
-- **主要逻辑**（[actions.py:860-910](../../src/tree_walker/tools/actions.py)，回显 helper `_describe_dropdown` 在 `actions.py:489`）：
+- **主要逻辑**（`_action_dropdown_options` 为多类型 dispatcher；格式化 helper `_format_options_result` + 回显 helper `_describe_dropdown` 在 actions.py）：
 
-  复用 session 层 `fetch_select_options(backend_node_id)`（`DOM.resolveNode` + `Runtime.callFunctionOn`），精确绑定到 index 指定的那个 `<select>`，修掉此前 `document.querySelectorAll('select option')` 全页扫描、与 index 无关的范围 bug。先做 tag 校验（非 `<select>` 早退报错），再读 option，最后用 json 编码 text/value 格式化输出 + 追加 `select_dropdown` 用法提示。
+  action 层做廉价预分类，按下拉类型分发到不同 session 方法，所有类型共用 `_format_options_result` 的 json 编码 + 序号 + `select_dropdown` 用法提示 + 短/长回显（`source` 折进 `long_term_memory` 作诊断通道）：
+  - **native `<select>`**：复用 `fetch_select_options(backend_node_id)`（`DOM.resolveNode` + `Runtime.callFunctionOn`），精确绑定到 index 指定的那个 select（修掉原 `querySelectorAll('select option')` 全页扫描 bug）；`source=native`，long_term_memory 无 `via` 后缀（P0 字节一致）。
+  - **combobox**（`_is_autocomplete_field` + `aria-controls`/`aria-owns`）：调 `expand_and_fetch_combobox_options` —— 真实 `click_element` 展开 → `sleep 0.5s` 等懒加载 → `getElementById(aria-controls)` 读 listbox → `finally` 强制 `send_keys("Escape")`+`blur()` 收起；`source=combobox`（**实验性**）。
+  - **其余**：委托 session 轻量 dispatcher `fetch_dropdown_options`，顺序试 `_fetch_aria_options`（`[role=option]`/`[role=menuitem"]`）→ `_fetch_custom_class_options`（`.dropdown`/`.ui` 下 `.item/.option/[data-value]`）→ `search_children_for_dropdowns`（BFS 子树 depth 4）；首个命中返回（`source=aria`/`custom`/`child-depth-N`），全未命中返回友好 error。
 
   ```python
-  async def _action_dropdown_options(self, params: dict, browser: BrowserSession) -> ActionResult:
+  async def _action_dropdown_options(self, params, browser):
       index = params["index"]
       entry, error = await self._get_element_by_index(index, browser)
       if error:
           return error
-      # tag 校验：非 <select> 早退，不返回全页 select 数据
       tag = (getattr(entry, "tag_name", "") or "").upper()
-      if tag != "SELECT":
-          return ActionResult(error=f"Index {index} is a [{tag}] element, not a <select>. ...")
-      # 复用 fetch_select_options，精确绑定到目标 select（与 click SELECT 分支一致）
+      backend_id = getattr(entry, "backend_node_id", None)
+      is_combo, _ = self._is_autocomplete_field(entry)
+      attrs = getattr(entry, "attributes", {}) or {}
       try:
-          raw_options = await browser.fetch_select_options(entry.backend_node_id)
+          if tag == "SELECT":                      # native：P0 路径零改动
+              raw = await browser.fetch_select_options(backend_id)
+              return self._format_options_result(raw, entry, index, "native")
+          if is_combo and (attrs.get("aria-controls") or attrs.get("aria-owns")):  # combobox
+              raw = await browser.expand_and_fetch_combobox_options(backend_id)
+              return self._format_options_result(raw, entry, index, "combobox")
+          dispatched = await browser.fetch_dropdown_options(backend_id)            # aria/custom/子树
+          if dispatched["source"] is None:
+              return ActionResult(error=f"Index {index} is a [{tag}], not a recognized dropdown ...")
+          return self._format_options_result(dispatched["options"], entry, index, dispatched["source"])
       except Exception as e:
-          return ActionResult(error=f"Failed to read select options: {e}")
-      # json 编码 text/value + 末尾用法提示（本项目 select_dropdown 参数名是 value）
-      lines = [
-          f"{i}: text={json.dumps(o.get('text', ''))}, value={json.dumps(o.get('value', ''))}"
-          f"{' (selected)' if o.get('selected') else ''}"
-          for i, o in enumerate(raw_options)
-      ]
-      hint = f"Use the value in select_dropdown(index={index}, value=...)"
-      extracted = hint if not lines else "\n".join(lines) + "\n" + hint
-      memory = f"Got {len(raw_options)} options from {self._describe_dropdown(entry, index)}"
-      return ActionResult(extracted_content=extracted, long_term_memory=memory)
+          return ActionResult(error=f"Failed to read dropdown options: {e}")
   ```
 
-- **CDP 调用清单**（经 `session.fetch_select_options`，`session.py:1616-1652`）：
+- **CDP 调用清单**（所有 reader 均为 `DOM.resolveNode({backendNodeId})` → `Runtime.callFunctionOn({objectId, functionDeclaration, returnByValue})`，无新 CDP 域）：
 
-  | CDP 命令 | 主要参数 | 行号 |
-  |---|---|---|
-  | `DOM.resolveNode` | `{backendNodeId}` | session.py:1628 |
-  | `Runtime.callFunctionOn` | `{objectId, functionDeclaration: function(){return Array.from(this.options).map(...)}, returnByValue:True}` | session.py:1633 |
+  | 下拉类型 | session 方法 | functionDeclaration 核心 | 选项上限 |
+  |---|---|---|---|
+  | native `<select>` | `fetch_select_options` | `Array.from(this.options).map(...)` | — |
+  | ARIA menu/listbox | `_fetch_aria_options` | `querySelectorAll('[role="menuitem"],[role="option"]')` | 200 |
+  | custom class | `_fetch_custom_class_options` | `.dropdown/.ui` 下 `.item,.option,[data-value]` | 200 |
+  | combobox | `expand_and_fetch_combobox_options` | `getElementById(aria-controls)` 下 `[role=option],li` + 展开/收起 | 200 |
+  | 子树搜索 | `search_children_for_dropdowns` | BFS depth 4，classify + readAria/readCustom | 200 |
+
+  combobox 另调用 `click_element`（展开，经 `Input.dispatchMouseEvent`/JS 回退）与 `send_keys("Escape")`（`Input.dispatchKeyEvent`，finally 强制收起）。
 
 - **注意事项**：
-  - 仅支持原生 `<select>`；非 select（ARIA menu/listbox、custom class、combobox）走 tag 校验 error 分支，提示用 click 手动展开（P1 蓝图见 `docs/tools-optimize/dropdown_options.md`）。
-  - 输出每行 `序号: text=<json>, value=<json> (selected)`，json 编码保证含引号/特殊字符的文本可被 LLM 精确复制到 `select_dropdown(index=N, value=...)`。
-  - 成功回显 short/long 分离：`extracted_content` 为紧凑选项列表（靠 `ActionResult.__str__` 的 500 字符截断自然兜底，工具只读幂等可重调），`long_term_memory` 为简短摘要 `Got N options from [SELECT] {label} at index N`。
+  - 支持 native `<select>` / ARIA menu·listbox / custom class（Semantic UI 等）/ combobox（`aria-controls` 独立 listbox）/ 子树搜索（depth 4）；非任何已知类型返回友好 error，提示用 click 手动展开（设计规格见 `docs/tools-optimize/dropdown_options_follow_up.md`）。
+  - combobox 为**实验性**：browser-use 自身跳过了全部 combobox/ARIA 测试；本实现用固定 `sleep 0.5s` + `finally` 强制收起 + 200 选项上限，框架差异（React Portal / Material）靠手测验收。
+  - 输出每行 `序号: text=<json>, value=<json> (selected)`，json 编码保证含引号/特殊字符的文本可被 LLM 精确复制到 `select_dropdown(index=N, value=...)`；`long_term_memory` 为 `Got N options from [TAG] {label} at index N [via <SOURCE>]`。
+  - 成功回显 short/long 分离：`extracted_content` 为紧凑列表（靠 `ActionResult.__str__` 的 500 字符截断自然兜底，工具只读幂等可重调），`long_term_memory` 为简短摘要（带选项数 + 类型 source）。
+  - 空选项诊断（G5 进阶）：非 native 类型空选项时追加类型诊断（如「Listbox found but no [role=option] children」）；native 空沿用 P0 仅 hint。
 
 ---
 

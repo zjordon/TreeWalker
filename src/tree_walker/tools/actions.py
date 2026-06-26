@@ -18,6 +18,15 @@ from tree_walker.tools.registry import ActionRegistry
 
 logger = logging.getLogger(__name__)
 
+# G5 进阶：空选项按下拉类型给诊断提示（native 不在此表 -> 沿用 P0 仅 hint，零回归）。
+# click-select 也列入：click SELECT 分支空选项时给同样的懒加载提示。
+_EMPTY_OPTIONS_DIAGNOSTIC = {
+	"aria": "Listbox/menu found but no [role=option] children (may need expanding).",
+	"custom": "Custom dropdown found but no .item/.option/[data-value] children (may need expanding).",
+	"combobox": "Combobox listbox found but empty (options may load on demand).",
+	"click-select": "Select element has no <option> children (may populate lazily — try dropdown_options again after the page settles).",
+}
+
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -406,12 +415,14 @@ class Tools:
             )
 
         # 2. SELECT 分支：精确查"指定 index 的那个 select"，不再全页 querySelectorAll
+        #    G9 降级：误点 <select> 时读出选项给 LLM；复用 _format_options_result，
+        #    输出与 dropdown_options 字节级同格式（修掉原 str(options) repr 不一致）。
         if entry.tag_name.upper() == "SELECT":
             try:
                 options = await browser.fetch_select_options(backend_id)
             except Exception as e:
                 return ActionResult(error=f"Failed to read select options: {e}")
-            return ActionResult(extracted_content=str(options))
+            return self._format_options_result(options, entry, params["index"], "click-select")
 
         # 3. 普通点击：highlight -> click_element，映射 bool 信号
         tabs_before = tuple(t.target_id for t in await browser.get_tabs())  # G7 新页检测快照
@@ -571,6 +582,36 @@ class Tools:
                 node_value = node_value[:60] + "..."
             return f"[{tag}] {node_value!r} at index {index}"
         return f"[{tag}] at index {index}"
+
+    def _format_options_result(
+        self, raw_options: list[dict], entry: Any, index: int, source: str,
+    ) -> ActionResult:
+        """Shared dropdown echo (short/long split) for native/aria/custom/combobox/
+        subtree/click-select paths. ``source`` folds into long_term_memory as the
+        subtree-search diagnostic channel; "native" renders no suffix
+        (byte-identical to P0 so existing tests don't regress)."""
+        lines: list[str] = []
+        for i, opt in enumerate(raw_options):
+            text = json.dumps(opt.get("text", ""))
+            value = json.dumps(opt.get("value", ""))
+            status = " (selected)" if opt.get("selected") else ""
+            lines.append(f"{i}: text={text}, value={value}{status}")
+        hint = f"Use the value in select_dropdown(index={index}, value=...)"
+        # G5 进阶：空选项按 source 给诊断（native 沿用 P0 仅 hint，避免回归）
+        if not lines:
+            diag = _EMPTY_OPTIONS_DIAGNOSTIC.get(source)
+            extracted = (diag + "\n" + hint) if diag else hint
+        else:
+            extracted = "\n".join(lines) + "\n" + hint
+        desc = self._describe_dropdown(entry, index)
+        if source == "native":
+            via = ""
+        elif source.startswith("child-depth-"):
+            via = f" via {source}"
+        else:
+            via = f" via [{source.upper()}]"
+        memory = f"Got {len(raw_options)} options from {desc}{via}"
+        return ActionResult(extracted_content=extracted, long_term_memory=memory)
 
     @staticmethod
     def _find_node_by_backend_id(
@@ -1018,10 +1059,14 @@ class Tools:
         return ActionResult(extracted_content=f"PDF saved to {path} ({meta})")
 
     async def _action_dropdown_options(self, params: dict, browser: BrowserSession) -> ActionResult:
-        """读取指定 index 的 <select> 的全部 option。
+        """读取指定 index 的下拉元素全部 option（native <select> / ARIA menu·listbox
+        / custom class / combobox / 子树搜索）。
 
-        复用 session.fetch_select_options（DOM.resolveNode + Runtime.callFunctionOn），
-        精确绑定到目标 select，修掉全局 querySelectorAll('select option') 范围 bug。
+        action 层做廉价预分类：native <select> 沿用 P0 的 fetch_select_options（零改动）；
+        combobox（_is_autocomplete_field + aria-controls/owns）走 session 的 Python flow
+        expand_and_fetch_combobox_options（展开→读→收起）；其余委托 session 轻量 dispatcher
+        fetch_dropdown_options（顺序试 aria→custom→子树）。所有类型共用 _format_options_result
+        的 json 编码 + 序号 + 用法提示 + 短/长回显；source 折进 long_term_memory 作诊断通道。
         对齐 _describe_click / _describe_upload 的成功回显 + try/except 软降级规范。
         """
         index = params["index"]
@@ -1029,45 +1074,36 @@ class Tools:
         if error:
             return error
 
-        # G2: tag 校验 —— 非 <select> 直接报错，不返回全页 select 数据
         tag = (getattr(entry, "tag_name", "") or "").upper()
-        if tag != "SELECT":
-            return ActionResult(
-                error=(
-                    f"Index {index} is a [{tag}] element, not a <select>. "
-                    f"dropdown_options only supports native <select>. "
-                    f"For ARIA menu/listbox or custom dropdowns, use click to expand and read options manually."
-                ),
-            )
-
-        # G1: 复用 fetch_select_options，精确绑定到目标 select（与 click SELECT 分支一致）
         backend_id = getattr(entry, "backend_node_id", None)
+        is_combo, _ = self._is_autocomplete_field(entry)
+        attrs = getattr(entry, "attributes", {}) or {}
+
         try:
-            raw_options = await browser.fetch_select_options(backend_id)
+            # native <select>：P0 路径零改动（source=native 无 via 后缀，与 P0 字节一致）
+            if tag == "SELECT":
+                raw_options = await browser.fetch_select_options(backend_id)
+                return self._format_options_result(raw_options, entry, index, "native")
+            # combobox（aria-controls 独立 listbox）：Python flow（展开→读→收起）
+            if is_combo and (attrs.get("aria-controls") or attrs.get("aria-owns")):
+                raw_options = await browser.expand_and_fetch_combobox_options(backend_id)
+                return self._format_options_result(raw_options, entry, index, "combobox")
+            # 其余：session 层 dispatcher（aria / custom / 子树）
+            dispatched = await browser.fetch_dropdown_options(backend_id)
+            if dispatched["source"] is None:
+                # 真阴性：非任何已知下拉类型，回退到 P0 风格的友好 error 提示手动展开
+                return ActionResult(
+                    error=(
+                        f"Index {index} is a [{tag}] element, not a recognized dropdown "
+                        f"(native <select>, ARIA listbox/menu, custom dropdown, or combobox). "
+                        f"Use click to expand and read options manually."
+                    ),
+                )
+            return self._format_options_result(
+                dispatched["options"], entry, index, dispatched["source"],
+            )
         except Exception as e:
-            return ActionResult(error=f"Failed to read select options: {e}")
-
-        # G4: 格式化输出 —— json 编码 text/value 保证含引号/特殊字符的文本可精确复制
-        # action 层 enumerate 补 index（fetch_select_options 返回结构无序号，不动 session）
-        lines: list[str] = []
-        for i, opt in enumerate(raw_options):
-            text = json.dumps(opt.get("text", ""))
-            value = json.dumps(opt.get("value", ""))
-            status = " (selected)" if opt.get("selected") else ""
-            lines.append(f"{i}: text={text}, value={value}{status}")
-
-        # 末尾追加用法提示（本项目 select_dropdown 参数名是 value 不是 text）
-        hint = f"Use the value in select_dropdown(index={index}, value=...)"
-        extracted = hint if not lines else "\n".join(lines) + "\n" + hint
-
-        # G3: 成功回显（short/long 分离）
-        # extracted_content = 紧凑选项列表（靠 ActionResult.__str__ 的 500 字符截断自然兜底）
-        # long_term_memory  = 简短摘要（≤120 字，仿 _describe_upload）
-        memory = (
-            f"Got {len(raw_options)} options from "
-            f"{self._describe_dropdown(entry, index)}"
-        )
-        return ActionResult(extracted_content=extracted, long_term_memory=memory)
+            return ActionResult(error=f"Failed to read dropdown options: {e}")
 
     async def _action_select_dropdown(self, params: dict, browser: BrowserSession) -> ActionResult:
         """Select an option in the <select> at the given index.
