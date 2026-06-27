@@ -5,6 +5,27 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.6.0] - 2026-06-27
+
+### Added
+
+**工具优化阶段二**（对齐 / 超越 browser-use 完整能力：分页 / 落盘 / 白名单 / 句柄往返 / 结构化输出）：
+
+- **extract 工具优化阶段二**（#67）：markdown 提取 + 分块分页 + 去重 + 大结果落盘 + 小模型默认化 + query 重命名 + inner timeout
+- **search_page 工具优化阶段二**（#69）：offset 分页 + 大结果落盘 + 同源 iframe / 开放 shadow DOM 遍历 + 属性检索
+- **find_elements 工具优化阶段二**（#71）：穿透 shadow/iframe + offset + 几何/visible + first_only + 大结果落盘 + backend_node_id/click-by-id
+- **evaluate 工具优化阶段二**（#73）：args 注入 + 元素句柄往返 + per-call 超时 + userGesture/iframe + 图片通道 + 大结果落盘
+- **write_file 工具优化阶段二**（#75）：原子写 + encoding 参数 + allowed_write_paths 白名单 + newline 翻译控制
+- **replace_file 工具优化阶段二**（#76）：阶段二 + file_system 示例
+- **read_file 工具优化阶段二**（#79）：offset/limit 分页 + 二进制嗅探 + allowed_read_paths 白名单 + 富文档 PDF/DOCX
+- **done 工具优化阶段二**（#81）：files_to_display/attachments + downloads 自动附加 + 内联开关 + 结构化输出（output_model / 泛型 registry）
+
+**P1 进阶**（find_text / dropdown_options / select_dropdown 读侧 G 系列 + 写侧 native 完整链）：
+
+- **find_text P1 进阶**（#61）：G8-G11 能力
+- **dropdown_options P1 进阶**（#63）：G7 读侧 + G9 + G5 进阶
+- **select_dropdown P1 进阶**（#65）：ARIA/custom/combobox/子树 + 懒加载 + click 降级
+
 ## [0.5.0] - 2026-06-24
 
 ### Added
