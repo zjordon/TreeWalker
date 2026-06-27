@@ -10,16 +10,16 @@
 
 | # | Action | 终止 | 主要参数 | 涉及 CDP 域 | 一句话职责 |
 |---|---|---|---|---|---|
-| 1 | [click](#41-click) | 否 | `index: int` | DOM + Input + Overlay | 点击元素，含 SELECT 分支 |
+| 1 | [click](#41-click) | 否 | `index \| element_id, ...` | DOM + Input + Overlay | 点击元素（index 或 element_id=backend id），含 SELECT 分支 |
 | 2 | [close_tab](#42-close_tab) | 否 | `tab_id: str=""` | Target | 关闭 Tab，必要时切换其他 |
 | 3 | [done](#43-done) | 否 | `text, success` | (无 CDP) | 任务终止信号 |
 | 4 | [dropdown_options](#44-dropdown_options) | 否 | `index: int` | Runtime (JS) | 读取 select 所有 option |
 | 5 | [evaluate](#45-evaluate) | 是 | `code: str` | Runtime | 执行任意 JS，返回结果 |
 | 6 | [extract](#46-extract) | 否 | `query, extract_links?, extract_images?, start_from_char?, already_collected?` | CDP (DOM.getDocument) + LLM | 页面转 markdown → LLM 抽取/结构化（分页 + 去重 + 大结果落盘） |
-| 7 | [find_elements](#47-find_elements) | 否 | `selector, attributes?, max_results?, include_text?` | Runtime (JS) | CSS 选择器查询元素（tag/text/attrs/children_count + 总数） |
+| 7 | [find_elements](#47-find_elements) | 否 | `selector, attributes?, max_results?, offset?, include_text?, first_only?, include_geometry?, return_node_ids?` | Runtime (JS) / DOM.performSearch | CSS 选择器查询元素（穿透 shadow/iframe；tag/text/attrs/children_count + 可选几何/visible + 总数；`return_node_ids` 回 backendNodeId） |
 | 8 | [find_text](#48-find_text) | 否 | `text: str` | DOM + Overlay (+ Runtime) | CDP performSearch 滚动到文本并高亮 |
 | 9 | [go_back](#49-go_back) | 是 | (无) | Page | 浏览器后退 |
-| 10 | [input_text](#410-input_text) | 否 | `index, text, clear` | DOM + Input + Runtime | 点击+输入文本+触发框架事件 |
+| 10 | [input_text](#410-input_text) | 否 | `index \| element_id, text, clear` | DOM + Input + Runtime | 点击+输入文本+触发框架事件（index 或 element_id=backend id） |
 | 11 | [navigate](#411-navigate) | 是 | `url: str, new_tab?: bool` | Page + Target | 导航到 URL（支持 new_tab、健康检查、错误映射） |
 | 12 | [read_file](#412-read_file) | 否 | `path: str` | (本地 fs) | 同步读本地文件 |
 | 13 | [replace_file](#413-replace_file) | 否 | `path, old, new` | (本地 fs) | 字符串替换并写回 |
@@ -418,7 +418,7 @@
 
 ### 4.7 `find_elements`
 
-- **description**：`Query DOM elements by CSS selector (zero LLM cost, instant). Returns matching elements with tag, text, and attributes...` / 按 CSS 选择器查询元素（瞬时、零 LLM 成本），返回 tag / text / 指定 attributes / children_count + 总数
+- **description**：`Query DOM elements by CSS selector (zero LLM cost, instant). Returns matching elements with tag, text, and attributes...` / 按 CSS 选择器查询元素（瞬时、零 LLM 成本），穿透开放 shadow / 同源 iframe，返回 tag / text / 指定 attributes / children_count（可选几何 + visible）+ 总数；`return_node_ids=True` 另走 `DOM.performSearch` 回稳定 backendNodeId（可直接喂 click/input_text）。
 - **terminates_sequence**：False
 - **Pydantic 参数**（[models.py `FindElementsParams`](../../src/tree_walker/tools/models.py)）：
 
@@ -427,49 +427,64 @@
   | `selector` | `str` | （必填） | CSS selector to query elements（如 `"table tr"`、`"a.link"`、`"div.product"`） |
   | `attributes` | `list[str] \| None` | `None` | 指定要提取的属性（如 `["href","src","class"]`）；不传则只返回 tag + text；`src`/`href` 解析为绝对 URL |
   | `max_results` | `int` (`ge=1, le=200`) | `50` | 返回元素上限（`total` 始终回真实命中数，即使被截断） |
+  | `offset` | `int` (`ge=0`) | `0` | 返回元素的起始下标（分页）；`total` 始终是全量命中数（含 shadow / 同源 iframe） |
   | `include_text` | `bool` | `True` | 是否包含元素文本 |
+  | `first_only` | `bool` | `False` | 只返回首个匹配（`total` 仍回全量） |
+  | `include_geometry` | `bool` | `False` | 附带每元素 `getBoundingClientRect()` + 可信 `visible`（祖先链 display/visibility/opacity + 非零尺寸） |
+  | `return_node_ids` | `bool` | `False` | 走 `DOM.performSearch` 回稳定 backendNodeId（可直接作 click/input_text 的 `index`/`element_id`；较重，无 text） |
 
 - **封装分层**：
-  - **session 层**（[session.py `_build_find_elements_js` / `BrowserSession.find_elements`](../../src/tree_walker/browser/session.py)）：单次 `Runtime.evaluate` 执行 `querySelectorAll` IIFE（两层 try/catch），逐元素取 `{index, tag, text?, attrs?, children_count}`，返回 `{elements, total, showing}`；`src`/`href` 走 DOM 属性（`el.href`）拿绝对 URL、其余走 `getAttribute`，null 属性跳过；text 截 300、attr 值截 500。JS 层 `{error:...}`（非法选择器）/ 空返回 → `RuntimeError`，由 action 捕获。
-  - **action 层**（[actions.py `_action_find_elements` / `_format_find_results`](../../src/tree_walker/tools/actions.py)）：薄编排 + 三层分流 —— 硬错误（`RuntimeError`）→ `ActionResult(error="Find elements failed: ...")` + `logger.warning`；软 miss（`total==0`）→ `extracted_content == long_term_memory == 'No elements found matching "..."'`；命中 → `_format_find_results` 渲染多行文本进 `extracted_content`、紧凑摘要 `'Found N element(s) matching "..."'` 进 `long_term_memory`。
+  - **session 层（JS 路径）**（[session.py `_build_find_elements_js` / `BrowserSession.find_elements`](../../src/tree_walker/browser/session.py)）：单次 `Runtime.evaluate` 执行 IIFE：`_collectAll` 递归收集顶层文档 + **开放 shadow root** + **同源 iframe contentDocument**（镜像 `_SEARCH_PAGE_JS_BODY._collectText`；closed shadow / 跨源 iframe 跳过），逐元素 `matches(SELECTOR)` 命中后取 `{index(全局序), tag, text?, attrs?, children_count, origin?, rect?, visible?}`，`offset` 窗口分页，返回 `{elements, total, showing, offset, has_more}`；`src`/`href` 走 DOM 属性（`el.href`）拿绝对 URL、其余走 `getAttribute`，null 属性跳过；text 截 300、attr 值截 500。选择器合法性先 `querySelector` 校验一次（invalid → `{error}`）。JS 层 `{error:...}` / 空返回 → `RuntimeError`，由 action 捕获。
+  - **session 层（node_ids 路径）**（[session.py `BrowserSession.find_elements_node_ids`](../../src/tree_walker/browser/session.py)）：复用 `find_text` 的 `DOM.performSearch`（query=CSS 选择器，`includeUserAgentShadowDOM`）→ `getSearchResults`（offset 窗口）→ 逐 `nodeId` `describeNode` 取 `backendNodeId` + `nodeName`；`finally` 里 `discardSearchResults` 清理。返回 `{node_ids:[{backend_id, tag}], total, showing, offset, has_more}`。较重（每元素一次 describeNode 往返）。
+  - **action 层**（[actions.py `_action_find_elements` / `_format_find_results` / `_format_node_id_results`](../../src/tree_walker/tools/actions.py)）：`return_node_ids` 选 session 方法 + 格式化器，其余三层分流不变 —— 硬错误（`RuntimeError`）→ `ActionResult(error="Find elements failed: ...")` + `logger.warning`；软 miss（`total==0`）→ `extracted_content == long_term_memory == 'No elements found matching "..."'`；命中 → 格式化文本进 `extracted_content`、紧凑摘要 `'Found N element(s) matching "..."'` 进 `long_term_memory`（node_ids 路径附 `(node ids)`）。大结果（≥ `TruncationSettings.find_elements_save_threshold`）落盘到 `find_elements_output/`，`extracted_content` 回预览 + 路径（镜像 search_page/extract）。
 
 - **主要逻辑**（[actions.py](../../src/tree_walker/tools/actions.py)）：
 
   ```python
   async def _action_find_elements(self, params: dict, browser: BrowserSession) -> ActionResult:
       selector = params["selector"]
-      attributes = params.get("attributes")
       max_results = params.get("max_results", 50)
-      include_text = params.get("include_text", True)
+      offset = params.get("offset", 0)
+      return_node_ids = params.get("return_node_ids", False)
       try:
-          data = await browser.find_elements(
-              selector, attributes=attributes, max_results=max_results, include_text=include_text,
-          )
+          if return_node_ids:
+              data = await browser.find_elements_node_ids(selector, max_results=max_results, offset=offset)
+              formatter = _format_node_id_results
+          else:
+              data = await browser.find_elements(
+                  selector, attributes=params.get("attributes"), max_results=max_results, offset=offset,
+                  include_text=params.get("include_text", True), first_only=params.get("first_only", False),
+                  include_geometry=params.get("include_geometry", False),
+              )
+              formatter = _format_find_results
       except Exception as e:
           logger.warning("find_elements(%r) failed: %s", selector, e)
           return ActionResult(error=f"Find elements failed: {e}")
       total = data.get("total", 0)
       if total == 0:
           msg = f'No elements found matching "{selector}"'
-          logger.info(msg)
           return ActionResult(extracted_content=msg, long_term_memory=msg)
-      formatted = _format_find_results(data, selector)
-      memory = f'Found {total} element{"s" if total != 1 else ""} matching "{selector}".'
-      logger.info(memory)
-      return ActionResult(extracted_content=formatted, long_term_memory=memory)
+      formatted = formatter(data, selector)
+      # ... 大结果落盘（镜像 _action_search_page） ...
+      return ActionResult(extracted_content=visible, long_term_memory=memory)
   ```
 
-  返回每个匹配元素的索引、tag、text（截断 300 字符）、指定 attributes（值截断 500）、children_count；并回显真实命中总数 `total`（即使被 `max_results` 截断，尾注提示 `Showing K of N total elements`）。
+  返回每个匹配元素的全局 index、tag、text（截断 300 字符）、指定 attributes（值截断 500）、children_count、可选 `origin`（`(in shadow DOM)` / `(in iframe)`）、可选 `rect`+`visible`；并回显真实命中总数 `total` + offset-aware 尾注 `... showing A–B of N total elements. Call again with offset=...`。`return_node_ids=True` 返回 `[backend_id] <tag>`，标注「pass as index= or element_id= to click/input_text」。
 
 - **CDP 调用清单**：
 
   | CDP 命令 | 主要参数 | 行号 |
   |---|---|---|
-  | `Runtime.evaluate` | `{expression, returnByValue, awaitPromise, timeout:30000}` | session.py（`execute_js`） |
+  | `Runtime.evaluate` | `{expression, returnByValue, awaitPromise, timeout:30000}` | session.py（`execute_js`，JS 路径） |
+  | `DOM.performSearch` | `{query, includeUserAgentShadowDOM}` | session.py（`find_elements_node_ids`，node_ids 路径） |
+  | `DOM.getSearchResults` | `{searchId, fromIndex, toIndex}` | 同上 |
+  | `DOM.describeNode` | `{nodeId}` → `backendNodeId` | 同上 |
+  | `DOM.discardSearchResults` | `{searchId}`（finally 清理） | 同上 |
 
-- **错误分级**：非法 CSS 选择器（`querySelectorAll` 抛 `DOMException`）→ JS 内层 try/catch 捕获 → `{error}` → session `RuntimeError` → action 硬错误 `Find elements failed: ...`；零命中（`total==0`）不是错误，走软回显；JS 执行异常（`exceptionDetails`）由 `execute_js` 翻译成 `RuntimeError("JS error: ...")` 上抛。
-- **安全**：用户值（selector / attributes / max_results / include_text）经 `json.dumps` 注入成 `var` 声明（绝不 f-string 拼用户串），含 `"` / `\` / 中文的选择器安全转义。
-- **限制**（同 browser-use）：仅顶层文档 light-DOM 元素；不进 iframe、不穿 shadow DOM。
+- **错误分级**：非法 CSS 选择器（`querySelector` 抛 `DOMException`）→ JS try/catch 捕获 → `{error}` → session `RuntimeError` → action 硬错误 `Find elements failed: ...`；零命中（`total==0`）不是错误，走软回显；JS 执行异常（`exceptionDetails`）由 `execute_js` 翻译成 `RuntimeError("JS error: ...")` 上抛；node_ids 路径 CDP 异常（performSearch/describeNode 失败）同样上抛 → 硬错误；`discardSearchResults` 异常被 finally 吞掉不影响结果。落盘 `OSError` 不失败，仅 `logger.warning` + 回退 inline。
+- **安全**：用户值（selector / attributes / max_results / offset / include_text / first_only / include_geometry）经 `json.dumps` 注入成 `var` 声明（绝不 f-string 拼用户串），含 `"` / `\` / 中文的选择器安全转义；node_ids 路径的 selector 作为 `DOM.performSearch` 的 `query`（CDP 原生参数，非 JS 拼接）。
+- **限制**：穿透**开放** shadow root + **同源** iframe（镜像 search_page 阶段二）；**closed** shadow root（`shadowRoot=null`）与**跨源** iframe（`contentDocument` 抛 `SecurityError`）跳过——属阶段三。`element_id`/index 经 selector_map 解析，仅交互元素可解析为可点击目标。
+- **阶段二（find_elements_follow_up.md）**：P2-A 落盘 + first_only；P2-B 穿透 shadow/iframe + offset + 几何/visible；P2-C `return_node_ids`（performSearch 链）+ click/input_text `element_id`。
 
 ---
 

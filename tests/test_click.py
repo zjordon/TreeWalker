@@ -136,6 +136,43 @@ class TestClickElementLookup:
 		browser.highlight_element.assert_not_awaited()
 		browser.click_element.assert_not_awaited()
 
+	@pytest.mark.asyncio
+	async def test_element_id_resolves_like_index(self):
+		# element_id is a backend node id (e.g. from find_elements(return_node_ids));
+		# index===backend_id, so it resolves through selector_map identically.
+		entry = _make_entry(backend_node_id=42)
+		state = _make_state({42: entry})
+		browser = _make_browser()
+
+		result = await Tools().execute("click", {"element_id": 42}, browser, browser_state=state)
+
+		assert result.error is None
+		browser.click_element.assert_awaited_once_with(42)
+
+	@pytest.mark.asyncio
+	async def test_element_id_and_index_mutually_exclusive_both(self):
+		state = _make_state({5: _make_entry(backend_node_id=5)})
+		browser = _make_browser()
+
+		result = await Tools().execute(
+			"click", {"index": 5, "element_id": 42}, browser, browser_state=state,
+		)
+
+		assert result.error is not None
+		assert "exactly one" in result.error
+		browser.click_element.assert_not_awaited()
+
+	@pytest.mark.asyncio
+	async def test_element_id_and_index_mutually_exclusive_neither(self):
+		state = _make_state({})
+		browser = _make_browser()
+
+		result = await Tools().execute("click", {}, browser, browser_state=state)
+
+		assert result.error is not None
+		assert "exactly one" in result.error
+		browser.click_element.assert_not_awaited()
+
 
 # ── file-input guard (issue #34, Bug 1) ───────────────────────────────────────
 
