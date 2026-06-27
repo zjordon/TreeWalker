@@ -88,6 +88,7 @@ class AgentSettings:
     observability_log_dir: str = "logs"
     action_page_filters: dict[str, list[str]] | None = None
     allowed_upload_paths: list[str] | None = None
+    allowed_write_paths: list[str] | None = None
     judge: JudgeSettings = field(default_factory=JudgeSettings)
     # extract 工具：专用 LLM（None=复用主 llm）+ 结构化抽取的 JSON Schema（None=free-text）
     extract_llm: LLMSettings | None = None
@@ -202,6 +203,15 @@ def _load_allowed_upload_paths() -> list[str] | None:
     return paths or None
 
 
+def _load_allowed_write_paths() -> list[str] | None:
+    """Load allowed write paths from AGENT_ALLOWED_WRITE_PATHS env var (comma-separated)."""
+    raw = os.environ.get("AGENT_ALLOWED_WRITE_PATHS")
+    if not raw:
+        return None
+    paths = [p.strip() for p in raw.split(",") if p.strip()]
+    return paths or None
+
+
 def load_settings() -> Settings:
     """Load settings from environment variables, fetching ws_url if needed."""
     api_key = os.environ.get("ZHIPU_API_KEY")
@@ -266,6 +276,7 @@ def load_settings() -> Settings:
         observability_log_dir=os.environ.get("AGENT_OBSERVABILITY_LOG_DIR", "logs"),
         action_page_filters=_load_action_page_filters(),
         allowed_upload_paths=_load_allowed_upload_paths(),
+        allowed_write_paths=_load_allowed_write_paths(),
         judge=JudgeSettings(
             enabled=os.environ.get("AGENT_JUDGE_ENABLED", "1") == "1",
             model=os.environ.get("AGENT_JUDGE_MODEL", ""),

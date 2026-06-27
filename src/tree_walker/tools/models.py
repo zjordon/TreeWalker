@@ -258,7 +258,7 @@ class UploadFileParams(BaseModel):
 class WriteFileParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
     path: str = Field(description="File path to write to (parent directories are auto-created).")
-    content: str = Field(description="Text content to write (UTF-8).")
+    content: str = Field(description="Text content to write (UTF-8 by default; see encoding).")
     append: bool = Field(
         default=False,
         description="If True, append to the end of an existing file instead of overwriting it. "
@@ -274,11 +274,34 @@ class WriteFileParams(BaseModel):
         description="If True, prepend a newline before the content (useful when appending to a "
         "file that lacks a trailing newline).",
     )
+    encoding: str | None = Field(
+        default=None,
+        description="Text encoding to write with (default UTF-8). Set e.g. 'latin-1' or 'cp936' "
+        "for legacy files; the byte-count echo reflects this encoding.",
+    )
+    newline: str | None = Field(
+        default="",
+        description="Python open() newline translation mode (default '' = no translation; "
+        "\\n/\\r\\n written as-is). Set '\\r\\n' to force CRLF output, None to translate \\n "
+        "to the OS native line ending (\\r\\n on Windows). Distinct from "
+        "trailing_newline/leading_newline, which only add/remove a \\n in the content.",
+    )
 
 
 class ReadFileParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    path: str = Field(description="Path to a local UTF-8 text file to read.")
+    path: str = Field(description="Path to a local text file to read (UTF-8 by default; see encoding).")
+    encoding: str | None = Field(
+        default=None,
+        description="Text encoding to decode with (default UTF-8). Set e.g. 'latin-1' or 'cp936' "
+        "for legacy files.",
+    )
+    newline: str | None = Field(
+        default="",
+        description="Python open() newline mode (default '' = no translation, preserves \\r\\n "
+        "byte-for-byte). Set None for universal-newline (collapses \\r\\n / \\r to \\n); other "
+        "values do not translate on a full-file read.",
+    )
 
 
 class ReplaceFileParams(BaseModel):
@@ -290,6 +313,16 @@ class ReplaceFileParams(BaseModel):
         "occurrences are replaced. Case-sensitive. Must be non-empty.",
     )
     new: str = Field(description="Replacement text (literal; may be empty to delete matches).")
+    encoding: str | None = Field(
+        default=None,
+        description="Text encoding to read/write with (default UTF-8). Set e.g. 'latin-1' or "
+        "'cp936' for legacy files.",
+    )
+    newline: str | None = Field(
+        default="",
+        description="Python open() newline mode (default '' = no translation, preserves original "
+        "line endings byte-for-byte). Set None for universal-newline translation on read.",
+    )
 
 
 class EvaluateParams(BaseModel):

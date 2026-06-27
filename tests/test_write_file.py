@@ -313,3 +313,168 @@ class TestWriteFileParamsValidation:
 		m = WriteFileParams(path="x", content="y", trailing_newline=False, leading_newline=True)
 		assert m.trailing_newline is False
 		assert m.leading_newline is True
+
+	def test_encoding_and_newline_defaults(self):
+		m = WriteFileParams(path="x", content="y")
+		assert m.encoding is None
+		assert m.newline == ""
+
+
+# ── 阶段二：原子写（overwrite tmp + os.replace）────────────────────
+
+
+class TestWriteFileAtomicWrite:
+	@pytest.mark.asyncio
+	async def test_overwrite_uses_tmp_then_replace(self, tmp_path, monkeypatch):
+		# overwrite 应走 tmp + os.replace：替换发生前 target 仍是旧内容、tmp 已存在。
+		p = tmp_path / "f.txt"
+		_seed(p, "original\n")
+		seen = {}
+		real_replace = os.replace
+
+		def spy_replace(src, dst):
+			seen["tmp_exists_before_replace"] = os.path.exists(src)
+			seen["target_before_replace"] = _read(p)
+			return real_replace(src, dst)
+
+		monkeypatch.setattr("tree_walker.tools.actions.os.replace", spy_replace)
+		r = await _run({"path": str(p), "content": "new"})
+		assert r.error is None
+		assert seen["tmp_exists_before_replace"] is True
+		assert seen["target_before_replace"] == "original\n"
+		assert _read(p) == "new\n"
+		# 替换完成后 tmp 已消失
+		assert not os.path.exists(str(p) + ".tmp")
+
+	@pytest.mark.asyncio
+	async def test_overwrite_replace_failure_keeps_original_and_cleans_tmp(self, tmp_path, monkeypatch):
+		# os.replace 抛错 → target 完好、无残留 tmp、返回 error。
+		p = tmp_path / "f.txt"
+		_seed(p, "keep me\n")
+
+		def boom(src, dst):
+			raise OSError("replace denied")
+
+		monkeypatch.setattr("tree_walker.tools.actions.os.replace", boom)
+		r = await _run({"path": str(p), "content": "new"})
+		assert r.error is not None
+		assert "Failed to write file" in r.error
+		# 原文件不被改写（原子性核心）
+		assert _read(p) == "keep me\n"
+		# 无残留 tmp
+		assert not os.path.exists(str(p) + ".tmp")
+
+	@pytest.mark.asyncio
+	async def test_append_does_not_use_tmp(self, tmp_path, monkeypatch):
+		# append 保持直接写，不产生 .tmp、不调用 os.replace。
+		p = tmp_path / "log.txt"
+		_seed(p, "a\n")
+
+		def boom(src, dst):
+			raise AssertionError("append must not call os.replace")
+
+		monkeypatch.setattr("tree_walker.tools.actions.os.replace", boom)
+		r = await _run({"path": str(p), "content": "b", "append": True})
+		assert r.error is None
+		assert _read(p) == "a\nb\n"
+		assert not os.path.exists(str(p) + ".tmp")
+
+
+# ── 阶段二：encoding 参数 ──────────────────────────────────────────
+
+
+class TestWriteFileEncoding:
+	@pytest.mark.asyncio
+	async def test_latin1_write_round_trips(self, tmp_path):
+		p = tmp_path / "f.txt"
+		r = await _run({"path": str(p), "content": "café", "encoding": "latin-1", "trailing_newline": False})
+		assert r.error is None
+		assert p.read_bytes() == "café".encode("latin-1")
+
+	@pytest.mark.asyncio
+	async def test_cp936_write_round_trips(self, tmp_path):
+		p = tmp_path / "f.txt"
+		r = await _run({"path": str(p), "content": "你好", "encoding": "cp936", "trailing_newline": False})
+		assert r.error is None
+		assert p.read_bytes() == "你好".encode("cp936")
+
+	@pytest.mark.asyncio
+	async def test_non_default_encoding_in_echo(self, tmp_path):
+		p = tmp_path / "f.txt"
+		r = await _run({"path": str(p), "content": "abc", "encoding": "latin-1"})
+		assert "(encoding: latin-1)" in r.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_default_encoding_not_in_echo(self, tmp_path):
+		p = tmp_path / "f.txt"
+		r = await _run({"path": str(p), "content": "abc"})
+		assert "(encoding:" not in r.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_byte_count_uses_encoding(self, tmp_path):
+		# "café" is 4 bytes in latin-1, 5 in utf-8
+		p = tmp_path / "f.txt"
+		r = await _run({"path": str(p), "content": "café", "encoding": "latin-1", "trailing_newline": False})
+		assert "4 bytes" in r.extracted_content
+		assert os.path.getsize(p) == 4
+
+	@pytest.mark.asyncio
+	async def test_unknown_encoding_returns_lookup_error(self, tmp_path):
+		p = tmp_path / "f.txt"
+		r = await _run({"path": str(p), "content": "x", "encoding": "no-such-codec"})
+		assert r.error is not None
+		assert "Unknown encoding" in r.error
+		assert "no-such-codec" in r.error
+		# 失败不留 tmp
+		assert not os.path.exists(str(p) + ".tmp")
+
+
+# ── 阶段二：newline 翻译控制 ───────────────────────────────────────
+
+
+class TestWriteFileNewlineMode:
+	@pytest.mark.asyncio
+	async def test_force_crlf_output(self, tmp_path):
+		p = tmp_path / "f.txt"
+		await _run({"path": str(p), "content": "a\nb", "newline": "\r\n", "trailing_newline": False})
+		assert p.read_bytes() == b"a\r\nb"
+
+	@pytest.mark.asyncio
+	async def test_default_newline_no_translation(self, tmp_path):
+		p = tmp_path / "f.txt"
+		await _run({"path": str(p), "content": "a\nb", "trailing_newline": False})
+		assert p.read_bytes() == b"a\nb"
+
+
+# ── 阶段二：allowed_write_paths 白名单 ─────────────────────────────
+
+
+class TestWriteFileWhitelist:
+	@pytest.mark.asyncio
+	async def test_blocked_outside_whitelist(self, tmp_path):
+		tools = Tools(allowed_write_paths=[str(tmp_path / "safe")])
+		outside = tmp_path / "elsewhere" / "x.txt"
+		r = await tools.execute("write_file", {"path": str(outside), "content": "x"}, MagicMock())
+		assert r.error is not None
+		assert "not in allowed write paths" in r.error
+		# fail fast：连父目录都不应被创建
+		assert not outside.exists()
+		assert not (tmp_path / "elsewhere").exists()
+
+	@pytest.mark.asyncio
+	async def test_allowed_inside_whitelist(self, tmp_path):
+		safe = tmp_path / "safe"
+		tools = Tools(allowed_write_paths=[str(safe)])
+		target = safe / "x.txt"
+		r = await tools.execute("write_file", {"path": str(target), "content": "x"}, MagicMock())
+		assert r.error is None
+		assert target.exists()
+
+	@pytest.mark.asyncio
+	async def test_none_whitelist_allows_anywhere(self, tmp_path):
+		# default Tools() → no whitelist → unrestricted write
+		tools = Tools()
+		outside = tmp_path / "anywhere" / "x.txt"
+		r = await tools.execute("write_file", {"path": str(outside), "content": "x"}, MagicMock())
+		assert r.error is None
+		assert outside.exists()
