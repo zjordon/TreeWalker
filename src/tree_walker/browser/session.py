@@ -774,6 +774,202 @@ function(maxDepth) {
 }
 """
 
+# ARIA menu/listbox 写脚本（写侧对应 _ARIA_OPTIONS_JS）。匹配段镜像 reader（text/value
+# 大小写不敏感精确）；写段：单选清兄弟 aria-selected/selected/active → 选目标 → 真实
+# item.click() + MouseEvent → 读回验证（div 无 element.value，改查 aria-selected/classList
+# 「是否粘住」）。返回与 _SELECT_OPTION_JS 同形 dict（省略 selectionReverted —— D2）。
+_SET_ARIA_JS = """
+function(targetText) {
+    const root = this;
+    const role = root.getAttribute('role');
+    const isAriaContainer = ['listbox', 'menu', 'menubar', 'tree', 'grid'].indexOf(role) !== -1;
+    const hasAriaOptions = !!root.querySelector('[role="option"],[role="menuitem"]');
+    if (!isAriaContainer && !hasAriaOptions) {
+        return { success: false, error: 'Element is not an ARIA listbox/menu' };
+    }
+    const all = Array.from(root.querySelectorAll('[role="menuitem"],[role="option"]'));
+    const availableOptions = all.map(function(n) {
+        return { text: (n.textContent || '').trim(), value: n.getAttribute('data-value') || n.getAttribute('value') || (n.textContent || '').trim() };
+    });
+    const targetLower = (targetText || '').toLowerCase();
+    for (const item of all) {
+        const textLower = (item.textContent || '').trim().toLowerCase();
+        const valLower = (item.getAttribute('data-value') || item.getAttribute('value') || '').toLowerCase();
+        if (textLower === targetLower || valLower === targetLower) {
+            root.dispatchEvent(new Event('focus', { bubbles: true, cancelable: true }));
+            all.forEach(function(o) {
+                o.setAttribute('aria-selected', 'false');
+                o.classList.remove('selected');
+                o.classList.remove('active');
+            });
+            item.setAttribute('aria-selected', 'true');
+            item.classList.add('selected');
+            item.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+            item.click();
+            item.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+            root.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+            const stuck = item.getAttribute('aria-selected') === 'true' || item.classList.contains('selected') || item.classList.contains('active');
+            const chosenValue = item.getAttribute('data-value') || item.getAttribute('value') || (item.textContent || '').trim();
+            if (!stuck) {
+                return {
+                    success: false,
+                    error: 'Selection was set but not retained. The dropdown may require a different interaction.',
+                    targetOption: { text: (item.textContent || '').trim(), value: chosenValue },
+                    availableOptions: availableOptions,
+                };
+            }
+            return {
+                success: true,
+                message: `Selected option: ${(item.textContent || '').trim()} (value: ${chosenValue})`,
+                value: chosenValue,
+            };
+        }
+    }
+    return {
+        success: false,
+        error: `Option with text or value '${targetText}' not found in ARIA listbox/menu`,
+        availableOptions: availableOptions,
+    };
+}
+"""
+
+# custom-class 下拉写脚本（写侧对应 _CUSTOM_CLASS_OPTIONS_JS，Semantic UI / Foundation）。
+# 非 custom-shaped（无 dropdown/ui class）返回 error；命中后 toggle selected/active +
+# 真实 click + change + 读回验证（classList「是否粘住」）。返回与 _SELECT_OPTION_JS 同形。
+_SET_CUSTOM_JS = """
+function(targetText) {
+    const root = this;
+    if (!(root.classList.contains('dropdown') || root.classList.contains('ui'))) {
+        return { success: false, error: 'Element is not a custom-class dropdown' };
+    }
+    const all = Array.from(root.querySelectorAll('.item, .option, [data-value]'));
+    const availableOptions = all.map(function(n) {
+        return { text: (n.textContent || '').trim(), value: n.getAttribute('data-value') || n.getAttribute('value') || (n.textContent || '').trim() };
+    });
+    const targetLower = (targetText || '').toLowerCase();
+    for (const item of all) {
+        const textLower = (item.textContent || '').trim().toLowerCase();
+        const valLower = (item.getAttribute('data-value') || item.getAttribute('value') || '').toLowerCase();
+        if (textLower === targetLower || valLower === targetLower) {
+            root.dispatchEvent(new Event('focus', { bubbles: true, cancelable: true }));
+            all.forEach(function(o) { o.classList.remove('selected'); o.classList.remove('active'); });
+            item.classList.add('selected');
+            item.classList.add('active');
+            item.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+            item.click();
+            item.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+            root.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+            const stuck = item.classList.contains('selected') || item.classList.contains('active');
+            const chosenValue = item.getAttribute('data-value') || item.getAttribute('value') || (item.textContent || '').trim();
+            if (!stuck) {
+                return {
+                    success: false,
+                    error: 'Selection was set but not retained. The dropdown may require a different interaction.',
+                    targetOption: { text: (item.textContent || '').trim(), value: chosenValue },
+                    availableOptions: availableOptions,
+                };
+            }
+            return {
+                success: true,
+                message: `Selected option: ${(item.textContent || '').trim()} (value: ${chosenValue})`,
+                value: chosenValue,
+            };
+        }
+    }
+    return {
+        success: false,
+        error: `Option with text or value '${targetText}' not found in custom dropdown`,
+        availableOptions: availableOptions,
+    };
+}
+"""
+
+# combobox listbox 定位 JS：解析 aria-controls/aria-owns 的 listbox 为 RemoteObject
+# （returnByValue=False 由 caller 设）。命中返回节点本身（CDP 序列化为 RemoteObject，带
+# objectId），null 则 result 无 objectId。caller 据此判 listboxFound 并取 objectId 跑 setter。
+_COMBOBOX_LISTBOX_ID_JS = """
+function() {
+    const combo = this;
+    const controlsId = combo.getAttribute('aria-controls') || combo.getAttribute('aria-owns');
+    if (!controlsId) return null;
+    return document.getElementById(controlsId);
+}
+"""
+
+# combobox listbox 写脚本（写侧对应 _COMBOBOX_OPTIONS_JS）。跑在 listbox 对象上（由 caller
+# 经 _COMBOBOX_LISTBOX_ID_JS 解析后传入 objectId）。单选清兄弟 aria-selected → 选目标 →
+# 真实 click → 读回验证（aria-selected「是否粘住」）。返回与 _SELECT_OPTION_JS 同形。
+_SET_COMBOBOX_OPTION_JS = """
+function(targetText) {
+    const listbox = this;
+    const all = Array.from(listbox.querySelectorAll('[role="option"], li'));
+    const availableOptions = all.map(function(n) {
+        return { text: (n.textContent || '').trim(), value: n.getAttribute('data-value') || n.getAttribute('value') || (n.textContent || '').trim() };
+    });
+    if (!all.length) {
+        return { success: false, error: 'combobox listbox has no [role=option] or li', availableOptions: [] };
+    }
+    const targetLower = (targetText || '').toLowerCase();
+    for (const item of all) {
+        const textLower = (item.textContent || '').trim().toLowerCase();
+        const valLower = (item.getAttribute('data-value') || item.getAttribute('value') || '').toLowerCase();
+        if (textLower === targetLower || valLower === targetLower) {
+            all.forEach(function(o) { o.setAttribute('aria-selected', 'false'); });
+            item.setAttribute('aria-selected', 'true');
+            item.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+            item.click();
+            item.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+            const stuck = item.getAttribute('aria-selected') === 'true';
+            const chosenValue = item.getAttribute('data-value') || item.getAttribute('value') || (item.textContent || '').trim();
+            if (!stuck) {
+                return {
+                    success: false,
+                    error: 'Combobox selection was set but not retained.',
+                    targetOption: { text: (item.textContent || '').trim(), value: chosenValue },
+                    availableOptions: availableOptions,
+                };
+            }
+            return {
+                success: true,
+                message: `Selected option: ${(item.textContent || '').trim()} (value: ${chosenValue})`,
+                value: chosenValue,
+            };
+        }
+    }
+    return {
+        success: false,
+        error: `Option with text or value '${targetText}' not found in combobox listbox`,
+        availableOptions: availableOptions,
+    };
+}
+"""
+
+# 子树定位 JS（写侧对应 _SUBTREE_SEARCH_JS）。同 BFS+classify，但返回首个命中后代
+# 的节点 + 类型（returnByValue=False 由 caller 设，节点以 RemoteObject 存活），供 Python
+# 写 flow 按类型 callFunctionOn 对应 setter。depth 0（start 自身）跳过。
+_SUBTREE_LOCATE_JS = """
+function(maxDepth) {
+    const start = this;
+    function classify(el) {
+        if (el.querySelector('[role="option"],[role="menuitem"]')) return 'aria';
+        if ((el.classList.contains('dropdown') || el.classList.contains('ui')) && el.querySelector('.item,.option,[data-value]')) return 'custom';
+        return null;
+    }
+    var queue = [[start, 0]];
+    while (queue.length) {
+        var pair = queue.shift(); var el = pair[0]; var d = pair[1];
+        if (d > 0) {
+            var t = classify(el);
+            if (t) return { found: true, type: t, node: el, depth: d };
+        }
+        if (d < maxDepth) {
+            for (var i = 0; i < el.children.length; i++) queue.push([el.children[i], d + 1]);
+        }
+    }
+    return { found: false, type: null, node: null };
+}
+"""
+
 
 class BrowserSession:
     """Manages browser connection and provides high-level page operations."""
@@ -2691,6 +2887,42 @@ class BrowserSession:
         )
         selection = result.get("result", {}).get("value", {}) or {}
 
+        # G11 懒加载重试：select 有 option 但全部为空（text 与 value 都空白）→ option
+        # 多半异步填充。focus() + sleep 1.0s + 重跑 _SELECT_OPTION_JS 一次（仅 native，
+        # 镜像 browser-use default_action_watchdog.py:3509-3547）。重试先于点击回退
+        # （懒加载是比框架回退更廉价的假设）。全空谓词：success=False 且 availableOptions
+        # 非空列表且每项 text/value 都空白。
+        avail = selection.get("availableOptions") or []
+        all_empty = (
+            not selection.get("success")
+            and isinstance(avail, list)
+            and len(avail) > 0
+            and all(
+                not (o.get("text") or "").strip() and not (o.get("value") or "").strip()
+                for o in avail
+            )
+        )
+        if all_empty:
+            await self.client.send.Runtime.callFunctionOn(
+                {
+                    "objectId": object_id,
+                    "functionDeclaration": "function(){ try{ this.focus(); } catch(e){} }",
+                    "returnByValue": True,
+                },
+                session_id=self.current_session_id,
+            )
+            await asyncio.sleep(1.0)
+            retry = await self.client.send.Runtime.callFunctionOn(
+                {
+                    "objectId": object_id,
+                    "functionDeclaration": _SELECT_OPTION_JS,
+                    "arguments": [{"value": value}],
+                    "returnByValue": True,
+                },
+                session_id=self.current_session_id,
+            )
+            selection = retry.get("result", {}).get("value", {}) or {}
+
         # Framework reverted the programmatic value set -> click fallback
         # (mirrors browser-use default_action_watchdog.py:3550-3617).
         if selection.get("selectionReverted"):
@@ -2711,6 +2943,60 @@ class BrowserSession:
             # structured error (carries availableOptions for the action layer
             # to echo back to the LLM).
         return selection
+
+    async def _call_setter_on_node(
+        self, backend_node_id: int, function_declaration: str, value: str,
+    ) -> dict:
+        """resolveNode + callFunctionOn(setter JS, value) -> dict。set_aria_option /
+        set_custom_option 共用，省去三处 15 行 resolveNode+callFunctionOn 样板。返回
+        setter 原始 dict（success/message/value/availableOptions/error）。CDP/JS 异常
+        上抛（caller 友好包装）。镜像 fetch_select_options 的 resolveNode+callFunctionOn 形状。"""
+        resolve = await self.client.send.DOM.resolveNode(
+            {"backendNodeId": backend_node_id},
+            session_id=self.current_session_id,
+        )
+        object_id = resolve["object"]["objectId"]
+        result = await self.client.send.Runtime.callFunctionOn(
+            {
+                "objectId": object_id,
+                "functionDeclaration": function_declaration,
+                "arguments": [{"value": value}],
+                "returnByValue": True,
+            },
+            session_id=self.current_session_id,
+        )
+        return result.get("result", {}).get("value", {}) or {}
+
+    async def set_aria_option(self, backend_node_id: int, value: str) -> dict:
+        """在 ARIA menu/listbox（backendNodeId 绑定）中选 option（_fetch_aria_options 的
+        写侧对应）。返回与 set_select_option 同形 dict。CDP/JS 异常上抛（caller 包装）。"""
+        return await self._call_setter_on_node(backend_node_id, _SET_ARIA_JS, value)
+
+    async def set_custom_option(self, backend_node_id: int, value: str) -> dict:
+        """在 custom-class 下拉（Semantic UI 等，backendNodeId 绑定）中选 option
+        （_fetch_custom_class_options 的写侧对应）。返回与 set_select_option 同形 dict。"""
+        return await self._call_setter_on_node(backend_node_id, _SET_CUSTOM_JS, value)
+
+    async def set_dropdown_option(self, backend_node_id: int, value: str) -> dict:
+        """写侧 dispatcher（镜像 fetch_dropdown_options）。复用读侧 dispatcher 做分类
+        （同一份 JS 判型，读写零漂移 —— D1），再按 source 路由到对应 setter。返回 setter
+        dict + 'source'（'aria'|'custom'|'child-depth-N'|None）；source=None 表示非任何已知
+        下拉类型（action 层据此返友好 error）。CDP/JS 异常上抛（caller 包装）。
+
+        与读侧对称：combobox 不进此 dispatcher（需真实 click/Escape，由 action 层 Python
+        预分类直调 set_combobox_option）。"""
+        classified = await self.fetch_dropdown_options(backend_node_id)
+        source = classified["source"]
+        if source == "aria":
+            result = await self.set_aria_option(backend_node_id, value)
+        elif source == "custom":
+            result = await self.set_custom_option(backend_node_id, value)
+        elif source is not None and str(source).startswith("child-depth-"):
+            result = await self._set_subtree_option(backend_node_id, value)
+        else:
+            return {"success": False, "source": None, "error": "not a recognized dropdown"}
+        result["source"] = source
+        return result
 
     async def _fetch_aria_options(self, backend_node_id: int) -> list[dict] | None:
         """Read options of an ARIA menu/listbox scoped to backendNodeId.
@@ -2777,6 +3063,24 @@ class BrowserSession:
             return {"options": found["options"], "source": found["source"]}
         return {"options": [], "source": None}
 
+    async def _collapse_combobox(self, object_id: str | None) -> None:
+        """强制收起已展开的 combobox（Escape + blur）。load-bearing：残留展开的遮罩
+        会拦截后续 click。best-effort（失败仅 debug 日志）—— 读/写 combobox flow 的
+        finally 共用（D6 行为等价重构）。"""
+        try:
+            await self.send_keys("Escape")
+            if object_id is not None:
+                await self.client.send.Runtime.callFunctionOn(
+                    {
+                        "objectId": object_id,
+                        "functionDeclaration": "function(){ try{ this.blur(); } catch(e){} }",
+                        "returnByValue": True,
+                    },
+                    session_id=self.current_session_id,
+                )
+        except Exception as e:
+            logger.debug("combobox collapse failed: %s", e)
+
     async def expand_and_fetch_combobox_options(self, backend_node_id: int) -> list[dict]:
         """Expand a combobox (real click), read its aria-controls listbox, then
         ALWAYS collapse (finally). Python flow — a combobox needs a real click +
@@ -2815,20 +3119,56 @@ class BrowserSession:
                 )
             return payload.get("options", [])
         finally:
-            # 4. 强制收起（即便第 3 步抛错也收起 —— D3 load-bearing，非装饰）
-            try:
-                await self.send_keys("Escape")
-                if object_id is not None:
-                    await self.client.send.Runtime.callFunctionOn(
-                        {
-                            "objectId": object_id,
-                            "functionDeclaration": "function(){ try{ this.blur(); } catch(e){} }",
-                            "returnByValue": True,
-                        },
-                        session_id=self.current_session_id,
-                    )
-            except Exception as e:
-                logger.debug("combobox collapse failed: %s", e)
+            # 4. 强制收起（即便第 3 步抛错也收起 —— D3 load-bearing，非装饰；抽到
+            # _collapse_combobox 供读/写 combobox flow 共用，行为等价）
+            await self._collapse_combobox(object_id)
+
+    async def set_combobox_option(self, backend_node_id: int, value: str) -> dict:
+        """在 combobox 的 aria-controls listbox 中选 option。Python flow 镜像
+        expand_and_fetch_combobox_options：展开（真实 click）→ settle → 解析 listbox
+        objectId（_COMBOBOX_LISTBOX_ID_JS，returnByValue=False）→ 在 listbox 上写
+        （_SET_COMBOBOX_OPTION_JS）→ finally 强制收起。NOTE：browser-use 缺 combobox 写侧
+        （已知不一致），此为从读 flow 自撰（D4）。返回与 set_select_option 同形 dict。
+        CDP/JS 异常上抛；收起仍于 finally 跑。"""
+        await self.click_element(backend_node_id)
+        await asyncio.sleep(0.5)
+        combo_object_id = None
+        try:
+            combo_resolve = await self.client.send.DOM.resolveNode(
+                {"backendNodeId": backend_node_id},
+                session_id=self.current_session_id,
+            )
+            combo_object_id = combo_resolve["object"]["objectId"]
+            # 定位 listbox（returnByValue=False 取 RemoteObject）
+            lb = await self.client.send.Runtime.callFunctionOn(
+                {
+                    "objectId": combo_object_id,
+                    "functionDeclaration": _COMBOBOX_LISTBOX_ID_JS,
+                    "returnByValue": False,
+                },
+                session_id=self.current_session_id,
+            )
+            lb_result = lb.get("result", {}) or {}
+            listbox_object_id = lb_result.get("objectId")
+            if not listbox_object_id:
+                return {
+                    "success": False,
+                    "error": "combobox listbox not found (no aria-controls/aria-owns target)",
+                    "availableOptions": [],
+                }
+            # 在 listbox 上写
+            result = await self.client.send.Runtime.callFunctionOn(
+                {
+                    "objectId": listbox_object_id,
+                    "functionDeclaration": _SET_COMBOBOX_OPTION_JS,
+                    "arguments": [{"value": value}],
+                    "returnByValue": True,
+                },
+                session_id=self.current_session_id,
+            )
+            return result.get("result", {}).get("value", {}) or {}
+        finally:
+            await self._collapse_combobox(combo_object_id)
 
     async def search_children_for_dropdowns(self, backend_node_id: int, max_depth: int = 4) -> dict:
         """BFS the subtree (max_depth levels) for a dropdown-shaped descendant
@@ -2854,6 +3194,50 @@ class BrowserSession:
         )
         value = result.get("result", {}).get("value") or {"options": [], "source": None}
         return value
+
+    async def _call_setter_on_object(
+        self, object_id: str, function_declaration: str, value: str,
+    ) -> dict:
+        """同 _call_setter_on_node 但直接接 remote objectId（子树/combobox 子代经 JS
+        locator 解析，只有 objectId 无 backendNodeId）。返回 setter dict。CDP/JS 异常上抛。"""
+        result = await self.client.send.Runtime.callFunctionOn(
+            {
+                "objectId": object_id,
+                "functionDeclaration": function_declaration,
+                "arguments": [{"value": value}],
+                "returnByValue": True,
+            },
+            session_id=self.current_session_id,
+        )
+        return result.get("result", {}).get("value", {}) or {}
+
+    async def _set_subtree_option(self, backend_node_id: int, value: str) -> dict:
+        """定位子代下拉（BFS，镜像 search_children_for_dropdowns 但返回子代 objectId+类型），
+        按类型调 _SET_ARIA_JS / _SET_CUSTOM_JS。被 set_dropdown_option 的 child-depth-N
+        分支调用（D5 两阶段编排：JS returnByValue 会剥离对象身份，故 locator 先取子代
+        RemoteObject 再写）。返回 setter dict（无 source —— dispatcher 补）。CDP/JS 异常上抛。"""
+        resolve = await self.client.send.DOM.resolveNode(
+            {"backendNodeId": backend_node_id}, session_id=self.current_session_id,
+        )
+        parent_object_id = resolve["object"]["objectId"]
+        located = await self.client.send.Runtime.callFunctionOn(
+            {
+                "objectId": parent_object_id,
+                "functionDeclaration": _SUBTREE_LOCATE_JS,
+                "arguments": [{"value": 4}],
+                "returnByValue": False,
+            },
+            session_id=self.current_session_id,
+        )
+        payload = located.get("result", {}) or {}
+        if not payload.get("found"):
+            return {"success": False, "error": "subtree child dropdown vanished between read and write"}
+        setter = _SET_ARIA_JS if payload.get("type") == "aria" else _SET_CUSTOM_JS
+        # CDP-shape：returnByValue=False 下嵌套节点 objectId 兼容顶层与 node.objectId 两种
+        child_object_id = payload.get("objectId") or (payload.get("node") or {}).get("objectId")
+        if not child_object_id:
+            return {"success": False, "error": "could not resolve subtree child objectId"}
+        return await self._call_setter_on_object(child_object_id, setter, value)
 
     # ── File operations (via CDP) ──────────────────────────────────────
 

@@ -431,6 +431,7 @@ class TestHighlightActions:
 		entry = MagicMock()
 		entry.tag_name = "BUTTON"
 		entry.backend_node_id = 42
+		entry.attributes = {}
 
 		state = _make_mock_browser_state({5: entry})
 		params = {"index": 5}
@@ -496,6 +497,7 @@ class TestHighlightActions:
 		entry = MagicMock()
 		entry.tag_name = "BUTTON"
 		entry.backend_node_id = 42
+		entry.attributes = {}
 
 		state = _make_mock_browser_state({5: entry})
 		params = {"index": 5}

@@ -414,15 +414,36 @@ class Tools:
                 ),
             )
 
-        # 2. SELECT 分支：精确查"指定 index 的那个 select"，不再全页 querySelectorAll
-        #    G9 降级：误点 <select> 时读出选项给 LLM；复用 _format_options_result，
-        #    输出与 dropdown_options 字节级同格式（修掉原 str(options) repr 不一致）。
-        if entry.tag_name.upper() == "SELECT":
+        # 2. 下拉降级（G9）：目标是下拉形元素（native select / ARIA listbox·menu / custom
+        #    dropdown / combobox）时，click 要么 no-op（native select 忽略 click）要么误开
+        #    遮罩（ARIA/combobox）。降级为读选项给 LLM（镜像 dropdown_options 调度，复用
+        #    _format_options_result，输出与 dropdown_options 字节级同格式，修掉原 str(options)
+        #    repr 不一致）。D7：不重路由到 dropdown_options（click 已「点过」）。非下拉落回真实 click。
+        tag = entry.tag_name.upper()
+        is_combo, _ = self._is_autocomplete_field(entry)
+        attrs = getattr(entry, "attributes", {}) or {}
+        is_dropdown_target = (
+            tag == "SELECT"
+            or attrs.get("role") in ("listbox", "menu", "menubar", "tree", "grid")
+            or "dropdown" in (attrs.get("class") or "").lower()
+            or (is_combo and (attrs.get("aria-controls") or attrs.get("aria-owns")))
+        )
+        if is_dropdown_target:
             try:
-                options = await browser.fetch_select_options(backend_id)
+                if tag == "SELECT":
+                    options = await browser.fetch_select_options(backend_id)
+                    return self._format_options_result(options, entry, params["index"], "click-select")
+                if is_combo and (attrs.get("aria-controls") or attrs.get("aria-owns")):
+                    options = await browser.expand_and_fetch_combobox_options(backend_id)
+                    return self._format_options_result(options, entry, params["index"], "click-combobox")
+                dispatched = await browser.fetch_dropdown_options(backend_id)
+                if dispatched["source"] is not None:
+                    return self._format_options_result(
+                        dispatched["options"], entry, params["index"], "click-" + dispatched["source"],
+                    )
+                # 假阳性：判错为下拉但 dispatcher 真阴性 → 落回真实 click
             except Exception as e:
-                return ActionResult(error=f"Failed to read select options: {e}")
-            return self._format_options_result(options, entry, params["index"], "click-select")
+                return ActionResult(error=f"Failed to read dropdown options: {e}")
 
         # 3. 普通点击：highlight -> click_element，映射 bool 信号
         tabs_before = tuple(t.target_id for t in await browser.get_tabs())  # G7 新页检测快照
@@ -1106,38 +1127,56 @@ class Tools:
             return ActionResult(error=f"Failed to read dropdown options: {e}")
 
     async def _action_select_dropdown(self, params: dict, browser: BrowserSession) -> ActionResult:
-        """Select an option in the <select> at the given index.
+        """Select an option in the dropdown at the given index.
 
-        Delegates to session.set_select_option (DOM.resolveNode + Runtime.
-        callFunctionOn), scoped to the target select via backend_node_id — fixing
-        the global querySelectorAll('select')[0] bug that wrote the first select
-        on the page regardless of index. Ports browser-use's native selection
-        chain (focus -> set value three ways -> input/change/blur -> readback
-        verify -> click fallback on framework reversion). On a miss, echoes the
-        available options back for the LLM to self-correct. Mirrors the
-        _describe_dropdown + try/except soft-degrade convention of dropdown_options.
+        P0 scoped the native <select> chain to the target's backend_node_id (DOM.resolveNode
+        + Runtime.callFunctionOn), fixing the global querySelectorAll('select')[0] bug and
+        porting browser-use's native selection chain (focus -> set value three ways ->
+        input/change/blur -> readback verify -> click fallback on framework reversion). P1
+        widens this to multi-type dispatch (mirrors _action_dropdown_options): native
+        <select> -> set_select_option; combobox (aria-controls) -> set_combobox_option
+        (Python flow); otherwise the session write-dispatcher set_dropdown_option classifies
+        (aria/custom/subtree, reusing read-side fetch_dropdown_options) and routes to the
+        matching setter. On a miss, echoes the available options back for the LLM to
+        self-correct. Mirrors the _describe_dropdown + try/except soft-degrade convention of
+        dropdown_options. The success/miss/error three-segment handling is shared by all
+        setter types (D2 — uniform dict shape, zero per-type branching here).
         """
         index = params["index"]
         entry, error = await self._get_element_by_index(index, browser)
         if error:
             return error
 
-        # Tag guard: native <select> only (mirrors dropdown_options early return).
+        # Multi-type dispatch (P1, mirrors _action_dropdown_options). native <select> ->
+        # set_select_option (P0 path, zero change); combobox (aria-controls) -> set_combobox_option
+        # (Python flow); otherwise the session write-dispatcher set_dropdown_option classifies
+        # (aria/custom/subtree, reusing read-side fetch_dropdown_options) and routes to the
+        # matching setter. Tag guard widened from P0's "tag != SELECT hard-reject".
         tag = (getattr(entry, "tag_name", "") or "").upper()
-        if tag != "SELECT":
-            return ActionResult(
-                error=(
-                    f"Index {index} is a [{tag}] element, not a <select>. "
-                    f"select_dropdown only supports native <select>. "
-                    f"For ARIA menu/listbox or custom dropdowns, use click to expand and select manually."
-                ),
-            )
-
-        # Scope to the target select's backend_node_id (fixes the [0] global bug).
         backend_id = getattr(entry, "backend_node_id", None)
         value = params["value"]
+        is_combo, _ = self._is_autocomplete_field(entry)
+        attrs = getattr(entry, "attributes", {}) or {}
+
         try:
-            result = await browser.set_select_option(backend_id, value)
+            if tag == "SELECT":
+                # native <select>：P0 路径零改动
+                result = await browser.set_select_option(backend_id, value)
+            elif is_combo and (attrs.get("aria-controls") or attrs.get("aria-owns")):
+                # combobox（aria-controls 独立 listbox）：Python flow（展开→定位→写→收起）
+                result = await browser.set_combobox_option(backend_id, value)
+            else:
+                # aria / custom / 子树：session 写 dispatcher（复用读侧分类，读写零漂移）
+                result = await browser.set_dropdown_option(backend_id, value)
+                if result.get("source") is None:
+                    # 真阴性：非任何已知下拉类型（与 dropdown_options 真阴性一致）
+                    return ActionResult(
+                        error=(
+                            f"Index {index} is a [{tag}] element, not a recognized dropdown "
+                            f"(native <select>, ARIA listbox/menu, custom dropdown, or combobox). "
+                            f"Use dropdown_options to list available options first."
+                        ),
+                    )
         except Exception as e:
             return ActionResult(error=f"Failed to select option: {e}")
 

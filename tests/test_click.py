@@ -72,8 +72,15 @@ def _make_browser(
 	click_element_side_effect=None,
 	fetch_options_return=None,
 	fetch_options_side_effect=None,
+	dispatch=None,
+	combobox_options=None,
 ) -> MagicMock:
-	"""Stub BrowserSession for action-layer tests (does NOT touch CDP)."""
+	"""Stub BrowserSession for action-layer tests (does NOT touch CDP).
+
+	P1f dropdown-degrade: native SELECT calls fetch_select_options; ARIA/custom/subtree
+	calls fetch_dropdown_options (``dispatch``); combobox calls expand_and_fetch_combobox_options
+	(``combobox_options``). Non-dropdown targets fall through to the real click_element.
+	"""
 	bs = MagicMock()
 	bs.current_session_id = "sid"
 	bs.current_target_id = "tid"
@@ -90,6 +97,12 @@ def _make_browser(
 			if fetch_options_return is not None
 			else [{"value": "a", "text": "A", "selected": False}],
 		)
+	bs.fetch_dropdown_options = AsyncMock(
+		return_value=dispatch if dispatch is not None else {"options": [], "source": None}
+	)
+	bs.expand_and_fetch_combobox_options = AsyncMock(
+		return_value=combobox_options if combobox_options is not None else []
+	)
 	bs.get_state = AsyncMock(return_value=_make_state({}))
 	bs.get_tabs = AsyncMock(return_value=[])  # _action_click snapshots tabs (G7)
 	return bs
@@ -236,7 +249,90 @@ class TestClickSelectBranch:
 
 		result = await Tools().execute("click", {"index": 2}, browser, browser_state=state)
 
-		assert result.error == "Failed to read select options: CDP down"
+		# P1f：SELECT 分支并进下拉降级守卫，错误信息统一为 "Failed to read dropdown options"
+		assert result.error == "Failed to read dropdown options: CDP down"
+
+	@pytest.mark.asyncio
+	async def test_click_aria_listbox_degrades_to_options(self):
+		"""P1f G9 扩面：误点 ARIA listbox → 降级读选项（走 fetch_dropdown_options，
+		source=aria），不真实 click。"""
+		entry = _make_entry(tag="UL", backend_node_id=7, attributes={"role": "listbox"})
+		state = _make_state({3: entry})
+		browser = _make_browser(dispatch={
+			"options": [{"value": "a", "text": "Alpha", "selected": False}], "source": "aria",
+		})
+
+		result = await Tools().execute("click", {"index": 3}, browser, browser_state=state)
+
+		assert result.error is None
+		assert "0: text=" in result.extracted_content
+		assert "via [CLICK-ARIA]" in result.long_term_memory
+		browser.fetch_dropdown_options.assert_awaited_once_with(7)
+		browser.click_element.assert_not_awaited()
+
+	@pytest.mark.asyncio
+	async def test_click_custom_dropdown_degrades_to_options(self):
+		entry = _make_entry(tag="DIV", backend_node_id=7, attributes={"class": "ui dropdown"})
+		state = _make_state({3: entry})
+		browser = _make_browser(dispatch={
+			"options": [{"value": "us", "text": "US", "selected": True}], "source": "custom",
+		})
+
+		result = await Tools().execute("click", {"index": 3}, browser, browser_state=state)
+
+		assert result.error is None
+		assert "via [CLICK-CUSTOM]" in result.long_term_memory
+		browser.fetch_dropdown_options.assert_awaited_once_with(7)
+		browser.click_element.assert_not_awaited()
+
+	@pytest.mark.asyncio
+	async def test_click_combobox_degrades_via_expand(self):
+		entry = _make_entry(tag="INPUT", backend_node_id=7, attributes={"role": "combobox", "aria-controls": "lb"})
+		state = _make_state({3: entry})
+		browser = _make_browser(combobox_options=[{"value": "a", "text": "A", "selected": False}])
+
+		result = await Tools().execute("click", {"index": 3}, browser, browser_state=state)
+
+		assert "via [CLICK-COMBOBOX]" in result.long_term_memory
+		browser.expand_and_fetch_combobox_options.assert_awaited_once_with(7)
+		browser.click_element.assert_not_awaited()
+
+	@pytest.mark.asyncio
+	async def test_click_native_select_unchanged_no_regression(self):
+		# P0 native 路径字节一致：仍走 fetch_select_options，source=click-select
+		entry = _make_entry(tag="SELECT", backend_node_id=7, attributes={"aria-label": "Country"})
+		state = _make_state({3: entry})
+		browser = _make_browser(fetch_options_return=[{"value": "us", "text": "US", "selected": True}])
+
+		result = await Tools().execute("click", {"index": 3}, browser, browser_state=state)
+
+		browser.fetch_select_options.assert_awaited_once_with(7)
+		assert "via [CLICK-SELECT]" in result.long_term_memory
+
+	@pytest.mark.asyncio
+	async def test_click_false_positive_dropdown_falls_through_to_real_click(self):
+		# 假阳性：class 含 dropdown 但 dispatcher 真阴性（source=None）→ 落回真实 click
+		entry = _make_entry(tag="DIV", backend_node_id=7, attributes={"class": "dropdown-menu"})
+		state = _make_state({3: entry})
+		browser = _make_browser(dispatch={"options": [], "source": None})
+
+		await Tools().execute("click", {"index": 3}, browser, browser_state=state)
+
+		browser.fetch_dropdown_options.assert_awaited_once_with(7)
+		browser.click_element.assert_awaited_once_with(7)   # 落回真实 click
+
+	@pytest.mark.asyncio
+	async def test_click_non_dropdown_falls_through_to_real_click(self):
+		# 普通 <button> 不被降级守卫捕获 → 走真实 click_element
+		entry = _make_entry(tag="BUTTON", backend_node_id=7)
+		state = _make_state({3: entry})
+		browser = _make_browser()
+
+		await Tools().execute("click", {"index": 3}, browser, browser_state=state)
+
+		browser.fetch_select_options.assert_not_awaited()
+		browser.fetch_dropdown_options.assert_not_awaited()
+		browser.click_element.assert_awaited_once_with(7)
 
 	@pytest.mark.asyncio
 	async def test_select_branch_uses_shared_format_not_str_repr(self):
