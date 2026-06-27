@@ -290,7 +290,7 @@ class WriteFileParams(BaseModel):
 
 class ReadFileParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    path: str = Field(description="Path to a local text file to read (UTF-8 by default; see encoding).")
+    path: str = Field(description="Path to a local file to read: UTF-8 text by default (see encoding), or PDF/DOCX for text extraction.")
     encoding: str | None = Field(
         default=None,
         description="Text encoding to decode with (default UTF-8). Set e.g. 'latin-1' or 'cp936' "
@@ -301,6 +301,16 @@ class ReadFileParams(BaseModel):
         description="Python open() newline mode (default '' = no translation, preserves \\r\\n "
         "byte-for-byte). Set None for universal-newline (collapses \\r\\n / \\r to \\n); other "
         "values do not translate on a full-file read.",
+    )
+    offset: int = Field(
+        default=0, ge=0,
+        description="0-based character offset to start reading at (for paginating files larger "
+        "than read_file_max_chars; pair with the truncation footer's 'use offset=N to continue').",
+    )
+    limit: int | None = Field(
+        default=None, ge=1,
+        description="Max characters to return from this read (default: read_file_max_chars). "
+        "Use with offset to page through very large files.",
     )
 
 
@@ -582,7 +592,7 @@ ACTION_DEFINITIONS: dict[str, tuple[type[BaseModel], str, bool]] = {
         "file you have already read.",
         False,
     ),
-    "read_file": (ReadFileParams, "Read content from a local UTF-8 text file.", False),
+    "read_file": (ReadFileParams, "Read content from a local text (UTF-8) or PDF/DOCX file; paginate large files with offset/limit.", False),
     "replace_file": (
         ReplaceFileParams,
         "Replace occurrences of text inside an existing local file, in place. By default "

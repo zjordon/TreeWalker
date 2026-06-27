@@ -8,6 +8,7 @@ FS isolation, newline="" byte-exact helpers, TAB indentation per CLAUDE.md.
 from __future__ import annotations
 
 import os
+import sys
 from unittest.mock import MagicMock
 
 import pytest
@@ -267,9 +268,9 @@ class TestReadFileParamsValidation:
 		assert m.path == "x"
 
 	def test_extra_field_forbidden(self):
-		# offset/limit are deliberately not added in phase 1
+		# offset/limit are now real fields (阶段二 二.A); test extra-forbid with an unknown field.
 		with pytest.raises(ValidationError):
-			ReadFileParams(path="x", offset=0)
+			ReadFileParams(path="x", bogus=1)
 
 	def test_path_required(self):
 		with pytest.raises(ValidationError):
@@ -338,3 +339,233 @@ class TestReadFileNewlineMode:
 		r = await _run({"path": str(p)})
 		assert r.error is None
 		assert r.extracted_content == "a\r\nb"
+
+
+# ── 阶段二 二.A：offset/limit 字符级分页 ────────────────────────────
+
+
+class TestReadFileOffsetLimit:
+	@pytest.mark.asyncio
+	async def test_offset_reads_from_offset(self, tmp_path):
+		p = tmp_path / "f.txt"
+		_seed(p, "abcdef")
+		r = await _run({"path": str(p), "offset": 2})
+		assert r.error is None
+		# window = read_file_max_chars (limit unset) > len; offset=2 -> "cdef", final page
+		assert r.extracted_content == "cdef"
+		assert "final page" in r.long_term_memory
+
+	@pytest.mark.asyncio
+	async def test_limit_caps_window(self, tmp_path):
+		p = tmp_path / "f.txt"
+		_seed(p, "abcdefghij")  # 10 chars
+		r = await _run({"path": str(p), "limit": 3})
+		assert r.error is None
+		assert r.extracted_content.startswith("abc")
+		assert "[...truncated" in r.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_offset_past_end_soft_miss(self, tmp_path):
+		p = tmp_path / "f.txt"
+		_seed(p, "abc")
+		r = await _run({"path": str(p), "offset": 5})
+		assert r.error is None
+		assert "past end" in r.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_default_offset_zero_is_phase1_behavior(self, tmp_path):
+		p = tmp_path / "f.txt"
+		_seed(p, "abc")
+		r = await _run({"path": str(p)})
+		assert r.error is None
+		assert r.extracted_content == "abc"
+		assert r.long_term_memory == f"Read {str(p)} (3 chars, 3 bytes)"
+
+	@pytest.mark.asyncio
+	async def test_truncated_footer_has_continue_hint(self, tmp_path):
+		n = _max_chars()
+		p = tmp_path / "big.txt"
+		_seed(p, "x" * (n + 100))
+		r = await _run({"path": str(p)})
+		# phase-1 substring preserved (backward compat) + new continue hint
+		assert f"[...truncated: showing {n} of {n + 100} chars" in r.extracted_content
+		assert "use offset=" in r.extracted_content
+		assert "to continue]" in r.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_offset_limit_pages(self, tmp_path):
+		n = _max_chars()
+		p = tmp_path / "big.txt"
+		_seed(p, "y" * (n + 200))
+		r = await _run({"path": str(p), "offset": n, "limit": 100})
+		assert r.error is None
+		# window=100 from offset n; next continue offset should be n+100
+		assert f"use offset={n + 100} to continue" in r.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_offset_preserves_crlf(self, tmp_path):
+		p = tmp_path / "crlf.txt"
+		_seed(p, "x\r\ny\r\nz")
+		r = await _run({"path": str(p), "offset": 1})
+		assert r.error is None
+		assert "\r\n" in r.extracted_content
+
+
+# ── 阶段二 二.B：二进制嗅探 ────────────────────────────────────────
+
+
+class TestReadFileBinarySniff:
+	@pytest.mark.asyncio
+	async def test_exe_rejected_as_binary(self, tmp_path):
+		p = tmp_path / "evil.exe"
+		with open(p, "wb") as f:
+			f.write(b"MZ\x90\x00" + b"\x00" * 32)
+		r = await _run({"path": str(p)})
+		assert r.error is not None
+		assert "binary" in r.error.lower()
+
+	@pytest.mark.asyncio
+	async def test_gzip_rejected_as_binary(self, tmp_path):
+		p = tmp_path / "a.gz"
+		with open(p, "wb") as f:
+			f.write(b"\x1f\x8b" + b"\x00" * 16)
+		r = await _run({"path": str(p)})
+		assert "binary" in r.error.lower()
+
+	@pytest.mark.asyncio
+	async def test_plain_zip_non_docx_rejected_as_binary(self, tmp_path):
+		p = tmp_path / "a.zip"
+		with open(p, "wb") as f:
+			f.write(b"PK\x03\x04" + b"\x00" * 16)
+		r = await _run({"path": str(p)})
+		assert "binary" in r.error.lower()
+
+	@pytest.mark.asyncio
+	async def test_png_routes_to_image_prompt(self, tmp_path):
+		p = tmp_path / "pic.png"
+		with open(p, "wb") as f:
+			f.write(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+		r = await _run({"path": str(p)})
+		assert r.error is None
+		assert "image" in r.extracted_content.lower()
+		assert "vision" in r.extracted_content.lower()
+
+	@pytest.mark.asyncio
+	async def test_utf8_text_not_sniffed_as_binary(self, tmp_path):
+		# plain text has no magic header -> text path -> normal read
+		p = tmp_path / "f.txt"
+		_seed(p, "hello world")
+		r = await _run({"path": str(p)})
+		assert r.error is None
+		assert r.extracted_content == "hello world"
+
+	@pytest.mark.asyncio
+	async def test_gbk_text_still_decode_error(self, tmp_path):
+		# GBK bytes have no magic header -> text path -> UnicodeDecodeError (regression)
+		p = tmp_path / "gbk.txt"
+		with open(p, "wb") as f:
+			f.write("你好".encode("gbk"))
+		r = await _run({"path": str(p)})
+		assert r.error is not None
+		assert "utf-8" in r.error.lower()
+
+
+# ── 阶段二 二.C：allowed_read_paths 白名单 ──────────────────────────
+
+
+class TestReadFileReadWhitelist:
+	@pytest.mark.asyncio
+	async def test_blocked_outside_whitelist(self, tmp_path):
+		inside = tmp_path / "inside"
+		inside.mkdir()
+		outside = tmp_path / "outside.txt"
+		_seed(outside, "hi")
+		tools = Tools(allowed_read_paths=[str(inside)])
+		r = await tools.execute("read_file", {"path": str(outside)}, MagicMock())
+		assert r.error is not None
+		assert "allowed read paths" in r.error
+
+	@pytest.mark.asyncio
+	async def test_allowed_inside_whitelist(self, tmp_path):
+		p = tmp_path / "f.txt"
+		_seed(p, "hi")
+		tools = Tools(allowed_read_paths=[str(tmp_path)])
+		r = await tools.execute("read_file", {"path": str(p)}, MagicMock())
+		assert r.error is None
+		assert r.extracted_content == "hi"
+
+	@pytest.mark.asyncio
+	async def test_none_whitelist_allows_anywhere(self, tmp_path):
+		p = tmp_path / "f.txt"
+		_seed(p, "hi")
+		# default Tools() -> _allowed_read_paths is None -> no restriction (现状)
+		r = await _run({"path": str(p)})
+		assert r.error is None
+		assert r.extracted_content == "hi"
+
+
+# ── 阶段二 二.D：富文档（PDF/DOCX/图片） ───────────────────────────
+
+
+class TestReadFileRichDocs:
+	@pytest.mark.asyncio
+	async def test_image_returns_actionable_prompt(self, tmp_path):
+		p = tmp_path / "pic.png"
+		with open(p, "wb") as f:
+			f.write(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+		r = await _run({"path": str(p)})
+		assert r.error is None
+		assert "image" in r.extracted_content.lower()
+		assert "vision" in r.extracted_content.lower()
+		assert r.metadata is None  # 不堆 base64 死数据（vision 通道未接线）
+
+	@pytest.mark.asyncio
+	async def test_pdf_text_extraction(self, tmp_path, monkeypatch):
+		pdf = pytest.importorskip("pypdf")
+		p = tmp_path / "doc.pdf"
+		p.write_bytes(b"%PDF-1.4\n")  # real magic so sniff routes to pdf
+		page = MagicMock()
+		page.extract_text.return_value = "page body text"
+		reader = MagicMock()
+		reader.pages = [page, page]
+		monkeypatch.setattr(pdf, "PdfReader", lambda path: reader)
+		r = await _run({"path": str(p)})
+		assert r.error is None
+		assert "page body text" in r.extracted_content
+		assert "--- page 1/2 ---" in r.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_pdf_without_dep_returns_install_hint(self, tmp_path, monkeypatch):
+		# simulate the 'docs' extra not installed
+		monkeypatch.setitem(sys.modules, "pypdf", None)
+		p = tmp_path / "doc.pdf"
+		p.write_bytes(b"%PDF-1.4\n")
+		r = await _run({"path": str(p)})
+		assert r.error is not None
+		assert "docs" in r.error
+
+	@pytest.mark.asyncio
+	async def test_docx_text_extraction(self, tmp_path, monkeypatch):
+		docx = pytest.importorskip("docx")
+		p = tmp_path / "doc.docx"
+		p.write_bytes(b"PK\x03\x04" + b"\x00" * 16)  # zip magic + .docx -> docx path
+		para1, para2, empty = MagicMock(), MagicMock(), MagicMock()
+		para1.text = "first line"
+		para2.text = "second line"
+		empty.text = ""  # filtered out (p.text.strip() falsy)
+		doc = MagicMock()
+		doc.paragraphs = [para1, empty, para2]
+		monkeypatch.setattr(docx, "Document", lambda path: doc)
+		r = await _run({"path": str(p)})
+		assert r.error is None
+		assert "first line" in r.extracted_content
+		assert "second line" in r.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_docx_without_dep_returns_install_hint(self, tmp_path, monkeypatch):
+		monkeypatch.setitem(sys.modules, "docx", None)
+		p = tmp_path / "doc.docx"
+		p.write_bytes(b"PK\x03\x04" + b"\x00" * 16)
+		r = await _run({"path": str(p)})
+		assert r.error is not None
+		assert "docs" in r.error

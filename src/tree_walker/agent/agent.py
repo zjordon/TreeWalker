@@ -54,7 +54,7 @@ class Agent(StepPipeline):
         self.llm = llm
         self.browser = browser
         _settings = settings or AgentSettings()
-        self.tools = tools or Tools(truncation=_settings.truncation, allowed_upload_paths=_settings.allowed_upload_paths, allowed_write_paths=_settings.allowed_write_paths)
+        self.tools = tools or Tools(truncation=_settings.truncation, allowed_upload_paths=_settings.allowed_upload_paths, allowed_write_paths=_settings.allowed_write_paths, allowed_read_paths=_settings.allowed_read_paths)
         if _settings.action_page_filters:
             self.tools.apply_page_filters(_settings.action_page_filters)
 

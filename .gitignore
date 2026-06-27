@@ -225,3 +225,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Temp gh PR / issue body files (written in-repo; Windows $env:TEMP is unreliable)
+.pr-body.md
+.issue-body.md
