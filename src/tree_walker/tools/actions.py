@@ -9,6 +9,7 @@ import logging
 import mimetypes
 import os
 import re
+import shutil
 import time
 
 from tree_walker.agent.views import ActionResult
@@ -1673,34 +1674,103 @@ class Tools:
             # min_length=1 覆盖 schema + 直接构造；运行时 registry 不校验 params，
             # 此守卫兜底 execute 路径，避免 str.replace("", x) 在每字符间插入而膨胀文件。
             return ActionResult(error="replace_file 'old' must be a non-empty string")
-        # 阶段二（二.B / 二.D）：编码与行尾翻译参数（默认复现阶段一行为）。
+
+        # 阶段二参数（registry 不校验 execute 路径，params 是 raw dict，运行时守卫）。
         enc = params.get("encoding") or "utf-8"
         newline = params.get("newline", "")
+        regex = params.get("regex", False)
+        case_sensitive = params.get("case_sensitive", True)  # 默认 True（分叉 search_page）
+        count = params.get("count", None)
+        expected_count = params.get("expected_count", None)
+        backup = params.get("backup", False)
 
-        # 阶段二（二.C）：写路径白名单（replace_file 也是写）。
+        # 运行时守卫：count 必须为 None 或正整数；expected_count 必须为 None 或非负整数。
+        # bool 是 int 子类——True/False 须显式拒，否则被当 1/0。
+        if count is not None and (not isinstance(count, int) or isinstance(count, bool) or count < 1):
+            return ActionResult(error=f"replace_file 'count' must be a positive integer (got {count!r})")
+        if expected_count is not None and (not isinstance(expected_count, int) or isinstance(expected_count, bool) or expected_count < 0):
+            return ActionResult(error=f"replace_file 'expected_count' must be a non-negative integer (got {expected_count!r})")
+
+        # 阶段二（二.C）：写路径白名单（replace_file 也是写）。.bak/.tmp 与 path 同目录同前缀，
+        # path 放行即隐含 bak/tmp 放行，无需单独检查。
         allowed = self._allowed_write_paths
         if allowed and not any(path.startswith(p) for p in allowed):
             return ActionResult(error=f"File path not in allowed write paths: {path}")
 
+        # 仅在 regex 或大小写不敏感时走 re；默认（literal+case_sensitive）保留阶段一
+        # str.count/str.replace 路径，字节级不变、零回归。
+        use_re = bool(regex) or not case_sensitive
+
+        def _literal_replacer(literal: str):
+            # 大小写不敏感但非 regex：把 new 当不透明字面量，不展开 \1 / \g<name>。
+            return lambda m: literal
+
         # 阶段二（二.A）：原子写 tmp（同目录→同卷原子），写段用 tmp + os.replace。
         tmp = path + ".tmp"
+        bak = path + ".bak"
         try:
             # newline="" 关闭 universal-newline 翻译（对齐 write_file:1263）：
             # 读时保留原始 \r\n，写时 \n 不被译成 \r\n。原 LF 保持 LF、原 CRLF 保持
             # CRLF，行尾字节级不变；含 \r\n 字面量的 old/new 也不会被压缩成 \n。
             with open(path, "r", encoding=enc, newline=newline) as f:
                 content = f.read()
-            count = content.count(old)
-            if count == 0:
-                # Soft miss（对齐 search_page:1332-1340）：old 不在文件里是可操作信息
-                # （LLM 可调 old、或改用 write_file），不是工具失败。修正 browser-use
-                # 的静默"Successfully replaced"缺陷——绝不假装改了。
+
+            # 计算原始匹配总数（expected_count 基准，也是软失败判定）。
+            if use_re:
+                flags = 0 if case_sensitive else re.IGNORECASE
+                try:
+                    pattern = re.compile(old if regex else re.escape(old), flags)
+                except re.error as e:
+                    logger.warning("replace_file(%r) invalid regex %r: %s", path, old, e)
+                    return ActionResult(error=f"Invalid regex pattern {old!r}: {e}")
+                raw_total = len(pattern.findall(content))
+            else:
+                raw_total = content.count(old)
+
+            # expected_count：写前守卫，比对原始总数；不匹配则文件不动（typo-guard）。
+            if expected_count is not None and raw_total != expected_count:
+                msg = (f"replace_file expected {expected_count} match(es) for {old!r} in {path}, "
+                       f"found {raw_total}; file unchanged")
+                logger.info(msg)
+                return ActionResult(error=msg)
+
+            # 软失败：raw_total==0（含 expected_count=0 & actual=0）→ 不写、成功语义。
+            # 修正 browser-use 的静默"Successfully replaced"缺陷——绝不假装改了。
+            if raw_total == 0:
                 msg = f"No occurrences of {old!r} found in {path}; file unchanged"
                 logger.info(msg)
                 return ActionResult(extracted_content=msg, long_term_memory=msg)
-            content = content.replace(old, new)
+
+            # 备份：读成功、校验通过后再复制原始内容到 .bak。失败致命——不写。
+            if backup:
+                try:
+                    shutil.copy2(path, bak)
+                except OSError as e:
+                    logger.warning("replace_file(%r) backup failed: %s", path, e)
+                    return ActionResult(error=f"Failed to create backup {bak}: {e}")
+
+            # 执行替换。
+            if use_re:
+                repl = new if regex else _literal_replacer(new)
+                try:
+                    if count is None:
+                        new_content, replaced = pattern.subn(repl, content)
+                    else:
+                        new_content, replaced = pattern.subn(repl, content, count=count)
+                except re.error as e:
+                    # 替换模板（new 含非法 \g<...>）也会抛 re.error。
+                    logger.warning("replace_file(%r) substitution failed: %s", path, e)
+                    return ActionResult(error=f"Regex substitution failed for {old!r}: {e}")
+            else:
+                if count is None:
+                    new_content = content.replace(old, new)
+                    replaced = raw_total
+                else:
+                    new_content = content.replace(old, new, count)
+                    replaced = min(count, raw_total)
+
             with open(tmp, "w", encoding=enc, newline=newline) as f:
-                f.write(content)
+                f.write(new_content)
             os.replace(tmp, path)
         except FileNotFoundError:
             return ActionResult(error=f"File not found: {path}")
@@ -1729,9 +1799,15 @@ class Tools:
             logger.warning("replace_file(%r) failed: %s", path, e)
             return ActionResult(error=f"Failed to replace text in {path}: {e}")
 
-        final_bytes = len(content.encode(enc))
+        # 回显：有限替换且未耗尽全部时注明 "of {raw_total}"；否则沿用原文案。
+        # final_bytes 用替换后的 new_content（不是替换前的 content）。
+        final_bytes = len(new_content.encode(enc))
+        if count is not None and replaced < raw_total:
+            match_clause = f"{replaced} of {raw_total} occurrence{'s' if raw_total != 1 else ''}"
+        else:
+            match_clause = f"{replaced} occurrence{'s' if replaced != 1 else ''}"
         memory = (
-            f"Replaced {count} occurrence{'s' if count != 1 else ''} of {old!r} with {new!r} "
+            f"Replaced {match_clause} of {old!r} with {new!r} "
             f"in {path} ({final_bytes} bytes)"
         )
         logger.info(memory)

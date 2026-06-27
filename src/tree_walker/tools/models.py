@@ -309,10 +309,14 @@ class ReplaceFileParams(BaseModel):
     path: str = Field(description="Path to an existing local file to edit in place.")
     old: str = Field(
         min_length=1,
-        description="Exact text to find (literal substring, NOT a regex). All non-overlapping "
-        "occurrences are replaced. Case-sensitive. Must be non-empty.",
+        description="Text to find. A literal substring by default (case-sensitive); set "
+        "regex=True to treat it as a Python regular expression. Must be non-empty.",
     )
-    new: str = Field(description="Replacement text (literal; may be empty to delete matches).")
+    new: str = Field(
+        description="Replacement text (literal; may be empty to delete matches). In regex mode "
+        "this is an re.sub replacement template and supports backreferences (\\1, \\g<name>); "
+        "escape backslashes for literal paths.",
+    )
     encoding: str | None = Field(
         default=None,
         description="Text encoding to read/write with (default UTF-8). Set e.g. 'latin-1' or "
@@ -322,6 +326,38 @@ class ReplaceFileParams(BaseModel):
         default="",
         description="Python open() newline mode (default '' = no translation, preserves original "
         "line endings byte-for-byte). Set None for universal-newline translation on read.",
+    )
+    regex: bool = Field(
+        default=False,
+        description="When True, treat 'old' as a Python regular expression (re.sub semantics, "
+        "including backreference expansion \\1 / \\g<name> in 'new'; escape backslashes for "
+        "literal paths). When False (default), 'old' is a literal substring.",
+    )
+    case_sensitive: bool = Field(
+        default=True,
+        description="When True (default), match case-sensitively. When False, match "
+        "case-insensitively regardless of regex mode. Note: defaults to True (unlike "
+        "search_page's False) to preserve replace_file's historical case-sensitive behavior.",
+    )
+    count: int | None = Field(
+        default=None,
+        ge=1,
+        description="Maximum number of occurrences to replace, from the top of the file. "
+        "None (default) replaces all; a positive integer replaces only the first N "
+        "(or fewer if the file has fewer matches).",
+    )
+    expected_count: int | None = Field(
+        default=None,
+        ge=0,
+        description="If set, the file must contain exactly this many matches for the operation "
+        "to proceed; on mismatch the file is left UNCHANGED and an error is returned (typo-guard "
+        "against 0 or unexpectedly-many replacements). Compared against the TOTAL match count, "
+        "before the 'count' limit is applied.",
+    )
+    backup: bool = Field(
+        default=False,
+        description="When True, copy the original (pre-edit) file to <path>.bak before replacing "
+        "(shutil.copy2 metadata retained). Default False; .bak is overwritten if it exists.",
     )
 
 
@@ -549,12 +585,16 @@ ACTION_DEFINITIONS: dict[str, tuple[type[BaseModel], str, bool]] = {
     "read_file": (ReadFileParams, "Read content from a local UTF-8 text file.", False),
     "replace_file": (
         ReplaceFileParams,
-        "Replace every occurrence of an exact substring (old) with new text inside an "
-        "existing local file, in place. Literal match, NOT a regex; case-sensitive; "
-        "all non-overlapping occurrences are replaced. old must be non-empty and must "
-        "already exist in the file (zero matches returns 'no occurrences' rather than "
-        "silently succeeding). Prefer this over write_file for small edits to a large "
-        "file you have already read.",
+        "Replace occurrences of text inside an existing local file, in place. By default "
+        "performs a case-sensitive literal substring replace of every non-overlapping "
+        "occurrence (phase-1 behavior preserved). Set regex=True to treat 'old' as a Python "
+        "regex (then 'new' supports backreferences), or case_sensitive=False for "
+        "case-insensitive matching. count limits replacements to the first N (default: all). "
+        "expected_count guards against typos: if the file does not contain exactly that many "
+        "matches it is left unchanged and an error is returned. backup=True first copies the "
+        "original to <path>.bak. old must be non-empty; zero matches returns 'no occurrences' "
+        "rather than silently succeeding. Prefer this over write_file for small edits to a "
+        "large file you have already read.",
         False,
     ),
     "evaluate": (

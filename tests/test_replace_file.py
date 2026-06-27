@@ -395,3 +395,370 @@ class TestReplaceFileWhitelist:
 		assert "not in allowed write paths" in r.error
 		# 文件未被改动
 		assert _read(outside) == "abc"
+
+
+# ── 阶段二：count 限制 ─────────────────────────────────────────────
+
+
+class TestReplaceFileCount:
+	@pytest.mark.asyncio
+	async def test_count_none_replaces_all(self, tmp_path):
+		p = tmp_path / "f.txt"
+		_seed(p, "a a a a")
+		r = await _run({"path": str(p), "old": "a", "new": "b", "count": None})
+		assert r.error is None
+		assert _read(p) == "b b b b"
+
+	@pytest.mark.asyncio
+	async def test_count_n_replaces_first_n(self, tmp_path):
+		p = tmp_path / "f.txt"
+		_seed(p, "a a a a")
+		r = await _run({"path": str(p), "old": "a", "new": "b", "count": 2})
+		assert r.error is None
+		assert _read(p) == "b b a a"
+		assert "2 of 4 occurrences" in r.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_count_greater_than_matches(self, tmp_path):
+		# count 超过匹配数 → 只换到上限；replaced==raw_total，文案不写成 "N of M"
+		p = tmp_path / "f.txt"
+		_seed(p, "a a")
+		r = await _run({"path": str(p), "old": "a", "new": "b", "count": 10})
+		assert r.error is None
+		assert _read(p) == "b b"
+		assert "2 occurrences" in r.extracted_content
+		assert not r.extracted_content.startswith("Replaced 2 of")
+
+	@pytest.mark.asyncio
+	async def test_count_zero_rejected(self, tmp_path):
+		p = tmp_path / "f.txt"
+		_seed(p, "abc")
+		r = await _run({"path": str(p), "old": "a", "new": "b", "count": 0})
+		assert r.error is not None
+		assert "positive integer" in r.error
+		assert _read(p) == "abc"
+
+	@pytest.mark.asyncio
+	async def test_count_negative_rejected(self, tmp_path):
+		p = tmp_path / "f.txt"
+		_seed(p, "abc")
+		r = await _run({"path": str(p), "old": "a", "new": "b", "count": -1})
+		assert r.error is not None
+		assert "positive integer" in r.error
+		assert _read(p) == "abc"
+
+	@pytest.mark.asyncio
+	async def test_count_bool_rejected(self, tmp_path):
+		# bool 是 int 子类；True 不应被当作 count=1
+		p = tmp_path / "f.txt"
+		_seed(p, "abc")
+		r = await _run({"path": str(p), "old": "a", "new": "b", "count": True})
+		assert r.error is not None
+		assert "positive integer" in r.error
+		assert _read(p) == "abc"
+
+
+# ── 阶段二：regex 模式 ─────────────────────────────────────────────
+
+
+class TestReplaceFileRegex:
+	@pytest.mark.asyncio
+	async def test_regex_basic(self, tmp_path):
+		p = tmp_path / "f.txt"
+		_seed(p, "foo123 bar456")
+		r = await _run({"path": str(p), "old": r"\d+", "new": "N", "regex": True})
+		assert r.error is None
+		assert _read(p) == "fooN barN"
+		assert "2 occurrences" in r.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_regex_backreference_in_new(self, tmp_path):
+		# regex 模式下 new 支持反向引用 \1 / \g<name>
+		p = tmp_path / "f.txt"
+		_seed(p, "2024-01-02")
+		r = await _run({"path": str(p), "old": r"(\d{4})-(\d{2})-(\d{2})", "new": r"\3/\2/\1", "regex": True})
+		assert r.error is None
+		assert _read(p) == "02/01/2024"
+
+	@pytest.mark.asyncio
+	async def test_regex_named_backref(self, tmp_path):
+		p = tmp_path / "f.txt"
+		_seed(p, "key=value")
+		r = await _run({"path": str(p), "old": r"(?P<k>\w+)=(?P<v>\w+)", "new": r"\g<v>=\g<k>", "regex": True})
+		assert r.error is None
+		assert _read(p) == "value=key"
+
+	@pytest.mark.asyncio
+	async def test_regex_invalid_pattern_returns_error(self, tmp_path):
+		p = tmp_path / "f.txt"
+		_seed(p, "abc")
+		r = await _run({"path": str(p), "old": "(unclosed", "new": "x", "regex": True})
+		assert r.error is not None
+		assert "Invalid regex" in r.error
+		assert _read(p) == "abc"
+
+	@pytest.mark.asyncio
+	async def test_regex_bad_backref_template_returns_error(self, tmp_path):
+		# new 含非法 \g<...> → subn 抛 re.error，文件不动
+		p = tmp_path / "f.txt"
+		_seed(p, "abc")
+		r = await _run({"path": str(p), "old": "(a)", "new": r"\g<nope>", "regex": True})
+		assert r.error is not None
+		assert _read(p) == "abc"
+
+	@pytest.mark.asyncio
+	async def test_regex_case_insensitive(self, tmp_path):
+		p = tmp_path / "f.txt"
+		_seed(p, "Foo fOO foo")
+		r = await _run({"path": str(p), "old": "foo", "new": "X", "regex": True, "case_sensitive": False})
+		assert r.error is None
+		assert _read(p) == "X X X"
+		assert "3 occurrences" in r.extracted_content
+
+
+# ── 阶段二：大小写不敏感字面匹配 ──────────────────────────────────
+
+
+class TestReplaceFileCaseInsensitiveLiteral:
+	@pytest.mark.asyncio
+	async def test_literal_case_insensitive_matches_all_cases(self, tmp_path):
+		p = tmp_path / "f.txt"
+		_seed(p, "Foo fOO foo FOO")
+		r = await _run({"path": str(p), "old": "foo", "new": "X", "case_sensitive": False})
+		assert r.error is None
+		assert _read(p) == "X X X X"
+		assert "4 occurrences" in r.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_literal_case_insensitive_new_is_literal(self, tmp_path):
+		# 大小写不敏感但非 regex：new 当字面量，不展开 \1 / \n
+		p = tmp_path / "f.txt"
+		_seed(p, "abc")
+		r = await _run({"path": str(p), "old": "a", "new": r"\1\n", "case_sensitive": False})
+		assert r.error is None
+		assert _read(p) == r"\1\nbc"
+
+	@pytest.mark.asyncio
+	async def test_case_sensitive_default_preserves_phase1(self, tmp_path):
+		# 回归：默认仍是大小写敏感字面匹配
+		p = tmp_path / "f.txt"
+		_seed(p, "Foo foo")
+		r = await _run({"path": str(p), "old": "Foo", "new": "X"})
+		assert r.error is None
+		assert _read(p) == "X foo"
+
+
+# ── 阶段二：expected_count 写前守卫 ────────────────────────────────
+
+
+class TestReplaceFileExpectedCount:
+	@pytest.mark.asyncio
+	async def test_expected_count_match_proceeds(self, tmp_path):
+		p = tmp_path / "f.txt"
+		_seed(p, "a a a")
+		r = await _run({"path": str(p), "old": "a", "new": "b", "expected_count": 3})
+		assert r.error is None
+		assert _read(p) == "b b b"
+
+	@pytest.mark.asyncio
+	async def test_expected_count_mismatch_aborts_without_write(self, tmp_path):
+		p = tmp_path / "f.txt"
+		_seed(p, "a a a")
+		r = await _run({"path": str(p), "old": "a", "new": "b", "expected_count": 5})
+		assert r.error is not None
+		assert "expected 5" in r.error
+		assert "found 3" in r.error
+		assert _read(p) == "a a a"
+
+	@pytest.mark.asyncio
+	async def test_expected_count_zero_typo_guard(self, tmp_path):
+		# 拼错的 old → 0 匹配 → 守卫触发
+		p = tmp_path / "f.txt"
+		_seed(p, "hello world")
+		r = await _run({"path": str(p), "old": "wrld", "new": "W", "expected_count": 1})
+		assert r.error is not None
+		assert "found 0" in r.error
+		assert _read(p) == "hello world"
+
+	@pytest.mark.asyncio
+	async def test_expected_count_zero_actual_zero_soft_miss(self, tmp_path):
+		# expected_count=0 且实际 0 → 校验通过 → 落到软失败（成功语义、不写）
+		p = tmp_path / "f.txt"
+		_seed(p, "abc")
+		r = await _run({"path": str(p), "old": "zzz", "new": "q", "expected_count": 0})
+		assert r.error is None
+		assert "No occurrences" in r.extracted_content
+		assert _read(p) == "abc"
+
+	@pytest.mark.asyncio
+	async def test_expected_count_negative_rejected(self, tmp_path):
+		p = tmp_path / "f.txt"
+		_seed(p, "abc")
+		r = await _run({"path": str(p), "old": "a", "new": "b", "expected_count": -1})
+		assert r.error is not None
+		assert "non-negative" in r.error
+
+	@pytest.mark.asyncio
+	async def test_expected_count_bool_rejected(self, tmp_path):
+		# bool 是 int 子类；True 不应被当作 expected_count=1
+		p = tmp_path / "f.txt"
+		_seed(p, "abc")
+		r = await _run({"path": str(p), "old": "a", "new": "b", "expected_count": True})
+		assert r.error is not None
+		assert "non-negative" in r.error
+
+	@pytest.mark.asyncio
+	async def test_expected_count_uses_raw_total_not_post_count(self, tmp_path):
+		# expected_count 比的是原始总数（5），不是 count 限制后的值
+		p = tmp_path / "f.txt"
+		_seed(p, "a a a a a")
+		r = await _run({"path": str(p), "old": "a", "new": "b", "count": 1, "expected_count": 1})
+		assert r.error is not None
+		assert "found 5" in r.error
+		assert _read(p) == "a a a a a"
+
+	@pytest.mark.asyncio
+	async def test_expected_count_with_count_limited_replace(self, tmp_path):
+		# 校验通过后按 count 限制替换
+		p = tmp_path / "f.txt"
+		_seed(p, "a a a a a")
+		r = await _run({"path": str(p), "old": "a", "new": "b", "count": 2, "expected_count": 5})
+		assert r.error is None
+		assert _read(p) == "b b a a a"
+		assert "2 of 5 occurrences" in r.extracted_content
+
+
+# ── 阶段二：backup ─────────────────────────────────────────────────
+
+
+class TestReplaceFileBackup:
+	@pytest.mark.asyncio
+	async def test_backup_creates_pre_edit_bak(self, tmp_path):
+		p = tmp_path / "f.txt"
+		_seed(p, "hello")
+		r = await _run({"path": str(p), "old": "hello", "new": "world", "backup": True})
+		assert r.error is None
+		assert _read(p) == "world"
+		assert os.path.exists(str(p) + ".bak")
+		assert _read(str(p) + ".bak") == "hello"
+
+	@pytest.mark.asyncio
+	async def test_backup_default_no_bak(self, tmp_path):
+		p = tmp_path / "f.txt"
+		_seed(p, "hello")
+		await _run({"path": str(p), "old": "hello", "new": "world"})
+		assert not os.path.exists(str(p) + ".bak")
+
+	@pytest.mark.asyncio
+	async def test_backup_overwrites_existing_bak(self, tmp_path):
+		p = tmp_path / "f.txt"
+		_seed(p, "hello")
+		with open(str(p) + ".bak", "w") as f:
+			f.write("STALE")
+		await _run({"path": str(p), "old": "hello", "new": "world", "backup": True})
+		assert _read(str(p) + ".bak") == "hello"
+
+	@pytest.mark.asyncio
+	async def test_backup_not_created_on_zero_matches(self, tmp_path):
+		# 软失败（raw_total==0）在 backup 之前返回 → 不产生 .bak
+		p = tmp_path / "f.txt"
+		_seed(p, "hello")
+		await _run({"path": str(p), "old": "zzz", "new": "q", "backup": True})
+		assert not os.path.exists(str(p) + ".bak")
+
+	@pytest.mark.asyncio
+	async def test_backup_failure_is_fatal(self, tmp_path, monkeypatch):
+		# shutil.copy2 失败 → 不写、返回 error、无 tmp
+		p = tmp_path / "f.txt"
+		_seed(p, "foo bar")
+
+		def boom(src, dst):
+			raise OSError("backup denied")
+
+		monkeypatch.setattr("tree_walker.tools.actions.shutil.copy2", boom)
+		r = await _run({"path": str(p), "old": "foo", "new": "baz", "backup": True})
+		assert r.error is not None
+		assert "backup" in r.error.lower()
+		assert _read(p) == "foo bar"
+		assert not os.path.exists(str(p) + ".tmp")
+
+
+# ── 阶段二：组合 ───────────────────────────────────────────────────
+
+
+class TestReplaceFilePhase2Combos:
+	@pytest.mark.asyncio
+	async def test_regex_with_count_limit(self, tmp_path):
+		p = tmp_path / "f.txt"
+		_seed(p, "a1 b2 c3 d4")
+		r = await _run({"path": str(p), "old": r"\w\d", "new": "X", "regex": True, "count": 2})
+		assert r.error is None
+		assert _read(p) == "X X c3 d4"
+		assert "2 of 4 occurrences" in r.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_case_insensitive_with_expected_count(self, tmp_path):
+		p = tmp_path / "f.txt"
+		_seed(p, "Foo fOO foo")
+		r = await _run({"path": str(p), "old": "foo", "new": "X", "case_sensitive": False, "expected_count": 3})
+		assert r.error is None
+		assert _read(p) == "X X X"
+
+	@pytest.mark.asyncio
+	async def test_full_combo_regex_count_expected_backup(self, tmp_path):
+		p = tmp_path / "f.txt"
+		_seed(p, "v1 v2 v3 v4 v5")
+		r = await _run({"path": str(p), "old": r"v\d", "new": "W", "regex": True, "count": 2, "expected_count": 5, "backup": True})
+		assert r.error is None
+		assert _read(p) == "W W v3 v4 v5"
+		assert _read(str(p) + ".bak") == "v1 v2 v3 v4 v5"
+		assert "2 of 5 occurrences" in r.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_backup_not_created_on_expected_count_mismatch(self, tmp_path):
+		# expected_count 不匹配 → 在 backup 之前返回 → 无 .bak
+		p = tmp_path / "f.txt"
+		_seed(p, "a a")
+		r = await _run({"path": str(p), "old": "a", "new": "b", "expected_count": 5, "backup": True})
+		assert r.error is not None
+		assert not os.path.exists(str(p) + ".bak")
+		assert _read(p) == "a a"
+
+
+# ── 阶段二：Pydantic schema 校验 ──────────────────────────────────
+
+
+class TestReplaceFilePhase2ParamsValidation:
+	def test_count_none_allowed(self):
+		m = ReplaceFileParams(path="x", old="a", new="b", count=None)
+		assert m.count is None
+
+	def test_count_positive_allowed(self):
+		m = ReplaceFileParams(path="x", old="a", new="b", count=3)
+		assert m.count == 3
+
+	def test_count_zero_rejected_by_schema(self):
+		# ge=1 在 schema/构造层拒绝 0
+		with pytest.raises(ValidationError):
+			ReplaceFileParams(path="x", old="a", new="b", count=0)
+
+	def test_expected_count_zero_allowed(self):
+		m = ReplaceFileParams(path="x", old="a", new="b", expected_count=0)
+		assert m.expected_count == 0
+
+	def test_expected_count_negative_rejected_by_schema(self):
+		# ge=0 在 schema/构造层拒绝负数
+		with pytest.raises(ValidationError):
+			ReplaceFileParams(path="x", old="a", new="b", expected_count=-1)
+
+	def test_regex_default_false(self):
+		m = ReplaceFileParams(path="x", old="a", new="b")
+		assert m.regex is False
+
+	def test_case_sensitive_default_true(self):
+		m = ReplaceFileParams(path="x", old="a", new="b")
+		assert m.case_sensitive is True
+
+	def test_backup_default_false(self):
+		m = ReplaceFileParams(path="x", old="a", new="b")
+		assert m.backup is False
