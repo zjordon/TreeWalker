@@ -17,7 +17,11 @@ from typing import Any, Literal
 from cdp_use import CDPClient
 
 from tree_walker.browser.circuit_breaker import CircuitBreaker
-from tree_walker.browser.dom import build_dom_state
+from tree_walker.browser.dom import (
+    _attach_to_iframe_target,
+    _build_frame_target_map,
+    build_dom_state,
+)
 from tree_walker.browser.highlight import HighlightManager
 from tree_walker.config import BrowserSettings
 from tree_walker.browser.views import (
@@ -2615,41 +2619,124 @@ class BrowserSession:
             logger.warning("get_page_html: DOM.getDocument failed: %s", e)
             return ""
 
-    async def evaluate(self, code: str) -> str:
+    async def evaluate(
+        self,
+        code: str,
+        *,
+        args: list | None = None,
+        elements: list[int] | None = None,
+        await_promise: bool = True,
+        timeout_ms: int | None = None,
+        user_gesture: bool = False,
+        return_element_ids: bool = False,
+        frame: int | None = None,
+    ) -> str:
         """Execute arbitrary user JavaScript and return a normalized result string.
 
-        Mirrors browser-use ``evaluate`` (service.py:1759-1867): preprocess the
-        code (fix common LLM quoting mistakes), run a single ``Runtime.evaluate``
-        with ``returnByValue=True, awaitPromise=True`` (+ ``timeout`` per project
-        convention), then normalize the value to an LLM-friendly string.
+        阶段一: preprocess the code (fix common LLM quoting mistakes), run a single
+        ``Runtime.evaluate`` with ``returnByValue=True, awaitPromise=True`` (+ ``timeout``
+        per project convention), then normalize the value to an LLM-friendly string. Raises
+        ``RuntimeError`` (debugging-rich) on a JS exception (``exceptionDetails``) or the
+        legacy ``wasThrown`` flag.
 
-        Raises ``RuntimeError`` (with a debugging-rich message) on a JS exception
-        (``exceptionDetails``) or the legacy ``wasThrown`` flag — the action
-        layer maps this to a hard ``ActionResult(error=...)``.
+        阶段二:
+        - 二.B: ``await_promise`` / ``timeout_ms`` / ``user_gesture`` are forwarded.
+          ``timeout_ms`` only applies on the no-inputs ``Runtime.evaluate`` path.
+        - 二.C: ``args`` switches to ``Runtime.callFunctionOn`` with the document as host
+          (``this = document``) so arguments are CDP-marshaled — no string splicing, no
+          injection surface. The code is wrapped as ``function(...a){ ... }`` and MUST
+          ``return``. (Project uses session/target isolation, not ``executionContextId``.)
+        - 二.D: ``elements`` are resolved via ``DOM.resolveNode`` to RemoteObject handles
+          passed after the JSON args (signature ``function(...a, ...e)``).
+          ``return_element_ids`` runs the call with ``returnByValue=False`` and, if the
+          result is a DOM node, resolves it back to a ``backendNodeId`` via
+          ``DOM.describeNode`` (returned as ``"backendNodeId:<id>"``; == the click index).
+        - 二.E: ``frame`` attaches to that iframe's target and runs the call in its session.
 
-        Does NOT reuse ``execute_js``: evaluate needs the full ``result`` dict
-        for null/undefined distinction, type-aware normalization, and exception
-        enrichment, which the shared ``execute_js`` discards.
+        Limitations: ``callFunctionOn`` has no ``timeout``, so ``timeout_ms`` is ignored
+        when ``args``/``elements`` are given. A returned node not in the current
+        selector_map needs a ``get_state`` refresh before it can be clicked.
 
-        Limitations (same as browser-use): top-document execution context; a
-        returned DOM node serializes to ``{}`` (no element-handle round-trip —
-        that needs ``Runtime.callFunctionOn`` + selector_map, see 阶段二).
+        Does NOT reuse ``execute_js``: evaluate needs the full ``result`` dict for
+        null/undefined distinction, type-aware normalization, and exception enrichment,
+        which the shared ``execute_js`` discards.
         """
         validated_code = _validate_and_fix_javascript(code)
-        result = await self.client.send.Runtime.evaluate(
-            {
-                "expression": validated_code,
-                "returnByValue": True,
-                "awaitPromise": True,
-                "timeout": 30000,
-            },
-            session_id=self.current_session_id,
-        )
+        sid = self.current_session_id
+        # 二.E: 在（通常跨源）iframe 上下文内执行
+        if frame is not None:
+            resolve_ifr = await self.client.send.DOM.resolveNode(
+                {"backendNodeId": frame}, session_id=self.current_session_id,
+            )
+            desc_ifr = await self.client.send.DOM.describeNode(
+                {"objectId": resolve_ifr["object"]["objectId"]}, session_id=self.current_session_id,
+            )
+            frame_id = desc_ifr.get("node", {}).get("frameId")
+            frame_target_map, _ = await _build_frame_target_map(self.client)
+            target_id = frame_target_map.get(frame_id) if frame_id else None
+            if not target_id:
+                raise RuntimeError(
+                    f"Evaluate failed: could not resolve iframe target for frame {frame_id!r}",
+                )
+            attached = await _attach_to_iframe_target(self.client, target_id)
+            if not attached:
+                raise RuntimeError("Evaluate failed: could not attach to iframe target")
+            sid = attached
+        # 二.D IN: 解析元素句柄（DOM.resolveNode，cf _js_click:1974-1977）
+        element_oids: list[str] = []
+        for bid in (elements or []):
+            r = await self.client.send.DOM.resolveNode({"backendNodeId": bid}, session_id=sid)
+            element_oids.append(r["object"]["objectId"])
+        use_call_fn = bool(args or elements)
+        if use_call_fn:
+            # call host = document（this=document）：DOM.getDocument + DOM.resolveNode，
+            # 无需 executionContextId / 事件订阅，与 _js_click 同姿势。
+            doc = await self.client.send.DOM.getDocument({"depth": 0}, session_id=sid)
+            host = await self.client.send.DOM.resolveNode(
+                {"nodeId": doc["root"]["nodeId"]}, session_id=sid,
+            )
+            # JSON args 在前、元素句柄在后，故签名 function(...a, ...e)
+            arguments = [{"value": a} for a in (args or [])] + [{"objectId": o} for o in element_oids]
+            params_str = "...a, ...e" if element_oids else "...a"
+            func_decl = f"function({params_str}){{\n" + validated_code + "\n}"
+            result = await self.client.send.Runtime.callFunctionOn(
+                {
+                    "objectId": host["object"]["objectId"],
+                    "functionDeclaration": func_decl,
+                    "arguments": arguments,
+                    "returnByValue": not return_element_ids,
+                    "awaitPromise": await_promise,
+                    "userGesture": user_gesture,
+                },
+                session_id=sid,
+            )
+        else:
+            result = await self.client.send.Runtime.evaluate(
+                {
+                    "expression": validated_code,
+                    "returnByValue": not return_element_ids,
+                    "awaitPromise": await_promise,
+                    "userGesture": user_gesture,
+                    "timeout": timeout_ms if timeout_ms is not None else 30000,
+                },
+                session_id=sid,
+            )
         if result.get("exceptionDetails"):
             raise RuntimeError(_format_eval_exception(result["exceptionDetails"], validated_code))
         result_data = result.get("result", {})
         if result_data.get("wasThrown"):
             raise RuntimeError("JavaScript execution failed (wasThrown=true)")
+        # 二.D OUT: 返回的 DOM 节点 → backendNodeId（== 可操作的 index/element_id）
+        if (return_element_ids
+                and result_data.get("type") == "object"
+                and result_data.get("subtype") == "node"
+                and "objectId" in result_data):
+            desc = await self.client.send.DOM.describeNode(
+                {"objectId": result_data["objectId"]}, session_id=sid,
+            )
+            bid = desc.get("node", {}).get("backendNodeId")
+            if bid is not None:
+                return f"backendNodeId:{bid}"
         return _normalize_eval_result(result_data)
 
     async def find_text(

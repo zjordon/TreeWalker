@@ -31,7 +31,8 @@ from tree_walker.browser.session import (
 	_normalize_eval_result,
 	_validate_and_fix_javascript,
 )
-from tree_walker.tools.actions import Tools, _eval_long_term_memory
+from tree_walker.config import TruncationSettings
+from tree_walker.tools.actions import Tools, _eval_long_term_memory, _extract_data_images
 from tree_walker.tools.models import EvaluateParams
 
 
@@ -69,7 +70,9 @@ class TestEvaluateAction:
 		assert result.extracted_content == "hello"
 		# short result echoed verbatim into long_term_memory
 		assert result.long_term_memory == "hello"
-		browser.evaluate.assert_awaited_once_with("return 'hi'")
+		browser.evaluate.assert_awaited_once()
+		# code is forwarded verbatim as the first positional arg
+		assert browser.evaluate.await_args.args == ("return 'hi'",)
 
 	@pytest.mark.asyncio
 	async def test_long_result_truncated_and_summarized(self):
@@ -112,7 +115,139 @@ class TestEvaluateAction:
 
 		await Tools().execute("evaluate", {"code": "return 1+1"}, browser)
 
-		browser.evaluate.assert_awaited_once_with("return 1+1")
+		browser.evaluate.assert_awaited_once()
+		assert browser.evaluate.await_args.args == ("return 1+1",)
+
+	# ── 二.A: 大结果落盘 ──
+
+	@pytest.mark.asyncio
+	async def test_oversize_result_spilled_to_file(self, tmp_path):
+		tools = Tools(truncation=TruncationSettings(eval_save_threshold=10, eval_output_dir=str(tmp_path)))
+		browser = _make_browser(eval_return="z" * 300)
+
+		result = await tools.execute("evaluate", {"code": "return big"}, browser)
+
+		assert result.error is None
+		files = list(tmp_path.iterdir())
+		assert len(files) == 1
+		assert files[0].read_text(encoding="utf-8") == "z" * 300
+		assert result.extracted_content.startswith("Evaluate result (300 chars) saved to")
+		assert "Preview:" in result.extracted_content
+		assert result.long_term_memory.startswith("JavaScript executed successfully, result saved:")
+
+	@pytest.mark.asyncio
+	async def test_small_result_not_spilled(self, tmp_path):
+		tools = Tools(truncation=TruncationSettings(eval_save_threshold=10000, eval_output_dir=str(tmp_path)))
+		browser = _make_browser(eval_return="tiny")
+
+		result = await tools.execute("evaluate", {"code": "return x"}, browser)
+
+		assert list(tmp_path.iterdir()) == []  # below threshold → no spill
+		assert result.extracted_content == "tiny"
+		assert result.long_term_memory == "tiny"
+
+	@pytest.mark.asyncio
+	async def test_save_failure_is_soft(self, tmp_path, monkeypatch, caplog):
+		tools = Tools(truncation=TruncationSettings(eval_save_threshold=10, eval_output_dir=str(tmp_path)))
+		browser = _make_browser(eval_return="z" * 300)
+
+		def _raise(*a, **k):
+			raise OSError("disk full")
+		monkeypatch.setattr("tree_walker.tools.actions.os.makedirs", _raise)
+
+		with caplog.at_level(logging.WARNING, logger="tree_walker.tools.actions"):
+			result = await tools.execute("evaluate", {"code": "return big"}, browser)
+
+		assert result.error is None  # OSError is a soft warning, not a hard error
+		assert result.extracted_content == "z" * 300  # fell back to normal echo
+		assert any("save to file failed" in r.getMessage() for r in caplog.records)
+
+	# ── 二.B: per-call 控制 ──
+
+	@pytest.mark.asyncio
+	async def test_runtime_guard_rejects_bad_timeout(self):
+		browser = _make_browser()
+
+		result = await Tools().execute("evaluate", {"code": "return 1", "timeout_ms": 0}, browser)
+
+		assert result.error == "Evaluate failed: timeout_ms must be in [1, 300000], got 0"
+		browser.evaluate.assert_not_awaited()
+
+	@pytest.mark.asyncio
+	async def test_forwards_flags_to_session(self):
+		browser = _make_browser(eval_return="ok")
+
+		await Tools().execute("evaluate", {
+			"code": "return 1",
+			"await_promise": False,
+			"timeout_ms": 5000,
+			"user_gesture": True,
+		}, browser)
+
+		kwargs = browser.evaluate.await_args.kwargs
+		assert kwargs["await_promise"] is False
+		assert kwargs["timeout_ms"] == 5000
+		assert kwargs["user_gesture"] is True
+
+	# ── 二.C: args ──
+
+	@pytest.mark.asyncio
+	async def test_args_not_serializable_guard(self):
+		browser = _make_browser()
+
+		result = await Tools().execute("evaluate", {"code": "return 1", "args": [object()]}, browser)
+
+		assert result.error.startswith("Evaluate failed: args not JSON-serializable")
+		browser.evaluate.assert_not_awaited()
+
+	# ── 二.D: 元素句柄 ──
+
+	@pytest.mark.asyncio
+	async def test_elements_guard_rejects_non_int(self):
+		browser = _make_browser()
+
+		result = await Tools().execute("evaluate", {"code": "return 1", "elements": ["x"]}, browser)
+
+		assert result.error == "Evaluate failed: elements must be a list of ints (backend node ids)"
+		browser.evaluate.assert_not_awaited()
+
+	@pytest.mark.asyncio
+	async def test_return_element_marker_surfaces_index(self):
+		browser = _make_browser(eval_return="backendNodeId:42")
+
+		result = await Tools().execute(
+			"evaluate", {"code": "return el", "return_element_ids": True}, browser,
+		)
+
+		assert result.error is None
+		assert "42" in result.extracted_content
+		assert "index/element_id" in result.extracted_content
+		assert result.long_term_memory == "evaluate returned element index 42"
+
+	# ── 二.F: 图片通道 ──
+
+	@pytest.mark.asyncio
+	async def test_extract_images_populates_metadata(self):
+		uri = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
+		browser = _make_browser(eval_return="before " + uri + " after")
+
+		result = await Tools().execute(
+			"evaluate", {"code": "return x", "extract_images": True}, browser,
+		)
+
+		assert result.metadata == {"images": [uri]}
+		assert "[image 1]" in result.extracted_content
+		assert uri not in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_extract_images_default_false(self):
+		uri = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
+		browser = _make_browser(eval_return=uri)
+
+		result = await Tools().execute("evaluate", {"code": "return x"}, browser)
+
+		assert result.metadata is None
+		assert uri in result.extracted_content  # untouched
 
 
 # ── param model ──────────────────────────────────────────────────────────────
@@ -134,6 +269,36 @@ class TestEvaluateParams:
 		assert p.code == long_code
 		special = 'const s="a\\"b\\nc"; return s;'
 		assert EvaluateParams(code=special).code == special
+
+	# ── 二.B–二.F: 阶段二新参数 ──
+
+	def test_phase2_defaults(self):
+		p = EvaluateParams(code="x")
+		assert p.await_promise is True
+		assert p.timeout_ms is None
+		assert p.user_gesture is False
+		assert p.args is None
+		assert p.elements is None
+		assert p.return_element_ids is False
+		assert p.frame is None
+		assert p.extract_images is False
+
+	def test_timeout_ms_rejects_out_of_bounds(self):
+		with pytest.raises(ValidationError):
+			EvaluateParams(code="x", timeout_ms=0)
+		with pytest.raises(ValidationError):
+			EvaluateParams(code="x", timeout_ms=300001)
+		# boundaries are inclusive
+		assert EvaluateParams(code="x", timeout_ms=1).timeout_ms == 1
+		assert EvaluateParams(code="x", timeout_ms=300000).timeout_ms == 300000
+
+	def test_args_accepts_list_of_json(self):
+		p = EvaluateParams(code="x", args=[1, "s", {"k": [2, 3]}, None, True])
+		assert p.args == [1, "s", {"k": [2, 3]}, None, True]
+
+	def test_elements_accepts_list_of_int(self):
+		p = EvaluateParams(code="x", elements=[10, 20, 30])
+		assert p.elements == [10, 20, 30]
 
 
 # ── session layer ────────────────────────────────────────────────────────────
@@ -217,6 +382,205 @@ class TestEvaluateSession:
 
 		with pytest.raises(RuntimeError, match="wasThrown"):
 			await s.evaluate("x")
+
+	# ── 二.B: per-call 控制透传 ──
+
+	@pytest.mark.asyncio
+	async def test_await_promise_false_passed(self):
+		s, client = self._make_session(eval_return={"result": {"value": "x"}})
+
+		await s.evaluate("return 1", await_promise=False)
+
+		assert client.send.Runtime.evaluate.await_args.args[0]["awaitPromise"] is False
+
+	@pytest.mark.asyncio
+	async def test_user_gesture_true_passed(self):
+		s, client = self._make_session(eval_return={"result": {"value": "x"}})
+
+		await s.evaluate("return 1", user_gesture=True)
+
+		assert client.send.Runtime.evaluate.await_args.args[0]["userGesture"] is True
+
+	@pytest.mark.asyncio
+	async def test_custom_timeout_used(self):
+		s, client = self._make_session(eval_return={"result": {"value": "x"}})
+
+		await s.evaluate("return 1", timeout_ms=5000)
+
+		assert client.send.Runtime.evaluate.await_args.args[0]["timeout"] == 5000
+
+	# callFunctionOn-path helper (二.C / 二.D)
+	def _make_callfn_session(
+		self,
+		*,
+		callfn_return: dict | None = None,
+		host_oid: str = "doc-oid",
+		elem_oids: list[str] | None = None,
+	) -> tuple[BrowserSession, MagicMock]:
+		"""Stub session for the callFunctionOn path: DOM.getDocument + DOM.resolveNode
+		(element handles first, then the document host) + Runtime.callFunctionOn."""
+		s = BrowserSession.__new__(BrowserSession)
+		s.current_session_id = "sid-1"
+		client = MagicMock()
+		client.send.DOM.getDocument = AsyncMock(return_value={"root": {"nodeId": 1}})
+		oids = (elem_oids or []) + [host_oid]
+		client.send.DOM.resolveNode = AsyncMock(
+			side_effect=[{"object": {"objectId": o}} for o in oids],
+		)
+		client.send.Runtime.callFunctionOn = AsyncMock(
+			return_value=callfn_return if callfn_return is not None else {"result": {"value": "ok"}},
+		)
+		# a real AsyncMock (never awaited on the callFunctionOn path) so assert_not_awaited works
+		client.send.Runtime.evaluate = AsyncMock()
+		s.client = client
+		return s, client
+
+	# ── 二.C: args → callFunctionOn（document host，CDP marshaling） ──
+
+	@pytest.mark.asyncio
+	async def test_args_uses_call_function_on(self):
+		s, client = self._make_callfn_session(callfn_return={"result": {"value": 3}})
+
+		text = await s.evaluate("return a[0]+a[1]", args=[1, "x"])
+
+		assert text == "3"
+		client.send.Runtime.evaluate.assert_not_awaited()
+		client.send.Runtime.callFunctionOn.assert_awaited_once()
+		params = client.send.Runtime.callFunctionOn.await_args.args[0]
+		assert params["arguments"] == [{"value": 1}, {"value": "x"}]
+		assert params["functionDeclaration"].startswith("function(...a){")
+		assert params["returnByValue"] is True
+		assert client.send.Runtime.callFunctionOn.await_args.kwargs == {"session_id": "sid-1"}
+
+	@pytest.mark.asyncio
+	async def test_no_args_uses_runtime_evaluate(self):
+		# regression: no args → original Runtime.evaluate path, NOT callFunctionOn
+		s, client = self._make_session(eval_return={"result": {"value": "ok"}})
+
+		await s.evaluate("return 1")
+
+		client.send.Runtime.evaluate.assert_awaited_once()
+		# callFunctionOn must not even be an awaited AsyncMock here (client is a plain MagicMock
+		# attribute until set); assert the args path was not taken by checking evaluate was used
+		assert client.send.Runtime.evaluate.await_args.kwargs == {"session_id": "sid-1"}
+
+	@pytest.mark.asyncio
+	async def test_args_exception_details_raises_rich_error(self):
+		s, _ = self._make_callfn_session(callfn_return={
+			"exceptionDetails": {
+				"text": "TypeError: bad",
+				"exception": {"description": "TypeError: bad\n    at x"},
+			},
+		})
+
+		with pytest.raises(RuntimeError) as ei:
+			await s.evaluate("return a[0]", args=[1])
+
+		msg = str(ei.value)
+		assert "TypeError: bad" in msg
+		assert "at x" in msg
+		assert "Validated code" in msg
+
+	# ── 二.D: 元素句柄 IN + OUT ──
+
+	@pytest.mark.asyncio
+	async def test_elements_resolved_to_object_ids(self):
+		s, client = self._make_callfn_session(
+			callfn_return={"result": {"value": "v"}}, elem_oids=["e1", "e2"],
+		)
+
+		await s.evaluate("return e[0].value", elements=[10, 20])
+
+		params = client.send.Runtime.callFunctionOn.await_args.args[0]
+		assert params["arguments"] == [{"objectId": "e1"}, {"objectId": "e2"}]
+		assert params["functionDeclaration"].startswith("function(...a, ...e){")
+
+	@pytest.mark.asyncio
+	async def test_args_then_elements_order(self):
+		s, client = self._make_callfn_session(
+			callfn_return={"result": {"value": 1}}, elem_oids=["e1"],
+		)
+
+		await s.evaluate("return f(a[0], e[0])", args=[1], elements=[2])
+
+		params = client.send.Runtime.callFunctionOn.await_args.args[0]
+		# JSON args first, element handles last
+		assert params["arguments"] == [{"value": 1}, {"objectId": "e1"}]
+
+	@pytest.mark.asyncio
+	async def test_return_element_id_resolves_node(self):
+		s, client = self._make_callfn_session(callfn_return={
+			"result": {"type": "object", "subtype": "node", "objectId": "node-oid"},
+		})
+		client.send.DOM.describeNode = AsyncMock(return_value={"node": {"backendNodeId": 5}})
+
+		text = await s.evaluate(
+			"return document.querySelector('form')", args=[1], return_element_ids=True,
+		)
+
+		assert text == "backendNodeId:5"
+		params = client.send.Runtime.callFunctionOn.await_args.args[0]
+		assert params["returnByValue"] is False
+		client.send.DOM.describeNode.assert_awaited_once()
+		assert client.send.DOM.describeNode.await_args.args[0] == {"objectId": "node-oid"}
+
+	@pytest.mark.asyncio
+	async def test_return_element_id_non_node_falls_back(self):
+		s, client = self._make_callfn_session(
+			callfn_return={"result": {"value": 42}}, elem_oids=["e1"],
+		)
+		client.send.DOM.describeNode = AsyncMock()
+
+		text = await s.evaluate("return e[0].value", elements=[2], return_element_ids=True)
+
+		assert text == "42"
+		client.send.DOM.describeNode.assert_not_awaited()
+
+	@pytest.mark.asyncio
+	async def test_return_element_id_uses_runtime_evaluate_when_no_inputs(self):
+		s, client = self._make_session(eval_return={
+			"result": {"type": "object", "subtype": "node", "objectId": "n"},
+		})
+		client.send.DOM.describeNode = AsyncMock(return_value={"node": {"backendNodeId": 7}})
+
+		text = await s.evaluate("return document.querySelector('a')", return_element_ids=True)
+
+		assert text == "backendNodeId:7"
+		assert client.send.Runtime.evaluate.await_args.args[0]["returnByValue"] is False
+
+	# ── 二.E: iframe 执行上下文 ──
+
+	@pytest.mark.asyncio
+	async def test_frame_attaches_to_iframe_target(self, monkeypatch):
+		s, client = self._make_session(eval_return={"result": {"value": "iframe-title"}})
+		client.send.DOM.resolveNode = AsyncMock(return_value={"object": {"objectId": "ifr-oid"}})
+		client.send.DOM.describeNode = AsyncMock(return_value={"node": {"frameId": "FRAME_A"}})
+		import tree_walker.browser.session as sess_mod
+		monkeypatch.setattr(
+			sess_mod, "_build_frame_target_map",
+			AsyncMock(return_value=({"FRAME_A": "TGT_A"}, {})),
+		)
+		attach = AsyncMock(return_value="iframe-sid")
+		monkeypatch.setattr(sess_mod, "_attach_to_iframe_target", attach)
+
+		text = await s.evaluate("return document.title", frame=99)
+
+		assert text == "iframe-title"
+		# the eval ran in the iframe session, not the base one
+		assert client.send.Runtime.evaluate.await_args.kwargs == {"session_id": "iframe-sid"}
+		attach.assert_awaited_once_with(s.client, "TGT_A")
+
+	@pytest.mark.asyncio
+	async def test_frame_missing_target_is_error(self, monkeypatch):
+		s, client = self._make_session()
+		client.send.DOM.resolveNode = AsyncMock(return_value={"object": {"objectId": "ifr-oid"}})
+		client.send.DOM.describeNode = AsyncMock(return_value={"node": {"frameId": "FRAME_X"}})
+		import tree_walker.browser.session as sess_mod
+		monkeypatch.setattr(sess_mod, "_build_frame_target_map", AsyncMock(return_value=({}, {})))
+		monkeypatch.setattr(sess_mod, "_attach_to_iframe_target", AsyncMock())
+
+		with pytest.raises(RuntimeError, match="could not resolve iframe target"):
+			await s.evaluate("return 1", frame=99)
 
 
 # ── pure functions (preprocessor / normalizer / exception formatter) ─────────
@@ -305,3 +669,38 @@ class TestEvaluatePreprocessorAndNormalizer:
 		assert _eval_long_term_memory(long_text) == (
 			f"JavaScript executed successfully, result length: {len(long_text)} characters."
 		)
+
+
+# ── _extract_data_images (阶段二 二.F) ────────────────────────────────────────
+
+
+class TestExtractDataImages:
+	def test_finds_single_data_uri(self):
+		uri = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
+		_text, images = _extract_data_images("pre " + uri + " post")
+		assert images == [uri]
+
+	def test_replaces_with_placeholder(self):
+		uri = "data:image/jpeg;base64,/9j/4AAQ=="
+		text, _images = _extract_data_images(uri)
+		assert text == "[image 1]"
+
+	def test_multiple_images_numbered(self):
+		u1 = "data:image/png;base64,AAAA"
+		u2 = "data:image/gif;base64,BBBB"
+		text, images = _extract_data_images(u1 + " " + u2)
+		assert images == [u1, u2]
+		assert text == "[image 1] [image 2]"
+
+	def test_no_image_unchanged(self):
+		s = "just plain text, no images here"
+		text, images = _extract_data_images(s)
+		assert text == s
+		assert images == []
+
+	def test_preserves_surrounding_text(self):
+		# realistic: data URIs are delimited by quotes / whitespace, not bare letters
+		uri = "data:image/png;base64,iVBORw0KGgo="
+		text, images = _extract_data_images("pre " + uri + " post")
+		assert text == "pre [image 1] post"
+		assert images == [uri]

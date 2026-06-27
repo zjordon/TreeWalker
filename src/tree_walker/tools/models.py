@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -301,6 +301,81 @@ class EvaluateParams(BaseModel):
         "browser APIs (document, window, fetch); NO Node.js APIs. Return a "
         "primitive or a JSON-serializable object/array. Keep output small."
     ))
+    # ── 阶段二（二.B）：per-call 执行控制 ──
+    await_promise: bool = Field(
+        default=True,
+        description=(
+            "Await a returned Promise (default True; needed for await fetch(...)). "
+            "Set False for fire-and-forget / strictly synchronous code."
+        ),
+    )
+    timeout_ms: int | None = Field(
+        default=None,
+        ge=1,
+        le=300000,
+        description=(
+            "Per-call CDP execution timeout in ms, clamped to [1, 300000]. Default None → "
+            "30000 (project default). Larger for long fetches, smaller to fail fast. "
+            "Only applies when no args/elements are given."
+        ),
+    )
+    user_gesture: bool = Field(
+        default=False,
+        description=(
+            "Run as a user gesture — required by some APIs (fullscreen, certain clipboard / "
+            "pointer-lock calls). No-op for most code."
+        ),
+    )
+    # ── 阶段二（二.C）：结构化参数注入（消除 f-string 注入面） ──
+    args: list[Any] | None = Field(
+        default=None,
+        description=(
+            "Optional JSON arguments injected as a[0], a[1], ... Your code is wrapped as "
+            "function(...a){ ... } so it MUST `return` a value. Eliminates string-concat "
+            "injection: pass values as JSON, reference them as a[i]. "
+            "Example: args=['.btn'] with code `return document.querySelector(a[0]).disabled`."
+        ),
+    )
+    # ── 阶段二（二.D）：元素句柄往返 ──
+    elements: list[int] | None = Field(
+        default=None,
+        description=(
+            "Backend node ids (index/element_id from get_state or find_elements(return_node_ids=True)) "
+            "of elements to inject as handles e[0], e[1], ... When present, code is wrapped as "
+            "function(...a, ...e){ ... } (JSON args first, element handles last) and MUST `return`. "
+            "Lets JS act on the exact node click/input_text operate on, without re-querying. "
+            "Example: elements=[42] with code `return e[0].value`."
+        ),
+    )
+    return_element_ids: bool = Field(
+        default=False,
+        description=(
+            "If True, a returned DOM node is resolved to its backend node id (usable as "
+            "`index`/`element_id` for click/input_text) and reported. Expects the code to "
+            "`return` a single element (e.g. `return document.querySelector('form')`). Only the "
+            "first returned node is resolved; non-node returns fall back to normal normalization."
+        ),
+    )
+    # ── 阶段二（二.E）：iframe 执行上下文 ──
+    frame: int | None = Field(
+        default=None,
+        description=(
+            "Backend node id of an iframe element to execute inside (cross-origin safe). "
+            "Default None → top document. When set, the call runs in that iframe's context "
+            "(attached via Target.attachToTarget). Use when the parent cannot reach a "
+            "cross-origin iframe's document. Same-origin iframes do NOT need this — just "
+            "reference `iframe.contentDocument` in your code."
+        ),
+    )
+    # ── 阶段二（二.F）：图片 / base64 结果通道 ──
+    extract_images: bool = Field(
+        default=False,
+        description=(
+            "If True, scan the result text for `data:image/...;base64,...` URIs, collect them "
+            "into ActionResult.metadata['images'], and replace each in the returned text with a "
+            "short placeholder ([image 1], [image 2], ...) to avoid bloating context. Default False."
+        ),
+    )
 
 
 class SearchPageParams(BaseModel):
