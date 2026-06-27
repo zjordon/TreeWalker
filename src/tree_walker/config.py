@@ -56,6 +56,8 @@ class TruncationSettings:
     search_page_output_dir: str = "search_page_output"  # dir for oversized match lists (env-config)
     find_elements_save_threshold: int = 10000  # find_elements result >= this → write to file (mirrors search_page)
     find_elements_output_dir: str = "find_elements_output"  # dir for oversized element lists (env-config)
+    eval_save_threshold: int = 10000      # evaluate result >= this → write to file (mirrors extract/search_page/find_elements)
+    eval_output_dir: str = "evaluate_output"  # dir for oversized JS results (env-config)
 
 
 @dataclass
@@ -253,6 +255,8 @@ def load_settings() -> Settings:
             dom_excerpt_max_chars=int(os.environ.get("AGENT_TRUNCATE_DOM_EXCERPT", "2000")),
             search_page_save_threshold=int(os.environ.get("AGENT_SEARCH_PAGE_SAVE_THRESHOLD", "10000")),
             search_page_output_dir=os.environ.get("AGENT_SEARCH_PAGE_OUTPUT_DIR", "search_page_output"),
+            eval_save_threshold=int(os.environ.get("AGENT_EVAL_SAVE_THRESHOLD", "10000")),
+            eval_output_dir=os.environ.get("AGENT_EVAL_OUTPUT_DIR", "evaluate_output"),
         ),
         enable_planning=os.environ.get("AGENT_ENABLE_PLANNING", "").lower() == "true",
         exploration_threshold=int(os.environ.get("AGENT_EXPLORATION_THRESHOLD", "5")),

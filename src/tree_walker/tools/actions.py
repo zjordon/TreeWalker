@@ -8,6 +8,7 @@ from typing import Any
 import logging
 import mimetypes
 import os
+import re
 import time
 
 from tree_walker.agent.views import ActionResult
@@ -205,6 +206,26 @@ def _eval_long_term_memory(text: str) -> str:
     if len(text) <= _EVAL_MEMORY_ECHO_MAX:
         return text
     return f"JavaScript executed successfully, result length: {len(text)} characters."
+
+
+_DATA_IMAGE_RE = re.compile(r"data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+")
+
+
+def _extract_data_images(text: str) -> tuple[str, list[str]]:
+    """Split ``data:image/...;base64,...`` URIs out of ``text`` (阶段二 二.F).
+
+    Returns ``(text_with_placeholders, images)``: each URI is replaced by
+    ``[image N]`` and ``images`` lists the extracted data URIs in order, so the
+    bulky base64 stays out of ``extracted_content`` (moved to ``metadata``).
+    Mirrors browser-use service.py:1821-1836, adapted to a free-text scan.
+    """
+    images: list[str] = []
+
+    def _repl(m: re.Match) -> str:
+        images.append(m.group(0))
+        return f"[image {len(images)}]"
+
+    return _DATA_IMAGE_RE.sub(_repl, text), images
 
 
 def _find_upload_label_near(
@@ -1652,20 +1673,83 @@ class Tools:
 
     async def _action_evaluate(self, params: dict, browser: BrowserSession) -> ActionResult:
         code = params["code"]
+        # 阶段二（二.B–二.F）：新增参数。registry 不校验 execute 路径（params 是 raw
+        # dict），故在此读取 + 运行时守卫；见 memory action-params-no-runtime-validation。
+        await_promise = params.get("await_promise", True)
+        timeout_ms = params.get("timeout_ms")
+        user_gesture = params.get("user_gesture", False)
+        args = params.get("args")
+        elements = params.get("elements")
+        return_element_ids = params.get("return_element_ids", False)
+        frame = params.get("frame")
+        extract_images = params.get("extract_images", False)
+        if timeout_ms is not None and not (1 <= timeout_ms <= 300000):
+            return ActionResult(
+                error=f"Evaluate failed: timeout_ms must be in [1, 300000], got {timeout_ms}",
+            )
+        if args is not None:
+            try:
+                json.dumps(args)  # 进 CDP 前先验可序列化
+            except (TypeError, ValueError) as e:
+                return ActionResult(error=f"Evaluate failed: args not JSON-serializable: {e}")
+        if elements is not None and (
+            not isinstance(elements, list) or not all(isinstance(i, int) for i in elements)
+        ):
+            return ActionResult(
+                error="Evaluate failed: elements must be a list of ints (backend node ids)",
+            )
         try:
-            text = await browser.evaluate(code)
+            text = await browser.evaluate(
+                code,
+                args=args,
+                elements=elements,
+                await_promise=await_promise,
+                timeout_ms=timeout_ms,
+                user_gesture=user_gesture,
+                return_element_ids=return_element_ids,
+                frame=frame,
+            )
         except Exception as e:
             # Hard error: JS exception / wasThrown / CDP failure — surface an
             # evaluate-specific error rather than the generic Tools.execute
             # fallback. Aligns with _action_find_elements / _action_search_page.
             logger.warning("evaluate(%r) failed: %s", code[:120], e)
             return ActionResult(error=f"Evaluate failed: {e}")
-        limit = self._truncation.eval_result_max_chars
-        memory = _eval_long_term_memory(text)
-        return ActionResult(
-            extracted_content=text[:limit],
-            long_term_memory=memory[:limit],
-        )
+        # 二.D OUT: session 把返回节点解析回 "backendNodeId:<id>" → 作为可操作 index 回显
+        if text.startswith("backendNodeId:"):
+            bid = text.split(":", 1)[1]
+            visible = (f"Returned element backend node id: {bid} "
+                       f"(usable as index/element_id for click/input_text; "
+                       f"if not in current selector_map, call get_state to refresh)")
+            return ActionResult(extracted_content=visible,
+                                long_term_memory=f"evaluate returned element index {bid}")
+        # 二.F: 抽出 base64 图片，避免撑爆上下文
+        metadata = None
+        if extract_images:
+            text, images = _extract_data_images(text)
+            if images:
+                metadata = {"images": images}
+        # 二.A: 大结果分级落盘（镜像 _action_find_elements:1122-1144；OSError 不失败只 warning）
+        tr = self._truncation
+        saved_to = None
+        if len(text) >= tr.eval_save_threshold:
+            try:
+                os.makedirs(tr.eval_output_dir, exist_ok=True)
+                fpath = os.path.join(tr.eval_output_dir, f"evaluate_{int(time.time() * 1000)}.txt")
+                with open(fpath, "w", encoding="utf-8", newline="") as f:
+                    f.write(text)
+                saved_to = fpath
+            except OSError as e:
+                logger.warning("evaluate: save to file failed: %s", e)
+        limit = tr.eval_result_max_chars
+        if saved_to:
+            visible = (f"Evaluate result ({len(text)} chars) saved to {saved_to}. "
+                       f"Preview: {text[:200]}...").strip()
+            memory = f"JavaScript executed successfully, result saved: {saved_to}"
+        else:
+            visible = text[:limit]
+            memory = _eval_long_term_memory(text)
+        return ActionResult(extracted_content=visible, long_term_memory=memory, metadata=metadata)
 
     async def _action_search_page(self, params: dict, browser: BrowserSession) -> ActionResult:
         query = params["query"]
