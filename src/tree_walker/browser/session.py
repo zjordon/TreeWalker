@@ -2458,6 +2458,30 @@ class BrowserSession:
             raise RuntimeError(f"JS error: {err.get('text', err)}")
         return result.get("result", {}).get("value")
 
+    async def get_page_html(
+        self, *, extract_links: bool = True, extract_images: bool = True
+    ) -> str:
+        """Fetch the current page body as clean HTML via a single CDP ``DOM.getDocument``.
+
+        ``depth=-1, pierce=True`` 的结果天然含 shadow DOM 与同源 iframe 的 ``contentDocument``；
+        经 ``html_source.document_body_to_html`` 重建为 markdownify 友好的干净 HTML（剥
+        script/style/template/HEAD，门控 ``<a href>`` / ``<img src>``）。失败返回 ``""``，
+        调用方（``_action_extract``）降级到 ``execute_js outerHTML``。跨源 iframe 不可达。
+        """
+        try:
+            doc = await self.client.send.DOM.getDocument(
+                {"depth": -1, "pierce": True}, session_id=self.current_session_id,
+            )
+            from tree_walker.browser.html_source import document_body_to_html
+            return document_body_to_html(
+                (doc or {}).get("root", {}),
+                extract_links=extract_links,
+                extract_images=extract_images,
+            )
+        except Exception as e:
+            logger.warning("get_page_html: DOM.getDocument failed: %s", e)
+            return ""
+
     async def evaluate(self, code: str) -> str:
         """Execute arbitrary user JavaScript and return a normalized result string.
 

@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class NavigateParams(BaseModel):
@@ -53,7 +53,43 @@ class SearchParams(BaseModel):
 
 class ExtractParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    goal: str = Field(description="What information to extract from the current page")
+    query: str = Field(
+        description=(
+            "What information to extract from the current page. Be specific: name the "
+            "fields/items and any filtering criteria. (Equivalent to browser-use `query`.)"
+        )
+    )
+    extract_links: bool = Field(
+        default=True,
+        description="If True, preserve <a href> URLs in the source markdown. Set False for text-only extraction.",
+    )
+    extract_images: bool = Field(
+        default=True,
+        description="If True, preserve <img src> URLs in the source markdown.",
+    )
+    start_from_char: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Character offset to resume extraction from (for paginating large pages). "
+            "Default 0 = start at the beginning. Use the offset reported by a previous "
+            "truncated extract call to continue."
+        ),
+    )
+    already_collected: list[str] | None = Field(
+        default=None,
+        description=(
+            "Items already extracted (dedupe across pages/chunks). Pass prior results "
+            "(as text) and the model will skip exact duplicates. Optional."
+        ),
+    )
+
+    @field_validator("already_collected")
+    @classmethod
+    def _drop_empty_items(cls, v):
+        if v is not None:
+            v = [item for item in v if item and item.strip()]
+        return v or None
 
 
 class SendKeysParams(BaseModel):
@@ -294,7 +330,8 @@ ACTION_DEFINITIONS: dict[str, tuple[type[BaseModel], str, bool]] = {
     ),
     "extract": (
         ExtractParams,
-        "Extract specific information from the current page content",
+        "Extract specific information from the current page as clean markdown (via an LLM). "
+        "Paginate large pages with start_from_char; dedupe across calls with already_collected.",
         False,
     ),
     "send_keys": (SendKeysParams, "Send keyboard shortcuts or key combinations", False),

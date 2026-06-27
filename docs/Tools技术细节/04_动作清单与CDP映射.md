@@ -15,7 +15,7 @@
 | 3 | [done](#43-done) | 否 | `text, success` | (无 CDP) | 任务终止信号 |
 | 4 | [dropdown_options](#44-dropdown_options) | 否 | `index: int` | Runtime (JS) | 读取 select 所有 option |
 | 5 | [evaluate](#45-evaluate) | 是 | `code: str` | Runtime | 执行任意 JS，返回结果 |
-| 6 | [extract](#46-extract) | 否 | `goal: str` | Runtime + LLM | 二次 LLM 抽取页面信息 |
+| 6 | [extract](#46-extract) | 否 | `query, extract_links?, extract_images?, start_from_char?, already_collected?` | CDP (DOM.getDocument) + LLM | 页面转 markdown → LLM 抽取/结构化（分页 + 去重 + 大结果落盘） |
 | 7 | [find_elements](#47-find_elements) | 否 | `selector, attributes?, max_results?, include_text?` | Runtime (JS) | CSS 选择器查询元素（tag/text/attrs/children_count + 总数） |
 | 8 | [find_text](#48-find_text) | 否 | `text: str` | DOM + Overlay (+ Runtime) | CDP performSearch 滚动到文本并高亮 |
 | 9 | [go_back](#49-go_back) | 是 | (无) | Page | 浏览器后退 |
@@ -340,60 +340,79 @@
 
 ### 4.6 `extract`
 
-- **description**：`Extract specific information from the current page content` / 从当前页面内容中抽取指定信息
+- **description**：`Extract specific information from the current page as clean markdown (via an LLM). Paginate large pages with start_from_char; dedupe across calls with already_collected.` / 把当前页面转成干净 markdown 后，用一次（专用小模型的）LLM 调用按需提炼/结构化抽取；长页面可分页、跨页可去重
 - **terminates_sequence**：False
-- **Pydantic 参数**：
+- **Pydantic 参数**（[models.py `ExtractParams`](../../src/tree_walker/tools/models.py)）：
 
-  | 字段 | 类型 | 描述 |
-  |---|---|---|
-  | `goal` | `str` | What information to extract from the current page |
+  | 字段 | 类型 | 默认 | 描述 |
+  |---|---|---|---|
+  | `query` | `str` | （必填） | 要抽取的信息（≡ browser-use `query`；阶段二由 `goal` 重命名而来） |
+  | `extract_links` | `bool` | `True` | 源 markdown 是否保留 `<a href>` URL（False=纯文本抽取） |
+  | `extract_images` | `bool` | `True` | 源 markdown 是否保留 `<img src>` URL |
+  | `start_from_char` | `int` (`ge=0`) | `0` | 分页续抽的字符偏移（用上一次被截断的 extract 回传的 offset 继续） |
+  | `already_collected` | `list[str] \| None` | `None` | 已抽取项（跨页/分块去重），去空项后拼进 prompt 让模型跳过精确重复 |
 
-- **主要逻辑**（[actions.py:633](../../src/tree_walker/tools/actions.py)）：
+- **封装分层**：
+  - **session 层**（[session.py `BrowserSession.get_page_html`](../../src/tree_walker/browser/session.py)）：单次 `DOM.getDocument(depth=-1, pierce=True)`，经 [html_source.py](../../src/tree_walker/browser/html_source.py) 的 `document_body_to_html` 重建干净 HTML（递归 `children`/`shadowRoots`/`contentDocument`，剥 script/style/template/HEAD，门控 `<a href>`/`<img src>`）；失败返回 `""`。跨源 iframe `contentDocument=None` 不可达。
+  - **纯函数层**（[extract_markdown.py](../../src/tree_walker/tools/extract_markdown.py)）：`extract_clean_markdown`（`markdownify` + 去噪 + 折叠空行）、`chunk_markdown_by_structure`（按行贪心打包、表头延续、`MarkdownChunk`）。
+  - **action 层**（[actions.py `_action_extract`](../../src/tree_walker/tools/actions.py)）：编排 —— 取 markdown → 按 `extract_chunk_max_chars` 分块取 `start_from_char` 所在单块 → 调 `llm.extract`（带 `already_collected`/`call_timeout`）→ 大结果落盘 → 回写分页进度。
+
+- **主要逻辑**（[actions.py](../../src/tree_walker/tools/actions.py)）：
 
   ```python
   async def _action_extract(self, params: dict, browser: BrowserSession) -> ActionResult:
-      goal = params["goal"]
-      try:
-          page_text = await browser.execute_js("document.body.innerText")
-      except Exception as e:
-          logger.warning("extract: document.body.innerText failed: %s", e)
-          page_text = ""
-      if not page_text:
-          return ActionResult(extracted_content="(empty page)")
+      query = params["query"]; tr = self._truncation; schema = getattr(self, "_extraction_schema", None)
+      # 1) 源：CDP HTML → markdown（取代 document.body.innerText）；空则降级 execute_js outerHTML
+      html_text = await browser.get_page_html(extract_links=..., extract_images=...)
+      if not html_text:
+          try: html_text = await browser.execute_js("document.documentElement.outerHTML") or ""
+          except Exception as e: logger.warning("extract: HTML source failed: %s", e); html_text = ""
+      if not html_text: return ActionResult(extracted_content="(empty page)")
+      md = extract_clean_markdown(html_text, extract_links=..., extract_images=...)
+      if not md.strip(): return ActionResult(extracted_content="(empty page)")
 
       llm = getattr(self, "_extract_llm", None)
-      if llm is None:
-          return ActionResult(extracted_content=page_text[:self._truncation.extract_fallback_max_chars])
+      if llm is None:  # 脱离 Agent 直接用 Tools() → 降级截断 markdown
+          return ActionResult(extracted_content=md[params["start_from_char"]:...+tr.extract_fallback_max_chars] or "(no content at offset)")
 
-      schema = getattr(self, "_extraction_schema", None)
+      # 2) 分页：取 start_from_char 所在单块（一次只抽一块）
+      chunks = chunk_markdown_by_structure(md, max_chars=tr.extract_chunk_max_chars)
+      if params["start_from_char"] >= chunks[-1].end_index:
+          return ActionResult(extracted_content="(no more content at this offset; extraction complete)")
+      ...  # 定位 target 块、块内子切片 chunk_content
+
+      # 3) 抽取（去重 + 内层超时）；TimeoutError → "Extract timed out"，其它异常 → "Extract failed"
       try:
-          result = await llm.extract(
-              goal,
-              page_text,
-              max_content_chars=self._truncation.extract_page_max_chars,
-              output_schema=schema,
-          )
-      except Exception as e:
-          logger.warning("extract: LLM call failed: %s", e)
-          return ActionResult(error=f"Extract failed: {e}")
-      return ActionResult(extracted_content=result)
+          result = await llm.extract(query, chunk_content, max_content_chars=tr.extract_chunk_max_chars,
+                                     output_schema=schema, already_collected=params["already_collected"],
+                                     call_timeout=tr.extract_call_timeout or None)
+      except TimeoutError as e: return ActionResult(error=f"Extract timed out: {e}")
+      except Exception as e: return ActionResult(error=f"Extract failed: {e}")
+
+      # 4) 分页进度提示（必须落在 __str__ 的 500 字窗口内可见）
+      # 5) 大结果（>= extract_save_threshold）落盘到 extract_output/extract_<ms>.{json|md}
+      # 结构化结果保持 JSON 纯净（提示走 long_term_memory）；free-text 提示前置（防 500 字截断）
+      return ActionResult(extracted_content=visible, long_term_memory=mem or None)
   ```
 
-  二次调用 LLM 进行抽取。`_extract_llm` 与 `_extraction_schema` 由 `Agent.__init__` 接线注入（默认 `_extract_llm` 复用主 llm；`extraction_schema` 来自 `AgentSettings`）。传 `output_schema` 时走结构化抽取，否则走 free-text；LLM 异常分级为 `ActionResult(error=...)`，不冒泡通用 catch。脱离 Agent 直接用 `Tools()` 时 `_extract_llm` 为 None → 降级返回前 N 个字符。
+  二次调用 LLM 抽取。`_extract_llm` / `_extraction_schema` 由 `Agent.__init__` 接线注入（默认 `_extract_llm` 复用主 llm；`extraction_schema` 来自 `AgentSettings`）。**源 = CDP HTML → markdown**（不再是 `document.body.innerText`），保留表格/链接/图片语义。长页面按 `extract_chunk_max_chars` 分块，一次只抽 `start_from_char` 所在块，并把「下一块 offset」作为提示回传，agent 据此 `start_from_char=` 续抽。`already_collected` 拼进 prompt 去重。结果 ≥ `extract_save_threshold`（默认 10000）落盘到 `extract_output/`、回显「saved to {path}」。LLM 异常分级（`TimeoutError`/其它 → `ActionResult(error=...)`），不冒泡通用 catch。
 
 - **CDP 调用清单**：
 
   | CDP 命令 | 主要参数 | 行号 |
   |---|---|---|
-  | `Runtime.evaluate` | `{expression: "document.body.innerText"}` | session.py:1809 (经 execute_js) |
-
-  二次 LLM 调用走 Anthropic `messages.create`（[client.py:295](../../src/tree_walker/llm/client.py)）：free-text 为普通补全；结构化为 tool-use 强约束（工具 `extract_result`、`input_schema=output_schema`、`tool_choice` 强制）。
+  | `DOM.getDocument` | `{depth:-1, pierce:true}` | session.py `get_page_html`（经 `html_source.document_body_to_html`） |
+  | `Runtime.evaluate`（降级） | `{expression: "document.documentElement.outerHTML"}` | session.py `execute_js` |
+  | `messages.create`（LLM） | free-text 补全 / 结构化 tool-use（`extract_result` 工具、`input_schema=output_schema`、`tool_choice` 强制） | [client.py](../../src/tree_walker/llm/client.py) |
 
 - **注意事项**：
-  - `_extract_llm` 默认在 `Agent.__init__` 接线为复用主 `llm`（对齐 browser-use `page_extraction_llm = llm`）；可经 `AgentSettings.extract_llm` 配专用小模型。
-  - `extraction_schema` 经 `AgentSettings.extraction_schema` 注入、对 LLM 隐藏（不进 `ExtractParams`）。传给 `LLMClient.extract` 后用 Anthropic tool-use 强约束产出结构化 JSON；schema 非法（非 object / 无 properties）自动降级 free-text。
-  - 结构化结果以 JSON 字符串进 `ActionResult.extracted_content`（与 free-text 类型一致）。
-  - 不加内层超时，依赖 `action_timeout`（默认 30s）。
+  - **字段重命名**：阶段二 `goal` → `query`（≡ browser-use）。破坏式但纯 LLM-facing（schema 经 `model_json_schema()` 自动传播），无持久化状态要迁移；`extraction_schema` 正交不受影响。
+  - **markdown 源**：CDP `DOM.getDocument` 树重建 HTML（穿透 shadow DOM + 同源 iframe），`execute_js outerHTML` 仅作降级后备；跨源 iframe 不可达。
+  - `_extract_llm` 默认复用主 `llm`；可经 `AgentSettings.extract_llm` 或 env `AGENT_EXTRACT_MODEL/_API_KEY/_BASE_URL/_MAX_TOKENS` 配专用小模型（未设则复用主 llm）。
+  - `extraction_schema` 经 `AgentSettings.extraction_schema` 注入、对 LLM 隐藏（不进 `ExtractParams`）；schema 非法（非 object / 无 properties）自动降级 free-text。
+  - **分页进度可见性**：LLM 经 `ActionResult.__str__` 只看 `extracted_content` 前 500 字 → 提示必须前置（free-text）或走 `long_term_memory`（结构化，保 JSON 纯净）。
+  - **inner timeout**：`extract_call_timeout`（env `AGENT_EXTRACT_CALL_TIMEOUT`，默认 0=关）；开启时经 `asyncio.wait_for(asyncio.to_thread(messages.create))` 计时，且必须 `< action_timeout`（否则外层先取消），分块多时建议配套调大 `AGENT_ACTION_TIMEOUT`。
+  - **配置**：`TruncationSettings` 新增 `extract_chunk_max_chars`/`extract_save_threshold`/`extract_output_dir`/`extract_call_timeout`（均有 env）。
 
 ---
 

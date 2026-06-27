@@ -8,11 +8,13 @@ from typing import Any
 import logging
 import mimetypes
 import os
+import time
 
 from tree_walker.agent.views import ActionResult
 from tree_walker.browser.session import BrowserSession, _requires_direct_value_assignment
 from tree_walker.browser.views import BrowserStateSummary, EnhancedDOMTreeNode, SerializedDOMState
 from tree_walker.config import TruncationSettings
+from tree_walker.tools.extract_markdown import chunk_markdown_by_structure, extract_clean_markdown
 from tree_walker.tools.models import ACTION_DEFINITIONS
 from tree_walker.tools.registry import ActionRegistry
 
@@ -772,32 +774,100 @@ class Tools:
         return ActionResult(extracted_content=memory, long_term_memory=memory)
 
     async def _action_extract(self, params: dict, browser: BrowserSession) -> ActionResult:
-        goal = params["goal"]
-        try:
-            page_text = await browser.execute_js("document.body.innerText")
-        except Exception as e:
-            logger.warning("extract: document.body.innerText failed: %s", e)
-            page_text = ""
-        if not page_text:
+        query = params["query"]
+        extract_links = params.get("extract_links", True)
+        extract_images = params.get("extract_images", True)
+        start_from_char = params.get("start_from_char", 0)
+        already_collected = params.get("already_collected")
+        tr = self._truncation
+        schema = getattr(self, "_extraction_schema", None)
+
+        # 1) 源：CDP HTML → markdown（取代阶段一的 document.body.innerText）
+        html_text = await browser.get_page_html(extract_links=extract_links, extract_images=extract_images)
+        if not html_text:  # 降级到 execute_js outerHTML
+            try:
+                html_text = await browser.execute_js("document.documentElement.outerHTML") or ""
+            except Exception as e:
+                logger.warning("extract: HTML source failed: %s", e)
+                html_text = ""
+        if not html_text:
+            return ActionResult(extracted_content="(empty page)")
+
+        md = extract_clean_markdown(html_text, extract_links=extract_links, extract_images=extract_images)
+        if not md.strip():
             return ActionResult(extracted_content="(empty page)")
 
         llm = getattr(self, "_extract_llm", None)
         if llm is None:
-            # 未接 LLM（如脱离 Agent 直接用 Tools）——显式降级为截断原文
-            return ActionResult(extracted_content=page_text[:self._truncation.extract_fallback_max_chars])
+            # 未接 LLM（如脱离 Agent 直接用 Tools）——显式降级为截断 markdown 片段
+            snippet = md[start_from_char:start_from_char + tr.extract_fallback_max_chars]
+            return ActionResult(extracted_content=snippet or "(no content at offset)")
 
-        schema = getattr(self, "_extraction_schema", None)
+        # 2) 分页：取 start_from_char 所在的单块（一次 extract 只抽一块）
+        chunks = chunk_markdown_by_structure(md, max_chars=tr.extract_chunk_max_chars)
+        if start_from_char >= chunks[-1].end_index:
+            return ActionResult(extracted_content="(no more content at this offset; extraction complete)")
+        target_idx = 0
+        for i, c in enumerate(chunks):
+            if c.start_index <= start_from_char < c.end_index:
+                target_idx = i
+                break
+        local_offset = max(0, start_from_char - chunks[target_idx].start_index)
+        chunk_content = chunks[target_idx].content[local_offset:]
+
+        # 3) 抽取（含去重 + 内层超时）
         try:
             result = await llm.extract(
-                goal,
-                page_text,
-                max_content_chars=self._truncation.extract_page_max_chars,
+                query,
+                chunk_content,
+                max_content_chars=tr.extract_chunk_max_chars,
                 output_schema=schema,
+                already_collected=already_collected,
+                call_timeout=tr.extract_call_timeout or None,
             )
+        except TimeoutError as e:
+            logger.warning("extract: LLM call timed out: %s", e)
+            return ActionResult(error=f"Extract timed out: {e}")
         except Exception as e:
             logger.warning("extract: LLM call failed: %s", e)
             return ActionResult(error=f"Extract failed: {e}")
-        return ActionResult(extracted_content=result)
+
+        # 4) 分页进度（提示必须落在 500 字窗口内可见）
+        next_offset = chunks[target_idx + 1].start_index if target_idx + 1 < len(chunks) else None
+        remaining = sum(c.end_index - c.start_index for c in chunks[target_idx + 1:])
+        hint = ""
+        if next_offset is not None:
+            hint = (f"[chunk {target_idx + 1}/{len(chunks)}; ~{remaining} chars remain; "
+                    f"call extract again with start_from_char={next_offset} to continue]")
+
+        # 5) 大结果分级落盘（仅按大小，与分页解耦；复用 write_file 直写姿势）
+        saved_to = None
+        if len(result) >= tr.extract_save_threshold:
+            try:
+                os.makedirs(tr.extract_output_dir, exist_ok=True)
+                ext = "json" if schema else "md"
+                fpath = os.path.join(tr.extract_output_dir, f"extract_{int(time.time() * 1000)}.{ext}")
+                with open(fpath, "w", encoding="utf-8", newline="") as f:
+                    f.write(result)
+                saved_to = fpath
+            except OSError as e:
+                logger.warning("extract: save to file failed: %s", e)
+
+        # 结构化结果保持 JSON 纯净；free-text 提示前置（防 __str__ 500 字截断）
+        if schema is not None:
+            if saved_to:
+                visible = (f"Extraction ({len(result)} chars) saved to {saved_to}. "
+                           f"Preview: {result[:200]}...\n{hint}").strip()
+            else:
+                visible = result  # 纯 JSON；hint 走 long_term_memory
+        else:
+            visible = (hint + "\n" + result) if hint else result
+        mem_parts = []
+        if saved_to:
+            mem_parts.append(f"extract result saved: {saved_to}")
+        if hint:
+            mem_parts.append(hint)
+        return ActionResult(extracted_content=visible, long_term_memory=" | ".join(mem_parts) or None)
 
     async def _action_send_keys(self, params: dict, browser: BrowserSession) -> ActionResult:
         keys = params["keys"]

@@ -44,6 +44,10 @@ class TruncationSettings:
 
     extract_page_max_chars: int = 8000       # page text fed to LLM for extraction
     extract_fallback_max_chars: int = 2000   # page text returned without LLM
+    extract_chunk_max_chars: int = 8000      # per-chunk budget for structured pagination (Phase 2)
+    extract_save_threshold: int = 10000      # result >= this → write to file (browser-use parity)
+    extract_output_dir: str = "extract_output"  # dir for oversized results (env-config, not agent-controlled)
+    extract_call_timeout: float = 0.0        # inner LLM-call timeout seconds (0 = disabled)
     read_file_max_chars: int = 5000          # file read tool result
     eval_result_max_chars: int = 2000        # JavaScript eval result
     display_max_chars: int = 500             # ActionResult display string
@@ -235,6 +239,10 @@ def load_settings() -> Settings:
         truncation=TruncationSettings(
             extract_page_max_chars=int(os.environ.get("AGENT_TRUNCATE_EXTRACT_PAGE", "8000")),
             extract_fallback_max_chars=int(os.environ.get("AGENT_TRUNCATE_EXTRACT_FALLBACK", "2000")),
+            extract_chunk_max_chars=int(os.environ.get("AGENT_TRUNCATE_EXTRACT_CHUNK", "8000")),
+            extract_save_threshold=int(os.environ.get("AGENT_EXTRACT_SAVE_THRESHOLD", "10000")),
+            extract_output_dir=os.environ.get("AGENT_EXTRACT_OUTPUT_DIR", "extract_output"),
+            extract_call_timeout=float(os.environ.get("AGENT_EXTRACT_CALL_TIMEOUT", "0")),
             read_file_max_chars=int(os.environ.get("AGENT_TRUNCATE_READ_FILE", "5000")),
             eval_result_max_chars=int(os.environ.get("AGENT_TRUNCATE_EVAL_RESULT", "2000")),
             display_max_chars=int(os.environ.get("AGENT_TRUNCATE_DISPLAY", "500")),
@@ -255,6 +263,19 @@ def load_settings() -> Settings:
             trace_max_chars=int(os.environ.get("AGENT_JUDGE_TRACE_MAX_CHARS", "40000")),
         ),
     )
+
+    # extract 专用 LLM（镜像 FALLBACK_LLM_* 模式；None=复用主 llm，保阶段一行为）
+    extract_model = os.environ.get("AGENT_EXTRACT_MODEL", "")
+    if extract_model:
+        agent.extract_llm = LLMSettings(
+            model=extract_model,
+            api_key=os.environ.get("AGENT_EXTRACT_API_KEY") or api_key,
+            base_url=os.environ.get(
+                "AGENT_EXTRACT_BASE_URL",
+                "https://open.bigmodel.cn/api/anthropic",
+            ),
+            max_tokens=int(os.environ.get("AGENT_EXTRACT_MAX_TOKENS", "4096")),
+        )
 
     # Fallback LLM configuration
     fallback_settings: FallbackLLMSettings | None = None

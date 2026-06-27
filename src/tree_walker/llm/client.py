@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -292,6 +293,23 @@ class LLMClient:
 
         return result
 
+    async def _extract_call(
+        self, *, call_timeout: float | None, **create_kwargs: Any
+    ):
+        """``messages.create`` 的薄封装：``call_timeout`` 非空时用 ``asyncio.wait_for`` 包裹。
+
+        Anthropic 同步客户端的 ``messages.create`` 是阻塞调用；``call_timeout`` 非空时
+        经 ``asyncio.to_thread`` 丢到线程池再用 ``asyncio.wait_for`` 计时。超时抛
+        ``asyncio.TimeoutError``（不会被 ``extract`` 的 RateLimit/APIError 分支捕获），
+        交由 ``_action_extract`` 映射成分级错误。
+        """
+        if call_timeout:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self.client.messages.create, **create_kwargs),
+                timeout=call_timeout,
+            )
+        return self.client.messages.create(**create_kwargs)
+
     async def extract(
         self,
         prompt: str,
@@ -299,12 +317,18 @@ class LLMClient:
         *,
         max_content_chars: int = 8000,
         output_schema: dict[str, Any] | None = None,
+        already_collected: list[str] | None = None,
+        call_timeout: float | None = None,
     ) -> str:
         """Secondary LLM call for page data extraction.
 
         When ``output_schema`` is a JSON Schema dict (top-level type=object with
         properties), forces structured output via an Anthropic tool and returns
         the validated JSON as a string. Otherwise returns free-text extraction.
+
+        - ``already_collected``：拼进 user message 作为「跳过这些」去重列表（上限 200 条）。
+        - ``call_timeout``：单次调用的 ``asyncio.wait_for`` 秒数（None=不加内层超时，交由
+          调用方的 ``action_timeout`` 兜底）；超时抛 ``asyncio.TimeoutError``。
         """
         # 最低限度校验 schema；不可用则降级 free-text（对齐 browser-use try/except 降级）
         if output_schema is not None and (
@@ -316,6 +340,14 @@ class LLMClient:
             output_schema = None
 
         content = content[:max_content_chars]
+        collected_block = ""
+        if already_collected:
+            joined = "\n".join(f"- {c}" for c in already_collected[:200])
+            collected_block = (
+                "\n\nItems already collected (DO NOT re-extract these, skip exact duplicates):\n"
+                + joined
+            )
+        user_msg = f"{prompt}{collected_block}\n\n---\n{content}"
 
         if output_schema is not None:
             system_prompt = (
@@ -330,18 +362,21 @@ class LLMClient:
                 "input_schema": output_schema,
             }
             try:
-                response = self.client.messages.create(
+                response = await self._extract_call(
+                    call_timeout=call_timeout,
                     model=self.model,
                     max_tokens=2048,
                     system=system_prompt,
-                    messages=[{"role": "user", "content": f"{prompt}\n\n---\n{content}"}],
+                    messages=[{"role": "user", "content": user_msg}],
                     tools=[tool],
                     tool_choice={"type": "tool", "name": "extract_result"},
                 )
             except (RateLimitError, APIError) as e:
                 if self._try_switch_to_fallback(e):
                     return await self.extract(
-                        prompt, content, max_content_chars=max_content_chars, output_schema=output_schema,
+                        prompt, content, max_content_chars=max_content_chars,
+                        output_schema=output_schema, already_collected=already_collected,
+                        call_timeout=call_timeout,
                     )
                 raise
             for block in response.content:
@@ -353,19 +388,20 @@ class LLMClient:
             text_parts = [b.text for b in response.content if hasattr(b, "text")]
             return "\n".join(text_parts)
 
-        # free-text 路径（goal 进 user message）
+        # free-text 路径（prompt 进 user message）
         try:
-            response = self.client.messages.create(
+            response = await self._extract_call(
+                call_timeout=call_timeout,
                 model=self.model,
                 max_tokens=2048,
-                messages=[
-                    {"role": "user", "content": f"{prompt}\n\n---\n{content}"},
-                ],
+                messages=[{"role": "user", "content": user_msg}],
             )
         except (RateLimitError, APIError) as e:
             if self._try_switch_to_fallback(e):
                 return await self.extract(
-                    prompt, content, max_content_chars=max_content_chars, output_schema=output_schema,
+                    prompt, content, max_content_chars=max_content_chars,
+                    output_schema=output_schema, already_collected=already_collected,
+                    call_timeout=call_timeout,
                 )
             raise
         text_parts = [b.text for b in response.content if hasattr(b, "text")]

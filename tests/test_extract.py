@@ -1,6 +1,7 @@
 """Tests for extract: _action_extract tool layer, Agent wiring, LLMClient.extract client layer."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -9,7 +10,7 @@ import pytest
 from anthropic import RateLimitError
 
 from tree_walker.agent.agent import Agent
-from tree_walker.config import AgentSettings, FallbackLLMSettings, LLMSettings
+from tree_walker.config import AgentSettings, FallbackLLMSettings, LLMSettings, TruncationSettings
 from tree_walker.llm.client import LLMClient
 from tree_walker.tools.actions import Tools
 
@@ -17,13 +18,26 @@ from tree_walker.tools.actions import Tools
 # ── tool-layer helpers ────────────────────────────────────────────────
 
 
-def _make_mock_browser(inner_text: str = "some page text", raise_exc: Exception | None = None) -> MagicMock:
-	"""Mock BrowserSession whose execute_js returns inner_text (or raises)."""
+def _make_mock_browser(
+	html: str = "<html><body><p>some page text</p></body></html>",
+	*,
+	execute_js_return: str | None = None,
+	execute_js_exc: Exception | None = None,
+) -> MagicMock:
+	"""Mock BrowserSession: get_page_html returns html; execute_js is the outerHTML fallback.
+
+	- 默认 execute_js 返回备用 HTML（走降级路径时用）。
+	- execute_js_exc 非空 → execute_js 抛异常（模拟降级源也失败）。
+	"""
 	browser = MagicMock()
-	if raise_exc is not None:
-		browser.execute_js = AsyncMock(side_effect=raise_exc)
+	browser.get_page_html = AsyncMock(return_value=html)
+	if execute_js_exc is not None:
+		browser.execute_js = AsyncMock(side_effect=execute_js_exc)
 	else:
-		browser.execute_js = AsyncMock(return_value=inner_text)
+		browser.execute_js = AsyncMock(
+			return_value=execute_js_return if execute_js_return is not None
+			else "<html><body><p>fallback html</p></body></html>"
+		)
 	return browser
 
 
@@ -56,8 +70,8 @@ class TestActionExtract:
 	async def test_freetext_path_no_schema(self):
 		"""No schema → extract called with output_schema=None, result echoed."""
 		llm = _make_mock_extract_llm(extract_return="the summary")
-		browser = _make_mock_browser(inner_text="page body")
-		result = await _make_tools(llm=llm, schema=None).execute("extract", {"goal": "summarize"}, browser)
+		browser = _make_mock_browser()
+		result = await _make_tools(llm=llm, schema=None).execute("extract", {"query": "summarize"}, browser)
 		assert result.error is None
 		assert result.extracted_content == "the summary"
 		llm.extract.assert_awaited_once()
@@ -67,69 +81,176 @@ class TestActionExtract:
 	async def test_structured_path_with_schema(self):
 		"""Schema injected → extract receives it; result echoed verbatim."""
 		llm = _make_mock_extract_llm(extract_return='{"title": "X"}')
-		browser = _make_mock_browser(inner_text="page body")
+		browser = _make_mock_browser()
 		tools = _make_tools(llm=llm, schema=_SCHEMA)
-		result = await tools.execute("extract", {"goal": "get title"}, browser)
+		result = await tools.execute("extract", {"query": "get title"}, browser)
 		assert result.error is None
 		assert result.extracted_content == '{"title": "X"}'
 		assert llm.extract.call_args.kwargs["output_schema"] == _SCHEMA
 
 	@pytest.mark.asyncio
+	async def test_structured_small_result_returns_pure_json(self):
+		"""Schema + single chunk + small result → extracted_content is pure JSON (no hint, no save)."""
+		llm = _make_mock_extract_llm(extract_return='{"title": "X"}')
+		browser = _make_mock_browser()
+		result = await _make_tools(llm=llm, schema=_SCHEMA).execute("extract", {"query": "x"}, browser)
+		assert result.error is None
+		assert result.extracted_content == '{"title": "X"}'
+		assert result.long_term_memory is None
+
+	@pytest.mark.asyncio
 	async def test_empty_page_returns_placeholder(self):
-		"""Empty innerText → '(empty page)', extract never called."""
+		"""Empty HTML source (both get_page_html and fallback) → '(empty page)', extract never called."""
 		llm = _make_mock_extract_llm()
-		browser = _make_mock_browser(inner_text="")
-		result = await _make_tools(llm=llm).execute("extract", {"goal": "x"}, browser)
+		browser = _make_mock_browser(html="", execute_js_return="")
+		result = await _make_tools(llm=llm).execute("extract", {"query": "x"}, browser)
 		assert result.extracted_content == "(empty page)"
 		llm.extract.assert_not_called()
 
 	@pytest.mark.asyncio
-	async def test_execute_js_failure_warns_and_treats_empty(self, caplog):
-		"""execute_js raising → logger.warning + '(empty page)' (no longer silent)."""
+	async def test_both_html_sources_fail_warns_and_empty(self, caplog):
+		"""get_page_html empty + execute_js raises → logger.warning + '(empty page)'."""
 		llm = _make_mock_extract_llm()
-		browser = _make_mock_browser(raise_exc=RuntimeError("cdp down"))
+		browser = _make_mock_browser(html="", execute_js_exc=RuntimeError("cdp down"))
 		with caplog.at_level(logging.WARNING):
-			result = await _make_tools(llm=llm).execute("extract", {"goal": "x"}, browser)
+			result = await _make_tools(llm=llm).execute("extract", {"query": "x"}, browser)
 		assert result.extracted_content == "(empty page)"
-		assert "document.body.innerText failed" in caplog.text
+		assert "HTML source failed" in caplog.text
 		llm.extract.assert_not_called()
+
+	@pytest.mark.asyncio
+	async def test_cdp_empty_falls_back_to_execute_js(self):
+		"""get_page_html returns '' but execute_js returns HTML → extraction proceeds from fallback."""
+		llm = _make_mock_extract_llm(extract_return="ok")
+		browser = _make_mock_browser(html="", execute_js_return="<html><body><p>fallback content</p></body></html>")
+		result = await _make_tools(llm=llm).execute("extract", {"query": "x"}, browser)
+		assert result.error is None
+		assert result.extracted_content == "ok"
+		llm.extract.assert_awaited_once()
 
 	@pytest.mark.asyncio
 	async def test_llm_exception_returns_error(self):
 		"""extract raising → ActionResult(error=...), not bubbling to Tools.execute generic catch."""
 		llm = _make_mock_extract_llm(extract_side_effect=RuntimeError("llm boom"))
-		browser = _make_mock_browser(inner_text="page body")
-		result = await _make_tools(llm=llm).execute("extract", {"goal": "x"}, browser)
+		browser = _make_mock_browser()
+		result = await _make_tools(llm=llm).execute("extract", {"query": "x"}, browser)
 		assert result.error is not None
 		assert "Extract failed" in result.error
 		assert result.extracted_content is None
 
 	@pytest.mark.asyncio
-	async def test_no_llm_truncates_raw_text(self):
-		"""_extract_llm unset (fresh Tools / no Agent wiring) → degrade to truncated innerText."""
-		browser = _make_mock_browser(inner_text="0123456789" * 500)  # 5000 chars
-		tools = _make_tools(llm=None)  # mirrors a bare Tools() with no injection
-		# shrink the fallback cap so the truncation is observable
-		from tree_walker.config import TruncationSettings
+	async def test_inner_timeout_returns_error(self):
+		"""extract raising asyncio.TimeoutError → graded 'Extract timed out' error."""
+		llm = _make_mock_extract_llm(extract_side_effect=asyncio.TimeoutError())
+		browser = _make_mock_browser()
+		result = await _make_tools(llm=llm).execute("extract", {"query": "x"}, browser)
+		assert result.error is not None
+		assert "timed out" in result.error
+
+	@pytest.mark.asyncio
+	async def test_no_llm_truncates_markdown(self):
+		"""_extract_llm unset → degrade to truncated markdown snippet at the offset."""
+		browser = _make_mock_browser(html="<p>" + "z" * 200 + "</p>")
+		tools = _make_tools(llm=None)
 		tools._truncation = TruncationSettings(extract_fallback_max_chars=50)
-		result = await tools.execute("extract", {"goal": "x"}, browser)
+		result = await tools.execute("extract", {"query": "x"}, browser)
 		assert result.error is None
 		assert len(result.extracted_content) == 50
 
 	@pytest.mark.asyncio
-	async def test_goal_and_max_chars_passed_through(self):
-		"""goal + extract_page_max_chars are forwarded to llm.extract."""
+	async def test_query_and_chunk_budget_passed_through(self):
+		"""query (positional) + chunk budget (max_content_chars) forwarded to llm.extract."""
 		llm = _make_mock_extract_llm()
-		browser = _make_mock_browser(inner_text="page body")
-		await _make_tools(llm=llm).execute("extract", {"goal": "find prices"}, browser)
+		browser = _make_mock_browser()
+		await _make_tools(llm=llm).execute("extract", {"query": "find prices"}, browser)
 		args, kwargs = llm.extract.call_args
-		assert args[0] == "find prices"  # positional goal
-		assert kwargs["max_content_chars"] == tools_default_page_max()
+		assert args[0] == "find prices"  # positional query
+		assert kwargs["max_content_chars"] == tools_default_chunk_max()
+
+	@pytest.mark.asyncio
+	async def test_markdown_source_used_not_innertext(self):
+		"""get_page_html HTML → markdown fed to llm.extract (links preserved as markdown)."""
+		llm = _make_mock_extract_llm()
+		browser = _make_mock_browser(html='<html><body><p>Hello <a href="http://x.example">click</a></p></body></html>')
+		await _make_tools(llm=llm).execute("extract", {"query": "x"}, browser)
+		content = llm.extract.call_args.args[1]
+		assert "Hello" in content
+		assert "http://x.example" in content
+
+	@pytest.mark.asyncio
+	async def test_extract_links_false_strips_links(self):
+		"""extract_links=False → no URL in the markdown fed to llm.extract (text kept)."""
+		llm = _make_mock_extract_llm()
+		browser = _make_mock_browser(html='<html><body><p>Hi <a href="http://x.example">click</a></p></body></html>')
+		await _make_tools(llm=llm).execute("extract", {"query": "x", "extract_links": False}, browser)
+		content = llm.extract.call_args.args[1]
+		assert "http://x.example" not in content
+		assert "click" in content
+
+	@pytest.mark.asyncio
+	async def test_already_collected_threaded_to_llm(self):
+		"""already_collected param forwarded to llm.extract."""
+		llm = _make_mock_extract_llm()
+		browser = _make_mock_browser()
+		await _make_tools(llm=llm).execute("extract", {"query": "x", "already_collected": ["dup item"]}, browser)
+		assert llm.extract.call_args.kwargs["already_collected"] == ["dup item"]
+
+	@pytest.mark.asyncio
+	async def test_pagination_emits_offset_hint(self, tmp_path):
+		"""Page markdown > chunk budget → free-text result carries a start_from_char hint up front."""
+		llm = _make_mock_extract_llm(extract_return="chunk-summary")
+		browser = _make_mock_browser(html="<html><body><p>" + "word " * 30 + "</p></body></html>")
+		tools = _make_tools(llm=llm)
+		tools._truncation = TruncationSettings(
+			extract_chunk_max_chars=20, extract_save_threshold=10_000_000, extract_output_dir=str(tmp_path),
+		)
+		result = await tools.execute("extract", {"query": "x"}, browser)
+		# threshold huge → not saved → hint must be up front in extracted_content (free-text)
+		assert result.extracted_content.startswith("[chunk")
+		assert "start_from_char=" in result.extracted_content
+		assert "chunk-summary" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_structured_pagination_keeps_json_pure(self, tmp_path):
+		"""Schema + pagination + small result → extracted_content pure JSON; hint in long_term_memory."""
+		llm = _make_mock_extract_llm(extract_return='{"title": "X"}')
+		browser = _make_mock_browser(html="<html><body><p>" + "word " * 30 + "</p></body></html>")
+		tools = _make_tools(llm=llm, schema=_SCHEMA)
+		tools._truncation = TruncationSettings(
+			extract_chunk_max_chars=20, extract_save_threshold=10_000_000, extract_output_dir=str(tmp_path),
+		)
+		result = await tools.execute("extract", {"query": "x"}, browser)
+		assert result.extracted_content == '{"title": "X"}'  # pure JSON, no hint
+		assert result.long_term_memory is not None
+		assert "start_from_char=" in result.long_term_memory
+
+	@pytest.mark.asyncio
+	async def test_result_above_threshold_saved_to_file(self, tmp_path):
+		"""Single chunk, result >= threshold → saved to file; visible shows 'saved to'."""
+		big = '{"title": "' + "X" * 60 + '"}'
+		llm = _make_mock_extract_llm(extract_return=big)
+		browser = _make_mock_browser()
+		tools = _make_tools(llm=llm, schema=_SCHEMA)
+		tools._truncation = TruncationSettings(extract_save_threshold=10, extract_output_dir=str(tmp_path))
+		result = await tools.execute("extract", {"query": "x"}, browser)
+		assert "saved to" in result.extracted_content
+		assert result.long_term_memory is not None and "saved" in result.long_term_memory
+		written = list(tmp_path.glob("extract_*.json"))
+		assert len(written) == 1
+		assert written[0].read_text(encoding="utf-8") == big
+
+	@pytest.mark.asyncio
+	async def test_start_from_char_past_end(self):
+		"""start_from_char beyond the page → friendly 'no more content' result, extract not called."""
+		llm = _make_mock_extract_llm()
+		browser = _make_mock_browser()
+		result = await _make_tools(llm=llm).execute("extract", {"query": "x", "start_from_char": 9_999_999}, browser)
+		assert "no more content" in (result.extracted_content or "")
+		llm.extract.assert_not_called()
 
 
-def tools_default_page_max() -> int:
-	from tree_walker.config import TruncationSettings
-	return TruncationSettings().extract_page_max_chars
+def tools_default_chunk_max() -> int:
+	return TruncationSettings().extract_chunk_max_chars
 
 
 # ── Agent.__init__: wiring layer ──────────────────────────────────────
@@ -334,3 +455,65 @@ class TestExtractClient:
 		)):
 			with pytest.raises(RateLimitError):
 				await client.extract("q", "page")
+
+	@pytest.mark.asyncio
+	async def test_already_collected_threaded_into_prompt(self):
+		"""already_collected → appended to user message as a skip-list."""
+		client = _make_client()
+		response = MagicMock()
+		response.content = [_mock_text_block("ok")]
+		with patch.object(client.client.messages, "create", return_value=response) as m:
+			await client.extract("q", "page", already_collected=["item A", "item B"])
+		sent = m.call_args.kwargs["messages"][0]["content"]
+		assert "item A" in sent and "item B" in sent
+		assert "already collected" in sent.lower()
+
+	@pytest.mark.asyncio
+	async def test_no_already_collected_omits_block(self):
+		"""already_collected=None → no skip-list block in user message."""
+		client = _make_client()
+		response = MagicMock()
+		response.content = [_mock_text_block("ok")]
+		with patch.object(client.client.messages, "create", return_value=response) as m:
+			await client.extract("q", "page")
+		sent = m.call_args.kwargs["messages"][0]["content"]
+		assert "already collected" not in sent.lower()
+
+	@pytest.mark.asyncio
+	async def test_call_timeout_raises_timeouterror(self):
+		"""call_timeout set + slow (sync) create → asyncio.TimeoutError propagates (not swallowed).
+
+		messages.create is a blocking sync call; the timeout path runs it via asyncio.to_thread.
+		"""
+		import time
+		client = _make_client()
+
+		def slow(*a, **k):
+			time.sleep(0.3)  # sync blocking; runs in a worker thread under to_thread
+			return MagicMock()
+
+		with patch.object(client.client.messages, "create", side_effect=slow):
+			with pytest.raises(asyncio.TimeoutError):
+				await client.extract("q", "page", call_timeout=0.01)
+
+	@pytest.mark.asyncio
+	async def test_fallback_forwards_already_collected(self):
+		"""RateLimit → switch to fallback + retry; retried call must carry already_collected."""
+		client = _make_client(fallback=True)
+		response = MagicMock()
+		response.content = [_mock_tool_use_block("extract_result", {"title": "X"})]
+		seen = []
+
+		def side_effect(*a, **k):
+			seen.append(k)
+			if len(seen) == 1:
+				raise RateLimitError(message="rl", response=MagicMock(status_code=429), body=None)
+			return response
+
+		with patch.object(client.client.messages, "create", side_effect=side_effect), \
+				patch.object(client._fallback_client.messages, "create", side_effect=side_effect):
+			await client.extract("q", "page", output_schema=_SCHEMA, already_collected=["dup"])
+		assert client._using_fallback is True
+		assert len(seen) == 2
+		# the retried (fallback) call's user message carries the dedupe list
+		assert "dup" in seen[1]["messages"][0]["content"]
