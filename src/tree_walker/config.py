@@ -54,6 +54,8 @@ class TruncationSettings:
     dom_excerpt_max_chars: int = 2000        # DOM excerpt persisted per step for Judge review
     search_page_save_threshold: int = 10000  # search_page result >= this → write to file (mirrors extract)
     search_page_output_dir: str = "search_page_output"  # dir for oversized match lists (env-config)
+    find_elements_save_threshold: int = 10000  # find_elements result >= this → write to file (mirrors search_page)
+    find_elements_output_dir: str = "find_elements_output"  # dir for oversized element lists (env-config)
 
 
 @dataclass

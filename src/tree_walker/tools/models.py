@@ -14,12 +14,30 @@ class NavigateParams(BaseModel):
 
 class ClickParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    index: int = Field(description="ID of the element to click, shown in brackets in the DOM tree")
+    index: int | None = Field(
+        default=None,
+        description="ID of the element to click, shown in brackets in the DOM tree. "
+        "Provide exactly one of index / element_id.",
+    )
+    element_id: int | None = Field(
+        default=None,
+        description="Stable backend node id from find_elements(return_node_ids=True); an alternative "
+        "to index (same resolution path). Provide exactly one of index / element_id.",
+    )
 
 
 class InputTextParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    index: int = Field(description="ID of the element to type into, shown in brackets in the DOM tree")
+    index: int | None = Field(
+        default=None,
+        description="ID of the element to type into, shown in brackets in the DOM tree. "
+        "Provide exactly one of index / element_id.",
+    )
+    element_id: int | None = Field(
+        default=None,
+        description="Stable backend node id from find_elements(return_node_ids=True); an alternative "
+        "to index (same resolution path). Provide exactly one of index / element_id.",
+    )
     text: str = Field(description="Text to type into the element")
     clear: bool = Field(default=True, description="Whether to clear existing text first")
 
@@ -141,7 +159,27 @@ class FindElementsParams(BaseModel):
         default=50, ge=1, le=200,
         description="Maximum elements to return (total count is always reported even when truncated).",
     )
+    offset: int = Field(
+        default=0, ge=0,
+        description="0-based index of the first element to return (for paginating large result sets; "
+        "total is always the full count across all roots including shadow DOM / same-origin iframes).",
+    )
     include_text: bool = Field(default=True, description="Include text content of each element")
+    first_only: bool = Field(
+        default=False,
+        description="Return only the first matching element; total still reports the full count so you know there are more.",
+    )
+    include_geometry: bool = Field(
+        default=False,
+        description="Add per-element getBoundingClientRect() {x,y,w,h} and a stable visibility flag "
+        "(checks ancestor display/visibility/opacity + non-zero size). Default off to avoid overhead.",
+    )
+    return_node_ids: bool = Field(
+        default=False,
+        description="Return stable backend node ids usable directly as click/input_text `index` "
+        "(uses DOM.performSearch — heavier, one CDP round-trip per element; no text). "
+        "Offset applies to the document-order match list.",
+    )
 
 
 class FindTextParams(BaseModel):
@@ -324,10 +362,16 @@ ACTION_DEFINITIONS: dict[str, tuple[type[BaseModel], str, bool]] = {
         "Navigate to a URL in the current tab, or open it in a new tab with new_tab=True",
         True,
     ),
-    "click": (ClickParams, "Click an element by its ID from the DOM state", False),
+    "click": (
+        ClickParams,
+        "Click an element by its ID from the DOM state. Use index (from the DOM tree) "
+        "or element_id (a backend node id from find_elements with return_node_ids=True).",
+        False,
+    ),
     "input_text": (
         InputTextParams,
-        "Type text into an input element identified by ID",
+        "Type text into an input element identified by index (from the DOM tree) or "
+        "element_id (a backend node id from find_elements with return_node_ids=True).",
         False,
     ),
     "scroll": (ScrollParams, "Scroll the page up or down by a number of increments", False),

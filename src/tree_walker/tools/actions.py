@@ -113,15 +113,19 @@ def _format_search_results(data: dict, query: str) -> str:
 
 
 def _format_find_results(data: dict, selector: str) -> str:
-    """Format find_elements {elements, total, showing} as LLM-readable text.
+    """Format find_elements {elements, total, showing, offset, has_more} as
+    LLM-readable text.
 
-    Mirrors browser-use ``_format_find_results`` (``service.py:363-401``).
-    Caller guarantees total > 0 (the total==0 soft-miss path is handled in
-    _action_find_elements).
+    Mirrors browser-use ``_format_find_results`` (``service.py:363-401``), with
+    Phase 2 additions: per-element origin tag (shadow DOM / iframe), optional
+    geometry+visibility, and an offset-aware pagination footer (mirrors
+    ``_format_search_results``). Caller guarantees total > 0 (the total==0
+    soft-miss path is handled in _action_find_elements).
     """
     elements = data.get("elements", [])
     total = data.get("total", 0)
-    showing = data.get("showing", 0)
+    offset = data.get("offset", 0)
+    has_more = data.get("has_more", False)
 
     lines = [f'Found {total} element{"s" if total != 1 else ""} matching "{selector}":', ""]
     for el in elements:
@@ -130,6 +134,8 @@ def _format_find_results(data: dict, selector: str) -> str:
         text = el.get("text", "")
         attrs = el.get("attrs", {})
         children = el.get("children_count", 0)
+        origin = el.get("origin", "")
+        rect = el.get("rect")
 
         parts = [f"[{idx}] <{tag}>"]
         if text:
@@ -141,11 +147,46 @@ def _format_find_results(data: dict, selector: str) -> str:
             attr_strs = [f'{k}="{v}"' for k, v in attrs.items()]
             parts.append("{" + ", ".join(attr_strs) + "}")
         parts.append(f"({children} children)")
+        if rect:
+            vis = "visible" if el.get("visible") else "hidden"
+            parts.append(f"({vis}, {int(rect['w'])}x{int(rect['h'])}@{int(rect['x'])},{int(rect['y'])})")
+        if origin:
+            parts.append(origin.strip())          # ' (in shadow DOM)' → 'in shadow DOM'
         lines.append(" ".join(parts))
 
-    if showing < total:
+    if has_more:
+        next_offset = offset + len(elements)
         lines.append(
-            f"\nShowing {showing} of {total} total elements. Increase max_results to see more."
+            f"\n... showing {offset + 1}–{offset + len(elements)} of {total} total elements. "
+            f"Call again with offset={next_offset} for the next batch (or raise max_results)."
+        )
+    return "\n".join(lines)
+
+
+def _format_node_id_results(data: dict, selector: str) -> str:
+    """Format find_elements_node_ids {node_ids, total, showing, offset, has_more}
+    as LLM-readable text.
+
+    Each ``backend_id`` is a backendNodeId usable directly as the
+    ``index``/``element_id`` of click/input_text (index===backend_id in this
+    system). Caller guarantees total > 0 (the total==0 soft-miss path is
+    handled in _action_find_elements).
+    """
+    node_ids = data.get("node_ids", [])
+    total = data.get("total", 0)
+    offset = data.get("offset", 0)
+    has_more = data.get("has_more", False)
+
+    lines = [f'Found {total} element{"s" if total != 1 else ""} matching "{selector}" (node ids):', ""]
+    for el in node_ids:
+        bid = el.get("backend_id")
+        tag = el.get("tag", "?")
+        lines.append(f"[{bid}] <{tag}>  (pass as index= or element_id= to click/input_text)")
+    if has_more:
+        next_offset = offset + len(node_ids)
+        lines.append(
+            f"\n... showing {offset + 1}–{offset + len(node_ids)} of {total} total elements. "
+            f"Call again with offset={next_offset} for the next batch."
         )
     return "\n".join(lines)
 
@@ -413,6 +454,17 @@ class Tools:
         return ActionResult(error=f"Navigation failed: {error_msg}")
 
     async def _action_click(self, params: dict, browser: BrowserSession) -> ActionResult:
+        # 0. element_id is an alias for index (a backend node id from
+        # find_elements(return_node_ids=True); index===backend_id in this
+        # system, so both resolve through selector_map). Exactly one required —
+        # the registry does not validate the execute path, so guard here.
+        index = params.get("index")
+        element_id = params.get("element_id")
+        if (index is None) == (element_id is None):
+            return ActionResult(
+                error="click requires exactly one of `index` or `element_id`.",
+            )
+        params = {**params, "index": index if index is not None else element_id}
         # 1. 元素查找（保持原逻辑）
         entry, error = await self._get_element_by_index(params["index"], browser)
         if error:
@@ -694,6 +746,16 @@ class Tools:
         return False, False
 
     async def _action_input_text(self, params: dict, browser: BrowserSession) -> ActionResult:
+        # element_id is an alias for index (a backend node id from
+        # find_elements(return_node_ids=True)). Exactly one required — guard
+        # here since the registry does not validate the execute path.
+        index = params.get("index")
+        element_id = params.get("element_id")
+        if (index is None) == (element_id is None):
+            return ActionResult(
+                error="input_text requires exactly one of `index` or `element_id`.",
+            )
+        params = {**params, "index": index if index is not None else element_id}
         entry, error = await self._get_element_by_index(params["index"], browser)
         if error:
             return error
@@ -1018,16 +1080,29 @@ class Tools:
 
     async def _action_find_elements(self, params: dict, browser: BrowserSession) -> ActionResult:
         selector = params["selector"]
-        attributes = params.get("attributes")
         max_results = params.get("max_results", 50)
-        include_text = params.get("include_text", True)
+        offset = params.get("offset", 0)
+        return_node_ids = params.get("return_node_ids", False)
         try:
-            data = await browser.find_elements(
-                selector,
-                attributes=attributes,
-                max_results=max_results,
-                include_text=include_text,
-            )
+            if return_node_ids:
+                # Phase 2 (item ②): resolve to stable backendNodeIds via
+                # DOM.performSearch so results can feed click/input_text
+                # directly (index===backend_id). Heavier; no text returned.
+                data = await browser.find_elements_node_ids(
+                    selector, max_results=max_results, offset=offset,
+                )
+                formatter = _format_node_id_results
+            else:
+                data = await browser.find_elements(
+                    selector,
+                    attributes=params.get("attributes"),
+                    max_results=max_results,
+                    offset=offset,
+                    include_text=params.get("include_text", True),
+                    first_only=params.get("first_only", False),
+                    include_geometry=params.get("include_geometry", False),
+                )
+                formatter = _format_find_results
         except Exception as e:
             # CDP layer failure (connection drop / invalid selector surfaced as
             # {error} -> RuntimeError) = tool execution failure; surface a
@@ -1043,10 +1118,30 @@ class Tools:
             msg = f'No elements found matching "{selector}"'
             logger.info(msg)
             return ActionResult(extracted_content=msg, long_term_memory=msg)
-        formatted = _format_find_results(data, selector)
-        memory = f'Found {total} element{"s" if total != 1 else ""} matching "{selector}".'
+        formatted = formatter(data, selector)
+        # 大结果分级落盘（镜像 _action_search_page / _action_extract；OSError 不失败只 warning）
+        tr = self._truncation
+        saved_to = None
+        if len(formatted) >= tr.find_elements_save_threshold:
+            try:
+                os.makedirs(tr.find_elements_output_dir, exist_ok=True)
+                fpath = os.path.join(tr.find_elements_output_dir, f"find_elements_{int(time.time() * 1000)}.txt")
+                with open(fpath, "w", encoding="utf-8", newline="") as f:
+                    f.write(formatted)
+                saved_to = fpath
+            except OSError as e:
+                logger.warning("find_elements: save to file failed: %s", e)
+        if saved_to:
+            visible = (f"Find results ({len(formatted)} chars) saved to {saved_to}. "
+                       f"Preview: {formatted[:200]}...").strip()
+        else:
+            visible = formatted
+        nid_suffix = " (node ids)" if return_node_ids else ""
+        memory = f'Found {total} element{"s" if total != 1 else ""} matching "{selector}"{nid_suffix}.'
+        if saved_to:
+            memory += f" Results saved: {saved_to}"
         logger.info(memory)
-        return ActionResult(extracted_content=formatted, long_term_memory=memory)
+        return ActionResult(extracted_content=visible, long_term_memory=memory)
 
     async def _action_find_text(self, params: dict, browser: BrowserSession) -> ActionResult:
         text = params["text"]

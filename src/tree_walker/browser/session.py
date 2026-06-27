@@ -279,45 +279,107 @@ def _build_search_page_js(
 # references SELECTOR/ATTRIBUTES/MAX_RESULTS/INCLUDE_TEXT by name. Stored
 # raw so JS backslashes survive verbatim.
 _FIND_ELEMENTS_JS_BODY = r"""
-    try {
-        var elements;
+    function _origin(node) {
+        // 标记非顶层文档来源：ShadowRoot(nodeType=11) → shadow DOM；其它(getRootNode≠document) → iframe
         try {
-            elements = document.querySelectorAll(SELECTOR);
+            var r = node.getRootNode ? node.getRootNode() : null;
+            if (r && r !== document) {
+                return r.nodeType === 11 ? ' (in shadow DOM)' : ' (in iframe)';
+            }
+        } catch (_) {}
+        return '';
+    }
+    function _collectAll(root, out) {
+        // 穿透：开放 shadow root + 同源 iframe contentDocument
+        // （TreeWalker 不跨 shadow / 文档边界，需手动递归；镜像 _SEARCH_PAGE_JS_BODY._collectText）
+        var we = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+        var el;
+        while ((el = we.nextNode())) {
+            out.push(el);
+            if (el.shadowRoot) {
+                try { _collectAll(el.shadowRoot, out); } catch (_) {}      // closed shadow: shadowRoot=null，自然跳过
+            }
+            if (el.tagName === 'IFRAME') {
+                try {
+                    var cd = el.contentDocument;                           // 同源可读；跨源抛 SecurityError → catch 跳过
+                    if (cd && cd.body) _collectAll(cd.body, out);
+                } catch (_) {}
+            }
+        }
+    }
+    function _isVisible(el) {
+        // 可信可见性：祖先链 display/visibility/opacity + 自身非零尺寸
+        // （修复阶段一 offsetParent !== null 的浅检测）
+        var node = el;
+        while (node && node.nodeType === 1) {
+            var cs = document.defaultView.getComputedStyle(node);
+            if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') {
+                return false;
+            }
+            node = node.parentElement;
+        }
+        var r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+    }
+    try {
+        try {
+            // 选择器合法性先校验一次（invalid selector 会让下面的 matches() 抛 SyntaxError）
+            document.querySelector(SELECTOR);
         } catch (e) {
             return {error: 'Invalid CSS selector: ' + (e && e.message ? e.message : e), elements: [], total: 0};
         }
-        var total = elements.length;
-        var limit = Math.min(total, MAX_RESULTS);
+        // 收集顶层文档 + 所有开放 shadow / 同源 iframe 内的元素
+        var all = [];
+        _collectAll(document.documentElement, all);
+        var total = 0;
+        var limit = FIRST_ONLY ? 1 : MAX_RESULTS;
         var results = [];
-        for (var i = 0; i < limit; i++) {
-            var el = elements[i];
-            var item = {index: i, tag: el.tagName.toLowerCase()};
-            if (INCLUDE_TEXT) {
-                var text = (el.textContent || '').trim();
-                item.text = text.length > 300 ? text.slice(0, 300) + '...' : text;
-            }
-            if (ATTRIBUTES && ATTRIBUTES.length > 0) {
-                item.attrs = {};
-                for (var j = 0; j < ATTRIBUTES.length; j++) {
-                    var attrName = ATTRIBUTES[j];
-                    var val;
-                    // src/href: use the resolved DOM property (absolute URL),
-                    // not getAttribute (raw authored value, often relative).
-                    if ((attrName === 'src' || attrName === 'href')
-                        && typeof el[attrName] === 'string' && el[attrName] !== '') {
-                        val = el[attrName];
-                    } else {
-                        val = el.getAttribute(attrName);
+        for (var k = 0; k < all.length; k++) {
+            if (all[k].matches(SELECTOR)) {
+                // offset 窗口：累计全部 total，只存 [OFFSET, OFFSET+limit) 区间（保持 early-bail 性能）
+                if (total >= OFFSET && results.length < limit) {
+                    var el = all[k];
+                    var item = {index: total, tag: el.tagName.toLowerCase(), origin: _origin(el)};
+                    if (INCLUDE_TEXT) {
+                        var text = (el.textContent || '').trim();
+                        item.text = text.length > 300 ? text.slice(0, 300) + '...' : text;
                     }
-                    if (val !== null) {
-                        item.attrs[attrName] = val.length > 500 ? val.slice(0, 500) + '...' : val;
+                    if (ATTRIBUTES && ATTRIBUTES.length > 0) {
+                        item.attrs = {};
+                        for (var j = 0; j < ATTRIBUTES.length; j++) {
+                            var attrName = ATTRIBUTES[j];
+                            var val;
+                            // src/href: use the resolved DOM property (absolute URL),
+                            // not getAttribute (raw authored value, often relative).
+                            if ((attrName === 'src' || attrName === 'href')
+                                && typeof el[attrName] === 'string' && el[attrName] !== '') {
+                                val = el[attrName];
+                            } else {
+                                val = el.getAttribute(attrName);
+                            }
+                            if (val !== null) {
+                                item.attrs[attrName] = val.length > 500 ? val.slice(0, 500) + '...' : val;
+                            }
+                        }
                     }
+                    item.children_count = el.children.length;
+                    if (INCLUDE_GEOMETRY) {
+                        var rect = el.getBoundingClientRect();
+                        item.rect = {x: rect.left, y: rect.top, w: rect.width, h: rect.height};
+                        item.visible = _isVisible(el);
+                    }
+                    results.push(item);
                 }
+                total++;
             }
-            item.children_count = el.children.length;
-            results.push(item);
         }
-        return {elements: results, total: total, showing: limit};
+        return {
+            elements: results,
+            total: total,
+            showing: results.length,
+            offset: OFFSET,
+            has_more: (OFFSET + results.length) < total
+        };
     } catch (e) {
         return {error: 'find_elements error: ' + (e && e.message ? e.message : e), elements: [], total: 0};
     }
@@ -329,6 +391,9 @@ def _build_find_elements_js(
     attributes: list[str] | None,
     max_results: int,
     include_text: bool,
+    first_only: bool,
+    offset: int,
+    include_geometry: bool,
 ) -> str:
     """Build the find_elements IIFE expression.
 
@@ -342,7 +407,10 @@ def _build_find_elements_js(
         f"var SELECTOR = {json.dumps(selector)};\n"
         f"var ATTRIBUTES = {json.dumps(attributes)};\n"
         f"var MAX_RESULTS = {json.dumps(max_results)};\n"
+        f"var OFFSET = {json.dumps(offset)};\n"
         f"var INCLUDE_TEXT = {json.dumps(include_text)};\n"
+        f"var FIRST_ONLY = {json.dumps(first_only)};\n"
+        f"var INCLUDE_GEOMETRY = {json.dumps(include_geometry)};\n"
     )
     return "(function() {\n" + params_js + _FIND_ELEMENTS_JS_BODY + "\n})()"
 
@@ -2888,32 +2956,104 @@ class BrowserSession:
         *,
         attributes: list[str] | None = None,
         max_results: int = 50,
+        offset: int = 0,
         include_text: bool = True,
+        first_only: bool = False,
+        include_geometry: bool = False,
     ) -> dict:
         """Query DOM elements by CSS selector via a single Runtime.evaluate.
 
-        Mirrors browser-use ``find_elements`` (``service.py:1297-1330`` + JS
-        body ``:257-298``): ``document.querySelectorAll`` + per-element
-        extraction (tag, text, attributes, children_count), returning
-        ``{elements, total, showing}``. ``src``/``href`` resolve to absolute
-        URLs.
+        Builds on browser-use ``find_elements`` (``service.py:1297-1330`` + JS
+        body ``:257-298``) and extends it (Phase 2): per-element extraction
+        (tag, text, attributes, children_count, optional geometry+visible),
+        piercing **open shadow roots** and **same-origin iframes** (closed
+        shadow roots and cross-origin iframes are skipped — ``shadowRoot`` is
+        null / ``contentDocument`` raises). ``src``/``href`` resolve to absolute
+        URLs. Returns ``{elements, total, showing, offset, has_more}``; the
+        ``offset`` window paginates the document-order match list and ``total``
+        is the full count across all pierced roots.
 
         Raises ``RuntimeError`` on a JS exception (via ``execute_js``), on a
         null return, or when the JS layer reports ``{error: ...}`` (invalid
         CSS selector) — the action layer maps these to a hard
         ``ActionResult(error=...)``. A clean miss returns ``total=0`` and
         never raises; the action layer builds the soft echo.
-
-        Limitations (same as browser-use): top-document elements only; does
-        not pierce shadow DOM or traverse into iframes.
         """
-        js = _build_find_elements_js(selector, attributes, max_results, include_text)
+        js = _build_find_elements_js(
+            selector, attributes, max_results, include_text, first_only, offset, include_geometry,
+        )
         data = await self.execute_js(js)  # returnByValue=True -> dict; RuntimeError on exceptionDetails
         if data is None:
             raise RuntimeError("find_elements returned no result")
         if isinstance(data, dict) and data.get("error"):
             raise RuntimeError(f"find_elements: {data['error']}")
         return data
+
+    async def find_elements_node_ids(
+        self,
+        selector: str,
+        *,
+        max_results: int = 50,
+        offset: int = 0,
+        include_user_agent_shadow: bool = True,
+    ) -> dict:
+        """Resolve CSS-selected elements to stable backendNodeIds via DOM.performSearch.
+
+        Reuses the find_text chain (``DOM.performSearch`` → ``getSearchResults``
+        → ``describeNode`` → ``backendNodeId``; session.py find_text). CDP's
+        ``performSearch`` accepts a CSS selector directly as ``query`` (same as
+        XPath), so ``selector`` needs no conversion. Returns
+        ``{node_ids, total, showing, offset, has_more}`` where each entry is
+        ``{backend_id, tag}`` and ``backend_id`` is a backendNodeId usable
+        directly as the ``index``/``element_id`` of click/input_text
+        (index===backend_id in this system; interactive elements are in
+        selector_map).
+
+        Heavier than find_elements (one describeNode round-trip per element);
+        use only when stable ids are needed for subsequent interaction. No text
+        is returned — pair with find_elements (without return_node_ids) for
+        text/attributes. ``includeUserAgentShadowDOM`` mirrors find_text.
+        """
+        sid = self.current_session_id
+        search = await self.client.send.DOM.performSearch(
+            {"query": selector, "includeUserAgentShadowDOM": include_user_agent_shadow},
+            session_id=sid,
+        )
+        search_id = search.get("searchId")
+        total = search.get("resultCount", 0)
+        try:
+            if total <= 0:
+                return {"node_ids": [], "total": 0, "showing": 0, "offset": offset, "has_more": False}
+            to_index = min(total, offset + max_results)
+            results = await self.client.send.DOM.getSearchResults(
+                {"searchId": search_id, "fromIndex": offset, "toIndex": to_index},
+                session_id=sid,
+            )
+            node_ids = results.get("nodeIds", [])
+            out: list[dict] = []
+            for nid in node_ids:
+                desc = await self.client.send.DOM.describeNode({"nodeId": nid}, session_id=sid)
+                node = desc.get("node", {}) or {}
+                bid = node.get("backendNodeId")
+                if bid is None:
+                    continue
+                tag = (node.get("nodeName") or node.get("localName") or "?").lower()
+                out.append({"backend_id": bid, "tag": tag})
+            return {
+                "node_ids": out,
+                "total": total,
+                "showing": len(out),
+                "offset": offset,
+                "has_more": (offset + len(out)) < total,
+            }
+        finally:
+            if search_id is not None:
+                try:
+                    await self.client.send.DOM.discardSearchResults(
+                        {"searchId": search_id}, session_id=sid,
+                    )
+                except Exception:
+                    pass
 
     async def fetch_select_options(self, backend_node_id: int) -> list[dict]:
         """Read all options of the <select> identified by backendNodeId.
