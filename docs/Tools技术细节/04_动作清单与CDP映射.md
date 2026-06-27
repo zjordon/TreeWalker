@@ -745,7 +745,9 @@
 
   | 字段 | 类型 | 描述 |
   |---|---|---|
-  | `path` | `str` | Path to a local UTF-8 text file to read |
+  | `path` | `str` | Path to a local text file to read（UTF-8 by default; see encoding） |
+  | `encoding` | `str \| None` | Text encoding to decode with（默认 `None`→UTF-8；设 `latin-1`/`cp936` 读遗留文件） |
+  | `newline` | `str \| None` | Python `open()` newline 模式（默认 `""` 不翻译、保留 `\r\n`；`None` 启用 universal-newline 把 `\r\n` 压成 `\n`） |
 
 - **主要逻辑**（[actions.py:1277-1323](../../src/tree_walker/tools/actions.py)）：
 
@@ -796,7 +798,7 @@
 
 - **CDP 调用清单**：无（纯本地 fs）
 
-- **注意事项**：仅支持 UTF-8 文本（图片/PDF/DOCX 等富文档、`offset`/`limit` 分页、`encoding` 参数均留阶段二）；`newline=""` 行尾字节保真；字节数用 `len(content.encode("utf-8"))`（CJK 准确，与 `os.path.getsize` 一致）；`read_file_max_chars` 默认 5000，env `AGENT_TRUNCATE_READ_FILE` 可覆盖。
+- **注意事项**：`encoding` 参数（默认 `None`→UTF-8）支持 latin-1/cp936 等遗留编码；`newline` 参数（默认 `""` 不翻译、保留 `\r\n`；`None` 启用 universal-newline）控制行尾翻译；非法编码名 → `ActionResult(error="Unknown encoding ...")`（`LookupError` 兜底）；decode 失败文案 `Failed to decode {path} as {enc}`（反映真实编码）；字节数用 `len(content.encode(enc))`（CJK 准确，与 `os.path.getsize` 一致）；`read_file_max_chars` 默认 5000，env `AGENT_TRUNCATE_READ_FILE` 可覆盖。图片/PDF/DOCX 等富文档、`offset`/`limit` 分页仍不支持。阶段二详见 `docs/tools-optimize/write_file_follow_up.md` 2.B/2.D。
 
 ---
 
@@ -811,6 +813,8 @@
   | `path` | `str` | Path to an existing local file to edit in place |
   | `old` | `str` (`min_length=1`) | Exact text to find（字面量子串，非正则；大小写敏感；非空） |
   | `new` | `str` | Replacement text（可为空以删除匹配） |
+  | `encoding` | `str \| None` | Text encoding to read/write with（默认 `None`→UTF-8；设 `latin-1`/`cp936` 处理遗留文件） |
+  | `newline` | `str \| None` | Python `open()` newline 模式（默认 `""` 不翻译、行尾字节保真） |
 
 - **主要逻辑**（[actions.py:1286-1329](../../src/tree_walker/tools/actions.py)）：
 
@@ -861,7 +865,7 @@
 
 - **CDP 调用清单**：无（纯本地 fs）
 
-- **注意事项**：全局替换所有非重叠匹配；大小写敏感；纯字面量（非正则）；`old` 非空（schema `min_length=1` + handler 运行时守卫双层）；不保留备份；非原子操作（写到一半异常会损坏文件，阶段二再修）。
+- **注意事项**：全局替换所有非重叠匹配；大小写敏感；纯字面量（非正则）；`old` 非空（schema `min_length=1` + handler 运行时守卫双层）；不保留备份；**原子写**（阶段二）：写 `path+".tmp"` 再 `os.replace(tmp, path)`，进程崩溃不留半个文件、失败清残留 tmp；`encoding`/`newline` 参数（默认 UTF-8 / `""`）；非法编码名 → `Unknown encoding ...`（`LookupError` 兜底）；decode 失败文案 `Failed to decode {path} as {enc}`；写路径受 `allowed_write_paths` 白名单约束（镜像 `allowed_upload_paths`，越界 → `File path not in allowed write paths`）。阶段二详见 `docs/tools-optimize/write_file_follow_up.md` 2.A/2.B/2.C/2.D。
 
 ---
 
@@ -1453,6 +1457,8 @@
   | `append` | `bool` | `False` | True 追加到既有文件末尾（文件不存在则自动创建）；默认 False 整体覆盖 |
   | `trailing_newline` | `bool` | `True` | True（默认）确保内容以恰好一个换行结尾（已有则不变） |
   | `leading_newline` | `bool` | `False` | True 在内容前补一个换行（追加到缺尾换行的文件时分隔新旧内容） |
+  | `encoding` | `str \| None` | `None` | Text encoding to write with（默认 `None`→UTF-8；设 `latin-1`/`cp936` 写遗留文件；回显字节数随之） |
+  | `newline` | `str \| None` | `""` | Python `open()` newline 模式（默认 `""` 不翻译、`\n`/`\r\n` 原样；`"\r\n"` 强制 CRLF；`None` 翻译为 OS 原生行尾）。与 `trailing_newline`/`leading_newline`（内容层补 `\n`）正交 |
 
 - **主要逻辑**（[actions.py:1243-1275](../../src/tree_walker/tools/actions.py)）：action 层做换行簿记 → `OSError` 分级捕获 → 字节数回显。无 session 封装（纯本地文件操作，不涉及 CDP）。
 
@@ -1492,8 +1498,11 @@
   - **`trailing_newline` 守卫式**：`not content.endswith("\n")`，幂等不双换行；CRLF（`"foo\r\n".endswith("\n")` 为 True）天然不被破坏。与 browser-use 无条件 `content += '\n'` 不同。
   - **`newline=""` 写盘**：关闭 Windows `\n→\r\n` 翻译，跨平台一致 LF 行尾，且回显字节数（`len(content.encode("utf-8"))`，换行簿记**之后**计算）== 磁盘真实大小。
   - 成功回显 `Wrote|Appended N bytes to {path}`，同时写 `extracted_content` + `long_term_memory`（对齐 navigate/click/find_elements/evaluate 主流约定）；`success` 保持 None（`ActionResult` 校验器拒绝非 done 的 `success=True`）。
-  - 自动创建父目录（`makedirs(exist_ok=True)`）；编码固定 UTF-8。
-  - 完整方案见 `docs/tools-optimize/write_file.md`；测试见 `tests/test_write_file.py`。
+  - 自动创建父目录（`makedirs(exist_ok=True)`）；编码默认 UTF-8，可经 `encoding` 参数覆盖（非默认时回显追加 `(encoding: <enc>)`）；非法编码名 → `Unknown encoding ...`（`LookupError` 兜底）。
+  - **原子写**（阶段二）：overwrite 写 `path+".tmp"` 再 `os.replace(tmp, path)`，崩溃不留半个文件、失败清残留 tmp；**append 保持 `open(path,"a")` 直接追加**（O(1)、非崩溃安全）。
+  - **`newline` 翻译控制**（阶段二）：默认 `""` 不翻译；`"\r\n"` 强制 CRLF；`None` 翻译为 OS 原生行尾。与 `trailing_newline`/`leading_newline`（内容层）正交。
+  - **`allowed_write_paths` 白名单**（阶段二）：`Tools(allowed_write_paths=[...])` / env `AGENT_ALLOWED_WRITE_PATHS` 约束写路径（前缀匹配，镜像 `allowed_upload_paths`），越界 → `File path not in allowed write paths`；`None` 全放行。
+  - 完整方案见 `docs/tools-optimize/write_file.md`（阶段一）与 `docs/tools-optimize/write_file_follow_up.md`（阶段二）；测试见 `tests/test_write_file.py`。
 
 ---
 

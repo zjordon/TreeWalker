@@ -199,7 +199,8 @@ class TestReadFileErrorMapping:
 			f.write("你好".encode("gbk"))
 		r = await _run({"path": str(p)})
 		assert r.error is not None
-		assert "UTF-8" in r.error
+		# 阶段二：decode 文案反映实际编码（默认 utf-8，小写）
+		assert "utf-8" in r.error.lower()
 
 	@pytest.mark.asyncio
 	async def test_error_has_no_extracted_content(self, tmp_path):
@@ -273,3 +274,67 @@ class TestReadFileParamsValidation:
 	def test_path_required(self):
 		with pytest.raises(ValidationError):
 			ReadFileParams()
+
+
+# ── 阶段二：encoding 参数 ──────────────────────────────────────────
+
+
+class TestReadFileEncoding:
+	@pytest.mark.asyncio
+	async def test_latin1_file_read(self, tmp_path):
+		p = tmp_path / "f.txt"
+		with open(p, "wb") as f:
+			f.write("café".encode("latin-1"))
+		r = await _run({"path": str(p), "encoding": "latin-1"})
+		assert r.error is None
+		assert r.extracted_content == "café"
+
+	@pytest.mark.asyncio
+	async def test_cp936_file_read(self, tmp_path):
+		p = tmp_path / "f.txt"
+		with open(p, "wb") as f:
+			f.write("你好".encode("cp936"))
+		r = await _run({"path": str(p), "encoding": "cp936"})
+		assert r.error is None
+		assert r.extracted_content == "你好"
+
+	@pytest.mark.asyncio
+	async def test_decode_error_mentions_encoding(self, tmp_path):
+		# 0x80/0xff are legal latin-1 but invalid utf-8 -> decode error names utf-8.
+		p = tmp_path / "f.txt"
+		with open(p, "wb") as f:
+			f.write(b"\x80\xff")
+		r = await _run({"path": str(p)})  # default utf-8
+		assert r.error is not None
+		assert "utf-8" in r.error.lower()
+
+	@pytest.mark.asyncio
+	async def test_unknown_encoding_returns_lookup_error(self, tmp_path):
+		p = tmp_path / "f.txt"
+		_seed(p, "abc")
+		r = await _run({"path": str(p), "encoding": "no-such-codec"})
+		assert r.error is not None
+		assert "Unknown encoding" in r.error
+
+
+# ── 阶段二：newline 翻译控制 ───────────────────────────────────────
+
+
+class TestReadFileNewlineMode:
+	@pytest.mark.asyncio
+	async def test_universal_newline_collapses_crlf(self, tmp_path):
+		# newline=None enables universal-newline translation: \r\n -> \n
+		p = tmp_path / "f.txt"
+		_seed(p, "a\r\nb")
+		r = await _run({"path": str(p), "newline": None})
+		assert r.error is None
+		assert r.extracted_content == "a\nb"
+
+	@pytest.mark.asyncio
+	async def test_default_newline_preserves_crlf(self, tmp_path):
+		# default newline="" keeps CRLF byte-for-byte (regression guard)
+		p = tmp_path / "f.txt"
+		_seed(p, "a\r\nb")
+		r = await _run({"path": str(p)})
+		assert r.error is None
+		assert r.extracted_content == "a\r\nb"

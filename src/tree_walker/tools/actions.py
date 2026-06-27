@@ -318,12 +318,13 @@ class Tools:
     The registry produces the Anthropic tool schema used by the LLM client.
     """
 
-    def __init__(self, truncation: TruncationSettings | None = None, allowed_upload_paths: list[str] | None = None) -> None:
+    def __init__(self, truncation: TruncationSettings | None = None, allowed_upload_paths: list[str] | None = None, allowed_write_paths: list[str] | None = None) -> None:
         self.registry = ActionRegistry()
         self._register_all()
         self._cached_browser_state: BrowserStateSummary | None = None
         self._truncation = truncation or TruncationSettings()
         self._allowed_upload_paths = allowed_upload_paths
+        self._allowed_write_paths = allowed_write_paths
 
     # ── Public API ─────────────────────────────────────────────────────
 
@@ -1550,6 +1551,15 @@ class Tools:
         append = params.get("append", False)
         trailing_newline = params.get("trailing_newline", True)
         leading_newline = params.get("leading_newline", False)
+        # 阶段二（二.B / 二.D）：编码与行尾翻译参数（默认复现阶段一行为）。
+        enc = params.get("encoding") or "utf-8"
+        newline = params.get("newline", "")
+
+        # 阶段二（二.C）：写路径白名单（镜像 allowed_upload_paths 前缀匹配）。
+        # None = 不启用、全放行；置于 makedirs/open 之前 fail fast，避免在 jail 外建目录/tmp。
+        allowed = self._allowed_write_paths
+        if allowed and not any(path.startswith(p) for p in allowed):
+            return ActionResult(error=f"File path not in allowed write paths: {path}")
 
         # 换行簿记在 action 层（对齐 browser-use service.py:1691-1694），但 trailing
         # 采用守卫式（幂等、不双换行、不破坏 CRLF —— "foo\r\n".endswith("\n") 为 True）。
@@ -1558,40 +1568,69 @@ class Tools:
         if trailing_newline and not content.endswith("\n"):
             content = content + "\n"
 
-        mode = "a" if append else "w"
+        # 阶段二（二.A）：overwrite 走原子写（tmp + os.replace，同目录→同卷原子），
+        # 进程崩溃不留半个文件；append 刻意保持 open(path,"a") 直接追加（O(1)，非崩溃安全）。
+        tmp = path + ".tmp"
         try:
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            # newline="" 关闭文本模式换行翻译：Windows 默认会把 \n 译成 \r\n，导致
-            # ① 写出的字节与下方 written 字节数不符；② 显式 \r\n 内容被破坏成 \r\r\n。
-            # LF 行尾跨平台一致，且与 save_as_pdf 二进制写、browser-use（Linux LF）对齐。
-            with open(path, mode, encoding="utf-8", newline="") as f:
-                f.write(content)
+            if append:
+                # newline= 关闭文本模式换行翻译（见 2.D）；append 非原子。
+                with open(path, "a", encoding=enc, newline=newline) as f:
+                    f.write(content)
+            else:
+                with open(tmp, "w", encoding=enc, newline=newline) as f:
+                    f.write(content)
+                os.replace(tmp, path)
+        except LookupError as e:
+            # 非法 encoding 名（非 OSError 子类）：单独兜底，避免冒泡到通用 catch。
+            # open() 可能已创建 tmp（overwrite）/path（append）残留，清理之。
+            if not append and os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            logger.warning("write_file(%r) unknown encoding %r: %s", path, enc, e)
+            return ActionResult(error=f"Unknown encoding {enc!r}: {e}")
         except OSError as e:
-            # 分级错误：磁盘/权限/路径异常 → 明确 error + warning（对齐 save_as_pdf:980-985），
-            # 不冒泡到 Tools.execute 的通用 catch（actions.py:260-262）。
+            # 仅 overwrite 路径会留下 tmp 残骸；清理之（吞二次 OSError）。分级错误（对齐
+            # save_as_pdf:980-985），不冒泡到 Tools.execute 通用 catch（actions.py:260-262）。
+            if not append and os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
             logger.warning("write_file(%r) failed: %s", path, e)
             return ActionResult(error=f"Failed to write file {path}: {e}")
 
-        written = len(content.encode("utf-8"))
+        written = len(content.encode(enc))
         action_word = "Appended" if append else "Wrote"
         memory = f"{action_word} {written} bytes to {path}"
+        if enc != "utf-8":
+            memory += f" (encoding: {enc})"
         logger.info(memory)
         return ActionResult(extracted_content=memory, long_term_memory=memory)
 
     async def _action_read_file(self, params: dict, browser: BrowserSession) -> ActionResult:
         path = params["path"]
+        # 阶段二（二.B / 二.D）：编码与行尾翻译参数（默认复现阶段一行为）。
+        enc = params.get("encoding") or "utf-8"
+        newline = params.get("newline", "")
         try:
             # newline="" 关闭 universal-newline 翻译（对齐 replace_file / write_file）：
             # 读时保留原始 \r\n，避免 CRLF 被压成 \n；行尾字节级不变，便于后续 replace_file
-            # 用含 \r\n 的 old 精确匹配。
-            with open(path, "r", encoding="utf-8", newline="") as f:
+            # 用含 \r\n 的 old 精确匹配。newline="\n"/None 则启用 universal-newline。
+            with open(path, "r", encoding=enc, newline=newline) as f:
                 content = f.read()
         except FileNotFoundError:
             return ActionResult(error=f"File not found: {path}")
         except UnicodeDecodeError as e:
-            # 读取侧特有（对齐 replace_file）：文件不是合法 UTF-8。
+            # 读取侧特有（对齐 replace_file）：文件不是合法 enc 编码。
             logger.warning("read_file(%r) decode failed: %s", path, e)
-            return ActionResult(error=f"Failed to decode {path} as UTF-8: {e}")
+            return ActionResult(error=f"Failed to decode {path} as {enc}: {e}")
+        except LookupError as e:
+            # 非法 encoding 名（非 OSError 子类）：单独兜底。
+            logger.warning("read_file(%r) unknown encoding %r: %s", path, enc, e)
+            return ActionResult(error=f"Unknown encoding {enc!r}: {e}")
         except OSError as e:
             # 分级错误（对齐 replace_file）：path 指向目录(IsADirectoryError/
             # PermissionError)、磁盘/只读/锁定 → 明确 error + warning，不冒泡到
@@ -1600,7 +1639,7 @@ class Tools:
             return ActionResult(error=f"Failed to read file {path}: {e}")
 
         total_chars = len(content)
-        total_bytes = len(content.encode("utf-8"))
+        total_bytes = len(content.encode(enc))
         max_chars = self._truncation.read_file_max_chars
         if not content:
             # 软提示（对齐 replace_file soft-miss / search_page）：空文件不是错误，
@@ -1634,11 +1673,22 @@ class Tools:
             # min_length=1 覆盖 schema + 直接构造；运行时 registry 不校验 params，
             # 此守卫兜底 execute 路径，避免 str.replace("", x) 在每字符间插入而膨胀文件。
             return ActionResult(error="replace_file 'old' must be a non-empty string")
+        # 阶段二（二.B / 二.D）：编码与行尾翻译参数（默认复现阶段一行为）。
+        enc = params.get("encoding") or "utf-8"
+        newline = params.get("newline", "")
+
+        # 阶段二（二.C）：写路径白名单（replace_file 也是写）。
+        allowed = self._allowed_write_paths
+        if allowed and not any(path.startswith(p) for p in allowed):
+            return ActionResult(error=f"File path not in allowed write paths: {path}")
+
+        # 阶段二（二.A）：原子写 tmp（同目录→同卷原子），写段用 tmp + os.replace。
+        tmp = path + ".tmp"
         try:
             # newline="" 关闭 universal-newline 翻译（对齐 write_file:1263）：
             # 读时保留原始 \r\n，写时 \n 不被译成 \r\n。原 LF 保持 LF、原 CRLF 保持
             # CRLF，行尾字节级不变；含 \r\n 字面量的 old/new 也不会被压缩成 \n。
-            with open(path, "r", encoding="utf-8", newline="") as f:
+            with open(path, "r", encoding=enc, newline=newline) as f:
                 content = f.read()
             count = content.count(old)
             if count == 0:
@@ -1649,21 +1699,37 @@ class Tools:
                 logger.info(msg)
                 return ActionResult(extracted_content=msg, long_term_memory=msg)
             content = content.replace(old, new)
-            with open(path, "w", encoding="utf-8", newline="") as f:
+            with open(tmp, "w", encoding=enc, newline=newline) as f:
                 f.write(content)
+            os.replace(tmp, path)
         except FileNotFoundError:
             return ActionResult(error=f"File not found: {path}")
         except UnicodeDecodeError as e:
-            # 读取侧特有（write_file 是写入不会有）：文件不是合法 UTF-8。
+            # 读取侧特有（write_file 是写入不会有）：文件不是合法 enc 编码。
             logger.warning("replace_file(%r) decode failed: %s", path, e)
-            return ActionResult(error=f"Failed to decode {path} as UTF-8: {e}")
+            return ActionResult(error=f"Failed to decode {path} as {enc}: {e}")
+        except LookupError as e:
+            # 非法 encoding 名（非 OSError 子类）：单独兜底。
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            logger.warning("replace_file(%r) unknown encoding %r: %s", path, enc, e)
+            return ActionResult(error=f"Unknown encoding {enc!r}: {e}")
         except OSError as e:
+            # 仅写阶段产生 tmp 残骸；读阶段失败时 tmp 不存在，exists 守卫保证安全。
             # 分级错误：权限/目录(path 指向目录)/磁盘满/只读 → 明确 error + warning，
             # 不冒泡到 Tools.execute 通用 catch（actions.py:260-262）。
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
             logger.warning("replace_file(%r) failed: %s", path, e)
             return ActionResult(error=f"Failed to replace text in {path}: {e}")
 
-        final_bytes = len(content.encode("utf-8"))
+        final_bytes = len(content.encode(enc))
         memory = (
             f"Replaced {count} occurrence{'s' if count != 1 else ''} of {old!r} with {new!r} "
             f"in {path} ({final_bytes} bytes)"
