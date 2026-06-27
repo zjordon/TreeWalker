@@ -73,15 +73,18 @@ def _file_matches_accept(file_path: str, accept: str | None) -> bool:
 
 
 def _format_search_results(data: dict, query: str) -> str:
-    """Format search_page {matches, total, has_more} as LLM-readable text.
+    """Format search_page {matches, total, has_more, offset, attribute_matches}
+    as LLM-readable text.
 
-    Mirrors browser-use ``_format_search_results`` (service.py:337-360). Caller
-    guarantees total > 0 (the total==0 soft-miss path is handled in
-    _action_search_page).
+    Mirrors browser-use ``_format_search_results`` (service.py:337-360), with
+    Phase 2 additions: an offset-aware pagination footer and a separate
+    attribute-matches section. Caller guarantees total > 0 or attribute_total >
+    0 (the total==0 soft-miss path is handled in _action_search_page).
     """
     matches = data.get("matches", [])
     total = data.get("total", 0)
     has_more = data.get("has_more", False)
+    offset = data.get("offset", 0)
 
     lines = [f'Found {total} match{"es" if total != 1 else ""} for "{query}" on page:', ""]
     for i, m in enumerate(matches):
@@ -90,10 +93,22 @@ def _format_search_results(data: dict, query: str) -> str:
         loc = f" (in {path})" if path else ""
         lines.append(f"[{i + 1}] {context}{loc}")
     if has_more:
+        next_offset = offset + len(matches)
         lines.append(
-            f"\n... showing {len(matches)} of {total} total matches. "
-            f"Increase max_results to see more."
+            f"\n... showing {offset + 1}–{offset + len(matches)} of {total} total matches. "
+            f"Call again with offset={next_offset} for the next batch (or raise max_results)."
         )
+    attr_matches = data.get("attribute_matches") or []
+    attr_total = data.get("attribute_total", 0)
+    if attr_total:
+        lines.append("")
+        lines.append(f'Attribute matches for "{query}" ({attr_total}):')
+        for i, m in enumerate(attr_matches):
+            path = m.get("element_path", "")
+            loc = f" (in {path})" if path else ""
+            lines.append(f"[{i + 1}] @{m.get('attribute', '')}={m.get('value', '')}{loc}")
+        if attr_total > len(attr_matches):
+            lines.append(f"... showing {len(attr_matches)} of {attr_total} attribute matches.")
     return "\n".join(lines)
 
 
@@ -1567,6 +1582,8 @@ class Tools:
                 context_chars=params.get("context_chars", 150),
                 css_scope=params.get("css_scope"),
                 max_results=params.get("max_results", 25),
+                offset=params.get("offset", 0),
+                search_attributes=params.get("search_attributes", False),
             )
         except Exception as e:
             # Hard error: CDP failure / invalid regex / css_scope not found —
@@ -1575,7 +1592,8 @@ class Tools:
             logger.warning("search_page(%r) failed: %s", query, e)
             return ActionResult(error=f"Search page failed: {e}")
         total = data.get("total", 0)
-        if total == 0:
+        attr_total = data.get("attribute_total", 0)
+        if total == 0 and not attr_total:
             # Soft miss: "text not on the page" is actionable info (the LLM can
             # scroll / switch tab / accept the text is absent), not a tool
             # failure — aligns with browser-use and _action_find_text (both
@@ -1584,9 +1602,30 @@ class Tools:
             logger.info(msg)
             return ActionResult(extracted_content=msg, long_term_memory=msg)
         formatted = _format_search_results(data, query)
+        # 大结果分级落盘（镜像 _action_extract；OSError 不失败只 warning）
+        tr = self._truncation
+        saved_to = None
+        if len(formatted) >= tr.search_page_save_threshold:
+            try:
+                os.makedirs(tr.search_page_output_dir, exist_ok=True)
+                fpath = os.path.join(tr.search_page_output_dir, f"search_page_{int(time.time() * 1000)}.txt")
+                with open(fpath, "w", encoding="utf-8", newline="") as f:
+                    f.write(formatted)
+                saved_to = fpath
+            except OSError as e:
+                logger.warning("search_page: save to file failed: %s", e)
+        if saved_to:
+            visible = (f"Search results ({len(formatted)} chars) saved to {saved_to}. "
+                       f"Preview: {formatted[:200]}...").strip()
+        else:
+            visible = formatted
         memory = f'Searched page for "{query}": {total} match{"es" if total != 1 else ""} found.'
+        if attr_total:
+            memory += f' (+{attr_total} attribute match{"es" if attr_total != 1 else ""})'
+        if saved_to:
+            memory += f" Results saved: {saved_to}"
         logger.info(memory)
-        return ActionResult(extracted_content=formatted, long_term_memory=memory)
+        return ActionResult(extracted_content=visible, long_term_memory=memory)
 
     async def _action_done(self, params: dict, browser: BrowserSession) -> ActionResult:
         success = params.get("success", True)

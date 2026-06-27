@@ -1062,7 +1062,7 @@
 
 ### 4.18 `search_page`
 
-- **description**：`Search page text for a pattern (like grep). Zero LLM cost, instant. Returns matches with surrounding context, element path, and a total count. Set regex=True for regex patterns; use css_scope to search within a section. Read-only — does not scroll or highlight (use find_text for that).` / grep 式页面文本搜索：零 LLM 成本、瞬时返回带上下文与元素路径的匹配及总数；只读不滚动
+- **description**：`Search page text for a pattern (like grep). Zero LLM cost, instant. Returns matches with surrounding context, element path, and a total count; paginate large result sets with offset. Traverses same-origin iframes and open shadow roots. Set regex=True for regex patterns; use css_scope to search within a section; search_attributes=True to also match href/value/etc. Read-only — does not scroll or highlight (use find_text for that).` / grep 式页面文本搜索：零 LLM 成本、瞬时返回带上下文与元素路径的匹配及总数；offset 分页；穿透同源 iframe / 开放 shadow DOM；可选属性检索；只读不滚动
 - **terminates_sequence**：False
 - **Pydantic 参数**：
 
@@ -1074,10 +1074,12 @@
   | `context_chars` | `int`（默认 `150`，`ge=0`） | 每条匹配的上下文字符数 |
   | `css_scope` | `str \| None`（默认 `None`） | CSS 选择器限定搜索范围；未命中报错 |
   | `max_results` | `int`（默认 `25`，`ge=1, le=200`） | 返回匹配上限（`total` 始终报真实总数） |
+  | `offset` | `int`（默认 `0`，`ge=0`） | 阶段二：返回的首条匹配的 0-based 偏移（翻页游标；`total` 始终是全量计数） |
+  | `search_attributes` | `bool`（默认 `False`） | 阶段二：同时检索元素属性值（href / value / data-*），返回独立的 `attribute_matches` 列表 |
 
 - **主要逻辑**（action 层 [actions.py `_action_search_page`](../../src/tree_walker/tools/actions.py) + session 层 [session.py `BrowserSession.search_page`](../../src/tree_walker/browser/session.py)）：
 
-  action 层是薄编排 + 分级错误：硬错误（CDP 失败 / 非法 regex / `css_scope` 未命中）返回 `ActionResult(error="Search page failed: ...")`；软 miss（`total==0`）返回 `extracted_content == long_term_memory == "No matches for '...'"`（非 error，对齐 `find_text`）；命中则 `extracted_content` 为格式化清单、`long_term_memory` 为紧凑摘要 `Searched page for "...": N match(es) found.`。
+  action 层是薄编排 + 分级错误：硬错误（CDP 失败 / 非法 regex / `css_scope` 未命中）返回 `ActionResult(error="Search page failed: ...")`；软 miss（`total==0` 且无属性命中）返回 `extracted_content == long_term_memory == "No matches for '...'"`（非 error，对齐 `find_text`）；命中则 `extracted_content` 为格式化清单、`long_term_memory` 为紧凑摘要 `Searched page for "...": N match(es) found.`。阶段二新增：`offset` / `search_attributes` 透传；格式化结果 `len >= search_page_save_threshold`（默认 10000）时分级落盘到 `search_page_output_dir/search_page_<ts>.txt`，返回 preview + 路径（镜像 `extract`）。
 
   ```python
   async def _action_search_page(self, params: dict, browser: BrowserSession) -> ActionResult:
@@ -1090,20 +1092,41 @@
               context_chars=params.get("context_chars", 150),
               css_scope=params.get("css_scope"),
               max_results=params.get("max_results", 25),
+              offset=params.get("offset", 0),
+              search_attributes=params.get("search_attributes", False),
           )
       except Exception as e:
           logger.warning("search_page(%r) failed: %s", query, e)
           return ActionResult(error=f"Search page failed: {e}")
       total = data.get("total", 0)
-      if total == 0:
+      attr_total = data.get("attribute_total", 0)
+      if total == 0 and not attr_total:
           msg = f"No matches for '{query}'"
           return ActionResult(extracted_content=msg, long_term_memory=msg)
       formatted = _format_search_results(data, query)
+      # 大结果分级落盘（镜像 _action_extract；OSError 不失败只 warning）
+      tr = self._truncation
+      saved_to = None
+      if len(formatted) >= tr.search_page_save_threshold:
+          try:
+              os.makedirs(tr.search_page_output_dir, exist_ok=True)
+              fpath = os.path.join(tr.search_page_output_dir, f"search_page_{int(time.time() * 1000)}.txt")
+              with open(fpath, "w", encoding="utf-8", newline="") as f:
+                  f.write(formatted)
+              saved_to = fpath
+          except OSError as e:
+              logger.warning("search_page: save to file failed: %s", e)
+      visible = (f"Search results ({len(formatted)} chars) saved to {saved_to}. "
+                 f"Preview: {formatted[:200]}...").strip() if saved_to else formatted
       memory = f'Searched page for "{query}": {total} match{"es" if total != 1 else ""} found.'
-      return ActionResult(extracted_content=formatted, long_term_memory=memory)
+      if attr_total:
+          memory += f' (+{attr_total} attribute match{"es" if attr_total != 1 else ""})'
+      if saved_to:
+          memory += f" Results saved: {saved_to}"
+      return ActionResult(extracted_content=visible, long_term_memory=memory)
   ```
 
-  session 层 `BrowserSession.search_page` 组装一个 TreeWalker-TextNodes IIFE（移植自 browser-use `service.py:181-255`）：把范围内所有文本节点拼成带 `{offset, length, node}` 偏移索引的大字符串，用 `g`-flag `RegExp.exec` 循环（含零宽匹配保护）收集匹配，每条回填 `{match_text, context, element_path, char_position}`，返回 `{matches, total, has_more}`。用户值经 `json.dumps` 注入成 `var` 声明（绝不 f-string 拼用户串）；JS 层 `{error:...}` / null 翻译成 `RuntimeError` 上抛。
+  session 层 `BrowserSession.search_page` 组装一个 TreeWalker-TextNodes IIFE（移植自 browser-use `service.py:181-255`）：把范围内所有文本节点拼成带 `{offset, length, node}` 偏移索引的大字符串，用 `g`-flag `RegExp.exec` 循环（含零宽匹配保护）收集匹配，每条回填 `{match_text, context, element_path, char_position}`，返回 `{matches, total, has_more}`。用户值经 `json.dumps` 注入成 `var` 声明（绝不 f-string 拼用户串）；JS 层 `{error:...}` / null 翻译成 `RuntimeError` 上抛。阶段二新增（超越 browser-use）：`_collectText` 递归穿透**开放 shadow root**（`el.shadowRoot`）与**同源 iframe**（`iframe.contentDocument`），跨源 iframe 抛 `SecurityError` 被 `catch` 跳过；`_origin` 在 `element_path` 上标 `(in shadow DOM)` / `(in iframe)`；`offset` 把 `matches.push` 窗口从 `[0, MAX_RESULTS)` 改成 `[OFFSET, OFFSET+MAX_RESULTS)`（仍累计全部 `total`，`has_more` = 当前页之后还有更多）；`search_attributes=True` 时用**非全局** `RegExp` 副本扫元素属性值，回填独立的 `{attribute, value, element_path}` 进 `attribute_matches` / `attribute_total`。
 
 - **CDP 调用清单**：
 
@@ -1113,7 +1136,7 @@
 
 - **注意事项**：
   - 与 `find_text` 的分工：`find_text` 用 `DOM.performSearch` 链路**滚动 + 高亮**首条匹配到视口；`search_page` 是**只读**的 grep 式全文检索，返回带上下文 / 元素路径 / 总数的匹配清单，不滚动、不高亮。
-  - 局限（与 browser-use 一致）：仅顶层文档文本节点；不进 iframe、不穿 shadow DOM。
+  - 局限：覆盖**同源 iframe + 开放 shadow DOM** 内的文本（阶段二，超越 browser-use）；**closed shadow root**（`shadowRoot=null`）与**跨源 iframe**（抛 `SecurityError`）不穿透——跨源需 `Target.attachToTarget` 多 session evaluate，列阶段三。
 
 ---
 

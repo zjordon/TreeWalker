@@ -282,6 +282,14 @@ class SearchPageParams(BaseModel):
         default=25, ge=1, le=200,
         description="Maximum matches to return (total count is always reported even when truncated).",
     )
+    offset: int = Field(
+        default=0, ge=0,
+        description="0-based index of the first match to return (for paginating large result sets; total is always the full count).",
+    )
+    search_attributes: bool = Field(
+        default=False,
+        description="Also search element attribute values (href / value / data-* etc). Returns a separate attribute_matches list; offset applies to text matches only.",
+    )
 
 
 class DoneParams(BaseModel):
@@ -410,8 +418,11 @@ ACTION_DEFINITIONS: dict[str, tuple[type[BaseModel], str, bool]] = {
         SearchPageParams,
         (
             "Search page text for a pattern (like grep). Zero LLM cost, instant. "
-            "Returns matches with surrounding context, element path, and a total count. "
-            "Set regex=True for regex patterns; use css_scope to search within a section. "
+            "Returns matches with surrounding context, element path, and a total count; "
+            "paginate large result sets with offset. "
+            "Traverses same-origin iframes and open shadow roots. "
+            "Set regex=True for regex patterns; use css_scope to search within a section; "
+            "search_attributes=True to also match href/value/etc. "
             "Read-only — does not scroll or highlight (use find_text for that)."
         ),
         False,

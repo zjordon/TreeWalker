@@ -96,7 +96,8 @@ def _text_queries(text: str, case_sensitive: bool) -> list[tuple[str, str]]:
 # are injected as `var` declarations by _build_search_page_js (never
 # f-string-interpolated into the expression), so this body only references
 # those vars (PATTERN/IS_REGEX/CASE_SENSITIVE/CONTEXT_CHARS/CSS_SCOPE/
-# MAX_RESULTS) by name. Stored raw so JS backslashes survive verbatim.
+# MAX_RESULTS/OFFSET/SEARCH_ATTRIBUTES) by name. Stored raw so JS backslashes
+# survive verbatim.
 _SEARCH_PAGE_JS_BODY = r"""
     function _getPath(el) {
         if (!el || el === document.body) return '';
@@ -116,22 +117,49 @@ _SEARCH_PAGE_JS_BODY = r"""
         }
         return parts.join(' > ');
     }
+    function _origin(node) {
+        // 标记非顶层文档来源：ShadowRoot(nodeType=11) → shadow DOM；其它(getRootNode≠document) → iframe
+        try {
+            var r = node.getRootNode ? node.getRootNode() : null;
+            if (r && r !== document) {
+                return r.nodeType === 11 ? ' (in shadow DOM)' : ' (in iframe)';
+            }
+        } catch (_) {}
+        return '';
+    }
+    function _collectText(root) {
+        var wt = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+        var n;
+        while ((n = wt.nextNode())) {
+            var t = n.textContent;
+            if (t && t.trim()) {
+                nodeOffsets.push({offset: fullText.length, length: t.length, node: n});
+                fullText += t;
+            }
+        }
+        // 穿透：开放 shadow root + 同源 iframe contentDocument（TreeWalker 不跨 shadow / 文档边界，需手动递归）
+        var we = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+        var el;
+        while ((el = we.nextNode())) {
+            if (el.shadowRoot) {
+                try { _collectText(el.shadowRoot); } catch (_) {}      // closed shadow: shadowRoot=null，自然跳过
+            }
+            if (el.tagName === 'IFRAME') {
+                try {
+                    var cd = el.contentDocument;                       // 同源可读；跨源抛 SecurityError → catch 跳过（阶段三）
+                    if (cd && cd.body) _collectText(cd.body);
+                } catch (_) {}
+            }
+        }
+    }
     try {
         var scope = CSS_SCOPE ? document.querySelector(CSS_SCOPE) : document.body;
         if (!scope) {
             return {error: 'CSS scope selector not found: ' + CSS_SCOPE, matches: [], total: 0};
         }
-        var walker = document.createTreeWalker(scope, NodeFilter.SHOW_TEXT);
         var fullText = '';
         var nodeOffsets = [];
-        while (walker.nextNode()) {
-            var node = walker.currentNode;
-            var text = node.textContent;
-            if (text && text.trim()) {
-                nodeOffsets.push({offset: fullText.length, length: text.length, node: node});
-                fullText += text;
-            }
-        }
+        _collectText(scope);
         var flags = CASE_SENSITIVE ? 'g' : 'gi';
         var re;
         try {
@@ -148,7 +176,8 @@ _SEARCH_PAGE_JS_BODY = r"""
         var match;
         while ((match = re.exec(fullText)) !== null) {
             total++;
-            if (matches.length < MAX_RESULTS) {
+            // offset 窗口：累计全部 total，只存 [OFFSET, OFFSET+MAX_RESULTS) 区间（保持 early-bail 性能）
+            if (total - 1 >= OFFSET && matches.length < MAX_RESULTS) {
                 var start = Math.max(0, match.index - CONTEXT_CHARS);
                 var end = Math.min(fullText.length, match.index + match[0].length + CONTEXT_CHARS);
                 var context = fullText.slice(start, end);
@@ -156,7 +185,7 @@ _SEARCH_PAGE_JS_BODY = r"""
                 for (var i = 0; i < nodeOffsets.length; i++) {
                     var no = nodeOffsets[i];
                     if (no.offset <= match.index && no.offset + no.length > match.index) {
-                        elementPath = _getPath(no.node.parentElement);
+                        elementPath = _getPath(no.node.parentElement) + _origin(no.node);
                         break;
                     }
                 }
@@ -169,7 +198,39 @@ _SEARCH_PAGE_JS_BODY = r"""
             }
             if (match[0].length === 0) re.lastIndex++;
         }
-        return {matches: matches, total: total, has_more: total > MAX_RESULTS};
+        var attribute_matches = [];
+        var attribute_total = 0;
+        if (SEARCH_ATTRIBUTES) {
+            // 非全局 RegExp 副本做 .test，规避全局正则 lastIndex 漂移
+            var reAttr = new RegExp(re.source, CASE_SENSITIVE ? '' : 'i');
+            var we = document.createTreeWalker(scope, NodeFilter.SHOW_ELEMENT);
+            var el;
+            while ((el = we.nextNode())) {
+                var attrs = el.attributes;
+                if (!attrs) continue;
+                for (var a = 0; a < attrs.length; a++) {
+                    var av = attrs[a].value;
+                    if (av && reAttr.test(av)) {
+                        attribute_total++;
+                        if (attribute_matches.length < MAX_RESULTS) {
+                            attribute_matches.push({
+                                attribute: attrs[a].name,
+                                value: av,
+                                element_path: _getPath(el) + _origin(el)
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        return {
+            matches: matches,
+            total: total,
+            offset: OFFSET,
+            has_more: (OFFSET + matches.length) < total,
+            attribute_matches: attribute_matches,
+            attribute_total: attribute_total
+        };
     } catch (e) {
         return {error: String((e && e.message) || e), matches: [], total: 0};
     }
@@ -183,6 +244,8 @@ def _build_search_page_js(
     context_chars: int,
     css_scope: str | None,
     max_results: int,
+    offset: int,
+    search_attributes: bool,
 ) -> str:
     """Build the search_page IIFE expression.
 
@@ -200,6 +263,8 @@ def _build_search_page_js(
         f"var CONTEXT_CHARS = {json.dumps(context_chars)};\n"
         f"var CSS_SCOPE = {json.dumps(css_scope)};\n"
         f"var MAX_RESULTS = {json.dumps(max_results)};\n"
+        f"var OFFSET = {json.dumps(offset)};\n"
+        f"var SEARCH_ATTRIBUTES = {json.dumps(search_attributes)};\n"
     )
     return "(function() {\n" + params_js + _SEARCH_PAGE_JS_BODY + "\n})()"
 
@@ -2779,6 +2844,8 @@ class BrowserSession:
         context_chars: int = 150,
         css_scope: str | None = None,
         max_results: int = 25,
+        offset: int = 0,
+        search_attributes: bool = False,
     ) -> dict:
         """Grep-style page text search via a single Runtime.evaluate.
 
@@ -2793,11 +2860,20 @@ class BrowserSession:
         ``ActionResult(error=...)``. A clean miss returns ``total=0`` and never
         raises; the action layer builds the soft echo.
 
-        Limitations (same as browser-use): top-document text nodes only; does
-        not traverse into iframes or pierce shadow DOM.
+        Phase 2 additions (surpass browser-use): ``offset`` paginates the match
+        window (total is always the full count); ``search_attributes`` adds a
+        separate ``attribute_matches`` scan; the text TreeWalker recurses into
+        open shadow roots (``el.shadowRoot``) and same-origin iframes
+        (``iframe.contentDocument``) so text inside Web Components / embedded
+        documents is also indexed.
+
+        Limitations: closed shadow roots are not pierced (``shadowRoot`` is
+        null); cross-origin iframes raise ``SecurityError`` and are skipped
+        (cross-origin traversal → Phase 3, needs ``Target.attachToTarget``).
         """
         js = _build_search_page_js(
-            pattern, regex, case_sensitive, context_chars, css_scope, max_results,
+            pattern, regex, case_sensitive, context_chars, css_scope,
+            max_results, offset, search_attributes,
         )
         data = await self.execute_js(js)  # returnByValue=True -> dict; RuntimeError on exceptionDetails
         if data is None:

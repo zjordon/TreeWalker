@@ -52,6 +52,8 @@ class TruncationSettings:
     eval_result_max_chars: int = 2000        # JavaScript eval result
     display_max_chars: int = 500             # ActionResult display string
     dom_excerpt_max_chars: int = 2000        # DOM excerpt persisted per step for Judge review
+    search_page_save_threshold: int = 10000  # search_page result >= this → write to file (mirrors extract)
+    search_page_output_dir: str = "search_page_output"  # dir for oversized match lists (env-config)
 
 
 @dataclass
@@ -247,6 +249,8 @@ def load_settings() -> Settings:
             eval_result_max_chars=int(os.environ.get("AGENT_TRUNCATE_EVAL_RESULT", "2000")),
             display_max_chars=int(os.environ.get("AGENT_TRUNCATE_DISPLAY", "500")),
             dom_excerpt_max_chars=int(os.environ.get("AGENT_TRUNCATE_DOM_EXCERPT", "2000")),
+            search_page_save_threshold=int(os.environ.get("AGENT_SEARCH_PAGE_SAVE_THRESHOLD", "10000")),
+            search_page_output_dir=os.environ.get("AGENT_SEARCH_PAGE_OUTPUT_DIR", "search_page_output"),
         ),
         enable_planning=os.environ.get("AGENT_ENABLE_PLANNING", "").lower() == "true",
         exploration_threshold=int(os.environ.get("AGENT_EXPLORATION_THRESHOLD", "5")),
