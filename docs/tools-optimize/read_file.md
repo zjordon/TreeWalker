@@ -295,12 +295,15 @@ uv run python -m pytest tests/ -x -v
 
 ## 阶段二（可选，独立，对齐 / 超越 browser-use 完整能力）
 
-- **`offset` / `limit` / `line_range` 分页** —— browser-use 把分页归单独的 `extract` 动作；本项目可在 `read_file` 内补，让 LLM 翻读超大文件（与阶段一的截断 footer 配合："已读前 5000 字符，用 offset=5000 读后续"）。
-- **`encoding` 参数** —— 显式指定 `latin-1` / `cp936` 等兜底读非 UTF-8 文本（替代直接 `UnicodeDecodeError`）。
-- **二进制嗅探** —— peek 文件头 magic bytes（或扩展名），拒读 `.png` / `.exe` / `.zip` 等，给可操作提示（对齐 browser-use `UNSUPPORTED_BINARY_EXTENSIONS` 思路，但不移植其沙箱）。
-- **`allowed_read_paths` 白名单** —— 与 write_file / replace_file 一起做安全收敛（三件套统一）。
-- **富文档解析** —— PDF(`pypdf`，可借鉴其 IDF 加权分页) / DOCX(`python-docx`) / 图片(base64 走 `images` 通道)，对齐 browser-use `read_file_structured` 的扩展名分派。
-- **`FileSystem` 沙箱** —— 若决定引入内部/外部文件双路径，三件套一起设计（当前明确不移植，见差异 #1）。
+> **状态（2026-06-27）**：`encoding` / `newline` 已随 write_file/replace_file 阶段二一并实现；其余 4 项（offset/limit、二进制嗅探、allowed_read_paths、富文档）已在 issue #78 / 分支 `feat/read-file-phase2` 落地，完整方案与决策见 [`read_file_follow_up.md`](read_file_follow_up.md)。
+
+- ✅ **`encoding` 参数** —— 已实现（`_action_read_file`、`ReadFileParams.encoding`）。
+- ✅ **`newline` 翻译控制** —— 已实现（`ReadFileParams.newline`）。
+- ✅ **`offset` / `limit` 分页** —— 已实现（字符级；截断 footer 带 `use offset=N to continue`，让 LLM 翻读超大文件）。
+- ✅ **二进制嗅探** —— 已实现（`_sniff_file_kind` magic bytes 主 + 扩展名辅；不支持二进制早拒、富文档分派）。
+- ✅ **`allowed_read_paths` 白名单** —— 已实现（默认 `None`=全放行；env `AGENT_ALLOWED_READ_PATHS` opt-in）。
+- ✅ **富文档解析** —— 已实现 PDF(`pypdf`)/DOCX(`python-docx`) 抽文本（optional extra `[docs]`，缺依赖给安装提示）；**图片**：`metadata["images"]` 当前是死代码（agent loop 不读），故暂只返回可操作提示（vision 通道未接线，待统一接线后再启用）。
+- ⏸️ **`FileSystem` 沙箱** —— 仍延后（重大架构变更，见差异 #1）。
 
 ---
 

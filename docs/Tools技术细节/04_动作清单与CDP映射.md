@@ -739,7 +739,7 @@
 
 ### 4.12 `read_file`
 
-- **description**：`Read content from a local UTF-8 text file.` / 读取本地 UTF-8 文本文件内容
+- **description**：`Read content from a local text (UTF-8) or PDF/DOCX file; paginate large files with offset/limit.` / 读取本地文本（UTF-8）或 PDF/DOCX 文件；大文件用 offset/limit 分页
 - **terminates_sequence**：False
 - **Pydantic 参数**（[models.py:186-188](../../src/tree_walker/tools/models.py)）：
 
@@ -748,47 +748,36 @@
   | `path` | `str` | Path to a local text file to read（UTF-8 by default; see encoding） |
   | `encoding` | `str \| None` | Text encoding to decode with（默认 `None`→UTF-8；设 `latin-1`/`cp936` 读遗留文件） |
   | `newline` | `str \| None` | Python `open()` newline 模式（默认 `""` 不翻译、保留 `\r\n`；`None` 启用 universal-newline 把 `\r\n` 压成 `\n`） |
+  | `offset` | `int` | 字符级读取起点（默认 `0`；截断 footer 的 `use offset=N to continue` 配合翻读超大文件） |
+  | `limit` | `int \| None` | 本次最多返回字符数（默认 `None`→`read_file_max_chars`） |
 
-- **主要逻辑**（[actions.py:1277-1323](../../src/tree_walker/tools/actions.py)）：
+- **主要逻辑**（`actions.py`：`_action_read_file` 编排 + `_sniff_file_kind` + `_window_and_echo` + `_read_rich_document`）：
 
   ```python
-  async def _action_read_file(self, params: dict, browser: BrowserSession) -> ActionResult:
+  async def _action_read_file(self, params, browser):
       path = params["path"]
+      # 二.C 读白名单（默认 None=全放行；fail fast，在 sniff/open 前）
+      if self._allowed_read_paths and not any(path.startswith(p) for p in self._allowed_read_paths):
+          return ActionResult(error=f"File path not in allowed read paths: {path}")
+      # 二.B 二进制嗅探（magic bytes 主 + 扩展名辅）
       try:
-          # newline=""：读时不翻译 \r\n -> \n，原 LF/CRLF 行尾字节级保持（对齐 replace_file / write_file）
-          with open(path, "r", encoding="utf-8", newline="") as f:
-              content = f.read()
+          kind = _sniff_file_kind(path)            # text | pdf | docx | image | binary
       except FileNotFoundError:
           return ActionResult(error=f"File not found: {path}")
-      except UnicodeDecodeError as e:
-          logger.warning("read_file(%r) decode failed: %s", path, e)
-          return ActionResult(error=f"Failed to decode {path} as UTF-8: {e}")
-      except OSError as e:
-          logger.warning("read_file(%r) failed: %s", path, e)
+      except OSError as e:                          # 目录/权限 → 嗅探的 open 即抛
           return ActionResult(error=f"Failed to read file {path}: {e}")
-      total_chars = len(content)
-      total_bytes = len(content.encode("utf-8"))
-      max_chars = self._truncation.read_file_max_chars
-      if not content:
-          # soft-miss：空文件不是错误，如实回报"文件为空"（避免 __str__ 兜底成 "OK" 的歧义）
-          msg = f"{path} is empty (0 bytes)"
-          logger.info(msg)
-          return ActionResult(extracted_content=msg, long_term_memory=msg)
-      if total_chars > max_chars:
-          # 截断必须告知（read_file 独有；browser-use 文本不限长仅截 memory，无此问题）
-          extracted = (
-              content[:max_chars]
-              + f"\n[...truncated: showing {max_chars} of {total_chars} chars ({total_bytes} bytes total)]"
-          )
-          memory = f"Read {path} ({total_chars} chars, {total_bytes} bytes; truncated to first {max_chars} chars)"
-      else:
-          extracted = content
-          memory = f"Read {path} ({total_chars} chars, {total_bytes} bytes)"
-      logger.info(memory)
-      return ActionResult(extracted_content=extracted, long_term_memory=memory)
+      if kind == "binary":
+          return ActionResult(error=f"{path} looks like a binary file; read_file reads UTF-8 text, PDF, DOCX, or images ...")
+      if kind in ("pdf", "docx", "image"):
+          return await self._read_rich_document(path, kind, params)   # 二.D
+      # text：newline/encoding 阶段一行为
+      with open(path, "r", encoding=params.get("encoding") or "utf-8", newline=params.get("newline", "")) as f:
+          content = f.read()
+      ...
+      return self._window_and_echo(content, path, params, total_bytes)   # 二.A offset/limit + 截断 footer
   ```
 
-  UTF-8 文本读取，`newline=""` 保证 Windows 下 `\r\n` 不被压成 `\n`；内容超 `read_file_max_chars`（默认 5000）时**显式截断并告知**，避免 LLM 把截断处误当文件结尾。
+  编排式（动作体只编排，逻辑下沉到 helper）：读白名单 → 二进制嗅探 → 富文档分派 → 文本解码 → `_window_and_echo`（offset/limit 字符级分页 + 截断 footer 带 `use offset=N to continue`）。`newline=""` 保证 Windows 下 `\r\n` 不被压成 `\n`；分级错误（`FileNotFoundError`/`UnicodeDecodeError`/`LookupError`/`OSError`）全 `logger.warning`，不冒泡到 `Tools.execute` 通用 catch。
 
 - **返回 / 回显**：
   - 正常（未截断）：`extracted_content` 为文件原文；`long_term_memory` 形如 `Read <path> (<N> chars, <M> bytes)`。
@@ -798,7 +787,7 @@
 
 - **CDP 调用清单**：无（纯本地 fs）
 
-- **注意事项**：`encoding` 参数（默认 `None`→UTF-8）支持 latin-1/cp936 等遗留编码；`newline` 参数（默认 `""` 不翻译、保留 `\r\n`；`None` 启用 universal-newline）控制行尾翻译；非法编码名 → `ActionResult(error="Unknown encoding ...")`（`LookupError` 兜底）；decode 失败文案 `Failed to decode {path} as {enc}`（反映真实编码）；字节数用 `len(content.encode(enc))`（CJK 准确，与 `os.path.getsize` 一致）；`read_file_max_chars` 默认 5000，env `AGENT_TRUNCATE_READ_FILE` 可覆盖。图片/PDF/DOCX 等富文档、`offset`/`limit` 分页仍不支持。阶段二详见 `docs/tools-optimize/write_file_follow_up.md` 2.B/2.D。
+- **注意事项**：`encoding`（默认 `None`→UTF-8，支持 latin-1/cp936 等遗留编码）；`newline`（默认 `""` 不翻译、保留 `\r\n`；`None` 启用 universal-newline）；`offset`/`limit`（字符级分页，截断 footer 带 `use offset=N to continue`）；非法编码名 → `Unknown encoding ...`（`LookupError` 兜底）；decode 失败文案 `Failed to decode {path} as {enc}`；二进制嗅探（`.exe`/`.zip` 等拒、`.pdf`/`.docx` 抽文本、图片暂只返回可操作提示）；`allowed_read_paths`（默认不限路径，env `AGENT_ALLOWED_READ_PATHS` opt-in）；富文档依赖 optional extra `[docs]`（`uv pip install -e .[docs]`）。阶段二详见 [`read_file_follow_up.md`](../tools-optimize/read_file_follow_up.md)（issue #78）。
 
 ---
 

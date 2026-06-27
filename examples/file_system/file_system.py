@@ -80,7 +80,8 @@ async def main() -> None:
 	llm = LLMClient(settings.llm)
 	browser = BrowserSession(settings.browser)
 	# Sandbox writes to the workspace dir (prefix match). Only write_file /
-	# replace_file are gated; read_file is not, so the agent can read anywhere.
+	# replace_file are gated here; read_file is unrestricted by default
+	# (allowed_read_paths is opt-in via AGENT_ALLOWED_READ_PATHS when you want it).
 	agent_settings = replace(settings.agent, allowed_write_paths=[str(WORKSPACE)])
 
 	agent = Agent(task=TASK, llm=llm, browser=browser, settings=agent_settings)

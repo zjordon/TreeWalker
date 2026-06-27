@@ -74,6 +74,39 @@ def _file_matches_accept(file_path: str, accept: str | None) -> bool:
     return False
 
 
+def _sniff_file_kind(path: str) -> str:
+    """Peek magic bytes (阶段二 二.B) to classify a file before decoding.
+
+    Returns one of ``"text"``, ``"pdf"``, ``"docx"``, ``"image"``, ``"binary"``.
+    Used by ``_action_read_file`` to reject unsupported binaries early (actionable
+    error instead of a cryptic UnicodeDecodeError) and to dispatch rich docs
+    (PDF/DOCX/image → ``_read_rich_document``). Magic bytes are primary;
+    extension is secondary because zip-family containers (docx/xlsx/pptx/plain
+    zip) share ``PK\\x03\\x04`` and WebP shares ``RIFF`` with AVI/WAV.
+    """
+    with open(path, "rb") as f:
+        head = f.read(12)
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image"
+    if head.startswith(b"\xff\xd8\xff"):  # JPEG
+        return "image"
+    if head.startswith(b"GIF87a") or head.startswith(b"GIF89a"):
+        return "image"
+    if head.startswith(b"RIFF"):
+        return "image" if head[8:12] == b"WEBP" else "binary"  # WebP vs AVI/WAV
+    if head.startswith(b"%PDF-"):
+        return "pdf"
+    if head.startswith(b"PK\x03\x04"):  # zip container
+        return "docx" if path.lower().endswith(".docx") else "binary"
+    if head.startswith(b"\x7fELF") or head.startswith(b"MZ"):  # executables
+        return "binary"
+    if head.startswith(b"\x1f\x8b") or head.startswith(b"BZh") or head.startswith(b"Rar!"):
+        return "binary"  # gzip / bzip2 / rar
+    if head.startswith(b"7z\xbc\xaf\x27\x1c"):
+        return "binary"  # 7z
+    return "text"
+
+
 def _format_search_results(data: dict, query: str) -> str:
     """Format search_page {matches, total, has_more, offset, attribute_matches}
     as LLM-readable text.
@@ -319,13 +352,14 @@ class Tools:
     The registry produces the Anthropic tool schema used by the LLM client.
     """
 
-    def __init__(self, truncation: TruncationSettings | None = None, allowed_upload_paths: list[str] | None = None, allowed_write_paths: list[str] | None = None) -> None:
+    def __init__(self, truncation: TruncationSettings | None = None, allowed_upload_paths: list[str] | None = None, allowed_write_paths: list[str] | None = None, allowed_read_paths: list[str] | None = None) -> None:
         self.registry = ActionRegistry()
         self._register_all()
         self._cached_browser_state: BrowserStateSummary | None = None
         self._truncation = truncation or TruncationSettings()
         self._allowed_upload_paths = allowed_upload_paths
         self._allowed_write_paths = allowed_write_paths
+        self._allowed_read_paths = allowed_read_paths
 
     # ── Public API ─────────────────────────────────────────────────────
 
@@ -1613,7 +1647,30 @@ class Tools:
 
     async def _action_read_file(self, params: dict, browser: BrowserSession) -> ActionResult:
         path = params["path"]
-        # 阶段二（二.B / 二.D）：编码与行尾翻译参数（默认复现阶段一行为）。
+        # 阶段二（二.C）：读路径白名单（镜像 allowed_write_paths；None=全放行）。
+        # 置于 sniff/open 之前 fail fast，与 write_file/replace_file 对称。
+        allowed = self._allowed_read_paths
+        if allowed and not any(path.startswith(p) for p in allowed):
+            return ActionResult(error=f"File path not in allowed read paths: {path}")
+
+        # 阶段二（二.B）：二进制嗅探（在文本解码前）。命中富文档转 二.D，
+        # 命中不支持二进制给可操作 error（早拒，优于 UnicodeDecodeError 啰嗦堆栈）。
+        try:
+            kind = _sniff_file_kind(path)
+        except FileNotFoundError:
+            return ActionResult(error=f"File not found: {path}")
+        except OSError as e:
+            # path 指向目录(IsADirectoryError/PermissionError) 等 → 嗅探的 open 即抛。
+            logger.warning("read_file(%r) sniff failed: %s", path, e)
+            return ActionResult(error=f"Failed to read file {path}: {e}")
+        if kind == "binary":
+            logger.warning("read_file(%r) rejected binary kind", path)
+            return ActionResult(error=f"{path} looks like a binary file; read_file reads UTF-8 text, "
+                                     "PDF, DOCX, or images (PNG/JPEG/GIF/WebP).")
+        if kind in ("pdf", "docx", "image"):
+            return await self._read_rich_document(path, kind, params)
+
+        # kind == "text" → 文本解码（newline/encoding 阶段一行为）。
         enc = params.get("encoding") or "utf-8"
         newline = params.get("newline", "")
         try:
@@ -1633,38 +1690,119 @@ class Tools:
             logger.warning("read_file(%r) unknown encoding %r: %s", path, enc, e)
             return ActionResult(error=f"Unknown encoding {enc!r}: {e}")
         except OSError as e:
-            # 分级错误（对齐 replace_file）：path 指向目录(IsADirectoryError/
-            # PermissionError)、磁盘/只读/锁定 → 明确 error + warning，不冒泡到
-            # Tools.execute 通用 catch（actions.py:260-262）。
+            # 分级错误（对齐 replace_file）：磁盘/只读/锁定 → 明确 error + warning，
+            # 不冒泡到 Tools.execute 通用 catch（actions.py:260-262）。
             logger.warning("read_file(%r) failed: %s", path, e)
             return ActionResult(error=f"Failed to read file {path}: {e}")
 
-        total_chars = len(content)
         total_bytes = len(content.encode(enc))
-        max_chars = self._truncation.read_file_max_chars
+        return self._window_and_echo(content, path, params, total_bytes)
+
+    def _window_and_echo(self, content: str, path: str, params: dict, total_bytes: int) -> ActionResult:
+        """阶段二（二.A）：offset/limit 字符级分页 + 截断 footer + 字符/字节回显。
+
+        供文本路径与 二.D 的 PDF/DOCX 路径复用（动作体只编排，对齐 browser-use
+        「service.py 只编排、逻辑下沉」思想）。字符级 offset 与 read_file_max_chars
+        及阶段一 footer「showing X of Y chars」一致，使 offset=read_file_max_chars
+        成为截断后的续读起点。
+        """
+        total_chars = len(content)
         if not content:
-            # 软提示（对齐 replace_file soft-miss / search_page）：空文件不是错误，
-            # 但要让 LLM 知道"文件存在且为空"，而非 __str__ 兜底成 "OK"。
+            # 软提示（对齐 replace_file soft-miss / search_page）：空内容不是错误，
+            # 但要让 LLM 知道"读到空"，而非 __str__ 兜底成 "OK"。
             msg = f"{path} is empty (0 bytes)"
             logger.info(msg)
             return ActionResult(extracted_content=msg, long_term_memory=msg)
-        if total_chars > max_chars:
-            # 截断必须告知（read_file 独有，有意超越 browser-use：browser-use 文本不限长，
-            # 仅截 memory；TreeWalker 必须截内容本身，故须显式告诉 LLM 还有更多）。
+        offset = params.get("offset", 0)
+        limit = params.get("limit")
+        max_chars = self._truncation.read_file_max_chars
+        window = limit if (limit is not None and limit < max_chars) else max_chars
+        if offset >= total_chars:
+            # offset 越过文件尾：软提示（非 error），对齐 empty soft-miss。
+            msg = f"offset {offset} is at or past end of {path} ({total_chars} chars); nothing to read"
+            logger.info(msg)
+            return ActionResult(extracted_content=msg, long_term_memory=msg)
+        content_window = content[offset:offset + window]
+        shown = len(content_window)
+        remaining = total_chars - offset - shown
+        if remaining > 0:
+            end = offset + shown
             extracted = (
-                content[:max_chars]
-                + f"\n[...truncated: showing {max_chars} of {total_chars} chars "
-                f"({total_bytes} bytes total)]"
+                content_window
+                + f"\n[...truncated: showing {shown} of {total_chars} chars "
+                f"from offset {offset} ({total_bytes} bytes total); "
+                f"use offset={end} to continue]"
             )
             memory = (
-                f"Read {path} ({total_chars} chars, {total_bytes} bytes; "
-                f"truncated to first {max_chars} chars)"
+                f"Read {path} ({shown} of {total_chars} chars from offset {offset}, "
+                f"{total_bytes} bytes; truncated)"
             )
         else:
-            extracted = content
-            memory = f"Read {path} ({total_chars} chars, {total_bytes} bytes)"
+            extracted = content_window
+            if offset > 0:
+                memory = (
+                    f"Read {path} chars {offset}-{offset + shown} of {total_chars} "
+                    f"({total_bytes} bytes; final page)"
+                )
+            else:
+                memory = f"Read {path} ({total_chars} chars, {total_bytes} bytes)"
         logger.info(memory)
         return ActionResult(extracted_content=extracted, long_term_memory=memory)
+
+    async def _read_rich_document(self, path: str, kind: str, params: dict) -> ActionResult:
+        """阶段二（二.D）：富文档分派（由 _action_read_file 的二进制嗅探路由而来）。
+
+        - PDF (pypdf) / DOCX (python-docx)：抽文本走 _window_and_echo（与文本路径
+          同款 offset/limit 分页）；依赖做成 optional extra ``[docs]``，缺则给安装提示。
+        - image：metadata['images'] 当前是死代码（evaluate 写了但 agent loop 从不读，
+          LLM 只收 extracted_content 文本），故**暂不接线 vision 通道**，只返回可操作
+          提示（不堆无用 base64）。待 agent loop 统一接线 images 通道后再启用。
+        """
+        if kind == "image":
+            mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+            try:
+                nbytes = os.path.getsize(path)
+            except OSError:
+                nbytes = 0
+            msg = (
+                f"{path} is an image ({mime}, {nbytes} bytes). read_file cannot inline images "
+                "yet (vision channel not wired); re-save as text/PDF, or use a vision-capable flow."
+            )
+            logger.info("read_file(%r) image detected; vision not wired", path)
+            return ActionResult(extracted_content=msg, long_term_memory=msg)
+        if kind == "pdf":
+            try:
+                from pypdf import PdfReader
+            except ImportError:
+                return ActionResult(
+                    error=f"{path} is a PDF; install the 'docs' extra to enable PDF reading: "
+                    "uv pip install -e .[docs]"
+                )
+            try:
+                pages = PdfReader(path).pages
+                parts = [
+                    f"--- page {i + 1}/{len(pages)} ---\n{(p.extract_text() or '')}"
+                    for i, p in enumerate(pages)
+                ]
+                text = "\n\n".join(parts)
+            except Exception as e:  # pypdf 抛多种异常（PdfReadError 等），统一降级
+                logger.warning("read_file(%r) pdf parse failed: %s", path, e)
+                return ActionResult(error=f"Failed to parse PDF {path}: {e}")
+        else:  # docx
+            try:
+                from docx import Document
+            except ImportError:
+                return ActionResult(
+                    error=f"{path} is a DOCX; install the 'docs' extra to enable DOCX reading: "
+                    "uv pip install -e .[docs]"
+                )
+            try:
+                doc = Document(path)
+                text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+            except Exception as e:  # python-docx 抛多种异常，统一降级
+                logger.warning("read_file(%r) docx parse failed: %s", path, e)
+                return ActionResult(error=f"Failed to parse DOCX {path}: {e}")
+        return self._window_and_echo(text, path, params, len(text.encode("utf-8")))
 
     async def _action_replace_file(self, params: dict, browser: BrowserSession) -> ActionResult:
         path = params["path"]
