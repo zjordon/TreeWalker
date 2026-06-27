@@ -12,7 +12,7 @@
 |---|---|---|---|---|---|
 | 1 | [click](#41-click) | 否 | `index \| element_id, ...` | DOM + Input + Overlay | 点击元素（index 或 element_id=backend id），含 SELECT 分支 |
 | 2 | [close_tab](#42-close_tab) | 否 | `tab_id: str=""` | Target | 关闭 Tab，必要时切换其他 |
-| 3 | [done](#43-done) | 否 | `text, success` | (无 CDP) | 任务终止信号 |
+| 3 | [done](#43-done) | 否 | `text, success, files_to_display`（变体 B：`data`） | (无 CDP) | 任务终止信号 |
 | 4 | [dropdown_options](#44-dropdown_options) | 否 | `index: int` | Runtime (JS) | 读取 select 所有 option |
 | 5 | [evaluate](#45-evaluate) | 是 | `code: str` | Runtime | 执行任意 JS，返回结果 |
 | 6 | [extract](#46-extract) | 否 | `query, extract_links?, extract_images?, start_from_char?, already_collected?` | CDP (DOM.getDocument) + LLM | 页面转 markdown → LLM 抽取/结构化（分页 + 去重 + 大结果落盘） |
@@ -193,34 +193,43 @@
   |---|---|---|---|
   | `text` | `str` | (必填，`min_length=1`) | Final message to the user. ONLY report data you directly observed in page state, tool outputs, or screenshots during this session.（含 anti-hallucination：禁止用训练知识补缺口、禁止引用压缩记忆里未亲验的步骤、不确定要明说；必须非空） |
   | `success` | `bool` | `True` | Whether the task was completed successfully. 任何需求未满足 / 页面无预期数据 / 步骤无法核验 → 设 False |
+  | `files_to_display` | `list[str]` | `[]` | 二.B 绝对路径附件（须存在且在 `allowed_read_paths` 内；非法路径 warn+跳过）。`attachments` 非空时 `extracted_content` 追加一行清单 |
 
-- **主要逻辑**（[actions.py:1418-1433](../../src/tree_walker/tools/actions.py)）：
+- **主要逻辑**（[actions.py:2105](../../src/tree_walker/tools/actions.py) `_action_done`；阶段二完整行为见 [`docs/tools-optimize/done_follow_up.md`](../tools-optimize/done_follow_up.md)）：
 
+  变体 A（自由文本，`output_model=None`，默认）核心：
   ```python
   async def _action_done(self, params: dict, browser: BrowserSession) -> ActionResult:
       success = params.get("success", True)
+      # 二.B：files_to_display → attachments（白名单 + 存在性；失败只 warn+跳过）
+      # 二.E：self._output_model 给定时走变体 B（data → JSON 进 extracted_content/metadata）
       text = (params.get("text") or "").strip()
       if not text:
-          # done 必须终止（is_done=True 才退出循环），空 text 不能走 soft-miss
-          # （会变非终止循环）。兜底默认值保证终止 + 让退化情形在日志可见。
-          text = "(no summary provided)"
+          text = "(no summary provided)"           # done 必须终止，空 text 兜底
           logger.warning("done called with empty text; substituting default summary")
-      memory = f"Task completed: {success} - {text[:100]}"
+      truncated = text[:100]
+      memory = f"Task completed: {success} - {truncated}"
+      if len(text) > 100:                           # 二.A：- N more characters 后缀
+          memory += f" - {len(text) - 100} more characters"
+      visible = text
+      if attachments:                               # 二.B：附件清单
+          visible += "\n\nAttachments: " + ", ".join(os.path.basename(a) for a in attachments)
+      # 二.D：display_files_in_done_text=True 时内联附件内容（cap=done_attachment_max_chars）
       logger.info(memory)
-      return ActionResult(
-          is_done=True,
-          success=success,
-          extracted_content=text,
-          long_term_memory=memory,
-      )
+      return ActionResult(is_done=True, success=success, extracted_content=visible,
+                          long_term_memory=memory, attachments=attachments or None)
   ```
 
 - **CDP 调用清单**：无（纯状态信号，`browser` 形参未用）
 
 - **注意事项**：
   - `text` 字段描述强调"只能报告直接观察到的数据" + anti-hallucination，防止 LLM 编造结果；schema 层 `min_length=1` + handler 层 `text.strip()` 运行时守卫双层（`Tools.execute` 路径不经 param_model 校验）
-  - 双写回显：`extracted_content == text`（全文）、`long_term_memory == "Task completed: {success} - {text[:100]}"`（一行摘要，>100 字截断）、`logger.info(memory)`
+  - 双写回显：`extracted_content == text`（全文，附件非空时追加清单）、`long_term_memory == "Task completed: {success} - {text[:100]}"`（>100 字截断，二.A 追加 ` - N more characters`）、`logger.info(memory)`
   - 空 / 纯空白 / 缺失 `text`：warn + 兜底 `"(no summary provided)"`，仍 `is_done=True`（done 必须终止，不走 soft-miss）
+  - 二.B 附件：`files_to_display` 解析为绝对路径进 `ActionResult.attachments`，复用 `allowed_read_paths` 白名单；任何校验失败只 warn + 跳过（done 必须终止，绝不 error）
+  - 二.C 下载自动附加：`_post_process`（`track_downloads` 开启时）把 `AgentState.downloaded_files` 并入 done 结果 `attachments`（去重）
+  - 二.D 内联：`display_files_in_done_text`（`AgentSettings`，默认 False）开启时把附件内容（cap `done_attachment_max_chars`）内联进 `extracted_content` 的 `Attachments:` 段；仅变体 A
+  - 二.E 结构化输出：`Tools(output_model=T)` 时走变体 B——参数模型变 `StructuredDoneParams(data: T)`，`_hide_fields_from_schema` 对 LLM 隐藏 success/files_to_display（实际作用点 `get_action_descriptions_text`）；`data` 经 `model_dump(mode='json')` 进 `extracted_content`（纯 JSON）+ `metadata["structured_output"]`
   - `_post_process` 通过 `any(r.is_done for r in results)` 检测并触发主循环退出
   - 在循环检测中豁免（`_LOOP_EXEMPT_ACTIONS`），即使连续 done 也不会触发循环警告
 

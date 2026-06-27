@@ -12,12 +12,14 @@ import re
 import shutil
 import time
 
+from pydantic import BaseModel, ValidationError
+
 from tree_walker.agent.views import ActionResult
 from tree_walker.browser.session import BrowserSession, _requires_direct_value_assignment
 from tree_walker.browser.views import BrowserStateSummary, EnhancedDOMTreeNode, SerializedDOMState
 from tree_walker.config import TruncationSettings
 from tree_walker.tools.extract_markdown import chunk_markdown_by_structure, extract_clean_markdown
-from tree_walker.tools.models import ACTION_DEFINITIONS
+from tree_walker.tools.models import ACTION_DEFINITIONS, make_structured_done_params
 from tree_walker.tools.registry import ActionRegistry
 
 logger = logging.getLogger(__name__)
@@ -352,14 +354,25 @@ class Tools:
     The registry produces the Anthropic tool schema used by the LLM client.
     """
 
-    def __init__(self, truncation: TruncationSettings | None = None, allowed_upload_paths: list[str] | None = None, allowed_write_paths: list[str] | None = None, allowed_read_paths: list[str] | None = None) -> None:
-        self.registry = ActionRegistry()
+    def __init__(
+        self,
+        truncation: TruncationSettings | None = None,
+        allowed_upload_paths: list[str] | None = None,
+        allowed_write_paths: list[str] | None = None,
+        allowed_read_paths: list[str] | None = None,
+        display_files_in_done_text: bool = False,
+        output_model: type[BaseModel] | None = None,
+    ) -> None:
+        # 二.E：output_model 须在 _register_all 之前落到 self / registry（_register_all 据此选变体）。
+        self._output_model = output_model
+        self.registry = ActionRegistry(output_model=output_model)
         self._register_all()
         self._cached_browser_state: BrowserStateSummary | None = None
         self._truncation = truncation or TruncationSettings()
         self._allowed_upload_paths = allowed_upload_paths
         self._allowed_write_paths = allowed_write_paths
         self._allowed_read_paths = allowed_read_paths
+        self._display_files_in_done_text = display_files_in_done_text
 
     # ── Public API ─────────────────────────────────────────────────────
 
@@ -410,6 +423,9 @@ class Tools:
 
     def _register_all(self) -> None:
         for name, (param_model, description, terminates) in ACTION_DEFINITIONS.items():
+            # 二.E：done 结构化输出——output_model 给定时用变体 B 参数模型（data: T）。
+            if name == "done" and self._output_model is not None:
+                param_model = make_structured_done_params(self._output_model)
             handler = getattr(self, f"_action_{name}", None)
             if handler is None:
                 logger.debug("No handler for action %s, skipping", name)
@@ -2088,26 +2104,95 @@ class Tools:
 
     async def _action_done(self, params: dict, browser: BrowserSession) -> ActionResult:
         success = params.get("success", True)
+
+        # 二.B 共享：解析 files_to_display → attachments（白名单 + 存在性）。
+        # done 必须终止，故任何失败只 warn + 跳过，绝不 error / 绝不 is_done=False。
+        attachments: list[str] = []
+        allowed = self._allowed_read_paths
+        for raw in params.get("files_to_display") or []:
+            p = os.path.abspath(raw)
+            if allowed and not any(p.startswith(pre) for pre in allowed):
+                logger.warning("done: skip attachment outside allowed_read_paths: %s", p)
+                continue
+            if not os.path.isfile(p):
+                logger.warning("done: skip missing attachment: %s", p)
+                continue
+            attachments.append(p)
+
+        # 二.E 变体 B：结构化输出（output_model 给定时）。extracted_content 保持纯 JSON，
+        # 不追加清单 / 不内联（避免破坏结构化输出）；原始数据另存 metadata。
+        if self._output_model is not None:
+            try:
+                data = self._output_model.model_validate(params["data"])
+            except (ValidationError, KeyError, TypeError) as e:
+                # done 必须终止：结构化校验失败 → success=False 兜底，仍 is_done=True
+                logger.warning("done: structured data invalid: %s", e)
+                memory = "Task completed: False - invalid structured output"
+                logger.info(memory)
+                return ActionResult(
+                    is_done=True,
+                    success=False,
+                    extracted_content=f"(invalid structured output: {e})",
+                    long_term_memory=memory,
+                    attachments=attachments or None,
+                )
+            payload = data.model_dump(mode="json")
+            memory = f"Task completed (structured): {success}"
+            logger.info(memory)
+            return ActionResult(
+                is_done=True,
+                success=success,
+                extracted_content=json.dumps(payload, ensure_ascii=False, indent=2),
+                long_term_memory=memory,
+                metadata={"structured_output": payload},
+                attachments=attachments or None,
+            )
+
+        # 变体 A：自由文本（阶段一 + 二.A 后缀 + 二.B 清单 + 二.D 内联）
         text = (params.get("text") or "").strip()
         if not text:
             # done 必须终止（is_done=True 才退出循环，step.py:103），空 text 不能走
             # soft-miss（会变非终止循环）。兜底默认值保证终止 + 让退化情形在日志可见。
             text = "(no summary provided)"
             logger.warning("done called with empty text; substituting default summary")
-        memory = f"Task completed: {success} - {text[:100]}"
+        truncated = text[:100]
+        memory = f"Task completed: {success} - {truncated}"
+        if len(text) > 100:  # 二.A：对齐 browser-use 变体 A 的 - N more characters 后缀
+            memory += f" - {len(text) - 100} more characters"
+        visible = text
+        if attachments:  # 二.B：附件清单（让 final_result() 可见；__str__ 仍被 500 截断）
+            visible += "\n\nAttachments: " + ", ".join(os.path.basename(a) for a in attachments)
+        if self._display_files_in_done_text and attachments:  # 二.D：内联文件内容
+            cap = self._truncation.done_attachment_max_chars
+            inline_parts = ["", "Attachments:"]
+            for a in attachments:
+                try:
+                    with open(a, "r", encoding="utf-8", errors="replace") as f:
+                        body = f.read(cap)
+                except OSError as e:
+                    logger.warning("done: skip inline read %s: %s", a, e)
+                    continue
+                inline_parts.append(f"--- {a} ---\n{body}")
+            if len(inline_parts) > 1:
+                visible += "\n" + "\n".join(inline_parts)
         logger.info(memory)
         return ActionResult(
             is_done=True,
             success=success,
-            extracted_content=text,
+            extracted_content=visible,
             long_term_memory=memory,
+            attachments=attachments or None,
         )
 
     # ── Helpers ────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _flatten_params(params: dict, action_name: str) -> dict:
-        """Handle nested params like {"click": {"index": 5}} -> {"index": 5}."""
+    def _flatten_params(self, params: dict, action_name: str) -> dict:
+        """Handle nested params like {"click": {"index": 5}} -> {"index": 5}.
+
+        Won't unwrap a single nested dict whose key is a real field of this
+        action's param_model (e.g. variant-B done ``data``) — that's a
+        legitimate dict-valued param, not LLM wrapping.
+        """
         if not params:
             return params
         if action_name in params and isinstance(params[action_name], dict):
@@ -2115,7 +2200,12 @@ class Tools:
         # Check for any single nested dict value (common LLM pattern)
         dict_vals = {k: v for k, v in params.items() if isinstance(v, dict)}
         if len(dict_vals) == 1 and len(params) == 1:
-            return list(dict_vals.values())[0]
+            only_key = next(iter(dict_vals))
+            param_model = self.registry.actions[action_name].param_model
+            # 二.E：若该键是动作参数模型的真字段（如 done 变体 B 的 data），
+            # 则是合法 dict 值参数，而非 LLM 包裹，不展开。
+            if only_key not in param_model.model_fields:
+                return list(dict_vals.values())[0]
         return params
 
     @staticmethod

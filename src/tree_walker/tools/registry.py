@@ -1,16 +1,33 @@
 ﻿from __future__ import annotations
 
+import copy
 import fnmatch
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterable
 
 from pydantic import BaseModel
 
 from tree_walker.agent.views import ActionResult
 
 logger = logging.getLogger(__name__)
+
+
+def _hide_fields_from_schema(schema: dict, fields: Iterable[str]) -> dict:
+    """Return a copy of a Pydantic JSON schema with ``fields`` removed from
+    ``properties`` and ``required`` (mirrors browser-use
+    ``_hide_internal_fields_from_schema``). Used so variant-B done exposes only
+    ``data`` to the LLM while the handler still accepts success/files_to_display.
+    """
+    out = copy.deepcopy(schema)
+    props = out.get("properties", {})
+    for f in fields:
+        props.pop(f, None)
+    req = out.get("required")
+    if isinstance(req, list):
+        out["required"] = [r for r in req if r not in set(fields)]
+    return out
 
 
 @dataclass
@@ -24,8 +41,11 @@ class RegisteredAction:
 
 
 class ActionRegistry:
-    def __init__(self) -> None:
+    def __init__(self, output_model: type[BaseModel] | None = None) -> None:
         self.actions: dict[str, RegisteredAction] = {}
+        # 二.E：done 结构化输出（变体 B）的用户模型；get_tool_schema 据此隐藏
+        # success/files_to_display，_register_all 据此选变体 B 参数模型。
+        self.output_model = output_model
 
     def _action_available(self, name: str, page_url: str | None) -> bool:
         if page_url is None:
@@ -201,6 +221,10 @@ class ActionRegistry:
                 continue
             act = self.actions[name]
             schema = act.param_model.model_json_schema()
+            # 二.E：变体 B（output_model 给定）时对 done 隐藏 success/files_to_display——
+            # 这是 LLM 实际看到的参数面（tool schema 的 params 是通用 object，详情走此处文本）。
+            if name == "done" and self.output_model is not None:
+                schema = _hide_fields_from_schema(schema, ("success", "files_to_display"))
             props = schema.get("properties", {})
             params_str = ", ".join(
                 f"{k}: {v.get('description', v.get('type', 'any'))}"

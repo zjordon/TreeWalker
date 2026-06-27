@@ -17,6 +17,9 @@ class ActionResult(BaseModel):
     # 阶段二（二.F）：通用结构化副字段（如 evaluate 的 images），默认 None；
     # __str__ 不 dump 它，保持 display_max_chars=500 的有界显示。
     metadata: dict[str, Any] | None = None
+    # 阶段二（二.B）：done 附件（绝对路径列表），默认 None；__str__ 不渲染它，
+    # 保持 display_max_chars=500 的有界显示（附件清单改走 extracted_content）。
+    attachments: list[str] | None = None
 
     @model_validator(mode='after')
     def validate_success_requires_done(self):

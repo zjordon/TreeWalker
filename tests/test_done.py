@@ -11,22 +11,27 @@ Covers:
   NOT validate, so the handler adds its own runtime guard).
 
 Tools().execute(...) entry point, MagicMock() browser, TAB indentation per
-CLAUDE.md. No tmp_path (done has no filesystem surface).
+CLAUDE.md. tmp_path for attachments/inline (二.B/二.D); variant B via
+Tools(output_model=...) (二.E); downloads via _attach_downloads_to_done_results
+(二.C).
 """
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
+from tree_walker.agent.step import _attach_downloads_to_done_results
+from tree_walker.agent.views import ActionResult, DownloadInfo
 from tree_walker.tools.actions import Tools
 from tree_walker.tools.models import DoneParams
 
 
-async def _run(params: dict):
+async def _run(params: dict, tools: Tools | None = None):
 	"""Drive done through the public Tools().execute entry point."""
-	tools = Tools()
+	tools = tools or Tools()
 	return await tools.execute("done", params, MagicMock())
 
 
@@ -79,9 +84,15 @@ class TestDoneEcho:
 	async def test_long_term_memory_truncates_at_100_chars(self):
 		long_text = "x" * 250
 		r = await _run({"text": long_text})
-		assert r.long_term_memory == f"Task completed: True - {'x' * 100}"
+		# 二.A: >100 字追加 " - N more characters" 后缀
+		assert r.long_term_memory == f"Task completed: True - {'x' * 100} - 150 more characters"
 		# extracted_content keeps the full text (no truncation)
 		assert r.extracted_content == long_text
+
+	@pytest.mark.asyncio
+	async def test_short_text_no_more_chars_suffix(self):
+		r = await _run({"text": "short summary"})
+		assert "more characters" not in r.long_term_memory
 
 	@pytest.mark.asyncio
 	async def test_logger_info_emits_memory(self, caplog):
@@ -160,4 +171,212 @@ class TestDoneParamsValidation:
 
 	def test_extra_forbidden(self):
 		with pytest.raises(ValidationError):
-			DoneParams(text="ok", files_to_display=[])  # type: ignore[call-arg]
+			DoneParams(text="ok", not_a_real_field=1)  # type: ignore[call-arg]
+
+	def test_files_to_display_defaults_empty(self):
+		p = DoneParams(text="ok")
+		assert p.files_to_display == []
+
+
+# ── 二.B attachments (files_to_display → attachments) ──────────────
+
+
+class TestDoneAttachments:
+	@pytest.mark.asyncio
+	async def test_files_to_display_attached_as_absolute(self, tmp_path):
+		f = tmp_path / "a.txt"
+		f.write_text("hi", encoding="utf-8")
+		r = await _run({"text": "ok", "files_to_display": [str(f)]})
+		assert r.attachments == [str(f)]
+		assert "Attachments: a.txt" in r.extracted_content
+		assert r.is_done is True
+
+	@pytest.mark.asyncio
+	async def test_relative_path_resolved_to_absolute(self, tmp_path, monkeypatch):
+		f = tmp_path / "rel.txt"
+		f.write_text("x", encoding="utf-8")
+		monkeypatch.chdir(tmp_path)
+		r = await _run({"text": "ok", "files_to_display": ["rel.txt"]})
+		assert r.attachments == [str(f)]
+
+	@pytest.mark.asyncio
+	async def test_attachment_outside_allowlist_skipped(self, tmp_path, caplog):
+		safe = tmp_path / "safe"
+		safe.mkdir()
+		inside = safe / "in.txt"
+		inside.write_text("x", encoding="utf-8")
+		outside = tmp_path / "out.txt"
+		outside.write_text("x", encoding="utf-8")
+		tools = Tools(allowed_read_paths=[str(safe)])
+		with caplog.at_level("WARNING", logger="tree_walker.tools.actions"):
+			r = await _run({"text": "ok", "files_to_display": [str(inside), str(outside)]}, tools)
+		assert str(inside) in (r.attachments or [])
+		assert str(outside) not in (r.attachments or [])
+		assert any("allowed_read_paths" in rec.message for rec in caplog.records)
+		assert r.is_done is True
+
+	@pytest.mark.asyncio
+	async def test_missing_attachment_skipped(self, tmp_path, caplog):
+		missing = tmp_path / "nope.txt"
+		with caplog.at_level("WARNING", logger="tree_walker.tools.actions"):
+			r = await _run({"text": "ok", "files_to_display": [str(missing)]})
+		assert r.attachments in (None, [])
+		assert any("missing attachment" in rec.message for rec in caplog.records)
+		assert r.is_done is True
+
+	@pytest.mark.asyncio
+	async def test_no_files_to_display_empty(self):
+		r = await _run({"text": "ok"})
+		assert r.attachments in (None, [])
+		assert "Attachments:" not in (r.extracted_content or "")
+
+
+# ── 二.C downloads auto-attach (pure helper) ───────────────────────
+
+
+class TestDoneDownloads:
+	def test_attach_downloads_to_done_result(self):
+		r = ActionResult(is_done=True, success=True, extracted_content="d")
+		_attach_downloads_to_done_results(
+			[r], [DownloadInfo(filename="a.csv", url="u", path="/tmp/a.csv")],
+		)
+		assert r.attachments == ["/tmp/a.csv"]
+
+	def test_attach_downloads_skips_non_done(self):
+		done = ActionResult(is_done=True, success=True, extracted_content="d")
+		other = ActionResult(extracted_content="x")
+		_attach_downloads_to_done_results(
+			[other, done], [DownloadInfo(filename="a.csv", url="u", path="/tmp/a.csv")],
+		)
+		assert done.attachments == ["/tmp/a.csv"]
+		assert other.attachments is None
+
+	def test_attach_downloads_dedup(self):
+		r = ActionResult(is_done=True, success=True, extracted_content="d",
+		                 attachments=["/tmp/a.csv"])
+		_attach_downloads_to_done_results(
+			[r],
+			[DownloadInfo(filename="a.csv", url="u", path="/tmp/a.csv"),
+			 DownloadInfo(filename="b.csv", url="v", path="/tmp/b.csv")],
+		)
+		assert r.attachments == ["/tmp/a.csv", "/tmp/b.csv"]
+
+	def test_attach_downloads_skips_missing_path(self):
+		r = ActionResult(is_done=True, success=True, extracted_content="d")
+		_attach_downloads_to_done_results(
+			[r], [DownloadInfo(filename="a", url="u", path=None)],
+		)
+		assert r.attachments is None
+
+
+# ── 二.D display_files_in_done_text inline switch ──────────────────
+
+
+class TestDoneInlineAttachments:
+	@pytest.mark.asyncio
+	async def test_inline_off_by_default(self, tmp_path):
+		f = tmp_path / "a.txt"
+		f.write_text("hello", encoding="utf-8")
+		r = await _run({"text": "ok", "files_to_display": [str(f)]})
+		assert "--- " not in (r.extracted_content or "")
+
+	@pytest.mark.asyncio
+	async def test_inline_on_embeds_content(self, tmp_path):
+		f = tmp_path / "a.txt"
+		f.write_text("hello world", encoding="utf-8")
+		tools = Tools(display_files_in_done_text=True)
+		r = await _run({"text": "ok", "files_to_display": [str(f)]}, tools)
+		assert f"--- {f} ---" in r.extracted_content
+		assert "hello world" in r.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_inline_caps_large_file(self, tmp_path):
+		f = tmp_path / "big.txt"
+		f.write_text("y" * 5000, encoding="utf-8")
+		tools = Tools(display_files_in_done_text=True)
+		tools._truncation.done_attachment_max_chars = 100
+		r = await _run({"text": "ok", "files_to_display": [str(f)]}, tools)
+		assert "y" * 100 in r.extracted_content
+		assert "y" * 101 not in r.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_inline_read_failure_skipped(self, tmp_path, caplog, monkeypatch):
+		f = tmp_path / "a.txt"
+		f.write_text("hi", encoding="utf-8")
+		tools = Tools(display_files_in_done_text=True)
+		import builtins
+		real_open = builtins.open
+
+		def _boom(path, *a, **k):
+			if str(path) == str(f):
+				raise OSError("boom")
+			return real_open(path, *a, **k)
+
+		monkeypatch.setattr(builtins, "open", _boom)
+		with caplog.at_level("WARNING", logger="tree_walker.tools.actions"):
+			r = await _run({"text": "ok", "files_to_display": [str(f)]}, tools)
+		assert r.is_done is True
+		assert any("skip inline read" in rec.message for rec in caplog.records)
+
+
+# ── 二.E structured output (output_model / variant B) ──────────────
+
+
+class _StructOut(BaseModel):
+	name: str
+	count: int = 0
+
+
+class TestDoneStructuredOutput:
+	@pytest.mark.asyncio
+	async def test_structured_serializes_data(self):
+		tools = Tools(output_model=_StructOut)
+		r = await _run({"data": {"name": "a", "count": 3}}, tools)
+		assert r.is_done is True
+		assert r.success is True
+		assert json.loads(r.extracted_content) == {"name": "a", "count": 3}
+		assert r.metadata == {"structured_output": {"name": "a", "count": 3}}
+
+	@pytest.mark.asyncio
+	async def test_structured_invalid_data_falls_back(self):
+		tools = Tools(output_model=_StructOut)
+		r = await _run({"data": {"count": 5}}, tools)  # missing required 'name'
+		assert r.is_done is True
+		assert r.success is False
+		assert "invalid structured output" in r.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_structured_missing_data_key_falls_back(self):
+		tools = Tools(output_model=_StructOut)
+		r = await _run({}, tools)  # no 'data' key → KeyError path
+		assert r.is_done is True
+		assert r.success is False
+
+	def test_structured_descriptions_hide_internal_fields(self):
+		tools = Tools(output_model=_StructOut)
+		text = tools.registry.get_action_descriptions_text()
+		done_line = next(ln for ln in text.splitlines() if ln.startswith("- **done**"))
+		params_part = done_line.split("(", 1)[1].split(")", 1)[0]
+		assert "data" in params_part
+		assert "success" not in params_part
+		assert "files_to_display" not in params_part
+
+	def test_variant_a_descriptions_show_text_success_files(self):
+		tools = Tools()
+		text = tools.registry.get_action_descriptions_text()
+		done_line = next(ln for ln in text.splitlines() if ln.startswith("- **done**"))
+		params_part = done_line.split("(", 1)[1].split(")", 1)[0]
+		assert "text" in params_part
+		assert "success" in params_part
+		assert "files_to_display" in params_part
+
+	@pytest.mark.asyncio
+	async def test_structured_done_with_attachments(self, tmp_path):
+		f = tmp_path / "a.txt"
+		f.write_text("x", encoding="utf-8")
+		tools = Tools(output_model=_StructOut)
+		r = await _run({"data": {"name": "a"}, "files_to_display": [str(f)]}, tools)
+		assert r.attachments == [str(f)]
+		# 变体 B extracted_content 保持纯 JSON（不追加清单 / 不内联）
+		assert r.extracted_content.lstrip().startswith("{")
+		assert "Attachments:" not in r.extracted_content
