@@ -58,6 +58,7 @@ class TruncationSettings:
     find_elements_output_dir: str = "find_elements_output"  # dir for oversized element lists (env-config)
     eval_save_threshold: int = 10000      # evaluate result >= this → write to file (mirrors extract/search_page/find_elements)
     eval_output_dir: str = "evaluate_output"  # dir for oversized JS results (env-config)
+    done_attachment_max_chars: int = 2000   # 二.D：单个附件内联上限（display_files_in_done_text 开启时）
 
 
 @dataclass
@@ -90,6 +91,7 @@ class AgentSettings:
     allowed_upload_paths: list[str] | None = None
     allowed_write_paths: list[str] | None = None
     allowed_read_paths: list[str] | None = None
+    display_files_in_done_text: bool = False  # 二.D：done 是否把附件内容内联进 extracted_content
     judge: JudgeSettings = field(default_factory=JudgeSettings)
     # extract 工具：专用 LLM（None=复用主 llm）+ 结构化抽取的 JSON Schema（None=free-text）
     extract_llm: LLMSettings | None = None
@@ -277,6 +279,7 @@ def load_settings() -> Settings:
             search_page_output_dir=os.environ.get("AGENT_SEARCH_PAGE_OUTPUT_DIR", "search_page_output"),
             eval_save_threshold=int(os.environ.get("AGENT_EVAL_SAVE_THRESHOLD", "10000")),
             eval_output_dir=os.environ.get("AGENT_EVAL_OUTPUT_DIR", "evaluate_output"),
+            done_attachment_max_chars=int(os.environ.get("AGENT_DONE_ATTACHMENT_MAX_CHARS", "2000")),
         ),
         enable_planning=os.environ.get("AGENT_ENABLE_PLANNING", "").lower() == "true",
         exploration_threshold=int(os.environ.get("AGENT_EXPLORATION_THRESHOLD", "5")),
@@ -288,6 +291,7 @@ def load_settings() -> Settings:
         allowed_upload_paths=_load_allowed_upload_paths(),
         allowed_write_paths=_load_allowed_write_paths(),
         allowed_read_paths=_load_allowed_read_paths(),
+        display_files_in_done_text=os.environ.get("AGENT_DISPLAY_FILES_IN_DONE_TEXT", "").lower() == "true",
         judge=JudgeSettings(
             enabled=os.environ.get("AGENT_JUDGE_ENABLED", "1") == "1",
             model=os.environ.get("AGENT_JUDGE_MODEL", ""),

@@ -1,6 +1,6 @@
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator
 
 
 class NavigateParams(BaseModel):
@@ -506,6 +506,31 @@ class DoneParams(BaseModel):
             "data, or a step could not be verified. Leave True only when every "
             "requirement was directly confirmed this session."
         ),
+    )
+    files_to_display: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Absolute file paths to attach to the final result (downloads, saved "
+            "reports, screenshots). Each must exist and be under an allowed read "
+            "path; invalid paths are skipped with a warning. Shown as a short "
+            "manifest in the summary."
+        ),
+    )
+
+
+def make_structured_done_params(output_model: type[BaseModel]) -> type[BaseModel]:
+    """Build the variant-B done param model (二.E 结构化输出).
+
+    ``data: output_model`` is required; ``success``/``files_to_display`` are kept
+    for the handler but hidden from the LLM schema by the registry (mirrors
+    browser-use ``StructuredOutputAction[T]`` + ``_hide_internal_fields_from_schema``).
+    """
+    return create_model(
+        "StructuredDoneParams",
+        data=(output_model, Field(..., description="Structured final output.")),
+        success=(bool, Field(default=True)),
+        files_to_display=(list[str], Field(default_factory=list)),
+        __config__=ConfigDict(extra="forbid"),
     )
 
 

@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import ValidationError
 
 from tree_walker.agent.log_formatter import log_response, log_step_completion
-from tree_walker.agent.views import ActionResult, AgentHistory
+from tree_walker.agent.views import ActionResult, AgentHistory, DownloadInfo
 from tree_walker.browser.views import BrowserStateSummary
 from tree_walker.prompts.system_prompt import build_state_message, build_system_prompt
 from tree_walker.tools.models import ACTION_DEFINITIONS
@@ -37,6 +37,25 @@ _FALLBACK_DONE_OUTPUT: dict[str, Any] = {
     "next_goal": "Ending task",
     "action": {"name": "done", "params": {"text": "No action returned by LLM", "success": False}},
 }
+
+
+def _attach_downloads_to_done_results(
+    results: list[ActionResult], downloaded_files: list[DownloadInfo],
+) -> None:
+    """二.C：把会话下载自动并入 done 结果的 attachments（对齐 browser-use 变体 B 的
+    browser_session.downloaded_files）。原地修改 results；去重；跳过无 path 的下载。
+    纯函数，便于单测（_post_process 门控 track_downloads 后调用）。
+    """
+    dl_paths = [d.path for d in downloaded_files if d.path]
+    if not dl_paths:
+        return
+    for r in results:
+        if not r.is_done:
+            continue
+        existing = set(r.attachments or [])
+        merged = list(r.attachments or []) + [p for p in dl_paths if p not in existing]
+        if merged:
+            r.attachments = merged
 
 
 class StepPipeline:
@@ -666,6 +685,12 @@ class StepPipeline:
         """
         self.state.last_result = results
         self.state.last_model_output = model_output
+
+        # 二.C：把会话下载自动并入 done 结果的 attachments（对齐 browser-use 变体 B 的
+        # browser_session.downloaded_files）。置于 failure 计数分支之前，不改变
+        # consecutive_failures 语义。
+        if self._track_downloads and self.state.downloaded_files:
+            _attach_downloads_to_done_results(results, self.state.downloaded_files)
 
         # Update plan state from model output (if planning enabled)
         if self._enable_planning and self.plan_manager:
