@@ -23,7 +23,7 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import BaseModel, ValidationError
 
-from tree_walker.agent.step import _attach_downloads_to_done_results
+from tree_walker.agent.step import StepPipeline, _attach_downloads_to_done_results
 from tree_walker.agent.views import ActionResult, DownloadInfo
 from tree_walker.tools.actions import Tools
 from tree_walker.tools.models import DoneParams
@@ -380,3 +380,59 @@ class TestDoneStructuredOutput:
 		# 变体 B extracted_content 保持纯 JSON（不追加清单 / 不内联）
 		assert r.extracted_content.lstrip().startswith("{")
 		assert "Attachments:" not in r.extracted_content
+
+
+# ── 二.E variant-B done param validation (step.py regression) ──────
+
+
+class _FakeStep:
+	"""Minimal step exposing only .tools — all _validate_action_params reads."""
+
+	def __init__(self, tools):
+		self.tools = tools
+
+
+class TestDoneStructuredParamValidation:
+	"""StepPipeline._validate_action_params must use the registry's variant-B
+	param_model (StructuredDoneParams), not the static DoneParams.
+
+	Regression: with output_model set, the LLM correctly emitted done(data=...),
+	but validation used the standard DoneParams (text required, data forbidden)
+	→ 'text: Field required; data: Extra inputs are not permitted' on every
+	retry → 'proceeding anyway' → handler saw a plain string → task failed.
+	"""
+
+	def _validate(self, tools, params):
+		response = {"action": {"name": "done", "params": params}}
+		return StepPipeline._validate_action_params(_FakeStep(tools), response)
+
+	def test_variant_b_valid_data_passes(self):
+		err = self._validate(Tools(output_model=_StructOut), {"data": {"name": "a", "count": 3}})
+		assert err is None
+
+	def test_variant_b_string_data_reports_data_not_text(self):
+		# LLM emitting data as a plain string → actionable 'data' error, not the
+		# old contradictory 'text: Field required; data: Extra inputs are not permitted'.
+		err = self._validate(Tools(output_model=_StructOut), {"data": "plain string"})
+		assert err is not None
+		assert "data" in err
+		assert "text" not in err
+
+	def test_variant_b_missing_data_reports_data_required(self):
+		err = self._validate(Tools(output_model=_StructOut), {})
+		assert err is not None
+		assert "data" in err
+
+	def test_variant_a_text_passes(self):
+		err = self._validate(Tools(), {"text": "ok"})
+		assert err is None
+
+	def test_variant_a_data_rejected(self):
+		# Without output_model, 'data' is extra → standard DoneParams rejects it.
+		err = self._validate(Tools(), {"data": "something"})
+		assert err is not None
+		assert "text" in err
+
+	def test_unknown_action_returns_none(self):
+		response = {"action": {"name": "bogus_action", "params": {}}}
+		assert StepPipeline._validate_action_params(_FakeStep(Tools()), response) is None

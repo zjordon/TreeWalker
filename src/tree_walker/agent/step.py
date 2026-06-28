@@ -15,7 +15,6 @@ from tree_walker.agent.log_formatter import log_response, log_step_completion
 from tree_walker.agent.views import ActionResult, AgentHistory, DownloadInfo
 from tree_walker.browser.views import BrowserStateSummary
 from tree_walker.prompts.system_prompt import build_state_message, build_system_prompt
-from tree_walker.tools.models import ACTION_DEFINITIONS
 
 if TYPE_CHECKING:
     from tree_walker.config import TruncationSettings
@@ -477,9 +476,16 @@ class StepPipeline:
         )
         return response
 
-    @staticmethod
-    def _validate_action_params(response: dict[str, Any]) -> str | None:
+    def _validate_action_params(self, response: dict[str, Any]) -> str | None:
         """Validate action params against the registered Pydantic model.
+
+        Uses the registry's param_model — variant-B aware (``done`` switches to
+        ``StructuredDoneParams`` when ``output_model`` is set) — and the same
+        flattening as the execution path (``Tools._flatten_params``), so the
+        schema the LLM sees, this validation, and execution all agree. The prior
+        static version used the ``ACTION_DEFINITIONS`` model, so variant-B
+        ``done(data=...)`` was validated against the standard ``DoneParams``
+        (text required, data forbidden) and always failed.
 
         Returns None if valid, or an error detail string if invalid.
         """
@@ -487,12 +493,13 @@ class StepPipeline:
         name = action.get("name", "")
         params = action.get("params", {})
 
-        definition = ACTION_DEFINITIONS.get(name)
-        if definition is None:
+        registered = self.tools.registry.actions.get(name)
+        if registered is None:
+            # Unknown action — let execution surface it; nothing to validate.
             return None
 
-        param_model = definition[0]
-        flat_params = _flatten_params_for_validation(params, name)
+        param_model = registered.param_model
+        flat_params = self.tools._flatten_params(params, name)
         try:
             param_model.model_validate(flat_params)
             return None
@@ -875,15 +882,3 @@ _CONNECTION_ERROR_PATTERNS = (
 
 # Actions excluded from loop detection — always hash the same or are terminal.
 _LOOP_EXEMPT_ACTIONS = frozenset({"wait", "done", "go_back"})
-
-
-def _flatten_params_for_validation(params: dict, action_name: str) -> dict:
-    """Flatten nested params before Pydantic validation (mirrors Tools._flatten_params)."""
-    if not params:
-        return params
-    if action_name in params and isinstance(params[action_name], dict):
-        return params[action_name]
-    dict_vals = {k: v for k, v in params.items() if isinstance(v, dict)}
-    if len(dict_vals) == 1 and len(params) == 1:
-        return list(dict_vals.values())[0]
-    return params
