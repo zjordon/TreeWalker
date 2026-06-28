@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -88,6 +89,48 @@ class TestDownloadTracking:
             mock_client.send.Browser.setDownloadBehavior.assert_called_once()
             call_args = mock_client.send.Browser.setDownloadBehavior.call_args
             assert call_args[0][0]["eventsEnabled"] is True
+            # behavior="allow" MUST carry a downloadPath or CDP rejects with
+            # -32602 "downloadPath not provided" (the bug this guards against).
+            assert call_args[0][0]["downloadPath"]
 
             mock_client.register.Browser.downloadWillBegin.assert_called_once()
             mock_client.register.Browser.downloadProgress.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_setup_default_download_path_is_user_downloads(self, monkeypatch):
+        # No explicit path and no env → resolve to the user's ~/Downloads.
+        monkeypatch.delenv("DOWNLOADS_PATH", raising=False)
+        with patch("tree_walker.browser.session.CDPClient") as MockCDP:
+            mock_client = _make_mock_client()
+            MockCDP.return_value = mock_client
+            session = BrowserSession(ws_url="ws://localhost:9222")
+            await session.start(track_downloads=True)
+
+            call_args = mock_client.send.Browser.setDownloadBehavior.call_args
+            expected = os.path.join(os.path.expanduser("~"), "Downloads")
+            assert call_args[0][0]["downloadPath"] == expected
+
+    @pytest.mark.asyncio
+    async def test_setup_explicit_download_path_is_passed_through(self, tmp_path):
+        target = tmp_path / "dl"
+        with patch("tree_walker.browser.session.CDPClient") as MockCDP:
+            mock_client = _make_mock_client()
+            MockCDP.return_value = mock_client
+            session = BrowserSession(ws_url="ws://localhost:9222")
+            await session.start(track_downloads=True, downloads_path=str(target))
+
+            call_args = mock_client.send.Browser.setDownloadBehavior.call_args
+            assert call_args[0][0]["downloadPath"] == str(target)
+
+    @pytest.mark.asyncio
+    async def test_setup_env_overrides_default_download_path(self, monkeypatch, tmp_path):
+        env_dir = tmp_path / "envdl"
+        monkeypatch.setenv("DOWNLOADS_PATH", str(env_dir))
+        with patch("tree_walker.browser.session.CDPClient") as MockCDP:
+            mock_client = _make_mock_client()
+            MockCDP.return_value = mock_client
+            session = BrowserSession(ws_url="ws://localhost:9222")
+            await session.start(track_downloads=True)
+
+            call_args = mock_client.send.Browser.setDownloadBehavior.call_args
+            assert call_args[0][0]["downloadPath"] == str(env_dir)
