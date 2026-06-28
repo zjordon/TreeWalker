@@ -118,15 +118,27 @@ def _build_units(md: str, max_chars: int) -> list[_Unit]:
 
 
 def _pack_units(units: list[_Unit], max_chars: int) -> list[tuple[int, int, str]]:
-    """贪心把相邻 unit 装进同一块，直到再加下一块会超 max_chars。"""
+    """贪心把相邻 unit 装进同一块，直到再加下一块会超 max_chars。
+
+    反孤岛：当前块过小（``< max_chars/4``）时，即使略超预算也把下一个 unit 并入，
+    避免 markdownify 把整页压成单行（如 HN 的 10K+ 行）时，前面那点 nav/header 被单独
+    切成无用小块——会让 extract 的第一块（``start_from_char=0``）只拿到 nav 空壳（issue #86）。
+    并入后该块 ``end_index - start_index`` 可能略超 max_chars（≤ 1.25×）。
+    """
     if not units:
         return []
+    min_chunk = max(max_chars // 4, 1)
     chunks: list[tuple[int, int, str]] = []
     cur_start = units[0].start
     cur_end = units[0].end
     cur_text = units[0].text
     for u in units[1:]:
-        if cur_end - cur_start + (u.end - u.start) <= max_chars:
+        cur_size = cur_end - cur_start
+        if cur_size + (u.end - u.start) <= max_chars:
+            cur_end = u.end
+            cur_text += u.text
+        elif cur_size < min_chunk:
+            # 当前块过小（孤岛）→ 并入下一块（允许略超 max_chars），避免无内容空壳块
             cur_end = u.end
             cur_text += u.text
         else:
@@ -185,6 +197,10 @@ def chunk_markdown_by_structure(md: str, *, max_chars: int = 8000) -> list[Markd
 
     策略：行级 unit → 贪心打包 → 表头延续。返回 ``start_index`` / ``end_index`` 单调递增、
     连续、覆盖全 md 的块；``md`` ≤ max_chars 时返回单个块；``md`` 为空返回 ``[]``。
+
+    反孤岛例外：当某块过小（``< max_chars/4``）且其后是大块时，会把它并入下一块，此时该块
+    ``end_index - start_index`` 可能略超 max_chars（≤ 1.25×）。避免 markdownify 把整页压成单行
+    （如 HN 的 10K+ 行）时，开头那点 nav/header 被切成无内容空壳块（issue #86）。
     """
     if not md:
         return []

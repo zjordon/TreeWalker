@@ -99,3 +99,35 @@ class TestChunkMarkdownByStructure:
 		# the trailing non-table chunk must NOT carry a synthetic header
 		assert not chunks[-1].content.startswith("| H |")
 		assert chunks[-1].end_index == len(md)
+
+	def test_giant_line_after_short_content_not_orphaned(self):
+		# markdownify 把表格密集页（如 HN）压成单行时，前面那点 nav/header 不能被
+		# 单独切成无内容空壳块（否则 extract 第一块 start_from_char=0 只拿到 nav）。issue #86。
+		nav = "# Nav\nlink link link\n"
+		giant = "STORY " * 4000  # ~24K 单行
+		md = nav + giant
+		chunks = chunk_markdown_by_structure(md, max_chars=8000)
+		assert chunks[0].end_index > len(nav), "chunk0 被孤岛成 nav 空壳"
+		assert "STORY" in chunks[0].content
+
+	def test_orphan_merge_preserves_contiguity_and_coverage(self):
+		# 反孤岛并入后仍须连续覆盖全文（可重组还原原文）
+		nav = "nav\n"
+		giant = "x" * 20000
+		md = nav + giant
+		chunks = chunk_markdown_by_structure(md, max_chars=8000)
+		assert chunks[0].start_index == 0
+		assert chunks[-1].end_index == len(md)
+		for a, b in zip(chunks, chunks[1:]):
+			assert a.end_index == b.start_index  # contiguous
+		reassembled = "".join(md[c.start_index:c.end_index] for c in chunks)
+		assert reassembled == md
+
+	def test_hn_like_short_nav_plus_giant_line(self):
+		# 复刻真实 HN：极短 nav + 单条 10K+ 内容行；第一块必须含正文故事
+		nav = "Hacker News\n| new | past | comments |\n"
+		stories = "".join(f"[Story {i}]({i} points) " for i in range(1, 1001))  # ~25K 单行
+		md = nav + stories
+		chunks = chunk_markdown_by_structure(md, max_chars=8000)
+		assert "Story 1" in chunks[0].content
+		assert "Story 2" in chunks[0].content
