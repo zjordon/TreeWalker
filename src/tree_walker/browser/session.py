@@ -1158,12 +1158,16 @@ class BrowserSession:
         # stop() 时统一清理（见 set_file_input / stop）。
         self._upload_temp_paths: list[str] = []
 
-    async def start(self, *, track_downloads: bool = False) -> None:
-        """Connect to the browser via CDP WebSocket."""
+    async def start(self, *, track_downloads: bool = False, downloads_path: str | None = None) -> None:
+        """Connect to the browser via CDP WebSocket.
+
+        ``downloads_path`` overrides where tracked downloads land; see
+        ``_setup_download_tracking``.
+        """
         self.client = CDPClient(self.ws_url)
         await self._connect()
         if track_downloads:
-            await self._setup_download_tracking()
+            await self._setup_download_tracking(downloads_path)
 
     async def _connect(self) -> None:
         """Perform CDP connection, target discovery, and session setup."""
@@ -1339,10 +1343,28 @@ class BrowserSession:
             self.client = None
             return False
 
-    async def _setup_download_tracking(self) -> None:
-        """Enable CDP download events and register callbacks."""
+    async def _setup_download_tracking(self, downloads_path: str | None = None) -> None:
+        """Enable CDP download events and register callbacks.
+
+        CDP ``Browser.setDownloadBehavior`` with ``behavior="allow"`` requires a
+        ``downloadPath`` — the ``default`` behavior emits no download events, so
+        it cannot be used for tracking. The path is resolved as: explicit
+        ``downloads_path`` arg > ``DOWNLOADS_PATH`` env > the user's OS
+        ``Downloads`` dir (Chrome's default download location). The dir is created
+        if missing; a creation failure is logged but does not abort startup.
+        """
+        download_path = (
+            downloads_path
+            or os.environ.get("DOWNLOADS_PATH")
+            or os.path.join(os.path.expanduser("~"), "Downloads")
+        )
+        try:
+            os.makedirs(download_path, exist_ok=True)
+        except OSError as e:
+            logger.warning("Could not create download dir %s: %s", download_path, e)
+
         await self.client.send.Browser.setDownloadBehavior(
-            {"behavior": "allow", "eventsEnabled": True},
+            {"behavior": "allow", "eventsEnabled": True, "downloadPath": download_path},
             session_id=self.current_session_id,
         )
 
