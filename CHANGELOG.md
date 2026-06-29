@@ -5,6 +5,27 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.7.0] - 2026-06-30
+
+### Added
+
+**示例库体系化移植自 browser-use**（覆盖入门 / 能力演示 / 进阶配置 / 用例 / 扩展机制，任务驱动调度内置动作）：
+
+- **结构化输出示例**（#83）：examples/features/structured_output.py（output_model）、examples/use-cases/phone_price_comparison.py（跨站结构化对比）、examples/getting_started/data_extraction.py（任务驱动抽取）
+- **浏览器能力演示示例**（#85）：multi_tab（navigate new_tab / switch_tab / close_tab）、save_as_pdf、scrolling_page
+- **LLM 配置示例**（#87）：fallback_model（FallbackLLMSettings）、extraction_small_model（extract_llm）、fast_agent（flash 模式 + page_settle_timeout/wait_between_actions）
+- **安全与扩展机制示例**（#89）：sensitive_data（扁平 sensitive_data 占位符往返）、custom_action（@tools.registry.action 注册范式）
+- **文件落地示例**（#91）：download_file（下载文件作为 done 附件）、csv_generation（write_file 写 CSV，受 allowed_write_paths 约束）
+- **并发多 agent 示例**（#93）：asyncio.gather 并发跑多个 agent
+- **入门补全示例**（#95）：表单填写 / 多步任务
+
+### Fixed
+
+- **upload_file 抖音封面「不支持的文件格式」**（#96，#97）：4 个 accept 相同的 file input 唯一可区分的 class 被序列化白名单丢弃，模型盲选 ~50% 失败（选到 replace 触发「不支持的图片格式」）；三层修复——序列化保留 file input class + [File Inputs] 段输出角色 + 选到 replace 且确属 semi-upload 双 input 时软纠正到 primary hidden-input（不硬拒绝，避免 #36 的 0% 回归）；+13 用例
+- **output_model 变体 B 参数校验**（#83）：output_model 给定时 done 应校验 StructuredDoneParams(data)，原先 _validate_action_params 误用静态 DoneParams(text)，导致 LLM 正确发出的 done(data=...) 被判非法、重试耗尽后 FAILED；改用注册表变体 B param_model，与执行路径共用 Tools._flatten_params；+6 回归测试
+- **extract chunker 反孤岛**（#86，随 #87）：markdownify 把表格密集页（HN）压成单条 10K+ 行，_pack_units 无法把前面 nav 小块并入巨行，chunk0 只剩 240 字 nav 空壳喂给小模型；当前块 < max_chars/4 时并入下一块（略超 ≤1.25×）；+3 单测
+- **下载跟踪缺 downloadPath**（#90，随 #91）：track_downloads 此前从未真正跑通，_setup_download_tracking 缺必填 downloadPath（CDP -32602）；显式 start(downloads_path=) > DOWNLOADS_PATH env > ~/Downloads，目录不存在则创建；+3 覆盖
+
 ## [0.6.0] - 2026-06-27
 
 ### Added
@@ -143,6 +164,8 @@
 - 编程接口（`Agent`、`LLMClient`、`BrowserSession` 可独立使用）
 - 498 项单元测试
 
+[0.7.0]: https://github.com/zjordon/TreeWalker/releases/tag/v0.7.0
+[0.6.0]: https://github.com/zjordon/TreeWalker/releases/tag/v0.6.0
 [0.5.0]: https://github.com/zjordon/TreeWalker/releases/tag/v0.5.0
 [0.4.0]: https://github.com/zjordon/TreeWalker/releases/tag/v0.4.0
 [0.3.0]: https://github.com/zjordon/TreeWalker/releases/tag/v0.3.0
