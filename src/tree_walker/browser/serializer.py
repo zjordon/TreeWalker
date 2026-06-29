@@ -940,7 +940,7 @@ def _build_attributes_string(
 
     8 步处理流程：
     1. HTML 属性白名单过滤
-    2. 日期/时间输入格式提示
+    2. input type 特殊处理（日期/时间/tel/text；file 保留 class）
     3. 密码字段保护
     4. AX 属性合并
     5. 表单当前值
@@ -1015,6 +1015,19 @@ def _build_attributes_string(
                 else:
                     attrs_to_include['placeholder'] = 'mm/dd/yyyy'
                     attrs_to_include['format'] = 'mm/dd/yyyy'
+        # file input：保留 class —— 抖音封面有多个 accept 完全相同的 file input，
+        # 唯一区分信号是 class（semi-upload-hidden-input=初次上传 / -replace=替换）。
+        # class 不在 DEFAULT_INCLUDE_ATTRIBUTES 白名单，需同时加入本次调用的
+        # include_attributes 局部副本，否则 Step 6 ordered_keys / Step 8 格式化
+        # 循环（都按 include_attributes 驱动）会跳过它（issue #96）。
+        # 注意：这是 input-type 外层 if/elif 链的分支（与 date/tel/text 同级，8 空格），
+        # 不能放进 text 分支内部（否则 type=file 不进 text 分支、永不触发）。
+        elif input_type == 'file':
+            cls = node.attributes.get('class', '').strip()
+            if cls:
+                if 'class' not in include_attributes:
+                    include_attributes = [*include_attributes, 'class']
+                attrs_to_include['class'] = cls
 
     # ── Step 3: 密码字段保护 ──
     is_password = (

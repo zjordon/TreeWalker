@@ -469,6 +469,132 @@ class TestUploadFileDiscover:
 		assert "[8]" in result.extracted_content
 
 	@pytest.mark.asyncio
+	async def test_replace_input_corrected_to_primary_hidden(self, tmp_upload):
+		# Fix C (#96)：抖音 Semi-UI 双 input，agent 选了 replace(替换) → 软纠正到 primary
+		# hidden-input(初次上传)。三条件：replace class + primary 候选 + ≥2 upload 祖先。
+		from tree_walker.browser.views import FileInputInfo
+		replace = _make_entry(
+			backend_node_id=7,
+			attributes={"type": "file", "class": "semi-upload-hidden-input-replace"},
+		)
+		primary = _make_entry(
+			backend_node_id=8,
+			attributes={"type": "file", "class": "semi-upload-hidden-input"},
+		)
+		metas = [
+			FileInputInfo(backend_node_id=7, visible=False, upload_ancestor=True,
+						  class_name="semi-upload-hidden-input-replace"),
+			FileInputInfo(backend_node_id=8, visible=False, upload_ancestor=True,
+						  class_name="semi-upload-hidden-input"),
+		]
+		state = _make_state(
+			{7: replace, 8: primary}, file_input_backend_ids=[7, 8], file_inputs_meta=metas,
+		)
+		browser = _make_browser()
+
+		result = await Tools().execute(
+			"upload_file", {"index": 7, "path": tmp_upload}, browser, browser_state=state,
+		)
+
+		assert result.error is None
+		# 纠正到 primary hidden-input（8），不是 agent 选的 replace（7）
+		assert browser.set_file_input.call_args.kwargs["backend_node_id"] == 8
+		assert "Auto-switched" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_replace_input_not_corrected_when_single_upload_ancestor(self, tmp_upload):
+		# 仅 1 个 upload 祖先（普通"替换头像"单 input 场景）→ 不满足 ≥2 护栏，不纠正。
+		from tree_walker.browser.views import FileInputInfo
+		replace = _make_entry(
+			backend_node_id=7,
+			attributes={"type": "file", "class": "semi-upload-hidden-input-replace"},
+		)
+		primary = _make_entry(
+			backend_node_id=8,
+			attributes={"type": "file", "class": "semi-upload-hidden-input"},
+		)
+		metas = [
+			FileInputInfo(backend_node_id=7, visible=False, upload_ancestor=True,
+						  class_name="semi-upload-hidden-input-replace"),
+			FileInputInfo(backend_node_id=8, visible=False, upload_ancestor=False,
+						  class_name="semi-upload-hidden-input"),
+		]
+		state = _make_state(
+			{7: replace, 8: primary}, file_input_backend_ids=[7, 8], file_inputs_meta=metas,
+		)
+		browser = _make_browser()
+
+		result = await Tools().execute(
+			"upload_file", {"index": 7, "path": tmp_upload}, browser, browser_state=state,
+		)
+
+		assert result.error is None
+		# upload_ancestor_count = 1 < 2 → 不纠正，保持 agent 选的 7
+		assert browser.set_file_input.call_args.kwargs["backend_node_id"] == 7
+
+	@pytest.mark.asyncio
+	async def test_replace_input_not_corrected_when_no_primary_candidate(self, tmp_upload):
+		# replace 但无 primary hidden-input 候选 → 不纠正，保持 agent 选的 + 软警告。
+		from tree_walker.browser.views import FileInputInfo
+		replace_a = _make_entry(
+			backend_node_id=7,
+			attributes={"type": "file", "class": "semi-upload-hidden-input-replace"},
+		)
+		replace_b = _make_entry(
+			backend_node_id=8,
+			attributes={"type": "file", "class": "semi-upload-hidden-input-replace"},
+		)
+		metas = [
+			FileInputInfo(backend_node_id=7, visible=False, upload_ancestor=True,
+						  class_name="semi-upload-hidden-input-replace"),
+			FileInputInfo(backend_node_id=8, visible=False, upload_ancestor=True,
+						  class_name="semi-upload-hidden-input-replace"),
+		]
+		state = _make_state(
+			{7: replace_a, 8: replace_b}, file_input_backend_ids=[7, 8], file_inputs_meta=metas,
+		)
+		browser = _make_browser()
+
+		result = await Tools().execute(
+			"upload_file", {"index": 7, "path": tmp_upload}, browser, browser_state=state,
+		)
+
+		assert result.error is None
+		# 无 primary 候选 → 不纠正，保持 7
+		assert browser.set_file_input.call_args.kwargs["backend_node_id"] == 7
+
+	@pytest.mark.asyncio
+	async def test_primary_input_not_corrected(self, tmp_upload):
+		# agent 选的本身就是 primary hidden-input（非 replace）→ 不纠正。
+		from tree_walker.browser.views import FileInputInfo
+		primary = _make_entry(
+			backend_node_id=8,
+			attributes={"type": "file", "class": "semi-upload-hidden-input"},
+		)
+		replace = _make_entry(
+			backend_node_id=7,
+			attributes={"type": "file", "class": "semi-upload-hidden-input-replace"},
+		)
+		metas = [
+			FileInputInfo(backend_node_id=7, visible=False, upload_ancestor=True,
+						  class_name="semi-upload-hidden-input-replace"),
+			FileInputInfo(backend_node_id=8, visible=False, upload_ancestor=True,
+						  class_name="semi-upload-hidden-input"),
+		]
+		state = _make_state(
+			{7: replace, 8: primary}, file_input_backend_ids=[7, 8], file_inputs_meta=metas,
+		)
+		browser = _make_browser()
+
+		result = await Tools().execute(
+			"upload_file", {"index": 8, "path": tmp_upload}, browser, browser_state=state,
+		)
+
+		assert result.error is None
+		# primary 不纠正，保持 8
+		assert browser.set_file_input.call_args.kwargs["backend_node_id"] == 8
+
+	@pytest.mark.asyncio
 	async def test_file_input_target_when_only_one_sets_directly(self, tmp_upload):
 		# Single file input on the page + agent targeted it -> direct set (normal
 		# site; the multi-input guard must not regress the common case).

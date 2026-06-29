@@ -292,6 +292,35 @@ class TestCollectFileInputs:
 		assert fi.accept == 'image/png,image/jpeg'
 		assert fi.upload_ancestor is True
 
+	def test_collects_class_name(self):
+		# input 的 class 被记录到 class_name（区分 hidden-input 初次上传 vs -replace 替换，#96）
+		dom_tree = {
+			'nodeType': 1,
+			'nodeName': 'DIV',
+			'backendNodeId': 1,
+			'children': [
+				{
+					'nodeType': 1,
+					'nodeName': 'INPUT',
+					'backendNodeId': 7,
+					'attributes': ['type', 'file', 'class', 'semi-upload-hidden-input'],
+				},
+			],
+		}
+		result = _collect_file_inputs(dom_tree)
+		assert len(result) == 1
+		assert result[0].class_name == 'semi-upload-hidden-input'
+
+	def test_class_name_empty_when_absent(self):
+		dom_tree = {
+			'nodeType': 1,
+			'nodeName': 'INPUT',
+			'backendNodeId': 8,
+			'attributes': ['type', 'file'],
+		}
+		result = _collect_file_inputs(dom_tree)
+		assert result[0].class_name == ""
+
 	def test_visible_false_when_display_none(self):
 		from types import SimpleNamespace
 		dom_tree = {
