@@ -680,12 +680,15 @@ class FileInputInfo:
 
 	抖音封面编辑器有多个 file input，多数是隐藏「诱饵」（无 handler）。
 	accept / visible / upload_ancestor 让 LLM 优先选可见且在 upload 容器内的 live input。
+	class_name 让 LLM 区分同 accept 的多个 input（如 semi-upload-hidden-input 初次上传
+	vs -replace 替换，issue #96）。
 	"""
 
 	backend_node_id: int
 	accept: str = ""
 	visible: bool = True
 	upload_ancestor: bool = False
+	class_name: str = ""
 
 
 @dataclass

@@ -599,3 +599,80 @@ class TestSerializeTreeTextOutput:
 		simplified = _make_simplified_node(original_node=text_node, children=[])
 		result = DOMTreeSerializer.serialize_tree(simplified, DEFAULT_INCLUDE_ATTRIBUTES, depth=0)
 		assert 'Hello World' in result
+
+	def test_file_input_keeps_class_outside_whitelist(self):
+		"""file input 的 class 即使不在白名单也保留（issue #96：accept 相同时 class 是唯一区分信号）。"""
+		assert 'class' not in DEFAULT_INCLUDE_ATTRIBUTES
+		node = _make_simplified_node(
+			original_node=_make_node(
+				tag='input', backend_node_id=42,
+				attributes={'type': 'file', 'class': 'semi-upload-hidden-input'},
+			),
+			is_interactive=True, highlight_index=42,
+		)
+		result = DOMTreeSerializer.serialize_tree(node, DEFAULT_INCLUDE_ATTRIBUTES)
+		assert '<input' in result
+		assert 'semi-upload-hidden-input' in result
+
+	def test_file_input_hidden_vs_replace_class_distinct(self):
+		"""两个 file input 的 class 不同 → 序列化输出可区分（#96 核心断言）。"""
+		hidden = _make_simplified_node(
+			original_node=_make_node(
+				tag='input', backend_node_id=7,
+				attributes={'type': 'file', 'class': 'semi-upload-hidden-input'},
+			),
+			is_interactive=True, highlight_index=7,
+		)
+		replace = _make_simplified_node(
+			original_node=_make_node(
+				tag='input', backend_node_id=8,
+				attributes={'type': 'file', 'class': 'semi-upload-hidden-input-replace'},
+			),
+			is_interactive=True, highlight_index=8,
+		)
+		text_hidden = DOMTreeSerializer.serialize_tree(hidden, DEFAULT_INCLUDE_ATTRIBUTES)
+		text_replace = DOMTreeSerializer.serialize_tree(replace, DEFAULT_INCLUDE_ATTRIBUTES)
+		assert 'semi-upload-hidden-input' in text_hidden
+		assert 'semi-upload-hidden-input-replace' in text_replace
+		assert text_hidden != text_replace  # 修复前两者完全相同
+
+	def test_file_input_without_class_omits_class_attr(self):
+		"""file input 无 class 时输出不含 class=。"""
+		node = _make_simplified_node(
+			original_node=_make_node(
+				tag='input', backend_node_id=9, attributes={'type': 'file'},
+			),
+			is_interactive=True, highlight_index=9,
+		)
+		result = DOMTreeSerializer.serialize_tree(node, DEFAULT_INCLUDE_ATTRIBUTES)
+		assert '<input' in result
+		assert 'class=' not in result
+
+	def test_text_input_class_not_leaked(self):
+		"""非 file input（text）即使有 class 也不输出 class（Fix A 只针对 file，不全局污染）。"""
+		node = _make_simplified_node(
+			original_node=_make_node(
+				tag='input', backend_node_id=10,
+				attributes={'type': 'text', 'class': 'some-text-class'},
+			),
+			is_interactive=True, highlight_index=10,
+		)
+		result = DOMTreeSerializer.serialize_tree(node, DEFAULT_INCLUDE_ATTRIBUTES)
+		assert '<input' in result
+		assert 'some-text-class' not in result
+		assert 'class=' not in result
+
+	def test_include_attributes_not_mutated_by_file_input(self):
+		"""file input 保留 class 用局部副本，不污染传入的 include_attributes 列表。"""
+		attrs_list = [*DEFAULT_INCLUDE_ATTRIBUTES]
+		assert 'class' not in attrs_list
+		node = _make_simplified_node(
+			original_node=_make_node(
+				tag='input', backend_node_id=11,
+				attributes={'type': 'file', 'class': 'semi-upload-hidden-input'},
+			),
+			is_interactive=True, highlight_index=11,
+		)
+		DOMTreeSerializer.serialize_tree(node, attrs_list)
+		assert attrs_list == DEFAULT_INCLUDE_ATTRIBUTES
+		assert 'class' not in attrs_list

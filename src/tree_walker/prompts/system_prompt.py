@@ -180,7 +180,8 @@ def build_state_message(
             vis = "visible" if fi.visible else "hidden"
             up = "yes" if fi.upload_ancestor else "no"
             acc = f" accept={fi.accept}" if fi.accept else ""
-            parts.append(f"  [{fi.backend_node_id}] {vis}, upload-ancestor={up}{acc}")
+            cls = f" class={fi.class_name}" if fi.class_name else ""
+            parts.append(f"  [{fi.backend_node_id}] {vis}, upload-ancestor={up}{acc}{cls}")
         parts.append("")
 
     # Download notifications

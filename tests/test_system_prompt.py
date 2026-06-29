@@ -94,6 +94,32 @@ class TestFileInputsSection:
         assert "upload-ancestor=yes" in msg  # 10 / 20
         assert "accept=image/*" in msg  # 10
 
+    def test_section_includes_class_for_each_input(self):
+        from tree_walker.browser.views import FileInputInfo
+        metas = [
+            FileInputInfo(
+                backend_node_id=10, visible=False, upload_ancestor=True,
+                class_name="semi-upload-hidden-input",
+            ),
+            FileInputInfo(
+                backend_node_id=20, visible=True, upload_ancestor=True,
+                class_name="semi-upload-hidden-input-replace",
+            ),
+        ]
+        msg = build_state_message(self._state(metas))
+        assert "class=semi-upload-hidden-input" in msg
+        assert "class=semi-upload-hidden-input-replace" in msg
+
+    def test_section_omits_class_when_empty(self):
+        from tree_walker.browser.views import FileInputInfo
+        metas = [
+            FileInputInfo(backend_node_id=10, visible=False, upload_ancestor=True),
+            FileInputInfo(backend_node_id=20, visible=True, upload_ancestor=True),
+        ]
+        msg = build_state_message(self._state(metas))
+        assert "[File Inputs]" in msg
+        assert "class=" not in msg
+
     def test_no_section_when_one_or_fewer(self):
         from tree_walker.browser.views import FileInputInfo
         assert "[File Inputs]" not in build_state_message(

@@ -506,8 +506,9 @@ def _collect_file_inputs(
 ) -> list[FileInputInfo]:
 	"""遍历 DOM.getDocument 树收集 file input 元数据（含 shadow DOM / iframe）。
 
-	每个 file input 记录 backendNodeId / accept / visible / upload_ancestor，
-	帮 LLM 在多 input 页面（如抖音封面编辑器）锁定 live input 而非隐藏诱饵。
+	每个 file input 记录 backendNodeId / accept / visible / upload_ancestor / class_name，
+	帮 LLM 在多 input 页面（如抖音封面编辑器）锁定 live input 而非隐藏诱饵；class_name 用于
+	区分同 accept 的多个 input（hidden-input 初次上传 vs -replace 替换，issue #96）。
 	"""
 	results: list[FileInputInfo] = []
 	node_attrs = _parse_attrs(node.get('attributes'))
@@ -520,6 +521,7 @@ def _collect_file_inputs(
 					accept=node_attrs.get('accept', ''),
 					visible=_file_input_visible(snapshot_lookup, bid),
 					upload_ancestor=upload_ancestor,
+					class_name=node_attrs.get('class', ''),
 				))
 	# 后代继承：当前节点自身是 upload 容器则置位
 	child_upload_ancestor = upload_ancestor or _node_has_upload_class(node_attrs)
