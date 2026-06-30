@@ -12,8 +12,8 @@ from typing import TYPE_CHECKING, Any
 from pydantic import ValidationError
 
 from tree_walker.agent.log_formatter import log_response, log_step_completion
-from tree_walker.agent.views import ActionResult, AgentHistory, DownloadInfo
-from tree_walker.browser.views import BrowserStateSummary
+from tree_walker.agent.views import ActionResult, AgentHistory, DownloadInfo, StepMetadata
+from tree_walker.browser.views import BrowserStateSummary, DOMInteractedElement
 from tree_walker.prompts.system_prompt import build_state_message, build_system_prompt
 
 if TYPE_CHECKING:
@@ -783,6 +783,8 @@ class StepPipeline:
                 model_output=model_output,
                 result=results,
                 state_summary=state_summary,
+                interacted_element=self._project_interacted_elements(model_output, browser_state),
+                metadata=self._build_step_metadata(time.time()),
             ))
 
         if self._obs_bus:
@@ -797,6 +799,51 @@ class StepPipeline:
 
         self._log_step_completion_summary(results)
         self.state.n_steps += 1
+
+    def _project_interacted_elements(
+        self,
+        model_output: dict[str, Any],
+        browser_state: BrowserStateSummary | None,
+    ) -> list[dict[str, Any] | None] | None:
+        """把每个动作当年交互的元素投影成 ``DOMInteractedElement.to_dict()``。
+
+        与 ``model_output`` 的 actions 列表【等长、按位对应】；无 index 的动作为 None。
+        使用【该步开始时】的 ``browser_state``（LLM 看到、index 所指的那份 selector_map），
+        这样重放时才能正确还原「当年点的元素」。
+        """
+        if not browser_state or not browser_state.dom_state:
+            return None
+        selector_map = browser_state.dom_state.selector_map
+        if not selector_map:
+            return None
+
+        actions = model_output.get("actions") or [model_output.get("action", {})]
+        projected: list[dict[str, Any] | None] = []
+        for action in actions:
+            params = action.get("params", {}) if isinstance(action, dict) else {}
+            index = params.get("index")
+            if index is None:
+                index = params.get("element_id")  # element_id 是 index 的别名
+            node = selector_map.get(index) if index is not None else None
+            if node is not None:
+                projected.append(DOMInteractedElement.load_from_enhanced_dom_tree(node).to_dict())
+            else:
+                projected.append(None)
+        return projected
+
+    def _build_step_metadata(self, step_end_time: float) -> StepMetadata:
+        """构造单步计时。``step_interval`` = 上一步的耗时（首步为 None）。
+
+        在当前步 AgentHistory 追加【之前】调用，故 ``history[-1]`` 即上一步。
+        """
+        prev = self.history.history[-1] if self.history.history else None
+        step_interval = prev.metadata.duration_seconds if prev and prev.metadata else None
+        return StepMetadata(
+            step_start_time=self._step_start_time,
+            step_end_time=step_end_time,
+            step_number=self.state.n_steps,
+            step_interval=step_interval,
+        )
 
     def _log_step_completion_summary(self, results: list[ActionResult]) -> None:
         """Log step duration and success/failure counts."""

@@ -47,6 +47,17 @@ class ActionRegistry:
         # success/files_to_display，_register_all 据此选变体 B 参数模型。
         self.output_model = output_model
 
+    @property
+    def registry_version(self) -> str:
+        """动作集合的稳定指纹，写入历史文件用于注册表漂移校验。
+
+        仅按「动作名集合」取 sha256——动作集合不变即视为兼容（参数细节变化不触发）。
+        """
+        import hashlib
+
+        names = "|".join(sorted(self.actions.keys()))
+        return "v1-" + hashlib.sha256(names.encode()).hexdigest()[:12]
+
     def _action_available(self, name: str, page_url: str | None) -> bool:
         if page_url is None:
             return True

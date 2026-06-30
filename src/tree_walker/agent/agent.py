@@ -13,6 +13,7 @@ from typing import Any
 from tree_walker.agent.loop_detector import ActionLoopDetector
 from tree_walker.agent.message_compactor import MessageCompactor
 from tree_walker.agent.plan_manager import PlanManager
+from tree_walker.agent.rerun import RerunMixin
 from tree_walker.agent.step import StepPipeline
 from tree_walker.agent.views import AgentHistoryList, ActionResult, AgentState
 from tree_walker.browser.session import BrowserSession
@@ -27,7 +28,7 @@ from tree_walker.config import JudgeSettings
 logger = logging.getLogger(__name__)
 
 
-class Agent(StepPipeline):
+class Agent(StepPipeline, RerunMixin):
     """Browser automation agent.
 
     Usage::
