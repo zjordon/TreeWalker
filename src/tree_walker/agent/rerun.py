@@ -66,6 +66,96 @@ def _substitute_in_dict(data: dict[str, Any], replacements: dict[str, str]) -> i
     return count
 
 
+def _truncate(text: str, limit: int = 80) -> str:
+    """截断长文本用于日志展示（剥首尾空白、折叠换行）。"""
+    text = (text or "").strip().replace("\n", " ")
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _format_action_params(params: dict[str, Any], limit: int = 120) -> str:
+    """把动作参数渲染成 ``key: value, key: value`` 形式（日志展示用）。"""
+    return _truncate(", ".join(f"{k}: {v}" for k, v in params.items()), limit)
+
+
+def _first_interacted_element(item: AgentHistory | None) -> dict[str, Any] | None:
+    """安全取某步首个被交互元素的投影 dict；无则 None。"""
+    if not item or not item.interacted_element:
+        return None
+    elem = item.interacted_element[0]
+    return elem or None
+
+
+def _bounds_center(bounds: Any) -> tuple[float, float] | None:
+    """``DOMRect`` 对象或 dict 形式的 bounds → 中心坐标 (cx, cy)；无则 None。
+
+    dict 兼容 ``DOMInteractedElement.to_dict()`` 的 ``{x,y,width,height}`` 与历史里
+    可能出现的 ``{x,y,w,h}`` 两种写法。
+    """
+    if bounds is None:
+        return None
+    if isinstance(bounds, dict):
+        x = float(bounds.get("x", 0) or 0)
+        y = float(bounds.get("y", 0) or 0)
+        w = float(bounds.get("width", bounds.get("w", 0)) or 0)
+        h = float(bounds.get("height", bounds.get("h", 0)) or 0)
+    else:
+        x, y, w, h = float(bounds.x), float(bounds.y), float(bounds.width), float(bounds.height)
+    if w <= 0 and h <= 0:
+        return None
+    return (x + w / 2.0, y + h / 2.0)
+
+
+def _elem_bounds(elem: Any) -> Any:
+    """EnhancedDOMTreeNode → snapshot bounds（与 ``DOMInteractedElement`` 投影一致）。"""
+    sn = getattr(elem, "snapshot_node", None)
+    return getattr(sn, "bounds", None) if sn else None
+
+
+def _nearest_idx(hist: dict[str, Any], candidates: list[tuple[int, Any]]) -> int:
+    """同一匹配级有多个候选时，按「录制 bounds 中心就近」选一个；无 bounds 退回第一个。
+
+    消除哈希碰撞（如多个相似下拉触发器同 ``element_hash``）时「按迭代顺序取到错误元素」
+    的问题——多个同款元素里，离录制时位置最近的那个最可能是正确目标。
+    """
+    if len(candidates) == 1:
+        return candidates[0][0]
+    rc = _bounds_center(hist.get("bounds"))
+    if rc is None:
+        return candidates[0][0]
+    best_idx, best_d = candidates[0][0], float("inf")
+    for idx, elem in candidates:
+        ec = _bounds_center(_elem_bounds(elem))
+        if ec is None:
+            continue
+        d = (ec[0] - rc[0]) ** 2 + (ec[1] - rc[1]) ** 2
+        if d < best_d:
+            best_d, best_idx = d, idx
+    return best_idx
+
+
+def resolve_rerun_path(rerun_history_dir: str, file_path: str | Path) -> Path:
+    """相对路径 → 相对根目录的路径；拒绝绝对路径与 ``..`` 越界。
+
+    公共函数：供 ``Agent.save_history`` / ``load_and_rerun``、示例、CLI 复用，保证重放文件
+    统一落在 ``rerun_history_dir`` 之下、且调用方只能给相对路径。
+    """
+    p = Path(file_path)
+    if p.is_absolute():
+        raise ValueError(
+            f"重放文件路径必须是相对路径（相对 rerun_history_dir={rerun_history_dir!r}），"
+            f"收到: {file_path}"
+        )
+    root = Path(rerun_history_dir)
+    resolved = root / p
+    try:  # 拒绝 `..` 越界：解析后必须仍在 root 之内
+        resolved.resolve().relative_to(root.resolve())
+    except ValueError:
+        raise ValueError(
+            f"重放文件路径越界（跳出根目录 {str(root)!r}）: {file_path}"
+        )
+    return resolved
+
+
 class RerunMixin:
     """历史重放能力，混入 ``Agent``。
 
@@ -85,11 +175,20 @@ class RerunMixin:
     _sensitive_map: dict[str, str] | None
     _obs_bus: Any
     _obs_session_id: str
+    rerun_history_dir: str
 
     # ── 公共 API ───────────────────────────────────────────────────────
 
+    def rerun_path(self, file_path: str | Path) -> Path:
+        """把相对路径解析到 ``self.rerun_history_dir`` 之下（含绝对路径/``..`` 越界校验）。"""
+        return resolve_rerun_path(self.rerun_history_dir, file_path)
+
     def save_history(self, file_path: str | Path | None = None) -> None:
-        """把本次运行的历史落盘（含敏感数据脱敏 + 注册表版本号）。"""
+        """把本次运行的历史落盘（含敏感数据脱敏 + 注册表版本号）。
+
+        ``file_path`` 必须是相对路径（相对 ``rerun_history_dir``）；绝对路径或 ``..`` 越界会抛
+        ``ValueError``。最终落到 ``rerun_history_dir / file_path``。
+        """
         if not file_path:
             file_path = "AgentHistory.json"
         # _sensitive_map 是 {real_val: placeholder}；脱敏需要 {placeholder: real_val}
@@ -97,7 +196,7 @@ class RerunMixin:
         if self._sensitive_map:
             sensitive = {p: r for r, p in self._sensitive_map.items()}
         self.history.save_to_file(
-            file_path,
+            self.rerun_path(file_path),
             sensitive_data=sensitive,
             action_registry_version=self.tools.registry.registry_version,
         )
@@ -114,8 +213,12 @@ class RerunMixin:
         variables: dict[str, str] | None = None,
         **kwargs: Any,
     ) -> list[ActionResult]:
-        """读历史文件 → 可选变量替换 → 重放。"""
-        history = AgentHistoryList.load_from_file(history_file)
+        """读历史文件 → 可选变量替换 → 重放。
+
+        ``history_file`` 必须是相对路径（相对 ``rerun_history_dir``）；绝对路径或 ``..`` 越界
+        会抛 ``ValueError``。
+        """
+        history = AgentHistoryList.load_from_file(self.rerun_path(history_file))
         current_ver = self.tools.registry.registry_version
         if history.action_registry_version and history.action_registry_version != current_ver:
             logger.warning(
@@ -154,19 +257,32 @@ class RerunMixin:
         previous_item: AgentHistory | None = None
         previous_succeeded = False
 
+        total = len(history.history)
+        logger.info("🔁 开始重放（共 %d 步）", total)
         try:
-            for item in history.history:
+            for i, item in enumerate(history.history, 1):
                 if self.state.stopped:
                     break
                 step_delay = self._compute_step_delay(
                     item, delay_between_actions, max_step_interval
                 )
-                if self._should_skip_step(
+                goal = _truncate(item.model_output.get("next_goal", ""))
+                delay_src = (
+                    f"saved step_interval={item.metadata.step_interval:.1f}s"
+                    if item.metadata and item.metadata.step_interval is not None
+                    else f"default delay={delay_between_actions}s"
+                )
+                skip_reason = self._skip_reason(
                     item, previous_item, previous_succeeded, skip_failures
-                ):
+                )
+                if skip_reason:
+                    logger.info("⏭️  跳过 Step %d (%d/%d) [%s]: %s",
+                                item.step_number, i, total, delay_src, skip_reason)
                     previous_item, previous_succeeded = item, False
                     continue
 
+                logger.info("🔁 回放 Step %d (%d/%d) [%s]: %s",
+                            item.step_number, i, total, delay_src, goal)
                 self.state.n_steps += 1
                 step_results = await self._rerun_step_with_retries(
                     item, step_delay, max_retries, previous_item, ai_step_llm, wait_for_elements
@@ -176,9 +292,10 @@ class RerunMixin:
                     r.error for r in step_results
                 )
                 previous_item = item
-
-                if any(r.is_done for r in step_results):
-                    break
+                # 注意：不在外层循环因 is_done 而 break——done 可能出现在录制中途
+                #（例如 agent 先 done、再因错误重试一步）。重放须忠实回放每一步，
+                # done 只终止「该步内的动作链」（_execute_history_step 的 guard），
+                # 不应截断后续步骤。对齐 browser-use rerun_history。
         finally:
             summary = await self._generate_rerun_summary(self.task, results, summary_llm)
             results.append(summary)
@@ -193,6 +310,7 @@ class RerunMixin:
         if not initial_url:
             initial_url = self._extract_url(self.task)
         if initial_url:
+            logger.info("🔗 重导航到 %s", initial_url)
             try:
                 await self.browser.navigate(initial_url)
             except Exception as e:
@@ -225,11 +343,17 @@ class RerunMixin:
                 )
             except Exception as e:
                 err_str = str(e)
-                # 菜单重打开：找不到元素 + 上一步是菜单 opener → 重打开后重试，不消耗 attempt
+                # 菜单重打开：找不到元素 + (上一步是下拉触发器 | 当前步要找的是下拉选项)
+                # → 重打开后重试，不消耗 attempt。后者是框架无关的强信号——option
+                #   匹配失败几乎必然意味着上一步打开的下拉已关闭。
                 if (
                     menu_reopens < 3
                     and "Could not find matching element" in err_str
-                    and self._is_menu_opener_step(previous_item)
+                    and previous_item is not None
+                    and (
+                        self._is_menu_opener_step(previous_item)
+                        or self._is_option_element(item)
+                    )
                 ):
                     if await self._reexecute_menu_opener(previous_item, ai_step_llm):
                         menu_reopens += 1
@@ -251,27 +375,25 @@ class RerunMixin:
                 attempt += 1
                 cur_delay = 0.0
 
-    def _should_skip_step(
+    def _skip_reason(
         self,
         item: AgentHistory,
         previous_item: AgentHistory | None,
         previous_succeeded: bool,
         skip_failures: bool,
-    ) -> bool:
+    ) -> str | None:
+        """返回跳过原因字符串；不跳过则返回 None（由调用方统一打日志）。"""
         actions = item.model_output.get("actions") or [item.model_output.get("action", {})]
-        # 无动作跳过
+        # 无动作
         if not actions or all(not (a and a.get("name")) for a in actions if isinstance(a, dict)):
-            logger.warning("步骤 %d 无动作，跳过", item.step_number)
-            return True
-        # 原始出错跳过
+            return "无动作"
+        # 原始出错
         if skip_failures and item.result and all(r.error for r in item.result):
-            logger.info("步骤 %d 原始运行即出错（skip_failures），跳过", item.step_number)
-            return True
-        # 冗余重试跳过
+            return "原始运行即出错（skip_failures=True）"
+        # 冗余重试
         if self._is_redundant_retry_step(item, previous_item, previous_succeeded):
-            logger.info("步骤 %d 是冗余重试（同元素同动作且上步已成功），跳过", item.step_number)
-            return True
-        return False
+            return "冗余重试（同元素同动作且上步已成功）"
+        return None
 
     async def _execute_history_step(
         self,
@@ -301,23 +423,22 @@ class RerunMixin:
 
             if name == "extract":
                 # extract 自带 LLM 且读当前页（tools/_action_extract）→ 直接 re-execute 即在当前页重算
-                result = await self._exec_one("extract", dict(action.get("params", {})), state)
+                params = dict(action.get("params", {}))
             else:
                 hist_elem = interacted[i] if i < len(interacted) else None
-                params = action.get("params") if isinstance(action.get("params"), dict) else {}
-                has_index = params.get("index") is not None or params.get("element_id") is not None
+                raw_params = action.get("params") if isinstance(action.get("params"), dict) else {}
+                has_index = raw_params.get("index") is not None or raw_params.get("element_id") is not None
                 if hist_elem and has_index:
                     updated = self._update_action_indices(hist_elem, action, selector_map)
                     if updated is None:
-                        raise ValueError(
-                            self._format_match_failure(hist_elem, i, selector_map)
-                        )
-                    result = await self._exec_one(
-                        updated.get("name", name), dict(updated.get("params", {})), state
-                    )
+                        raise ValueError(self._format_match_failure(hist_elem, i, selector_map))
+                    name = updated.get("name", name)
+                    params = dict(updated.get("params", {}))
                 else:
-                    result = await self._exec_one(name, dict(action.get("params", {})), state)
+                    params = dict(action.get("params", {}))
 
+            logger.info("▶️  %s: %s", name, _format_action_params(params))
+            result = await self._exec_one(name, params, state)
             results.append(result)
 
             # guard：done/error → 停
@@ -394,49 +515,60 @@ class RerunMixin:
     def _match_element_index(
         self, hist: dict[str, Any], selector_map: dict[int, Any]
     ) -> tuple[int, MatchLevel] | None:
-        """在当前 selector_map 里找回同款元素。返回 (index, level) 或 None。"""
+        """在当前 selector_map 里找回同款元素。返回 (index, level) 或 None。
+
+        每一级若有多个候选（哈希/属性碰撞——常见于多个相似下拉触发器），按「录制 bounds
+        中心就近」tie-break，避免取到迭代顺序里靠前的错误元素。
+        """
+        h_name = (hist.get("node_name") or "").lower()
+
+        def _ax(elem: Any) -> str | None:
+            return (
+                elem.ax_node.name
+                if elem.ax_node and getattr(elem.ax_node, "name", None)
+                else None
+            )
+
         # Level 1: EXACT（TreeWalker 确定性 sha256，跨会话稳定）
         h_exact = hist.get("element_hash")
         if h_exact is not None:
-            for idx, elem in selector_map.items():
-                if elem.element_hash == h_exact:
-                    return idx, MatchLevel.EXACT
+            matches = [(idx, e) for idx, e in selector_map.items() if e.element_hash == h_exact]
+            if matches:
+                return _nearest_idx(hist, matches), MatchLevel.EXACT
         # Level 2: STABLE（重放首选）
         h_stable = hist.get("stable_hash")
         if h_stable is not None:
-            for idx, elem in selector_map.items():
-                if elem.compute_stable_hash() == h_stable:
-                    return idx, MatchLevel.STABLE
+            matches = [(idx, e) for idx, e in selector_map.items() if e.compute_stable_hash() == h_stable]
+            if matches:
+                return _nearest_idx(hist, matches), MatchLevel.STABLE
         # Level 3: XPATH
         h_xpath = hist.get("x_path")
         if h_xpath:
-            for idx, elem in selector_map.items():
-                if elem.xpath == h_xpath:
-                    return idx, MatchLevel.XPATH
+            matches = [(idx, e) for idx, e in selector_map.items() if e.xpath == h_xpath]
+            if matches:
+                return _nearest_idx(hist, matches), MatchLevel.XPATH
         # Level 4: AX_NAME
         h_ax = hist.get("ax_name")
-        h_name = (hist.get("node_name") or "").lower()
         if h_ax:
-            for idx, elem in selector_map.items():
-                elem_ax = (
-                    elem.ax_node.name
-                    if elem.ax_node and getattr(elem.ax_node, "name", None)
-                    else None
-                )
-                if elem.node_name.lower() == h_name and elem_ax == h_ax:
-                    return idx, MatchLevel.AX_NAME
+            matches = [
+                (idx, e) for idx, e in selector_map.items()
+                if e.node_name.lower() == h_name and _ax(e) == h_ax
+            ]
+            if matches:
+                return _nearest_idx(hist, matches), MatchLevel.AX_NAME
         # Level 5: ATTRIBUTE
         h_attrs = hist.get("attributes") or {}
         if h_attrs:
             for attr_key in ("name", "id", "aria-label"):
                 target = h_attrs.get(attr_key)
                 if target:
-                    for idx, elem in selector_map.items():
-                        if (
-                            elem.node_name.lower() == h_name
-                            and (elem.attributes or {}).get(attr_key) == target
-                        ):
-                            return idx, MatchLevel.ATTRIBUTE
+                    matches = [
+                        (idx, e) for idx, e in selector_map.items()
+                        if e.node_name.lower() == h_name
+                        and (e.attributes or {}).get(attr_key) == target
+                    ]
+                    if matches:
+                        return _nearest_idx(hist, matches), MatchLevel.ATTRIBUTE
         return None
 
     def _update_action_indices(
@@ -448,6 +580,19 @@ class RerunMixin:
         """重定位后返回更新了 index 的 action（深拷贝）；匹配失败返回 None。"""
         if not historical_elem:
             return None
+        node_name = historical_elem.get("node_name") or "?"
+        logger.info("🔍 定位元素: <%s> hash=%s stable_hash=%s",
+                    node_name, historical_elem.get("element_hash"),
+                    historical_elem.get("stable_hash"))
+        if logger.isEnabledFor(logging.DEBUG):
+            same_tag = [
+                (idx, e.node_name, (e.attributes or {}).get("name")
+                 or (e.attributes or {}).get("aria-label"))
+                for idx, e in selector_map.items()
+                if e.node_name == historical_elem.get("node_name")
+            ]
+            logger.debug("🔍 Selector map 共 %d 元素，其中 %d 个 <%s>: %s",
+                         len(selector_map), len(same_tag), node_name, same_tag[:10])
         match = self._match_element_index(historical_elem, selector_map)
         if match is None:
             return None
@@ -469,11 +614,29 @@ class RerunMixin:
         name = hist_elem.get("node_name") or "?"
         attrs = hist_elem.get("attributes") or {}
         attr_str = " ".join(f'{k}="{v}"' for k, v in list(attrs.items())[:4])
+        h_role = (attrs.get("role") or "").lower()
+        # 列出同标签（同类 role）的候选元素，便于诊断：目标到底在不在页面上、当前 ax_name 是什么
+        candidates: list[str] = []
+        for idx, e in selector_map.items():
+            if e.node_name != hist_elem.get("node_name"):
+                continue
+            if h_role and (e.attributes or {}).get("role", "").lower() != h_role:
+                continue
+            e_ax = e.ax_node.name if e.ax_node and getattr(e.ax_node, "name", None) else None
+            e_cls = (e.attributes or {}).get("class", "")
+            candidates.append(f"[{idx}] ax={e_ax!r} class={e_cls!r}")
+            if len(candidates) >= 10:
+                break
+        cand_block = (
+            "; ".join(candidates) if candidates
+            else "(无同标签候选——元素不在 selector_map，可能下拉已关闭或被排除)"
+        )
         return (
             f"Could not find matching element for action {action_index} in current page. "
             f"Looking for: <{name}> {attr_str} hash={hist_elem.get('element_hash')} "
-            f"xpath={hist_elem.get('x_path')}. "
+            f"xpath={hist_elem.get('x_path')} ax_name={hist_elem.get('ax_name')!r}. "
             f"Page has {len(selector_map)} interactive elements. "
+            f"Same-<{name}> candidates: {cand_block}. "
             f"Tried: EXACT -> STABLE -> XPATH -> AX_NAME -> ATTRIBUTE"
         )
 
@@ -511,23 +674,50 @@ class RerunMixin:
         return self._first_action_name(curr) == self._first_action_name(prev)
 
     def _is_menu_opener_step(self, item: AgentHistory | None) -> bool:
-        if not item or not item.interacted_element:
-            return False
-        elem = item.interacted_element[0]
+        """上一步是否是「下拉/菜单触发器」（重放失败时可据此重打开）。
+
+        启发式覆盖 ARIA 语义 + 主流前端框架的触发器 class：
+        - ``aria-haspopup``（任意值）/ ``aria-expanded``（任意元素，不限 role=button）
+        - ``role`` ∈ {combobox, button, menuitem, menu, option, listbox}
+        - class 含 select / dropdown / combobox / menu / picker / expand-button
+          （涵盖 semi-select、ant-select、el-select、select-selection 等）
+        """
+        elem = _first_interacted_element(item)
         if not elem:
             return False
         attrs = elem.get("attributes") or {}
-        if attrs.get("aria-haspopup") in ("true", "menu", "listbox"):
+        cls = (attrs.get("class") or "").lower()
+        role = (attrs.get("role") or "").lower()
+        if attrs.get("aria-haspopup"):
             return True
-        if "expand-button" in (attrs.get("class") or ""):
+        if attrs.get("aria-expanded") is not None:
             return True
-        if attrs.get("role") == "button" and attrs.get("aria-expanded") in ("false", "true"):
+        if role in ("combobox", "button", "menuitem", "menu", "option", "listbox"):
+            return True
+        if any(k in cls for k in ("select", "dropdown", "combobox", "menu", "picker", "expand-button")):
             return True
         return False
+
+    def _is_option_element(self, item: AgentHistory | None) -> bool:
+        """当前步要找的元素是否是「下拉选项」（框架无关的强信号）。
+
+        ``role=option`` 或 class 含 option / select-item → 几乎必然是某个下拉的选项；
+        匹配失败时，上一步几乎必然是打开它的触发器（无论触发器 class 是什么），
+        故可据此触发「菜单重打开」，而不必依赖 ``_is_menu_opener_step`` 认得出触发器。
+        """
+        elem = _first_interacted_element(item)
+        if not elem:
+            return False
+        attrs = elem.get("attributes") or {}
+        if (attrs.get("role") or "").lower() == "option":
+            return True
+        cls = (attrs.get("class") or "").lower()
+        return "option" in cls or "select-item" in cls
 
     async def _reexecute_menu_opener(
         self, opener_item: AgentHistory, ai_step_llm: LLMClient | None
     ) -> bool:
+        logger.info("🔁 菜单重打开：重执行上一步（opener）以重新展开下拉，随后立即重试")
         try:
             await self._execute_history_step(
                 opener_item, delay=0.5, ai_step_llm=ai_step_llm, wait_for_elements=False
@@ -584,6 +774,7 @@ class RerunMixin:
         if not value_replacements:
             return history
 
+        logger.info("🔁 已替换 %d 个变量值", len(value_replacements))
         modified = copy.deepcopy(history)
         for item in modified.history:
             actions = item.model_output.get("actions") or [item.model_output.get("action", {})]
@@ -603,6 +794,7 @@ class RerunMixin:
         summary_llm: LLMClient | None,
     ) -> ActionResult:
         llm = summary_llm or self.llm
+        logger.info("🤖 生成重放完成 AI 摘要...")
         error_count = sum(1 for r in results if r.error)
         success_count = len(results) - error_count
         completion = (
@@ -646,6 +838,11 @@ class RerunMixin:
                     success=(error_count == 0),
                     completion_status=completion,
                 )
+
+        logger.info("📊 重放摘要: %s", _truncate(summary.summary, 300))
+        logger.info("📊 状态: %s (success=%s, %d/%d 步成功)",
+                    summary.completion_status, summary.success,
+                    success_count, len(results))
 
         return ActionResult(
             is_done=True,

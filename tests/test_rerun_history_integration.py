@@ -225,6 +225,79 @@ async def test_menu_reopen_attempted(make_node):
     assert any(r.error for r in results)                                 # 菜单项最终失败
 
 
+def test_is_option_element():
+    from tree_walker.agent.rerun import RerunMixin
+    rm = RerunMixin()
+
+    def item(attrs):
+        return AgentHistory(step_number=0, model_output={"action": {}}, result=[],
+                            interacted_element=[{"node_name": "DIV", "attributes": attrs}])
+
+    assert rm._is_option_element(item({"role": "option"})) is True
+    assert rm._is_option_element(item({"class": "semi-select-option collection-option"})) is True
+    assert rm._is_option_element(item({"class": "btn"})) is False
+    assert rm._is_option_element(
+        AgentHistory(step_number=0, model_output={"action": {}}, result=[])) is False
+    assert rm._is_option_element(None) is False
+
+
+def test_is_menu_opener_step_broadened():
+    from tree_walker.agent.rerun import RerunMixin
+    rm = RerunMixin()
+
+    def item(attrs):
+        return AgentHistory(step_number=0, model_output={"action": {}}, result=[],
+                            interacted_element=[{"node_name": "DIV", "attributes": attrs}])
+
+    # 旧启发式也认
+    assert rm._is_menu_opener_step(item({"aria-haspopup": "true"})) is True
+    # 拓宽后新认的（Semi / Ant / Element 等框架触发器 + ARIA）
+    assert rm._is_menu_opener_step(item({"class": "semi-select-selection"})) is True
+    assert rm._is_menu_opener_step(item({"class": "ant-select-selector"})) is True
+    assert rm._is_menu_opener_step(item({"role": "combobox"})) is True
+    assert rm._is_menu_opener_step(item({"aria-expanded": "false"})) is True
+    # 非触发器
+    assert rm._is_menu_opener_step(item({"class": "ordinary-div"})) is False
+    assert rm._is_menu_opener_step(None) is False
+
+
+@pytest.mark.asyncio
+async def test_menu_reopen_on_option_not_found(make_node):
+    # 上一步是 Semi Design 触发器（semi-select-selection，旧启发式不认），
+    # 当前步要找 role=option 的下拉选项；下拉先关后开 → 菜单重打开应触发并救回。
+    # 给 opener/option 各自一个 parent，使 x_path 不同（避免裸 div 误命中 XPATH 级）。
+    opener_node = make_node(tag="div", attributes={"class": "semi-select-selection"},
+                            parent=make_node(tag="form"))
+    option_node = make_node(
+        tag="div",
+        attributes={"class": "semi-select-option collection-option", "role": "option"},
+        parent=make_node(tag="body"),
+    )
+    history = AgentHistoryList(history=[
+        AgentHistory(step_number=0,
+                     model_output={"action": {"name": "click", "params": {"index": 5}}},
+                     result=[], interacted_element=[_elem(opener_node)]),
+        AgentHistory(step_number=1,
+                     model_output={"action": {"name": "click", "params": {"index": 6}}},
+                     result=[], interacted_element=[_elem(option_node)]),
+    ])
+    state_no_option = _live_state({100: opener_node})                       # 下拉已关：只有触发器
+    state_with_option = _live_state({100: opener_node, 200: option_node})   # 下拉打开：选项出现
+    # get_state 调用序：step0 → step1(失败) → 重开 step0 → step1 重试(成功)
+    agent, browser, calls = _make_agent(state_no_option)
+    browser.get_state = AsyncMock(side_effect=[
+        state_no_option, state_no_option, state_no_option, state_with_option,
+    ])
+    results = await agent.rerun_history(history, max_step_interval=0, delay_between_actions=0,
+                                        summary_llm=_StructuredLLM())
+    # option 最终被点击
+    assert any(c[0] == "click" and c[1].get("index") == 200 for c in calls)
+    # opener 被点 2 次（主循环 step0 + 重开 step0）
+    assert sum(1 for c in calls if c[0] == "click" and c[1].get("index") == 100) == 2
+    # step1 没有报错（重开救回了）——末项是摘要，排除
+    assert not any(r.error for r in results[:-1])
+
+
 @pytest.mark.asyncio
 async def test_wait_for_elements_polls(make_node):
     live = make_node(tag="input", attributes={"name": "email"})
@@ -240,6 +313,28 @@ async def test_wait_for_elements_polls(make_node):
     await agent.rerun_history(history, wait_for_elements=True, max_step_interval=0,
                               delay_between_actions=0, summary_llm=_StructuredLLM())
     assert calls and calls[0][1]["index"] == 0
+
+
+@pytest.mark.asyncio
+async def test_replay_continues_past_mid_done(make_node):
+    # done 可能出现在录制中途（agent 先 done、再因错误重试一步）。
+    # 重放须回放每一步，不被中途的 done 截断后续步骤（回归：外层循环不再因 is_done break）。
+    state = _live_state({})
+    history = AgentHistoryList(history=[
+        AgentHistory(step_number=0,
+                     model_output={"action": {"name": "done", "params": {"text": "first done"}}},
+                     result=[], interacted_element=[None]),
+        AgentHistory(step_number=1,
+                     model_output={"action": {"name": "done", "params": {"text": "final done"}}},
+                     result=[], interacted_element=[None]),
+    ])
+    agent, _, calls = _make_agent(
+        state, execute_results={"done": ActionResult(is_done=True)}
+    )
+    results = await agent.rerun_history(history, max_step_interval=0,
+                                        delay_between_actions=0, summary_llm=_StructuredLLM())
+    assert [c[0] for c in calls] == ["done", "done"]   # 两步都回放，未被首个 done 截断
+    assert results[-1].is_done                          # 最后是摘要
 
 
 @pytest.mark.asyncio
@@ -263,11 +358,13 @@ async def test_load_and_rerun(tmp_path, make_node):
                      result=[], state_summary={"url": "http://example.com"},
                      interacted_element=[_elem(make_node(tag="input", attributes={"name": "email"}))]),
     ])
-    path = tmp_path / "h.json"
-    history.save_to_file(path)
+    # 历史写到 tmp_path/h.json（底层 save_to_file 接受绝对路径）；agent 的根目录重定向到 tmp_path，
+    # load_and_rerun 用相对路径（新校验：只许相对）解析到同一文件
+    history.save_to_file(tmp_path / "h.json")
 
     agent, _, calls = _make_agent(state)
-    results = await agent.load_and_rerun(str(path), max_step_interval=0,
+    agent.rerun_history_dir = str(tmp_path)
+    results = await agent.load_and_rerun("h.json", max_step_interval=0,
                                          delay_between_actions=0, summary_llm=_StructuredLLM())
     assert calls[0][0] == "input_text"
     assert calls[0][1]["index"] == 7               # 重定位
@@ -279,14 +376,14 @@ async def test_agent_save_history_writes_registry_version(tmp_path):
     import json
 
     agent, _, _ = _make_agent(_live_state({}))
+    agent.rerun_history_dir = str(tmp_path)   # 根目录重定向到 tmp_path；save 用相对路径
     agent.history.history.append(
         AgentHistory(step_number=0, model_output={"action": {"name": "click", "params": {}}},
                      result=[ActionResult()],
                      metadata=StepMetadata(step_start_time=0.0, step_end_time=1.0, step_number=0))
     )
-    path = tmp_path / "out.json"
-    agent.save_history(path)
-    data = json.loads(path.read_text(encoding="utf-8"))
+    agent.save_history("out.json")
+    data = json.loads((tmp_path / "out.json").read_text(encoding="utf-8"))
     assert data["action_registry_version"]
     assert len(data["history"]) == 1
 
@@ -381,3 +478,36 @@ def test_detect_unique_name_suffix():
     ])
     dv = detect_variables_in_history(h)
     assert "email" in dv and "email_2" in dv
+
+
+# ── 重放文件根目录 + 路径校验（Agent 级）──────────────────────────────
+
+
+def test_save_history_writes_under_root(tmp_path):
+	# rerun_history_dir 重定向到临时目录；相对路径落到其下（含自动建子目录）
+	agent, _, _ = _make_agent(_live_state({}))
+	agent.rerun_history_dir = str(tmp_path)
+	agent.save_history("sub/history.json")
+	assert (tmp_path / "sub" / "history.json").is_file()
+
+
+def test_save_history_rejects_absolute(tmp_path):
+	agent, _, _ = _make_agent(_live_state({}))
+	agent.rerun_history_dir = str(tmp_path)
+	with pytest.raises(ValueError):
+		agent.save_history("/abs/history.json")
+
+
+def test_save_history_rejects_traversal(tmp_path):
+	agent, _, _ = _make_agent(_live_state({}))
+	agent.rerun_history_dir = str(tmp_path)
+	with pytest.raises(ValueError):
+		agent.save_history("../escape.json")
+
+
+@pytest.mark.asyncio
+async def test_load_and_rerun_rejects_absolute(tmp_path):
+	agent, _, _ = _make_agent(_live_state({}))
+	agent.rerun_history_dir = str(tmp_path)
+	with pytest.raises(ValueError):
+		await agent.load_and_rerun("/abs/history.json")

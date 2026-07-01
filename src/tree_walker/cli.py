@@ -19,8 +19,8 @@ logger = logging.getLogger(__name__)
 	"--rerun",
 	"rerun_path",
 	default=None,
-	type=click.Path(exists=True, dir_okay=False),
-	help="重放指定历史文件（不进入交互 TUI）",
+	type=click.Path(dir_okay=False),
+	help="重放指定历史文件（相对 rerun_history_dir；不进入交互 TUI）",
 )
 @click.option(
 	"--var",

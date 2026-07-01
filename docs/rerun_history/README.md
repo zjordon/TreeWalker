@@ -87,6 +87,7 @@ flowchart TD
 | [06-AI摘要（无截图适配）.md](06-AI摘要（无截图适配）.md) | 无截图下的文本+统计判定、三层兜底、`RerunSummaryAction` |
 | [07-集成入口与示例.md](07-集成入口与示例.md) | 编程 API、`examples/features/rerun_history.py`、click CLI flag、TUI 入口 |
 | [08-测试与落地清单.md](08-测试与落地清单.md) | 测试策略与用例、mock 范式、实施顺序、关键陷阱清单 |
+| [09-重放文件根目录与路径校验.md](09-重放文件根目录与路径校验.md) | 根目录配置项 + 相对路径/`..` 越界强制校验（设计文档） |
 
 ---
 

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -145,6 +146,33 @@ def test_match_none(make_node):
     assert rm._match_element_index(
         {"node_name": "INPUT", "attributes": {"name": "email"}}, {1: live}
     ) is None
+
+
+def test_match_tiebreak_by_position(make_node, make_snapshot_node, make_dom_rect):
+    # 哈希碰撞：两个同 attrs、同 parent(无) 的 div → element_hash 相同。
+    # 同级多个候选时，按「录制 bounds 中心就近」选——不能取迭代顺序里靠前的那个。
+    rm = RerunMixin()
+    near = make_node(tag="div", attributes={"class": "x"},
+                     snapshot_node=make_snapshot_node(bounds=make_dom_rect(x=700, y=660, w=200, h=30)))
+    far = make_node(tag="div", attributes={"class": "x"},
+                    snapshot_node=make_snapshot_node(bounds=make_dom_rect(x=400, y=500, w=200, h=30)))
+    assert near.element_hash == far.element_hash   # 确认确实碰撞
+    hist = DOMInteractedElement.load_from_enhanced_dom_tree(near).to_dict()
+    hist["bounds"] = {"x": 614.7, "y": 657.8, "width": 390.4, "height": 30.4}  # center≈(810,673)
+    # far 放在 selector_map 前面，确保不是「取第一个」
+    match = rm._match_element_index(hist, {1: far, 2: near})
+    assert match == (2, MatchLevel.EXACT)          # 选离录制位置最近的 near(idx 2)
+
+
+def test_match_tiebreak_falls_back_to_first_without_bounds(make_node):
+    # 录制元素无 bounds 时，无法按位置 tie-break → 退回第一个（保持旧行为，不报错）
+    rm = RerunMixin()
+    a = make_node(tag="div", attributes={"class": "x"})
+    b = make_node(tag="div", attributes={"class": "x"})
+    hist = {"node_name": "DIV", "attributes": {"class": "x"},
+            "element_hash": a.element_hash, "bounds": None}
+    match = rm._match_element_index(hist, {1: a, 2: b})
+    assert match == (1, MatchLevel.EXACT)          # 退回第一个
 
 
 def test_update_action_indices_relocates_and_preserves_params(make_node):
@@ -455,3 +483,49 @@ async def test_rerun_history_relocates_and_runs(make_node):
     assert captured["params"]["index"] == 7          # 重定位成功
     assert results[-1].is_done
     assert results[-1].success is True
+
+
+# ── 重放文件根目录 + 相对路径校验 ──────────────────────────────────────
+
+
+def test_resolve_rerun_path_relative():
+	from tree_walker.agent.rerun import resolve_rerun_path
+	assert resolve_rerun_path("rerun-history", "a/b.json") == Path("rerun-history") / "a" / "b.json"
+
+
+def test_resolve_rerun_path_absolute_root(tmp_path):
+	from tree_walker.agent.rerun import resolve_rerun_path
+	# 根目录本身允许绝对；相对路径落在其下
+	assert resolve_rerun_path(str(tmp_path), "x.json") == tmp_path / "x.json"
+
+
+def test_resolve_rerun_path_rejects_absolute():
+	from tree_walker.agent.rerun import resolve_rerun_path
+	with pytest.raises(ValueError):
+		resolve_rerun_path("rerun-history", "/abs/x.json")
+	with pytest.raises(ValueError):
+		resolve_rerun_path("rerun-history", "C:/abs/x.json")
+
+
+def test_resolve_rerun_path_rejects_traversal():
+	from tree_walker.agent.rerun import resolve_rerun_path
+	with pytest.raises(ValueError):
+		resolve_rerun_path("rerun-history", "../escape.json")
+	with pytest.raises(ValueError):
+		resolve_rerun_path("rerun-history", "a/../../escape.json")
+
+
+def test_agent_rerun_path_default_and_rejection():
+	from tree_walker.agent.rerun import RerunMixin
+	rm = RerunMixin()
+	rm.rerun_history_dir = "rerun-history"
+	assert rm.rerun_path("x.json") == Path("rerun-history/x.json")
+	with pytest.raises(ValueError):
+		rm.rerun_path("/abs/x.json")
+	with pytest.raises(ValueError):
+		rm.rerun_path("../escape.json")
+
+
+def test_agentsettings_default_rerun_history_dir():
+	from tree_walker.config import AgentSettings
+	assert AgentSettings().rerun_history_dir == "rerun-history"

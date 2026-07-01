@@ -229,3 +229,6 @@ __marimo__/
 # Temp gh PR / issue body files (written in-repo; Windows $env:TEMP is unreliable)
 .pr-body.md
 .issue-body.md
+
+# Rerun history files (recorded session outputs; regenerable, may contain recorded page/form data)
+rerun-history/
