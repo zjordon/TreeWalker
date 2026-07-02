@@ -1,6 +1,7 @@
 ﻿"""TreeWalker — a browser automation agent."""
 
 from tree_walker.agent import Agent, AgentHistoryList, AgentState, ActionResult
+from tree_walker.agent.views import DetectedVariable, StepMetadata
 from tree_walker.browser import BrowserSession
 from tree_walker.config import AgentSettings, BrowserSettings, LLMSettings, MessageCompactionSettings, Settings, load_settings
 from tree_walker.llm import LLMClient
@@ -20,4 +21,6 @@ __all__ = [
     "MessageCompactionSettings",
     "Settings",
     "load_settings",
+    "DetectedVariable",
+    "StepMetadata",
 ]

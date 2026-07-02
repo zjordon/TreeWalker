@@ -8,12 +8,13 @@ from tree_walker.browser.views import BrowserStateSummary, SerializedDOMState
 from tree_walker.config import TruncationSettings
 
 
-class _FakeAgent:
+class _FakeAgent(StepPipeline):
     """Minimal agent-like object exposing only what _finalize touches.
 
-    _finalize is a StepPipeline method; we call it as
-    ``StepPipeline._finalize(fake, ...)`` so the fake only needs the attributes
-    the method reads — same pattern as test_step_error_handling.py.
+    Subclasses StepPipeline to inherit the recording helpers
+    (``_project_interacted_elements`` / ``_build_step_metadata``) added for
+    history replay, while keeping a hand-rolled ``__init__`` and a stubbed
+    ``_log_step_completion_summary``. Called as ``StepPipeline._finalize(fake, ...)``.
     """
 
     def __init__(self, truncation=None):

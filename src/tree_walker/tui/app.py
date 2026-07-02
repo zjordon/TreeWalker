@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+from datetime import datetime
 from pathlib import Path
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, HorizontalGroup, VerticalScroll
-from textual.widgets import Footer, Header, RichLog, Static
+from textual.widgets import Footer, Header, RichLog, Static, Switch
 
 from tree_walker.agent.agent import Agent
 from tree_walker.browser.session import BrowserSession
@@ -29,6 +30,35 @@ TW_LOGO = r"""
    | || | | (_| | | | \__ \ | | | | | | | | (_| | |  |   <
    |_||_|  \__,_|_| |_|___/_| |_|_| |_| |_|\__,_|_|  |_|\_\
 """
+
+
+def _record_filename(now: datetime | None = None) -> str:
+	"""当前时间 → ``yyyyMMddhhmm.json``（24 小时制，避免上下午歧义）。
+
+	录制开关打开时，本次任务历史以此文件名保存到 ``rerun_history_dir``。
+	"""
+	return (now or datetime.now()).strftime("%Y%m%d%H%M") + ".json"
+
+
+def _parse_rerun_command(text: str) -> tuple[str, dict[str, str]] | None:
+	"""解析 ``/rerun <相对路径> [key=value ...]`` → ``(path, vars)``。
+
+	非 ``/rerun`` 开头返回 ``None``；``/rerun`` 无参数返回 ``("", {})``（由调用方给用法提示）。
+	路径校验（相对/越界）留给 ``Agent.load_and_rerun``。
+	"""
+	t = text.strip()
+	if not t.startswith("/rerun"):
+		return None
+	parts = t.split()
+	if len(parts) < 2:
+		return ("", {})
+	path = parts[1]
+	variables: dict[str, str] = {}
+	for kv in parts[2:]:
+		k, _, v = kv.partition("=")
+		if k:
+			variables[k] = v
+	return path, variables
 
 
 class TreeWalkerApp(App):
@@ -52,6 +82,8 @@ class TreeWalkerApp(App):
 	#task-input-container HorizontalGroup { height: auto; }
 	#task-input { width: 3fr; }
 	#file-paths-input { width: 1fr; border-left: solid $accent; }
+	#record-label { width: auto; padding: 0 1; border-left: solid $accent; }
+	#record-switch { width: auto; }
 	"""
 
 	BINDINGS = [
@@ -79,6 +111,8 @@ class TreeWalkerApp(App):
 		self._agent: Agent | None = None
 		self._task_history: list[str] = []
 		self._history_index = 0
+		self._rerun_file: str | None = None
+		self._rerun_vars: dict[str, str] | None = None
 
 	def compose(self) -> ComposeResult:
 		yield Header()
@@ -103,6 +137,8 @@ class TreeWalkerApp(App):
 					placeholder="File paths (one per line, optional)",
 					id="file-paths-input",
 				)
+				yield Static("录制", id="record-label")
+				yield Switch(value=False, id="record-switch")
 		yield Footer()
 
 	def on_mount(self) -> None:
@@ -118,6 +154,17 @@ class TreeWalkerApp(App):
 			return
 		task = event.text.strip()
 		if not task:
+			return
+
+		# /rerun 命令：重放历史文件（相对 rerun_history_dir），不走正常任务流程
+		parsed = _parse_rerun_command(task)
+		if parsed is not None:
+			path, variables = parsed
+			if not path:
+				self._log("用法：/rerun <相对路径> [key=value ...]")
+				return
+			event.input.text = ""
+			self._run_rerun(path, variables or None)
 			return
 
 		# Parse and validate file paths
@@ -211,9 +258,68 @@ class TreeWalkerApp(App):
 		"""Run the agent without blocking the UI."""
 		try:
 			await self._agent.run(keep_alive=True)
+			self._maybe_save_recording()
 		except Exception as e:
 			logger.error("Agent error: %s", e)
 			self._log(f"Agent error: {e}")
+		finally:
+			self.query_one("#task-input", MultilineInput).focus()
+
+	def _is_recording(self) -> bool:
+		"""录制开关是否打开。"""
+		try:
+			return self.query_one("#record-switch", Switch).value
+		except Exception:
+			return False
+
+	def _maybe_save_recording(self) -> None:
+		"""录制开关开时，把本次运行历史保存为 yyyyMMddhhmm.json（落 rerun_history_dir）。"""
+		if not self._is_recording() or not self._agent or not self._agent.history.history:
+			return
+		try:
+			name = _record_filename()
+			self._agent.save_history(name)   # 相对路径，含脱敏 + 注册表版本号
+			self._log(f"✓ 历史已保存：{self._agent.rerun_history_dir}/{name}")
+		except Exception as e:
+			self._log(f"⚠️ 保存历史失败：{e}")
+
+	def _run_rerun(self, history_file: str, variables: dict[str, str] | None) -> None:
+		"""从历史文件重放（仿 _run_task，但跑 load_and_rerun 而非 run）。"""
+		from tree_walker.config import AgentSettings
+
+		self._switch_to_working_view()
+		settings = self._agent_settings or AgentSettings()
+		self._agent = Agent(
+			task="",
+			llm=self._llm,
+			browser=self._browser,
+			settings=settings,
+			sensitive_data=self._sensitive_data,
+		)
+		# Skip signal handler in TUI mode (use Textual key bindings instead)
+		self._agent._setup_signal_handler = lambda: None
+		self._setup_event_bridge()   # 重放事件经 EventBus 自动流到右栏
+		self._rerun_file, self._rerun_vars = history_file, variables
+		self.run_worker(self._rerun_worker, name="agent_rerun")
+
+	async def _rerun_worker(self) -> None:
+		"""重放历史，结束后打印摘要。重放本身不录制。"""
+		try:
+			results = await self._agent.load_and_rerun(
+				self._rerun_file,
+				variables=self._rerun_vars,
+				max_step_interval=5,
+				delay_between_actions=1,
+				summary_llm=self._llm,
+			)
+			if results and results[-1].is_done:
+				self._log(f"📊 重放摘要：{results[-1].extracted_content}")
+		except ValueError as e:
+			# 相对路径 / `..` 越界校验（load_and_rerun → resolve_rerun_path）
+			self._log(f"⚠️ 重放失败：{e}")
+		except Exception as e:
+			logger.error("Rerun error: %s", e)
+			self._log(f"⚠️ 重放失败：{e}")
 		finally:
 			self.query_one("#task-input", MultilineInput).focus()
 

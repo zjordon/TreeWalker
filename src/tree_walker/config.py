@@ -96,6 +96,9 @@ class AgentSettings:
     # extract 工具：专用 LLM（None=复用主 llm）+ 结构化抽取的 JSON Schema（None=free-text）
     extract_llm: LLMSettings | None = None
     extraction_schema: dict | None = None
+    # 历史重放文件根目录：save_history/load_and_rerun 的相对路径都相对此根解析。
+    # 相对路径=相对 CWD(项目根)；可用绝对路径覆盖。默认 "rerun-history"。
+    rerun_history_dir: str = "rerun-history"
 
 
 @dataclass
@@ -292,6 +295,7 @@ def load_settings() -> Settings:
         allowed_write_paths=_load_allowed_write_paths(),
         allowed_read_paths=_load_allowed_read_paths(),
         display_files_in_done_text=os.environ.get("AGENT_DISPLAY_FILES_IN_DONE_TEXT", "").lower() == "true",
+        rerun_history_dir=os.environ.get("AGENT_RERUN_HISTORY_DIR", "rerun-history"),
         judge=JudgeSettings(
             enabled=os.environ.get("AGENT_JUDGE_ENABLED", "1") == "1",
             model=os.environ.get("AGENT_JUDGE_MODEL", ""),
