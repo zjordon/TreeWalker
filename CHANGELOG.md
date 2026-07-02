@@ -5,6 +5,31 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.0] - 2026-07-02
+
+### Added
+
+**历史重放（录制 / 重放 / 五级元素匹配 / 变量替换 / AI 摘要）—— 移植自 browser-use**（#98，#99）：把一次 Agent 运行录制为历史文件，之后用不同数据重放同一动作序列，重放不调决策 LLM，让一次昂贵的 LLM 决策成果可反复复用（批量回填表单、回归测试、自动验证成功）。复用已有底座（`DOMInteractedElement` / `compute_stable_hash` / 纯 dict action / `extract` 自包含），主要是「接线」而非从零造轮子。
+
+- **数据模型 / 序列化**：`AgentHistory` 增 `interacted_element` / `metadata`；`save` / `load`；敏感数据脱敏（仅 input 类动作参数）；action 注册表版本号防漂移
+- **录制改造**：`_finalize` 投影每步被交互元素 + 计时（`step_interval` = 上一步耗时）
+- **五级元素匹配**：EXACT → STABLE → XPATH → AX_NAME → ATTRIBUTE（sha256 确定性，跨会话稳定）；同级多候选按「录制 bounds 中心就近」tie-break
+- **重放执行器**：`rerun_history` / `_execute_history_step`；`extract` 重算；步间延迟（`max_step_interval` 封顶）；5 种跳过 / 重试（含菜单重打开）；SPA `wait_for_elements`
+- **自动变量检测**（纯规则：属性 + 值模式两条策略）+ 精确整串替换
+- **三层兜底 AI 摘要**（无截图适配：文本 + 执行统计判定，复用 `LLMClient.extract` 结构化输出）
+- **重放文件根目录配置**：`AgentSettings.rerun_history_dir`（默认 `rerun-history`，env `AGENT_RERUN_HISTORY_DIR` 可覆盖）；`save_history` / `load_and_rerun` 只收相对路径，绝对路径 / `..` 越界一律 `ValueError`
+- **集成入口**：编程 API + `examples/features/rerun_history.py` + CLI（`--rerun` / `--var`）+ TUI（`/rerun` 命令 +「录制」开关）
+- **示例**：`rerun_history.py`、`douyin_upload_rerun.py`（手动替换映射）、`_debug_selectors.py`（排查「点错相似元素」）
+- **设计文档**：`docs/rerun_history/`（README + 9 个专题，每节带 `文件:行号` 引用）
+- **测试**：+72 用例；新模块覆盖率 87%
+
+### Fixed
+
+- **重放中途 done 截断**（#98）：外层循环不再因中途 `done` 截断（done 可能出现在录制中途，须忠实回放每一步）
+- **抖音「点错合集下拉」**（#98）：同级多候选（哈希碰撞，如多个相似下拉触发器）此前取迭代顺序里靠前的错误元素，改为按录制 bounds 中心就近 tie-break
+- **菜单重打开识别**（#98）：拓宽 `_is_menu_opener_step`（认 `aria-expanded` / `role=combobox` / 框架 class）+ 新增 `_is_option_element`（失败元素是 option 即触发重开，框架无关）
+- **失败诊断增强**（#98）：列出同标签候选元素及其 `ax_name`，便于排查
+
 ## [0.7.0] - 2026-06-30
 
 ### Added
