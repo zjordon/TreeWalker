@@ -80,6 +80,7 @@ class AgentSettings:
     sensitive_data: dict[str, str] | None = None
     track_downloads: bool = False
     message_compaction: MessageCompactionSettings | None = None
+    enable_message_typing: bool = True  # P0：消息分类管理（state 替换/context 清理），关则回退原始 append
     truncation: TruncationSettings = field(default_factory=TruncationSettings)
     enable_planning: bool = False
     exploration_threshold: int = 5
@@ -267,6 +268,7 @@ def load_settings() -> Settings:
         sensitive_data=_load_sensitive_data(),
         track_downloads=os.environ.get("TRACK_DOWNLOADS", "").lower() == "true",
         message_compaction=message_compaction,
+        enable_message_typing=os.environ.get("AGENT_ENABLE_MESSAGE_TYPING", "true").lower() == "true",
         truncation=TruncationSettings(
             extract_page_max_chars=int(os.environ.get("AGENT_TRUNCATE_EXTRACT_PAGE", "8000")),
             extract_fallback_max_chars=int(os.environ.get("AGENT_TRUNCATE_EXTRACT_FALLBACK", "2000")),

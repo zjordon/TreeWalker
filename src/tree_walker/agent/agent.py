@@ -84,6 +84,7 @@ class Agent(StepPipeline, RerunMixin):
         if _settings.message_compaction and _settings.message_compaction.enabled:
             self._compactor = MessageCompactor(_settings.message_compaction, self.llm)
         self.messages: list[dict[str, Any]] = []
+        self._enable_message_typing = _settings.enable_message_typing
 
         # Sensitive data filtering
         _sd = sensitive_data or _settings.sensitive_data
@@ -335,7 +336,12 @@ class Agent(StepPipeline, RerunMixin):
         return None
 
     def _trim_messages(self, max_messages: int = 20) -> list[dict[str, Any]]:
-        """Keep recent messages to avoid exceeding context window."""
+        """Keep recent messages to avoid exceeding context window.
+
+        P0：返回前剥除内部 ``_type`` 键（不送 Anthropic SDK，否则报
+        ``Extra inputs are not permitted``）。``_strip_type`` 定义在
+        ``StepPipeline``（step.py），与 ``_MSG_TYPE`` 常量同处。
+        """
         if self._compactor:
             # Compactor manages trimming, but enforce a hard safety limit
             if len(self.messages) > max_messages * 3:
@@ -344,11 +350,15 @@ class Agent(StepPipeline, RerunMixin):
                     len(self.messages),
                     max_messages * 3,
                 )
-                return list(self.messages[-(max_messages * 3):])
-            return list(self.messages)
-        if len(self.messages) <= max_messages:
-            return list(self.messages)
-        return list(self.messages[-max_messages:])
+                out = list(self.messages[-(max_messages * 3):])
+            else:
+                out = list(self.messages)
+        elif len(self.messages) <= max_messages:
+            out = list(self.messages)
+        else:
+            out = list(self.messages[-max_messages:])
+        # P0：边界剥 _type（无该键时为纯复制，对未启用 typing 的消息安全）。
+        return [self._strip_type(m) for m in out]
 
     @staticmethod
     def _extract_url(task: str) -> str | None:

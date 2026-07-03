@@ -30,6 +30,14 @@ logger = logging.getLogger(__name__)
 
 _PARAM_VALIDATION_MAX_RETRIES = 2
 
+# P0 消息分类管理：内部 _type 键标记消息类别（不送 SDK，_trim_messages 边界剥除）。
+# 对齐 browser-use MessageManager 的 state/context/agent_history 分类。
+_MSG_TYPE = "_type"
+TYPE_STATE = "state"        # 当前页状态消息：每步替换，全局唯一
+TYPE_CONTEXT = "context"    # 注入提示（budget/last/failure/loop）：每步清理后重灌
+TYPE_USER = "user"          # 持久 user 消息（任务说明、conversation summary）
+TYPE_ASSISTANT = "assistant"
+
 _FALLBACK_DONE_OUTPUT: dict[str, Any] = {
     "evaluation_previous_goal": "No action returned",
     "memory": "",
@@ -76,6 +84,7 @@ class StepPipeline:
     _track_downloads: bool
     _step_start_time: float
     messages: list[dict[str, Any]]
+    _enable_message_typing: bool
     _system_prompt: str
     _tool_schema: dict[str, Any]
     loop_detector: ActionLoopDetector
@@ -145,6 +154,10 @@ class StepPipeline:
 
     async def _prepare_context(self) -> tuple[BrowserStateSummary, str]:
         """Gather browser state and build the state message for the LLM."""
+        # 0. P0：每步入口清理上一步的注入提示（budget/last/failure/loop），
+        # 避免 context 消息累积污染。enable_message_typing=False 时 no-op。
+        self._clear_context_messages()
+
         # 1. Get browser state
         # 断路止血：每步截图暂不取（LLM 视觉通道尚未打通，见 docs/tools-optimize/screenshot.md 阶段二）
         browser_state = await self.browser.get_state(include_screenshot=False)
@@ -202,7 +215,7 @@ class StepPipeline:
             planning_nudge=planning_nudge,
             download_notice=download_notice,
         )
-        self.messages.append({"role": "user", "content": state_msg})
+        self._set_state_message(state_msg)  # P0：替换唯一 state 消息（避免完整 DOM 随步数累积）
 
         # 5. Inject budget warning (>=75% steps used)
         self._inject_budget_warning()
@@ -216,6 +229,42 @@ class StepPipeline:
         return browser_state, state_msg
 
     # ── Context injection helpers ─────────────────────────────────────
+
+    @staticmethod
+    def _strip_type(msg: dict[str, Any]) -> dict[str, Any]:
+        """P0：剥除内部 ``_type`` 键（送 SDK 前的边界）。无该键时原样返回。"""
+        if _MSG_TYPE not in msg:
+            return msg
+        return {k: v for k, v in msg.items() if k != _MSG_TYPE}
+
+    def _set_state_message(self, content: str) -> None:
+        """设置当前步状态消息。``enable_message_typing=True`` 时**替换**唯一 state
+        消息（对齐 browser-use ``_set_message_with_type('state')``），避免每步
+        append 导致 N 份完整 DOM 累积；False 时回退原始 append 行为。
+        """
+        if not self._enable_message_typing:
+            self.messages.append({"role": "user", "content": content})
+            return
+        self.messages = [m for m in self.messages if m.get(_MSG_TYPE) != TYPE_STATE]
+        self.messages.append({"role": "user", "content": content, _MSG_TYPE: TYPE_STATE})
+
+    def _clear_context_messages(self) -> None:
+        """每步入口清理上一步的注入提示（对齐 ``prepare_step_state`` 的
+        ``context_messages.clear()``）。``enable_message_typing=False`` 时 no-op
+        （保持原始累积行为，向后兼容）。
+        """
+        if not self._enable_message_typing:
+            return
+        self.messages = [m for m in self.messages if m.get(_MSG_TYPE) != TYPE_CONTEXT]
+
+    def _add_context_message(self, content: str) -> None:
+        """追加注入提示（budget/last/failure/loop）。每步先 ``_clear_context_messages``
+        后灌，不累积。``enable_message_typing=False`` 时回退原始 append。
+        """
+        if not self._enable_message_typing:
+            self.messages.append({"role": "user", "content": content})
+            return
+        self.messages.append({"role": "user", "content": content, _MSG_TYPE: TYPE_CONTEXT})
 
     def _update_action_models_for_page(self, page_url: str) -> None:
         self._tool_schema = self.tools.registry.get_tool_schema(
@@ -264,7 +313,7 @@ class StepPipeline:
                 f"prioritize consolidating your results and call done. "
                 f"Partial results are far more valuable than exhausting all steps with nothing saved."
             )
-            self.messages.append({"role": "user", "content": msg})
+            self._add_context_message(msg)  # P0：注入提示（每步清理后重灌，不累积）
             logger.info("Budget warning injected: %d/%d steps used", steps_used, self.max_steps)
 
     def _force_done_on_last_step(self) -> None:
@@ -275,7 +324,7 @@ class StepPipeline:
                 'You must call the "done" action now. '
                 "Summarize what you have accomplished so far."
             )
-            self.messages.append({"role": "user", "content": msg})
+            self._add_context_message(msg)  # P0：注入提示（每步清理后重灌）
             self._tool_schema = self.tools.registry.get_tool_schema(
                 include_actions=["done"],
                 output_mode=self._output_mode,
@@ -291,7 +340,7 @@ class StepPipeline:
                 f"The agent will terminate after this step. "
                 'You must call the "done" action now with whatever results you have.'
             )
-            self.messages.append({"role": "user", "content": msg})
+            self._add_context_message(msg)  # P0：注入提示（每步清理后重灌）
             self._tool_schema = self.tools.registry.get_tool_schema(
                 include_actions=["done"],
                 output_mode=self._output_mode,
@@ -359,14 +408,17 @@ class StepPipeline:
             ))
 
         # Record assistant message for conversation history
-        self.messages.append({
+        assistant_msg: dict[str, Any] = {
             "role": "assistant",
             "content": (
                 f"[{response.get('evaluation_previous_goal', '')}] "
                 f"Goal: {response.get('next_goal', '')} | "
                 f"Action: {response.get('action', {}).get('name', 'unknown')}"
             ),
-        })
+        }
+        if self._enable_message_typing:
+            assistant_msg[_MSG_TYPE] = TYPE_ASSISTANT  # P0：标记类型（_trim_messages 边界剥除）
+        self.messages.append(assistant_msg)
 
         # Log action decision (structured four-line block)
         action = response.get("action", {})
