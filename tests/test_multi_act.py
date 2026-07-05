@@ -1302,8 +1302,12 @@ class TestPhase4FailureCount:
 
 		assert agent.state.consecutive_failures == 1
 
-	def test_multi_action_all_error_increments(self):
-		"""多动作步全失败 → consecutive_failures += 1。"""
+	def test_multi_action_all_error_does_not_increment(self):
+		"""多动作步全失败 → consecutive_failures 不增加（对齐 browser-use len==1）。
+
+		browser-use service.py:1223 仅 len==1 单动作失败计数；多动作失败（含全失败）
+		交给循环检测 + replan。关键回归点。
+		"""
 		from tree_walker.agent.step import StepPipeline
 
 		agent = self._make_post_process_agent(initial_failures=0)
@@ -1320,7 +1324,29 @@ class TestPhase4FailureCount:
 
 		StepPipeline._post_process(agent, results, model_output)
 
-		assert agent.state.consecutive_failures == 1
+		# 关键断言：多动作全失败不再递增 consecutive_failures
+		assert agent.state.consecutive_failures == 0
+
+	def test_multi_action_all_error_resets_prior_failures(self):
+		"""多动作步全失败、有 prior failures → reset 为 0（fall through 到 reset 分支）。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = self._make_post_process_agent(initial_failures=2)
+		model_output = {
+			"actions": [
+				{"name": "click", "params": {}},
+				{"name": "click", "params": {}},
+			],
+		}
+		results = [
+			ActionResult(error="err1"),
+			ActionResult(error="err2"),
+		]
+
+		StepPipeline._post_process(agent, results, model_output)
+
+		# 多动作全失败 fall through 到 reset 分支
+		assert agent.state.consecutive_failures == 0
 
 	def test_multi_action_partial_error_does_not_increment(self):
 		"""多动作步部分失败 → consecutive_failures 不增加（保持原值或被 reset，但不 +1）。"""
@@ -1401,6 +1427,93 @@ class TestPhase4FailureCount:
 		StepPipeline._post_process(agent, results, model_output)
 
 		assert agent.state.consecutive_failures == 0
+
+
+# ── 10b. Phase 4 completion logging ─────────────────────────────────────
+
+
+class TestPhase4CompletionLogging:
+	"""Phase 4 _post_process 完成结果日志（对齐 browser-use service.py:1232-1244）。"""
+
+	def _make_post_process_agent(self) -> Any:
+		from tree_walker.agent.step import StepPipeline  # noqa: F401
+
+		agent = MagicMock()
+		agent.state = AgentState()
+		agent._enable_planning = False
+		agent.plan_manager = None
+		agent._track_downloads = False
+
+		class _NoOpLoopDetector:
+			def record_action(self, *args, **kwargs):
+				pass
+
+		agent.loop_detector = _NoOpLoopDetector()
+		return agent
+
+	def test_done_success_logs_green_final_result(self, caplog):
+		"""done+success → 绿色 📄 Final Result:。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = self._make_post_process_agent()
+		results = [ActionResult(is_done=True, success=True, extracted_content="all good")]
+		model_output = {"action": {"name": "done", "params": {}}}
+
+		with caplog.at_level(logging.INFO, logger="tree_walker.agent.step"):
+			StepPipeline._post_process(agent, results, model_output)
+
+		messages = [r.getMessage() for r in caplog.records]
+		assert any("📄" in m and "Final Result:" in m and "\033[32m" in m for m in messages), messages
+
+	def test_done_failure_logs_red_final_result(self, caplog):
+		"""done+fail → 红色 📄 Final Result:。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = self._make_post_process_agent()
+		results = [ActionResult(is_done=True, success=False, extracted_content="nope")]
+		model_output = {"action": {"name": "done", "params": {}}}
+
+		with caplog.at_level(logging.INFO, logger="tree_walker.agent.step"):
+			StepPipeline._post_process(agent, results, model_output)
+
+		messages = [r.getMessage() for r in caplog.records]
+		assert any("📄" in m and "Final Result:" in m and "\033[31m" in m for m in messages), messages
+
+	def test_single_attachment_has_no_index(self, caplog):
+		"""单个 attachment → 👉 Attachment : path（序号占位为空，无 "1"）。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = self._make_post_process_agent()
+		results = [ActionResult(
+			is_done=True, success=True, extracted_content="x",
+			attachments=["/tmp/a.csv"],
+		)]
+		model_output = {"action": {"name": "done", "params": {}}}
+
+		with caplog.at_level(logging.INFO, logger="tree_walker.agent.step"):
+			StepPipeline._post_process(agent, results, model_output)
+
+		messages = [r.getMessage() for r in caplog.records]
+		assert any("👉 Attachment :" in m and "/tmp/a.csv" in m for m in messages), messages
+		assert not any("👉 Attachment 1:" in m for m in messages), messages
+
+	def test_multiple_attachments_have_index(self, caplog):
+		"""≥2 个 attachment → 👉 Attachment 1: ... / 👉 Attachment 2: ...（带序号）。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = self._make_post_process_agent()
+		results = [ActionResult(
+			is_done=True, success=True, extracted_content="x",
+			attachments=["/tmp/a.csv", "/tmp/b.csv"],
+		)]
+		model_output = {"action": {"name": "done", "params": {}}}
+
+		with caplog.at_level(logging.INFO, logger="tree_walker.agent.step"):
+			StepPipeline._post_process(agent, results, model_output)
+
+		messages = [r.getMessage() for r in caplog.records]
+		assert any("👉 Attachment 1: /tmp/a.csv" in m for m in messages), messages
+		assert any("👉 Attachment 2: /tmp/b.csv" in m for m in messages), messages
 
 
 # ── 11. Phase 4 wait_between_actions ────────────────────────────────────
