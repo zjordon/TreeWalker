@@ -187,6 +187,11 @@ class LLMClient:
                 tool_choice={"type": "tool", "name": "agent_response"},
             )
         except (RateLimitError, APIError) as e:
+            # Covers browser-use retryable status codes (service.py:1989-1995:
+            # 401/402/429/500/502/503/504) via the SDK exception hierarchy —
+            # RateLimitError (429), AuthenticationError (401) and APIStatusError
+            # (5xx, 402, ...) are all subclasses of APIError, so this single
+            # except is behaviorally equivalent to browser-use's explicit set.
             if self._try_switch_to_fallback(e):
                 return await self.get_action(system_prompt, messages, tool_schema)
             raise

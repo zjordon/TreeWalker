@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from anthropic import APIError, RateLimitError
+from anthropic import APIError, AuthenticationError, RateLimitError
 
 from tree_walker.config import FallbackLLMSettings, LLMSettings
 from tree_walker.llm.client import LLMClient
@@ -319,6 +319,51 @@ class TestGetActionIntegration:
                 raise RateLimitError(
                     message="rate limited",
                     response=MagicMock(status_code=429),
+                    body=None,
+                )
+            return mock_response
+
+        with patch.object(client.client.messages, "create", side_effect=side_effect), \
+             patch.object(client._fallback_client.messages, "create", side_effect=side_effect):
+            result = asyncio.run(
+                client.get_action("sys", [], {"name": "tool"}),
+            )
+
+        assert result["action"]["name"] == "done"
+        assert client._using_fallback is True
+        assert call_count == 2
+
+    def test_authentication_error_triggers_fallback(self):
+        """401 (AuthenticationError) is an APIError subclass — fallback covers it.
+
+        Aligns TreeWalker with browser-use's retryable status-code set
+        (service.py:1989-1995: 401/402/429/5xx). The SDK exception hierarchy
+        routes 401 through ``except (RateLimitError, APIError)``, so
+        AuthenticationError triggers the fallback path without explicit
+        status-code checking.
+        """
+        main_settings = LLMSettings(
+            model="main-model",
+            api_key="main-key",
+            fallback=FallbackLLMSettings(model="fallback-model", api_key="fallback-key"),
+        )
+        client = LLMClient(main_settings)
+
+        mock_response = self._mock_tool_use_response({
+            "evaluation_previous_goal": "ok",
+            "memory": "",
+            "next_goal": "done",
+            "action": {"name": "done", "params": {"text": "complete", "success": True}},
+        })
+
+        call_count = 0
+        def side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise AuthenticationError(
+                    message="invalid api key",
+                    response=MagicMock(status_code=401),
                     body=None,
                 )
             return mock_response

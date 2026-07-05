@@ -7,6 +7,7 @@ import json
 import logging
 import time
 import uuid
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
@@ -100,6 +101,7 @@ class StepPipeline:
     _obs_bus: EventBus | None
     _obs_session_id: str
     _truncation: TruncationSettings
+    _save_conversation_path: str
 
     # ── Orchestrator ──────────────────────────────────────────────────
 
@@ -129,6 +131,10 @@ class StepPipeline:
             self.state.last_result = None
 
             model_output = await self._get_next_action(browser_state, state_message)
+            if model_output is None:
+                # P0-1：LLM 期间用户停止 → 输出已丢弃。不执行动作、不进 post_process，
+                # _finalize 的 `if model_output is not None` 守卫会跳过历史写入。
+                return False
             results = await self._execute_actions(model_output, browser_state)
             self._post_process(results, model_output)
 
@@ -413,7 +419,7 @@ class StepPipeline:
         self,
         browser_state: BrowserStateSummary,
         state_message: str,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         """Call the LLM with timeout and retry, return parsed output."""
         trimmed = self._trim_messages()
         logger.debug(
@@ -442,6 +448,26 @@ class StepPipeline:
                 "Keep your output concise."
             )
 
+        # P0-1 post-LLM stop check #1 (browser-use service.py:1191). If the user
+        # stopped/paused during the LLM call, discard the output before any side
+        # effect (no event emit, no history append) and return None so _step
+        # short-circuits. Returning None (not raising InterruptedError) keeps this
+        # distinct from Phase 4 in-execution interruption semantics.
+        if self.state.stopped or self.state.paused:
+            logger.debug(
+                "Step %d: stopped/paused during LLM call — discarding output",
+                self.state.n_steps,
+            )
+            return None
+
+        # Hard-cap actions to max_actions_per_step (browser-use service.py:1950-1951).
+        # The system prompt and schema maxItems only *tell* the LLM the limit;
+        # this is the runtime safety net for when small models ignore them and
+        # emit too many actions (which would run on stale DOM as earlier actions
+        # mutate the page). Before the ModelResultEvent emit so the reported
+        # action_name matches what will actually execute.
+        response = self._truncate_actions(response)
+
         if self._obs_bus:
             from tree_walker.observability.events import ModelResultEvent
             action = response.get("action", {})
@@ -463,6 +489,17 @@ class StepPipeline:
         }
         if self._enable_message_typing:
             assistant_msg[_MSG_TYPE] = TYPE_ASSISTANT  # P0：标记类型（_trim_messages 边界剥除）
+        # P0-1 post-LLM stop check #2 (browser-use service.py:1197 — "check again
+        # before we commit the output to history"). Side effects above (event emit,
+        # log) already ran, but if the user stopped in that window we must not commit
+        # the stale assistant message to self.messages. Return the response so the
+        # existing _execute_actions stop guard (L654) handles non-execution.
+        if self.state.stopped or self.state.paused:
+            logger.debug(
+                "Step %d: stopped/paused before committing assistant message",
+                self.state.n_steps,
+            )
+            return response
         self.messages.append(assistant_msg)
 
         # Log action decision (structured four-line block)
@@ -479,9 +516,65 @@ class StepPipeline:
             logger=logger,
         )
 
+        # P1-3：每步对话 dump（browser-use save_conversation_path）。在 log_response 之后、
+        # return 之前。trimmed 已脱敏/缩短/剥 _type，dump 安全且忠实于 LLM 所见。
+        self._save_conversation(trimmed, response)
+
         self._current_model_call_id = model_call_id
 
         return response
+
+    def _truncate_actions(self, response: dict[str, Any]) -> dict[str, Any]:
+        """Hard-cap actions to ``max_actions_per_step`` (browser-use service.py:1950-1951).
+
+        The system prompt and schema ``maxItems`` only *tell* the LLM the limit;
+        this is the runtime safety net for when small models ignore them and emit
+        too many actions (which would execute on stale DOM as earlier actions
+        mutate the page). Mutates ``response`` in place and returns it, keeping
+        ``action`` (first) and ``actions`` (list) consistent.
+        """
+        actions = response.get("actions")
+        if not isinstance(actions, list):
+            return response
+        if len(actions) <= self.max_actions_per_step:
+            return response
+        kept = actions[: self.max_actions_per_step]
+        dropped = actions[self.max_actions_per_step:]
+        response["actions"] = kept
+        response["action"] = kept[0] if kept else response.get("action", {})
+        dropped_names = [a.get("name", "?") for a in dropped if isinstance(a, dict)]
+        logger.warning(
+            "Step %d: LLM emitted %d actions (max %d) — truncated, dropped: %s",
+            self.state.n_steps, len(actions), self.max_actions_per_step, dropped_names,
+        )
+        return response
+
+    def _save_conversation(self, messages: list[dict[str, Any]], model_output: dict[str, Any]) -> None:
+        """Dump this step's input messages + model output to a text file (browser-use service.py:1713-1723).
+
+        Human-readable audit artifact — distinct from rerun-history (machine replay) and
+        observability JsonlRecorder (event stream). ``messages`` is the post-processed
+        ``trimmed`` list (URLs shortened to ``[uN]``, sensitive values masked, ``_type``
+        stripped) — i.e. exactly what the LLM saw, so the dump is safe (no real secret
+        values) and faithful. Best-effort: IO errors are logged and swallowed so the agent
+        loop is never blocked by disk failure.
+        """
+        if not self._save_conversation_path:
+            return
+        try:
+            path = Path(self._save_conversation_path)
+            path.mkdir(parents=True, exist_ok=True)
+            conv_id = self._obs_session_id or format(id(self), "x")
+            target = path / f"conversation_{conv_id}_{self.state.n_steps}.txt"
+            lines = [f"=== Step {self.state.n_steps} (model={getattr(self.llm, 'model', '?')}) ==="]
+            for m in messages:
+                role = m.get("role", "?")
+                content = m.get("content", "")
+                lines.append(f"\n--- {role} ---\n{content}")
+            lines.append(f"\n--- model_output ---\n{json.dumps(model_output, ensure_ascii=False, indent=2)}")
+            target.write_text("\n".join(lines), encoding="utf-8")
+        except Exception as e:
+            logger.warning("Failed to save conversation for step %d: %s", self.state.n_steps, e)
 
     async def _get_action_with_retry(
         self,
