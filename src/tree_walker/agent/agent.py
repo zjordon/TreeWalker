@@ -76,6 +76,7 @@ class Agent(StepPipeline, RerunMixin):
         self.max_actions_per_step = _settings.max_actions_per_step
         self.wait_between_actions = browser._settings.wait_between_actions
         self.rerun_history_dir = _settings.rerun_history_dir
+        self._save_conversation_path = _settings.save_conversation_path
 
         self.state = AgentState()
         self.history = AgentHistoryList()

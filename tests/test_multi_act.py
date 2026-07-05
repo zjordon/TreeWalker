@@ -1311,3 +1311,94 @@ class TestPhase4WaitBetweenActions:
 		# done 在 sleep 之前被 guard #1 拦截
 		assert sleep_calls == []
 
+
+class TestActionTruncation:
+	"""P0-2: _truncate_actions hard-caps actions to max_actions_per_step (browser-use service.py:1950-1951)."""
+
+	def _make_agent(self, max_actions: int = 3) -> Any:
+		agent = _make_agent()
+		agent.max_actions_per_step = max_actions
+		agent.state.n_steps = 1
+		return agent
+
+	def _resp(self, names: list[str]) -> dict[str, Any]:
+		return {
+			"action": {"name": names[0], "params": {}} if names else {},
+			"actions": [{"name": n, "params": {}} for n in names],
+		}
+
+	def test_under_max_not_truncated(self):
+		"""actions count <= max → unchanged."""
+		from tree_walker.agent.step import StepPipeline
+		agent = self._make_agent(max_actions=3)
+		resp = self._resp(["click", "input_text"])
+		out = StepPipeline._truncate_actions(agent, resp)
+		assert len(out["actions"]) == 2
+
+	def test_over_max_truncated_with_warning(self, caplog):
+		"""actions count > max → truncated to max and warning lists dropped names."""
+		import logging
+		from tree_walker.agent.step import StepPipeline
+		agent = self._make_agent(max_actions=3)
+		resp = self._resp(["click", "input_text", "scroll", "wait", "done"])
+		with caplog.at_level(logging.WARNING):
+			out = StepPipeline._truncate_actions(agent, resp)
+		assert len(out["actions"]) == 3
+		assert "truncated" in caplog.text
+		assert "wait" in caplog.text
+		assert "done" in caplog.text
+
+	def test_truncation_keeps_action_and_actions_consistent(self):
+		"""After truncation, action (first) and actions (list) stay in sync."""
+		from tree_walker.agent.step import StepPipeline
+		agent = self._make_agent(max_actions=2)
+		resp = self._resp(["click", "input_text", "scroll", "wait"])
+		out = StepPipeline._truncate_actions(agent, resp)
+		assert len(out["actions"]) == 2
+		assert out["action"]["name"] == "click"
+		assert out["actions"][0]["name"] == "click"
+
+	def test_exactly_max_not_truncated(self):
+		"""actions count == max boundary → unchanged."""
+		from tree_walker.agent.step import StepPipeline
+		agent = self._make_agent(max_actions=3)
+		resp = self._resp(["click", "input_text", "scroll"])
+		out = StepPipeline._truncate_actions(agent, resp)
+		assert len(out["actions"]) == 3
+
+	def test_empty_actions_not_truncated(self):
+		"""Empty actions list → unchanged, no crash."""
+		from tree_walker.agent.step import StepPipeline
+		agent = self._make_agent(max_actions=3)
+		resp = {"action": {}, "actions": []}
+		out = StepPipeline._truncate_actions(agent, resp)
+		assert out["actions"] == []
+
+	def test_single_action_not_truncated(self):
+		"""Single action → unchanged."""
+		from tree_walker.agent.step import StepPipeline
+		agent = self._make_agent(max_actions=5)
+		resp = self._resp(["click"])
+		out = StepPipeline._truncate_actions(agent, resp)
+		assert len(out["actions"]) == 1
+
+	def test_actions_not_list_returned_unchanged(self):
+		"""Missing/non-list actions → response returned unchanged."""
+		from tree_walker.agent.step import StepPipeline
+		agent = self._make_agent(max_actions=3)
+		resp = {"action": {"name": "click", "params": {}}}
+		out = StepPipeline._truncate_actions(agent, resp)
+		assert out is resp
+
+	def test_done_in_dropped_region_is_dropped(self, caplog):
+		"""done beyond max is dropped — LLM violated 'done must be last', truncation is the feedback."""
+		import logging
+		from tree_walker.agent.step import StepPipeline
+		agent = self._make_agent(max_actions=2)
+		resp = self._resp(["click", "input_text", "scroll", "done"])
+		with caplog.at_level(logging.WARNING):
+			out = StepPipeline._truncate_actions(agent, resp)
+		assert len(out["actions"]) == 2
+		assert all(a["name"] != "done" for a in out["actions"])
+		assert "done" in caplog.text
+

@@ -105,6 +105,10 @@ class AgentSettings:
     # 历史重放文件根目录：save_history/load_and_rerun 的相对路径都相对此根解析。
     # 相对路径=相对 CWD(项目根)；可用绝对路径覆盖。默认 "rerun-history"。
     rerun_history_dir: str = "rerun-history"
+    # P1-3：每步对话 dump（input messages + model output 的人类可读文本快照），用于离线审计
+    # LLM 决策。空=禁用。与 rerun_history_dir（机器重放）/ observability JsonlRecorder（事件流）
+    # 定位不同，可并存。browser-use parity（service.py save_conversation_path）。
+    save_conversation_path: str = ""
 
 
 @dataclass
@@ -313,6 +317,7 @@ def load_settings() -> Settings:
         allowed_read_paths=_load_allowed_read_paths(),
         display_files_in_done_text=os.environ.get("AGENT_DISPLAY_FILES_IN_DONE_TEXT", "").lower() == "true",
         rerun_history_dir=os.environ.get("AGENT_RERUN_HISTORY_DIR", "rerun-history"),
+        save_conversation_path=os.environ.get("AGENT_SAVE_CONVERSATION_PATH", ""),
         judge=JudgeSettings(
             enabled=os.environ.get("AGENT_JUDGE_ENABLED", "1") == "1",
             model=os.environ.get("AGENT_JUDGE_MODEL", ""),
