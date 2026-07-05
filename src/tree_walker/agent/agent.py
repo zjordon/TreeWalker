@@ -85,11 +85,21 @@ class Agent(StepPipeline, RerunMixin):
             self._compactor = MessageCompactor(_settings.message_compaction, self.llm)
         self.messages: list[dict[str, Any]] = []
         self._enable_message_typing = _settings.enable_message_typing
+        self._enable_page_stats = _settings.enable_page_stats
+        self._enable_sensitive_description = _settings.enable_sensitive_description
+        self._max_history_items = _settings.max_history_items
+        self._enable_recent_events = _settings.enable_recent_events
 
-        # Sensitive data filtering
+        # Sensitive data filtering（P1d：归一化为 _sensitive_data_raw，兼容旧/新格式）
         _sd = sensitive_data or _settings.sensitive_data
-        if _sd:
-            self._sensitive_map = {v: k for k, v in _sd.items()}
+        self._sensitive_data_raw = self._normalize_sensitive_data(_sd)
+        if self._sensitive_data_raw:
+            # _sensitive_map = {real_val: placeholder}（client 脱敏 + _safe_task 用）
+            self._sensitive_map = {
+                spec["value"]: placeholder
+                for placeholder, spec in self._sensitive_data_raw.items()
+                if spec.get("value")
+            }
             self._safe_task = self.task
             for real_val, placeholder in self._sensitive_map.items():
                 self._safe_task = self._safe_task.replace(real_val, placeholder)
@@ -198,7 +208,10 @@ class Agent(StepPipeline, RerunMixin):
 
     async def run(self, keep_alive: bool = False) -> AgentHistoryList:
         """Execute the agent loop until done, max_steps, or max_failures."""
-        await self.browser.start(track_downloads=self._track_downloads)
+        await self.browser.start(
+            track_downloads=self._track_downloads,
+            enable_recent_events=self._enable_recent_events,
+        )
 
         initial_url = self._extract_url(self.task)
         if initial_url:
@@ -334,6 +347,143 @@ class Agent(StepPipeline, RerunMixin):
         if self.state.last_model_output:
             return self.state.last_model_output.get(field)
         return None
+
+    # ── P1d：sensitive_data_description ───────────────────────────────
+
+    @staticmethod
+    def _normalize_sensitive_data(
+        raw: dict[str, Any] | None,
+    ) -> dict[str, dict[str, Any]] | None:
+        """把 sensitive_data 归一化为 ``{placeholder: {value, urls}}``。
+
+        兼容两种格式：
+          旧（全局）：``{"password": "real123"}``
+          新（URL 过滤）：``{"password": {"value": "real123", "urls": ["*login*"]}}``
+        ``urls`` 为 ``None`` 或省略 → 全局可用（任何页面都列出）。跳过无 value 的项。
+        """
+        if not raw:
+            return None
+        normalized: dict[str, dict[str, Any]] = {}
+        for placeholder, spec in raw.items():
+            if isinstance(spec, dict):
+                value = spec.get("value")
+                urls = spec.get("urls")
+            else:
+                value = spec
+                urls = None
+            if value is None or value == "":
+                continue
+            normalized[str(placeholder)] = {"value": str(value), "urls": urls}
+        return normalized or None
+
+    def _build_sensitive_description(self, page_url: str) -> str | None:
+        """列出当前页（按 URL pattern 过滤后）可用的 ``<secret>`` 占位符。
+
+        只列 placeholder key，**绝不列真实值**。对齐 browser-use
+        ``_get_sensitive_data_description``。无可用项时返回 None（不渲染）。
+        URL pattern 用 ``fnmatch.fnmatchcase``（大小写敏感、跨平台一致）。
+        """
+        if not self._sensitive_data_raw:
+            return None
+        import fnmatch
+
+        available: list[str] = []
+        for placeholder, spec in self._sensitive_data_raw.items():
+            urls = spec.get("urls")
+            if not urls:
+                available.append(placeholder)  # 全局可用
+            elif any(fnmatch.fnmatchcase(page_url, p) for p in urls):
+                available.append(placeholder)
+        if not available:
+            return None
+        return (
+            "Available secrets (use as <secret>key</secret> in input_text params): "
+            + ", ".join(sorted(available))
+        )
+
+    # ── P1c：agent_history_description（统一历史格式 + 滑动窗口）─────────
+
+    def _effective_max_history_items(self) -> int:
+        """compactor 启用时把窗口降到 5（避免与 compactor 双重占用 token）。"""
+        if self._compactor:
+            return min(self._max_history_items, 5)
+        return self._max_history_items
+
+    def _build_agent_history_description(self) -> str | None:
+        """读 ``self.history`` 格式化为 ``<agent_history>`` 块（滑动窗口）。
+
+        滑动窗口：首条 + ``[... N previous steps omitted ...]`` + 最近 N 条。
+        ``self.history`` 在 ``_prepare_context`` 时尚未追加当前步（``_finalize`` 才追加），
+        故描述的是【过去的步】，正是 LLM 需要的上下文。对齐 browser-use
+        ``agent_history_description``。无历史（首步）或 window<=0 时返回 None。
+        """
+        items = self.history.history if self.history else []
+        if not items:
+            return None
+        max_items = self._effective_max_history_items()
+        if max_items <= 0:
+            return None
+
+        if len(items) <= max_items:
+            shown, omitted = items, 0
+        elif max_items == 1:
+            shown, omitted = items[:1], len(items) - 1
+        else:
+            shown = [items[0]] + items[-(max_items - 1):]
+            omitted = len(items) - max_items
+
+        lines = ["<agent_history>"]
+        if omitted > 0:
+            lines.append(f"  [... {omitted} previous steps omitted ...]")
+        for h in shown:
+            mo = h.model_output or {}
+            goal = mo.get("next_goal", "")
+            eval_ = mo.get("evaluation_previous_goal", "")
+            memory = mo.get("memory", "")
+            actions = mo.get("actions") or ([mo.get("action")] if mo.get("action") else [])
+            action_parts = [
+                f"{a.get('name', '?')}({a.get('params', {})})"
+                for a in actions
+                if isinstance(a, dict)
+            ]
+            action_str = (", ".join(action_parts)[:150]) if action_parts else "?"
+            # P1c 修订：<agent_history> 只保留每步结果状态（✓/✗/done），不灌入
+            # extracted_content 的情境性软警告（如 upload 的"⚠️ retry...候选列表"）——
+            # 那些是给紧接着的下一步用的，持久化进滑动窗口会累积放大、误导模型反复
+            # 重试（抖音封面上传回归）。完整 result 仍由 [Previous Action Results]
+            # 在下一步展示，职责分明。
+            result_str = self._summarize_step_result(h.result)
+            lines.append(
+                f"  Step {h.step_number}: [{eval_}] Goal: {goal} | {action_str} -> {result_str}"
+            )
+            if memory:
+                lines.append(f"    Memory: {memory}")
+        lines.append("</agent_history>")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _summarize_step_result(results: list[ActionResult]) -> str:
+        """把单步 ``ActionResult`` 列表压缩成简洁状态指示，供 ``<agent_history>`` 用。
+
+        P1c 修订：只保留"成功/失败/done"语义，**不**携带 ``extracted_content`` 的情境性
+        文本（典型：``upload_file`` 多 input 时的"⚠️ Page has N file inputs; ...
+        Likely-live candidates: [...]; retry upload_file..."软警告）。这些是给紧接着的
+        下一步用的，灌进滑动窗口会累积放大、误导模型反复重试（抖音封面上传回归）。
+        完整 result 仍由 ``[Previous Action Results]`` 在下一步展示。
+
+        - 任一 error → ``"✗ {error[:80]}"``（取第一个 error）
+        - 任一 is_done → ``"✓ done"``
+        - 否则 → ``"✓"``
+        - 空列表 → ``""``
+        """
+        if not results:
+            return ""
+        for r in results:
+            if r.error:
+                return f"✗ {r.error[:80]}"
+        if any(r.is_done for r in results):
+            return "✓ done"
+        return "✓"
 
     def _trim_messages(self, max_messages: int = 20) -> list[dict[str, Any]]:
         """Keep recent messages to avoid exceeding context window.
