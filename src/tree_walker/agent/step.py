@@ -948,7 +948,7 @@ class StepPipeline:
 
         # Record each action to loop detector with exemption filtering.
         # Multi-action steps record each action individually so the detector
-        # sees the full sequence; Phase 4 will refine failure semantics.
+        # sees the full sequence.
         actions = model_output.get("actions") or [model_output.get("action", {})]
         for action in actions:
             action_name = action.get("name", "done")
@@ -956,39 +956,50 @@ class StepPipeline:
             if action_name not in _LOOP_EXEMPT_ACTIONS:
                 self.loop_detector.record_action(action_name, action_params)
 
-        # Phase 4 failure semantics:
-        #   - all-error step (single-action OR multi-action all failed) → count
-        #   - multi-action step with partial failure → do NOT count
-        #     (loop_detector + replan handle recovery)
-        #   - any success → reset counter
-        if results and all(r.error for r in results):
+        # Phase 4 failure semantics (aligned to browser-use service.py:1221-1231):
+        #   - single-action step with error → count + early return
+        #   - multi-action step (any failure, partial or all) → do NOT count;
+        #     loop_detector + replan nudges handle recovery instead
+        #   - any non-counted step → reset counter if previously > 0
+        if results and len(results) == 1 and results[-1].error:
             self.state.consecutive_failures += 1
             logger.debug("Consecutive failures: %d", self.state.consecutive_failures)
             return
-        if results and any(r.error for r in results) and not all(r.error for r in results):
+        if results and len(results) > 1 and any(r.error for r in results):
+            # TreeWalker 增强：显式记录多动作失败（含全失败）以便观测，但按
+            # browser-use 语义不计入 consecutive_failures（交循环检测 + replan）。
             logger.info(
-                "Multi-action step had partial failure (%d/%d actions failed) "
-                "— not incrementing consecutive_failures",
+                "Multi-action step had %d/%d actions failed — not incrementing "
+                "consecutive_failures (deferred to loop detection)",
                 sum(1 for r in results if r.error), len(results),
             )
 
-        # Success → reset failure counter
+        # Non-counted step (success or multi-action failure) → reset counter
         if self.state.consecutive_failures > 0:
             self.state.consecutive_failures = 0
 
-        # Completion result logging
+        # Completion result logging (aligned to browser-use service.py:1232-1244):
+        # 统一标签 "📄 Final Result:"，绿/红靠 ANSI 颜色区分；随后输出 attachments。
         if results and results[-1].is_done:
             result = results[-1]
             if result.success:
                 logger.info(
-                    "\n\033[32m Task SUCCESS\033[0m\n%s\n",
+                    "\n📄 \033[32m Final Result:\033[0m\n%s\n",
                     result.extracted_content or "",
                 )
             else:
                 logger.info(
-                    "\n\033[31m Task FAILED\033[0m\n%s\n",
+                    "\n📄 \033[31m Final Result:\033[0m\n%s\n",
                     result.extracted_content or "",
                 )
+            if result.attachments:
+                total = len(result.attachments)
+                for i, file_path in enumerate(result.attachments):
+                    logger.info(
+                        "👉 Attachment %s: %s",
+                        i + 1 if total > 1 else "",
+                        file_path,
+                    )
 
     # ── Stage 5: Finalize ─────────────────────────────────────────────
 
