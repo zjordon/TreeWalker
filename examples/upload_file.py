@@ -60,6 +60,11 @@ async def main():
             r"D:\dev\git\claude\skills-deom\ppt\browser-use\heng.png",
             r"D:\dev\git\claude\skills-deom\ppt\browser-use\shu.png",
         ],
+        # 上传验证：透传 env 开关（AGENT_UPLOAD_VERIFY_ENABLED / _WAIT_S / _INTERVAL_S），
+        # 否则 AgentSettings 走 dataclass 默认值，env 不生效（四次修订修复）。
+        upload_verify_enabled=settings.agent.upload_verify_enabled,
+        upload_verify_wait_s=settings.agent.upload_verify_wait_s,
+        upload_verify_interval_s=settings.agent.upload_verify_interval_s,
     )
 
     agent = Agent(
