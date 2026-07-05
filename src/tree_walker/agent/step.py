@@ -12,8 +12,15 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
-from tree_walker.agent.log_formatter import log_response, log_step_completion
-from tree_walker.agent.views import ActionResult, AgentHistory, DownloadInfo, StepMetadata
+from tree_walker.agent.log_formatter import BLUE, RESET, format_action_params, log_response, log_step_completion
+from tree_walker.agent.views import (
+    ActionResult,
+    AgentHistory,
+    DownloadInfo,
+    StepMetadata,
+    _SENSITIVE_ACTION_FIELDS,
+    redact_sensitive_string,
+)
 from tree_walker.browser.views import BrowserStateSummary, DOMInteractedElement
 from tree_walker.prompts.system_prompt import build_state_message, build_system_prompt
 
@@ -506,12 +513,18 @@ class StepPipeline:
         action = response.get("action", {})
         action_name = action.get("name", "done")
         action_params = action.get("params", {})
+        # P1-2：决策日志脱敏（修复 pre-existing 泄露——params 已被 client
+        # ``_restore_sensitive_in_output`` 还原为真值，直接打印会泄密；与
+        # ``_execute_actions`` 的 per-action 日志共用同一辅助）。
+        safe_params = _redact_params_for_log(
+            action_name, action_params, self._sensitive_map_for_log,
+        )
         log_response(
             evaluation=response.get("evaluation_previous_goal", ""),
             memory=response.get("memory", ""),
             next_goal=response.get("next_goal", ""),
             action_name=action_name,
-            action_params=action_params,
+            action_params=safe_params,
             step=self.state.n_steps,
             logger=logger,
         )
@@ -711,6 +724,20 @@ class StepPipeline:
 
     # ── Stage 3: Act ──────────────────────────────────────────────────
 
+    @property
+    def _sensitive_map_for_log(self) -> dict[str, str] | None:
+        """``{placeholder: real_value}`` 方向的敏感映射，供终端日志脱敏使用。
+
+        ``redact_sensitive_string`` 要求 ``{placeholder: real_value}`` 方向，而
+        Agent 维护的 ``_sensitive_map`` 是反向 ``{real_value: placeholder}``
+        （client 脱敏用）。这里惰性反转，与 ``rerun.py:197`` 的 history 脱敏路径
+        同款。无 sensitive 配置时返回 None（``_redact_params_for_log`` 据此 no-op）。
+        """
+        raw = getattr(self, "_sensitive_map", None)
+        if not raw:
+            return None
+        return {placeholder: real for real, placeholder in raw.items()}
+
     async def _execute_actions(
         self,
         model_output: dict[str, Any],
@@ -769,6 +796,32 @@ class StepPipeline:
             # Skipped on the first action and whenever guard #1 already broke.
             if i > 0 and self.wait_between_actions > 0:
                 await asyncio.sleep(self.wait_between_actions)
+
+            # P0-1：per-action stop/pause 检查（对齐 browser-use service.py:2753
+            # ``_check_stop_or_pause``）。放在下方 inner try **之前**，使 raise
+            # 直达 ``_step`` 外层 try → ``_handle_step_error`` 分支 1（不计
+            # failure）。partial results 随 raise 丢弃——与 browser-use 一致
+            # （用户主动停 = 不要剩余结果）。02 期 P0-1 已为 LLM 阶段修过对称漏洞，
+            # 此处补齐 Act 阶段。
+            if self.state.stopped or self.state.paused:
+                logger.debug(
+                    "Step %d: stopped/paused before action %d/%d — aborting sequence",
+                    self.state.n_steps, i + 1, total,
+                )
+                raise InterruptedError
+
+            # P1-2：per-action 执行日志（对齐 browser-use ``_log_action``
+            # service.py:2756，格式 ``[i/total] name: params``）。``action_params``
+            # 已被 client 还原为真值，必须先脱敏再打印（复用 ``_redact_params_for_log``）。
+            safe_params = _redact_params_for_log(
+                action_name, action_params, self._sensitive_map_for_log,
+            )
+            logger.info(
+                "  [%d/%d] %s%s%s: %s",
+                i + 1, total,
+                BLUE, action_name, RESET,
+                format_action_params(safe_params),
+            )
 
             tool_call_id = ""
             tool_start = time.time()
@@ -1096,6 +1149,42 @@ class StepPipeline:
 
 
 # ── Helpers ────────────────────────────────────────────────────────────
+
+
+def _redact_params_for_log(
+    action_name: str,
+    params: dict[str, Any],
+    sensitive_map: dict[str, str] | None,
+) -> dict[str, Any]:
+    """Return a copy of ``params`` with sensitive fields redacted for logging.
+
+    Mirrors ``_redact_history_data`` (views.py) but for a single action and
+    **non-mutating** (returns a copy so the real ``action_params`` is untouched
+    and the action still executes with real values). ``action_params`` reaches
+    ``_execute_actions`` already restored to real values by client-side
+    ``_restore_sensitive_in_output``; logging it raw would leak secrets.
+
+    Only fields listed in ``_SENSITIVE_ACTION_FIELDS[action_name]`` are redacted
+    (input_text.text / search.query / extract.query); other params (index, url,
+    ...) are returned unchanged so the log stays readable. No-op when
+    ``sensitive_map`` is None/empty.
+
+    ``sensitive_map`` must be ``{placeholder: real_value}`` (the orientation
+    ``redact_sensitive_string`` expects); obtained by inverting Agent's
+    ``_sensitive_map`` — see ``StepPipeline._sensitive_map_for_log``.
+    """
+    if not isinstance(params, dict):
+        return {}
+    if not sensitive_map:
+        return dict(params)
+    fields = _SENSITIVE_ACTION_FIELDS.get(action_name)
+    if not fields:
+        return dict(params)
+    redacted = dict(params)
+    for f in fields:
+        if isinstance(redacted.get(f), str):
+            redacted[f] = redact_sensitive_string(redacted[f], sensitive_map)
+    return redacted
 
 
 def _is_connection_error(error: Exception) -> bool:
