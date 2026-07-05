@@ -11,7 +11,9 @@ import re
 import secrets
 import shutil
 import tempfile
+import threading
 import time
+from collections import deque
 from typing import Any, Literal
 
 from cdp_use import CDPClient
@@ -25,6 +27,7 @@ from tree_walker.browser.dom import (
 from tree_walker.browser.highlight import HighlightManager
 from tree_walker.config import BrowserSettings
 from tree_walker.browser.views import (
+    BrowserEvent,
     BrowserStateSummary,
     DOMCollectionConfig,
     DOMDegradationLevel,
@@ -1157,17 +1160,37 @@ class BrowserSession:
         # 创建的是路径背书 File，浏览器会惰性读盘——临时副本必须存活到 session 结束，
         # stop() 时统一清理（见 set_file_input / stop）。
         self._upload_temp_paths: list[str] = []
+        # P1b：最近浏览器事件（首期仅 dialog）。CDP 回调在 websocket 读线程触发，
+        # deque + 锁保证线程安全；maxlen=20 自动丢弃溢出。get_state 每步 consume。
+        self._recent_events: deque[BrowserEvent] = deque(maxlen=20)
+        self._recent_events_lock = threading.Lock()
+        self._enable_recent_events: bool = False
 
-    async def start(self, *, track_downloads: bool = False, downloads_path: str | None = None) -> None:
+    async def start(
+        self,
+        *,
+        track_downloads: bool = False,
+        downloads_path: str | None = None,
+        enable_recent_events: bool = False,
+    ) -> None:
         """Connect to the browser via CDP WebSocket.
 
         ``downloads_path`` overrides where tracked downloads land; see
-        ``_setup_download_tracking``.
+        ``_setup_download_tracking``. ``enable_recent_events`` turns on
+        ``[Recent Events]`` capture (P1b，首期仅 dialog).
         """
         self.client = CDPClient(self.ws_url)
         await self._connect()
         if track_downloads:
             await self._setup_download_tracking(downloads_path)
+        self._enable_recent_events = enable_recent_events
+        if enable_recent_events:
+            try:
+                await self._setup_event_tracking()
+            except Exception as e:
+                # 事件采集失败不能拖垮启动——降级为不采集
+                logger.warning("recent_events setup failed (degrading to off): %s", e)
+                self._enable_recent_events = False
 
     async def _connect(self) -> None:
         """Perform CDP connection, target discovery, and session setup."""
@@ -1394,6 +1417,42 @@ class BrowserSession:
         self._completed_downloads.clear()
         return downloads
 
+    # ── P1b：recent_events（最近浏览器事件，首期仅 dialog）──────────────
+
+    async def _setup_event_tracking(self) -> None:
+        """注册 CDP 事件回调，把浏览器事件灌入 ``_recent_events`` 队列。
+
+        首期只接 ``Page.javascriptDialogOpening``（alert/confirm/prompt/beforeunload）。
+        download 由 ``_setup_download_tracking`` → ``[Downloads]`` 覆盖；cdp_use 单回调
+        机制（``registry._handlers[method] = callback`` 覆盖式）下不能双注册
+        ``Browser.downloadWillBegin``，故这里不监听 download。
+        回调在 websocket 读线程触发 → ``record_event`` 用锁保证线程安全。
+        """
+        def _on_javascript_dialog(event: dict, session_id: str | None = None) -> None:
+            # event: {url, message, type: alert/confirm/prompt/beforeunload}
+            message = event.get("message", "") or event.get("url", "")
+            dialog_type = event.get("type", "alert")
+            self.record_event(BrowserEvent(
+                type="dialog",
+                message=f"[{dialog_type}] {message}" if message else f"[{dialog_type}]",
+                timestamp=time.time(),
+            ))
+
+        self.client.register.Page.javascriptDialogOpening(_on_javascript_dialog)
+        logger.info("recent_events tracking enabled (dialog)")
+
+    def record_event(self, event: BrowserEvent) -> None:
+        """线程安全地追加一个浏览器事件（CDP 回调线程调用）。deque maxlen 自动溢出。"""
+        with self._recent_events_lock:
+            self._recent_events.append(event)
+
+    def consume_recent_events(self) -> list[BrowserEvent]:
+        """返回并清空近期事件缓冲（get_state 每步调用，避免重复出现）。"""
+        with self._recent_events_lock:
+            events = list(self._recent_events)
+            self._recent_events.clear()
+            return events
+
     async def stop(self) -> None:
         """Disconnect from the browser."""
         self._cached_selector_map = None
@@ -1502,6 +1561,7 @@ class BrowserSession:
             tabs=tabs,
             dom_state=dom_state,
             screenshot=screenshot,
+            recent_events=self.consume_recent_events(),  # P1b：每步 consume，避免重复
         )
 
     async def take_screenshot(

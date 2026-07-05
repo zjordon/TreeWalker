@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from tree_walker.agent.views import ActionResult
 from tree_walker.browser.views import BrowserStateSummary, TabInfo
 
@@ -122,6 +124,8 @@ def build_state_message(
     plan_description: str | None = None,
     planning_nudge: str | None = None,
     download_notice: str | None = None,
+    page_stats: dict[str, Any] | None = None,
+    sensitive_description: str | None = None,
 ) -> str:
     """Build the user message describing the current browser state."""
     parts: list[str] = []
@@ -129,6 +133,10 @@ def build_state_message(
     # Task reminder
     if task:
         parts.append(f"[Task] {task}")
+
+    # P1d：告知 LLM 当前页可用的 <secret> 占位符（只列 key，不含真实值）
+    if sensitive_description:
+        parts.append(f"[Available Secrets] {sensitive_description}")
 
     # Previous step context
     if previous_goal:
@@ -153,12 +161,33 @@ def build_state_message(
     parts.append(f"[Current URL] {browser_state.url}")
     parts.append(f"[Page Title] {browser_state.title}")
 
+    # P1a：页面统计（links/交互元素/iframe/骨架屏）。page_stats 为空（如空页面、
+    # EMPTY_DOM_STATE、或 enable_page_stats=False）时不渲染。
+    if page_stats:
+        stats = (
+            f"[Page Stats] links={page_stats.get('links', 0)}, "
+            f"interactive={page_stats.get('interactive', 0)}, "
+            f"iframes={page_stats.get('iframes', 0)}"
+        )
+        if page_stats.get('skeleton'):
+            stats += " SKELETON/LOADING (page may not be fully rendered)"
+        parts.append(stats)
+
     # Tabs
     if len(browser_state.tabs) > 1:
         parts.append("[Open Tabs]")
         for tab in browser_state.tabs:
             marker = " (active)" if tab.target_id == current_target_id else ""
             parts.append(f"  [{tab.target_id[-4:]}] {tab.title} - {tab.url}{marker}")
+        parts.append("")
+
+    # P1b：最近浏览器事件（首期仅 dialog）。enable_recent_events=False 或无事件时不渲染。
+    # 最多 5 条、倒序（最新在前）。直接读 browser_state.recent_events，无需额外参数。
+    if browser_state.recent_events:
+        recent = browser_state.recent_events[-5:][::-1]  # 最近 5 条，倒序
+        parts.append("[Recent Events]")
+        for ev in recent:
+            parts.append(f"  {ev.type}: {ev.message}")
         parts.append("")
 
     # DOM tree

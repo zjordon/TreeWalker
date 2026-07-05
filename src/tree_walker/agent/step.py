@@ -85,6 +85,9 @@ class StepPipeline:
     _step_start_time: float
     messages: list[dict[str, Any]]
     _enable_message_typing: bool
+    _enable_page_stats: bool
+    _enable_sensitive_description: bool
+    _max_history_items: int
     _system_prompt: str
     _tool_schema: dict[str, Any]
     loop_detector: ActionLoopDetector
@@ -202,6 +205,18 @@ class StepPipeline:
                 file_list = ", ".join(d["filename"] for d in new_downloads)
                 download_notice = f"New files available: {file_list}"
 
+        # P1a/P1d：页面统计 + 当前页可用 secret（均受 flag 控制；None 时 build_state_message 不渲染）
+        page_stats = (
+            browser_state.dom_state.page_stats
+            if (self._enable_page_stats and browser_state.dom_state)
+            else None
+        )
+        sensitive_desc = (
+            self._build_sensitive_description(browser_state.url)
+            if self._enable_sensitive_description
+            else None
+        )
+
         state_msg = build_state_message(
             browser_state=browser_state,
             task=self._safe_task,
@@ -214,8 +229,14 @@ class StepPipeline:
             plan_description=plan_description,
             planning_nudge=planning_nudge,
             download_notice=download_notice,
+            page_stats=page_stats,
+            sensitive_description=sensitive_desc,
         )
         self._set_state_message(state_msg)  # P0：替换唯一 state 消息（避免完整 DOM 随步数累积）
+
+        # P1c：注入 <agent_history>（滑动窗口，每步替换 TYPE_USER 消息）。
+        # 首步无历史 → _build_... 返回 None → _set_history_message 仅清残留（无操作）。
+        self._set_history_message(self._build_agent_history_description())
 
         # 5. Inject budget warning (>=75% steps used)
         self._inject_budget_warning()
@@ -238,14 +259,23 @@ class StepPipeline:
         return {k: v for k, v in msg.items() if k != _MSG_TYPE}
 
     def _set_state_message(self, content: str) -> None:
-        """设置当前步状态消息。``enable_message_typing=True`` 时**替换**唯一 state
-        消息（对齐 browser-use ``_set_message_with_type('state')``），避免每步
-        append 导致 N 份完整 DOM 累积；False 时回退原始 append 行为。
+        """设置当前步状态消息，并保留上一份 state 供 LLM 前后对比。
+
+        ``enable_message_typing=True`` 时保留**最近 2 份** state（previous + current），
+        而非 P0 原版的"仅留 1 份"：纯替换会让模型丧失 before/after DOM 对比，无法确认
+        动作是否生效——抖音封面上传回归：上传后画布新增的 ``<img>`` 节点必须与上一步的
+        空画布对比才能确认成功；只剩当前 state 时，模型被其他空槽位残留的"点击上传"
+        占位文 + 变化的 input 索引误导，误判"上传没生效"而反复重试。保留 2 份既恢复对比
+        能力，又有界（远小于 P0 前无界累积的 token 成本）。False 时回退原始 append。
         """
         if not self._enable_message_typing:
             self.messages.append({"role": "user", "content": content})
             return
-        self.messages = [m for m in self.messages if m.get(_MSG_TYPE) != TYPE_STATE]
+        # 保留最近 1 份旧 state（让 LLM 能 before/after 对比），删更老的。
+        # state_idxs[:-1] = 除最近一份外的全部旧 state 索引。
+        state_idxs = [i for i, m in enumerate(self.messages) if m.get(_MSG_TYPE) == TYPE_STATE]
+        drop = set(state_idxs[:-1])
+        self.messages = [m for i, m in enumerate(self.messages) if i not in drop]
         self.messages.append({"role": "user", "content": content, _MSG_TYPE: TYPE_STATE})
 
     def _clear_context_messages(self) -> None:
@@ -256,6 +286,21 @@ class StepPipeline:
         if not self._enable_message_typing:
             return
         self.messages = [m for m in self.messages if m.get(_MSG_TYPE) != TYPE_CONTEXT]
+
+    def _set_history_message(self, content: str | None) -> None:
+        """P1c：设置/替换唯一的 ``<agent_history>`` 消息（TYPE_USER，每步替换）。
+
+        对齐 browser-use ``agent_history_items``：保留首条 + 省略提示 + 最近 N 步，
+        让 LLM 看到早期 memory/目标，避免重复探索。``content=None``（首步无历史）
+        时移除上一步残留的 history 消息。``enable_message_typing=False`` 时 no-op
+        （不单独维护历史消息，回退到 messages 里既有的简化 assistant 文本）。
+        TYPE_USER 当前为 history 专属槽位（compactor summary 无 ``_type``，不碰撞）。
+        """
+        if not self._enable_message_typing:
+            return
+        self.messages = [m for m in self.messages if m.get(_MSG_TYPE) != TYPE_USER]
+        if content:
+            self.messages.append({"role": "user", "content": content, _MSG_TYPE: TYPE_USER})
 
     def _add_context_message(self, content: str) -> None:
         """追加注入提示（budget/last/failure/loop）。每步先 ``_clear_context_messages``

@@ -6,6 +6,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -77,10 +78,14 @@ class AgentSettings:
     llm_timeout: int = 120  # seconds; wraps the entire retry sequence
     action_timeout: int = 30  # seconds; per-action execution timeout
     reconnect_timeout: int = 30  # seconds; wait for browser reconnection
-    sensitive_data: dict[str, str] | None = None
+    sensitive_data: dict[str, Any] | None = None
     track_downloads: bool = False
     message_compaction: MessageCompactionSettings | None = None
     enable_message_typing: bool = True  # P0：消息分类管理（state 替换/context 清理），关则回退原始 append
+    enable_page_stats: bool = True  # P1a：state 消息渲染 [Page Stats]（links/交互/iframe/骨架屏），关则不渲染
+    enable_sensitive_description: bool = True  # P1d：state 消息渲染 [Available Secrets]（按 URL 过滤告知可用占位符）
+    max_history_items: int = 10  # P1c：<agent_history> 滑动窗口大小（compactor 启用时自动降到 5）
+    enable_recent_events: bool = False  # P1b：state 消息渲染 [Recent Events]（首期仅 dialog；CDP 回调风险，默认关）
     truncation: TruncationSettings = field(default_factory=TruncationSettings)
     enable_planning: bool = False
     exploration_threshold: int = 5
@@ -171,8 +176,14 @@ class Settings:
     tui: TUISettings = field(default_factory=TUISettings)
 
 
-def _load_sensitive_data() -> dict[str, str] | None:
-    """Load sensitive data mapping from SENSITIVE_DATA env var (JSON)."""
+def _load_sensitive_data() -> dict[str, Any] | None:
+    """Load sensitive data mapping from SENSITIVE_DATA env var (JSON).
+
+    P1d：兼容两种格式——
+      旧（全局，无 URL 过滤）：``{"password": "real123"}``
+      新（按 URL pattern 过滤）：``{"password": {"value": "real123", "urls": ["*login*"]}}``
+    两种都原样返回，归一化在 Agent 侧完成（``_sensitive_data_raw``）。
+    """
     raw = os.environ.get("SENSITIVE_DATA")
     if not raw:
         return None
@@ -269,6 +280,10 @@ def load_settings() -> Settings:
         track_downloads=os.environ.get("TRACK_DOWNLOADS", "").lower() == "true",
         message_compaction=message_compaction,
         enable_message_typing=os.environ.get("AGENT_ENABLE_MESSAGE_TYPING", "true").lower() == "true",
+        enable_page_stats=os.environ.get("AGENT_ENABLE_PAGE_STATS", "true").lower() == "true",
+        enable_sensitive_description=os.environ.get("AGENT_ENABLE_SENSITIVE_DESCRIPTION", "true").lower() == "true",
+        max_history_items=int(os.environ.get("AGENT_MAX_HISTORY_ITEMS", "10")),
+        enable_recent_events=os.environ.get("AGENT_ENABLE_RECENT_EVENTS", "false").lower() == "true",
         truncation=TruncationSettings(
             extract_page_max_chars=int(os.environ.get("AGENT_TRUNCATE_EXTRACT_PAGE", "8000")),
             extract_fallback_max_chars=int(os.environ.get("AGENT_TRUNCATE_EXTRACT_FALLBACK", "2000")),

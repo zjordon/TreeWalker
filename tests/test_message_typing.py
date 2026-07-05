@@ -28,15 +28,18 @@ class _FakeAgent(StepPipeline):
 
 
 class TestSetStateMessage:
-	def test_replaces_previous_state(self):
-		"""连续 _set_state_message 后 messages 里 TYPE_STATE 恒为 1 条（最新 DOM）。"""
+	def test_keeps_last_two_states(self):
+		"""连续 _set_state_message 后 messages 里 TYPE_STATE 恒为 2 条（previous + current），
+		让 LLM 能 before/after 对比（修复 P0 封面上传回归：纯替换让模型看不到画布新出现的
+		img 节点而被残留占位文误导）。更老的 state 被删。"""
 		agent = _FakeAgent()
 		for i in range(5):
 			agent._set_state_message(f"dom-step-{i}")
 		state_msgs = [m for m in agent.messages if m.get(_MSG_TYPE) == TYPE_STATE]
-		assert len(state_msgs) == 1
-		assert state_msgs[0]["content"] == "dom-step-4"
-		assert len(agent.messages) == 1  # 只保留唯一 state，旧 DOM 不累积
+		assert len(state_msgs) == 2
+		assert state_msgs[-1]["content"] == "dom-step-4"  # 当前
+		assert state_msgs[-2]["content"] == "dom-step-3"  # 上一步
+		assert len(agent.messages) == 2  # 仅 2 份 state，更老的已删
 
 	def test_first_step_no_error(self):
 		"""首步（无旧 state）不报错。"""
@@ -129,8 +132,8 @@ class TestStripType:
 class TestSimulatedStepCycle:
 	"""模拟 _prepare_context 多步循环：clear → set_state → add_context。"""
 
-	def test_five_steps_single_state_no_context_accumulation(self):
-		"""连续 5 步后 state 恒 1 条、context 不累积（每步清后灌）。"""
+	def test_five_steps_keep_two_states_no_context_accumulation(self):
+		"""连续 5 步后 state 恒 2 条（最近两步：dom-3 + dom-4）、context 不累积（每步清后灌）。"""
 		agent = _FakeAgent()
 		for i in range(5):
 			agent._clear_context_messages()
@@ -138,8 +141,9 @@ class TestSimulatedStepCycle:
 			agent._add_context_message(f"budget-{i}")
 		state_msgs = [m for m in agent.messages if m.get(_MSG_TYPE) == TYPE_STATE]
 		context_msgs = [m for m in agent.messages if m.get(_MSG_TYPE) == TYPE_CONTEXT]
-		assert len(state_msgs) == 1
-		assert state_msgs[0]["content"] == "dom-4"
+		assert len(state_msgs) == 2
+		assert state_msgs[-1]["content"] == "dom-4"  # 当前步
+		assert state_msgs[-2]["content"] == "dom-3"  # 上一步
 		assert len(context_msgs) == 1
 		assert context_msgs[0]["content"] == "budget-4"
 

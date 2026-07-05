@@ -120,6 +120,13 @@ class DOMTreeSerializer:
 
         element_tree_text = self.serialize_tree(filtered_tree, DEFAULT_INCLUDE_ATTRIBUTES)
 
+        # P1a：页面统计（links/interactive/iframes/skeleton）。serializer 持有
+        # filtered_tree + selector_map，是唯一能可靠统计的位置——metrics.element_count
+        # 从不被赋值（恒 0）、metrics.iframe_count 仅在超限截断时赋值，都不可用。
+        start = time.time()
+        page_stats = self._collect_page_stats(filtered_tree)
+        self.timing_info['page_stats'] = time.time() - start
+
         self.timing_info['serialize_accessible_elements_total'] = time.time() - start_total
 
         return (
@@ -127,9 +134,50 @@ class DOMTreeSerializer:
                 _root=filtered_tree,
                 selector_map=self._selector_map,
                 element_tree_text=element_tree_text,
+                page_stats=page_stats,
             ),
             self.timing_info,
         )
+
+    # ── P1a：页面统计 ───────────────────────────────────────────────
+
+    _SKELETON_CLASS_PATTERNS = ('skeleton', 'placeholder', 'spinner', 'loading')
+    _SKELETON_LOW_INTERACTIVE_THRESHOLD = 3
+
+    def _collect_page_stats(self, root: SimplifiedNode | None) -> dict[str, Any]:
+        """统计 links/interactive/iframes/skeleton 供 state 消息 [Page Stats] 渲染。
+
+        - interactive：编号的可交互元素数（= ``len(selector_map)``，与 step 日志一致）
+        - links：``<a>`` 可交互元素数
+        - iframes：树中 iframe/frame 节点数（含跨源 iframe 的占位）
+        - skeleton：骨架屏启发式（skeleton/loading/placeholder/spinner 类命中且
+          可交互元素 < 3 → 页面可能尚未渲染完成，提示 LLM 别急着点占位元素）
+        """
+        interactive = len(self._selector_map)
+        links = sum(1 for n in self._selector_map.values() if n.tag_name == 'a')
+
+        iframes = 0
+        skeleton_hits = 0
+        stack: list[SimplifiedNode | None] = [root]
+        while stack:
+            sn = stack.pop()
+            if sn is None:
+                continue
+            on = sn.original_node
+            if on.node_name.upper() in ('IFRAME', 'FRAME'):
+                iframes += 1
+            cls = (on.attributes or {}).get('class', '').lower() if on.attributes else ''
+            if cls and any(p in cls for p in self._SKELETON_CLASS_PATTERNS):
+                skeleton_hits += 1
+            stack.extend(sn.children)
+
+        skeleton = skeleton_hits > 0 and interactive < self._SKELETON_LOW_INTERACTIVE_THRESHOLD
+        return {
+            'links': links,
+            'interactive': interactive,
+            'iframes': iframes,
+            'skeleton': skeleton,
+        }
 
     # ── Step 1: 创建简化树 ──────────────────────────────────────────
 

@@ -15,7 +15,7 @@ import hashlib
 import uuid as _uuid
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -700,6 +700,9 @@ class SerializedDOMState:
 	element_tree_text: str
 	file_input_backend_ids: list[int] = field(default_factory=list)
 	file_inputs_meta: list[FileInputInfo] = field(default_factory=list)
+	# P1a：页面统计（links/interactive/iframes/skeleton），由 serializer 填充，
+	# 透传到 state 消息的 [Page Stats] 段。空 dict（如 EMPTY_DOM_STATE）不渲染。
+	page_stats: dict[str, Any] = field(default_factory=dict)
 
 	def llm_representation(self, include_attributes: list[str] | None = None) -> str:
 		if not self._root:
@@ -768,12 +771,28 @@ class TabInfo(BaseModel):
 	title: str
 
 
+class BrowserEvent(BaseModel):
+	"""P1b：最近浏览器事件。
+
+	首期仅采集 ``dialog``（alert/confirm/prompt/beforeunload，由
+	``Page.javascriptDialogOpening`` 触发）。``download`` 由
+	``consume_completed_downloads`` → ``[Downloads]`` 段覆盖——cdp_use 单回调机制
+	（``registry._handlers[method] = callback`` 覆盖式）下不能与 download tracking
+	双注册 ``Browser.downloadWillBegin``，故不入此列表。type 字段保留完整枚举供未来扩展。
+	"""
+
+	type: Literal["navigation", "dialog", "download", "network_error", "console_error"]
+	message: str
+	timestamp: float
+
+
 class BrowserStateSummary(BaseModel):
 	url: str = ""
 	title: str = ""
 	tabs: list[TabInfo] = Field(default_factory=list)
 	dom_state: SerializedDOMState | None = None
 	screenshot: bytes | None = None
+	recent_events: list[BrowserEvent] = Field(default_factory=list)  # P1b：每步 consume
 
 	class Config:
 		arbitrary_types_allowed = True
