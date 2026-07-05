@@ -37,6 +37,38 @@ _EMPTY_OPTIONS_DIAGNOSTIC = {
 # ── Helpers ───────────────────────────────────────────────────────────
 
 
+# P1 三次修订：upload_file 页面级验证探针。数 canvas + blob/data img 预览，通用、只读、
+# 无站点选择器。before/after 比对，计数增加 = 客观成功证据（抖音封面走 canvas 预览）。
+# 四次修订：扩 bgPreviews（inline background-image blob/data，覆盖 React 上传器常用渲染）。
+# 参考 docs/agent-loop-optimize/上传失败诊断-P1对文件上传影响分析.md 三/四次修订。
+_UPLOAD_PROBE_JS = (
+    "(() => {"
+    "  const canvases = document.querySelectorAll('canvas').length;"
+    "  let imgPreviews = 0;"
+    "  for (const img of document.querySelectorAll('img')) {"
+    "    const s = img.getAttribute('src') || img.src || '';"
+    "    if (s.indexOf('blob:') === 0 || s.indexOf('data:') === 0) imgPreviews++;"
+    "  }"
+    "  const bgPreviews = document.querySelectorAll(\"[style*='blob:'],[style*='data:']\").length;"
+    "  return JSON.stringify({ canvases: canvases, imgPreviews: imgPreviews, bgPreviews: bgPreviews });"
+    "})()"
+)
+
+# 验证无定论（未检测到新 canvas/img）时的引导文案——直接拆掉「占位文案 → 怀疑 → screenshot」
+# 死链。注意括号里的例外：只豁免静态占位文案，不豁免真实错误信号，避免模型无脑判成功。
+_UPLOAD_INCONCLUSIVE_ADVISORY = (
+    "  ℹ️ File was set on the input successfully (DOM.setFileInputFiles returned OK). "
+    "No new <canvas>/<img> preview detected within the wait window — the page may still "
+    "be processing, or use a non-standard preview mechanism. Do NOT conclude the upload "
+    "failed just because the upload area still shows placeholder text like "
+    "\"点击上传文件或拖拽文件到这里\" — that text is static markup, not upload state. "
+    "(This does NOT override explicit failure signals — an error toast / \"rejected\" / "
+    "red border / size-limit notice still means failure.) To confirm, proceed one step "
+    "and re-read the DOM (look for a newly appeared preview) rather than taking a "
+    "screenshot (visual verification is currently disabled).\n"
+)
+
+
 def _is_file_input_node(node: EnhancedDOMTreeNode) -> bool:
     return node.tag_name.upper() == "INPUT" and node.attributes.get("type", "").lower() == "file"
 
@@ -362,6 +394,9 @@ class Tools:
         allowed_read_paths: list[str] | None = None,
         display_files_in_done_text: bool = False,
         output_model: type[BaseModel] | None = None,
+        upload_verify_enabled: bool = True,
+        upload_verify_wait_s: float = 1.5,
+        upload_verify_interval_s: float = 0.25,
     ) -> None:
         # 二.E：output_model 须在 _register_all 之前落到 self / registry（_register_all 据此选变体）。
         self._output_model = output_model
@@ -373,6 +408,12 @@ class Tools:
         self._allowed_write_paths = allowed_write_paths
         self._allowed_read_paths = allowed_read_paths
         self._display_files_in_done_text = display_files_in_done_text
+        # P1 三次修订：upload_file 上传后页面级验证（canvas/img/bg-image 预览探测）。默认开，
+        # 关则 _verify_upload 直接返回空串（等价旧行为）。四次修订：wait_s 是 polling 总预算，
+        # interval_s 是 poll 间隔（早退于首个 delta）。
+        self._upload_verify_enabled = upload_verify_enabled
+        self._upload_verify_wait_s = upload_verify_wait_s
+        self._upload_verify_interval_s = upload_verify_interval_s
 
     # ── Public API ─────────────────────────────────────────────────────
 
@@ -793,6 +834,83 @@ class Tools:
             if getattr(node, "backend_node_id", None) == backend_node_id:
                 return node
         return None
+
+    async def _probe_upload_signals(self, browser: BrowserSession) -> tuple[int, int, int] | None:
+        """One-shot read-only probe: ``(canvas_count, img_preview_count, bg_preview_count)``.
+
+        Counts ``<canvas>`` elements, ``<img>`` whose src is ``blob:``/``data:``, and
+        elements whose inline style mentions ``blob:``/``data:`` (background-image previews
+        rendered by React uploaders). Generic — no site-specific selectors. Returns None
+        on any error so ``_verify_upload`` treats verification as inconclusive, never raises.
+        """
+        try:
+            raw = await browser.execute_js(_UPLOAD_PROBE_JS)
+            if isinstance(raw, str):
+                data = json.loads(raw)
+            elif isinstance(raw, dict):
+                data = raw
+            else:
+                return None
+            return (
+                int(data.get("canvases", 0)),
+                int(data.get("imgPreviews", 0)),
+                int(data.get("bgPreviews", 0)),
+            )
+        except Exception as exc:
+            logger.debug("upload probe failed (non-blocking): %s", exc)
+            return None
+
+    async def _verify_upload(
+        self,
+        browser: BrowserSession,
+        before: tuple[int, int, int] | None,
+        file_basename: str,
+    ) -> str:
+        """Page-level verification: poll for canvas/img/bg-image delta after upload.
+
+        Four次修订：原 single-shot (sleep 0.6s + probe once) 系统性错过抖音慢渲染的 canvas
+        (出现在 0.6s 之后、下一步 state 之前)。改为 polling：每 ``interval_s`` 探一次，命中
+        任一信号 delta 即早退报 ✅，否则跑到 ``wait_s`` 总预算耗尽报 inconclusive。
+
+        Returns evidence text to **append** to the upload echo:
+
+        * disabled  → ``""`` (no evidence appended)
+        * success   → ``"  ✅ Upload verified on page: new <canvas>/<img>/background preview ...\\n"``
+        * inconclusive (no delta within budget, probe failed, before None, or any exception)
+          → ``_UPLOAD_INCONCLUSIVE_ADVISORY``
+
+        Never raises — the outer ``try/except`` turns any exception into the advisory,
+        so verification can never block the upload flow.
+        """
+        if not self._upload_verify_enabled:
+            return ""
+        try:
+            if before is None:
+                # No baseline (before-probe failed) → can't compare → advisory.
+                return _UPLOAD_INCONCLUSIVE_ADVISORY
+            interval = max(self._upload_verify_interval_s, 0.05)
+            attempts = max(1, int(self._upload_verify_wait_s / interval))
+            for _ in range(attempts):
+                await asyncio.sleep(interval)
+                after = await self._probe_upload_signals(browser)
+                if after is None:
+                    continue  # probe failed this round — keep polling
+                d_canvas = after[0] - before[0]
+                d_img = after[1] - before[1]
+                d_bg = after[2] - before[2]
+                if d_canvas > 0 or d_img > 0 or d_bg > 0:
+                    parts = []
+                    if d_canvas > 0:
+                        parts.append(f"new <canvas> preview appeared (count {before[0]}→{after[0]})")
+                    if d_img > 0:
+                        parts.append(f"new <img> preview appeared (count {before[1]}→{after[1]})")
+                    if d_bg > 0:
+                        parts.append(f"new background-image preview appeared (count {before[2]}→{after[2]})")
+                    return "  ✅ Upload verified on page: " + "; ".join(parts) + ".\n"
+            return _UPLOAD_INCONCLUSIVE_ADVISORY
+        except Exception as exc:
+            logger.warning("upload verification raised (non-blocking): %s", exc)
+            return _UPLOAD_INCONCLUSIVE_ADVISORY
 
     @staticmethod
     def _is_autocomplete_field(entry: Any) -> tuple[bool, bool]:
@@ -1585,6 +1703,13 @@ class Tools:
             is_file_input, backend_id, file_input_ids,
         )
 
+        # P1 三次修订：上传前页面信号快照（canvas/img 计数），上传后比对给 LLM 客观证据。
+        # 验证关闭时跳过探针（避免无谓 CDP 往返）——_verify_upload 也会直接返回空串。
+        before_signals = (
+            await self._probe_upload_signals(browser)
+            if self._upload_verify_enabled else None
+        )
+
         # 4. 高亮 + 上传（对齐 _action_click：共用 try，统一映射；highlight best-effort）
         try:
             await browser.highlight_element(backend_id)
@@ -1617,6 +1742,10 @@ class Tools:
                 f"accept={accept_attr!r}. The file was uploaded successfully regardless "
                 f"— browsers do not enforce accept (it is advisory only). No retry needed."
             )
+
+        # P1 三次修订：上传后页面级验证（canvas/img 预览探测），把 ✅ 证据或 inconclusive
+        # 引导追加进回显。_verify_upload 内部全 try/except，绝不阻塞主流程。
+        memory += await self._verify_upload(browser, before_signals, os.path.basename(file_path))
 
         logger.info(memory)
         return ActionResult(extracted_content=memory, long_term_memory=memory)

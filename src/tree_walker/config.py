@@ -97,6 +97,12 @@ class AgentSettings:
     allowed_upload_paths: list[str] | None = None
     allowed_write_paths: list[str] | None = None
     allowed_read_paths: list[str] | None = None
+    # P1 三次修订：upload_file 上传后页面级验证（canvas/img/bg-image 预览探测）。默认开；
+    # 关则回显无 ✅/ℹ️ 验证段（等价旧行为）。四次修订：wait_s 是 polling 总预算（默认 1.5s，
+    # 早退于首个 delta；抖音 canvas 慢渲染需要 > 原 0.6s），interval_s 是 poll 间隔。
+    upload_verify_enabled: bool = True
+    upload_verify_wait_s: float = 1.5
+    upload_verify_interval_s: float = 0.25
     display_files_in_done_text: bool = False  # 二.D：done 是否把附件内容内联进 extracted_content
     judge: JudgeSettings = field(default_factory=JudgeSettings)
     # extract 工具：专用 LLM（None=复用主 llm）+ 结构化抽取的 JSON Schema（None=free-text）
@@ -312,6 +318,9 @@ def load_settings() -> Settings:
         allowed_write_paths=_load_allowed_write_paths(),
         allowed_read_paths=_load_allowed_read_paths(),
         display_files_in_done_text=os.environ.get("AGENT_DISPLAY_FILES_IN_DONE_TEXT", "").lower() == "true",
+        upload_verify_enabled=os.environ.get("AGENT_UPLOAD_VERIFY_ENABLED", "true").lower() == "true",
+        upload_verify_wait_s=float(os.environ.get("AGENT_UPLOAD_VERIFY_WAIT_S", "1.5")),
+        upload_verify_interval_s=float(os.environ.get("AGENT_UPLOAD_VERIFY_INTERVAL_S", "0.25")),
         rerun_history_dir=os.environ.get("AGENT_RERUN_HISTORY_DIR", "rerun-history"),
         judge=JudgeSettings(
             enabled=os.environ.get("AGENT_JUDGE_ENABLED", "1") == "1",

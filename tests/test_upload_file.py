@@ -77,6 +77,7 @@ def _make_state(
 
 def _make_browser(
 	*, set_side_effect=None, discover_return: int | None = None,
+	execute_js_side_effect=None,
 ) -> MagicMock:
 	"""Stub BrowserSession for action-layer tests (does NOT touch CDP).
 
@@ -93,6 +94,10 @@ def _make_browser(
 		bs.set_file_input = AsyncMock()
 	bs.discover_file_input_via_click = AsyncMock(return_value=discover_return)
 	bs.get_state = AsyncMock(return_value=_make_state({}))
+	if execute_js_side_effect is None:
+		bs.execute_js = AsyncMock(return_value='{"canvases": 0, "imgPreviews": 0}')
+	else:
+		bs.execute_js = AsyncMock(side_effect=execute_js_side_effect)
 	return bs
 
 
@@ -136,7 +141,7 @@ class TestUploadFileElementLookup:
 		state = _make_state({5: entry})
 		browser = _make_browser()
 
-		result = await Tools().execute(
+		result = await Tools(upload_verify_enabled=False).execute(
 			"upload_file", {"index": 5, "path": tmp_upload}, browser, browser_state=state,
 		)
 
@@ -152,7 +157,7 @@ class TestUploadFileElementLookup:
 		state = _make_state({})  # index 5 absent
 		browser = _make_browser()
 
-		result = await Tools().execute(
+		result = await Tools(upload_verify_enabled=False).execute(
 			"upload_file", {"index": 5, "path": tmp_upload}, browser, browser_state=state,
 		)
 
@@ -171,7 +176,7 @@ class TestUploadFilePathValidation:
 		state = _make_state({1: entry})
 		browser = _make_browser()
 
-		result = await Tools().execute(
+		result = await Tools(upload_verify_enabled=False).execute(
 			"upload_file", {"index": 1, "path": r"Z:\nope\missing.png"},
 			browser, browser_state=state,
 		)
@@ -187,7 +192,7 @@ class TestUploadFilePathValidation:
 		state = _make_state({1: entry})
 		browser = _make_browser()
 
-		result = await Tools().execute(
+		result = await Tools(upload_verify_enabled=False).execute(
 			"upload_file", {"index": 1, "path": str(p)}, browser, browser_state=state,
 		)
 
@@ -219,7 +224,7 @@ class TestUploadFileEcho:
 		state = _make_state({5: entry})
 		browser = _make_browser()
 
-		result = await Tools().execute(
+		result = await Tools(upload_verify_enabled=False).execute(
 			"upload_file", {"index": 5, "path": tmp_upload}, browser, browser_state=state,
 		)
 
@@ -235,7 +240,7 @@ class TestUploadFileEcho:
 		state = _make_state({5: entry})
 		browser = _make_browser()
 
-		result = await Tools().execute(
+		result = await Tools(upload_verify_enabled=False).execute(
 			"upload_file", {"index": 5, "path": tmp_upload}, browser, browser_state=state,
 		)
 
@@ -252,7 +257,7 @@ class TestUploadFileEcho:
 		state = _make_state({2: entry})
 		browser = _make_browser()
 
-		result = await Tools().execute(
+		result = await Tools(upload_verify_enabled=False).execute(
 			"upload_file", {"index": 2, "path": str(p)}, browser, browser_state=state,
 		)
 
@@ -264,7 +269,7 @@ class TestUploadFileEcho:
 	async def test_echo_uses_name_when_no_aria_label(self, tmp_upload):
 		entry = _make_entry(attributes={"type": "file", "name": "avatar_file"})
 		state = _make_state({5: entry})
-		result = await Tools().execute(
+		result = await Tools(upload_verify_enabled=False).execute(
 			"upload_file", {"index": 5, "path": tmp_upload}, _make_browser(), browser_state=state,
 		)
 		bn = os.path.basename(tmp_upload)
@@ -274,7 +279,7 @@ class TestUploadFileEcho:
 	async def test_echo_uses_node_value(self, tmp_upload):
 		entry = _make_entry(attributes={"type": "file"}, node_value="Choose file")
 		state = _make_state({5: entry})
-		result = await Tools().execute(
+		result = await Tools(upload_verify_enabled=False).execute(
 			"upload_file", {"index": 5, "path": tmp_upload}, _make_browser(), browser_state=state,
 		)
 		bn = os.path.basename(tmp_upload)
@@ -294,7 +299,7 @@ class TestUploadFileResolution:
 		state.dom_state.selector_map[9] = fin
 		browser = _make_browser()
 
-		result = await Tools().execute(
+		result = await Tools(upload_verify_enabled=False).execute(
 			"upload_file", {"index": 3, "path": tmp_upload}, browser, browser_state=state,
 		)
 
@@ -313,7 +318,7 @@ class TestUploadFileResolution:
 		state = _make_state({3: btn}, file_input_backend_ids=[])
 		browser = _make_browser()
 
-		result = await Tools().execute(
+		result = await Tools(upload_verify_enabled=False).execute(
 			"upload_file", {"index": 3, "path": tmp_upload}, browser, browser_state=state,
 		)
 
@@ -326,7 +331,7 @@ class TestUploadFileResolution:
 		# resolution note still present, no accept note.
 		btn = _make_entry(tag="BUTTON", backend_node_id=3)
 		state = _make_state({3: btn}, file_input_backend_ids=[9])  # 9 not in selector_map
-		result = await Tools().execute(
+		result = await Tools(upload_verify_enabled=False).execute(
 			"upload_file", {"index": 3, "path": tmp_upload}, _make_browser(), browser_state=state,
 		)
 		assert result.error is None
@@ -349,7 +354,7 @@ class TestUploadFileDiscover:
 		# page wiring reveals input 9 (e.g. the vertical cover slot)
 		browser = _make_browser(discover_return=9)
 
-		result = await Tools().execute(
+		result = await Tools(upload_verify_enabled=False).execute(
 			"upload_file", {"index": 3, "path": tmp_upload}, browser, browser_state=state,
 		)
 
@@ -367,7 +372,7 @@ class TestUploadFileDiscover:
 		state = _make_state({3: btn}, file_input_backend_ids=[10, 9])
 		browser = _make_browser(discover_return=None)
 
-		result = await Tools().execute(
+		result = await Tools(upload_verify_enabled=False).execute(
 			"upload_file", {"index": 3, "path": tmp_upload}, browser, browser_state=state,
 		)
 
@@ -385,7 +390,7 @@ class TestUploadFileDiscover:
 		state = _make_state({3: btn}, file_input_backend_ids=[10, 9])
 		browser = _make_browser(discover_return=None)
 
-		result = await Tools().execute(
+		result = await Tools(upload_verify_enabled=False).execute(
 			"upload_file", {"index": 3, "path": tmp_upload}, browser, browser_state=state,
 		)
 
@@ -406,7 +411,7 @@ class TestUploadFileDiscover:
 		state = _make_state({3: drag}, file_input_backend_ids=[10, 9])
 		browser = _make_browser(discover_return=9)
 
-		result = await Tools().execute(
+		result = await Tools(upload_verify_enabled=False).execute(
 			"upload_file", {"index": 3, "path": tmp_upload}, browser, browser_state=state,
 		)
 
@@ -427,7 +432,7 @@ class TestUploadFileDiscover:
 		state = _make_state({7: hidden}, file_input_backend_ids=[7, 8, 9])
 		browser = _make_browser()
 
-		result = await Tools().execute(
+		result = await Tools(upload_verify_enabled=False).execute(
 			"upload_file", {"index": 7, "path": tmp_upload}, browser, browser_state=state,
 		)
 
@@ -457,7 +462,7 @@ class TestUploadFileDiscover:
 		)
 		browser = _make_browser()
 
-		result = await Tools().execute(
+		result = await Tools(upload_verify_enabled=False).execute(
 			"upload_file", {"index": 7, "path": tmp_upload}, browser, browser_state=state,
 		)
 
@@ -492,7 +497,7 @@ class TestUploadFileDiscover:
 		)
 		browser = _make_browser()
 
-		result = await Tools().execute(
+		result = await Tools(upload_verify_enabled=False).execute(
 			"upload_file", {"index": 7, "path": tmp_upload}, browser, browser_state=state,
 		)
 
@@ -524,7 +529,7 @@ class TestUploadFileDiscover:
 		)
 		browser = _make_browser()
 
-		result = await Tools().execute(
+		result = await Tools(upload_verify_enabled=False).execute(
 			"upload_file", {"index": 7, "path": tmp_upload}, browser, browser_state=state,
 		)
 
@@ -555,7 +560,7 @@ class TestUploadFileDiscover:
 		)
 		browser = _make_browser()
 
-		result = await Tools().execute(
+		result = await Tools(upload_verify_enabled=False).execute(
 			"upload_file", {"index": 7, "path": tmp_upload}, browser, browser_state=state,
 		)
 
@@ -586,7 +591,7 @@ class TestUploadFileDiscover:
 		)
 		browser = _make_browser()
 
-		result = await Tools().execute(
+		result = await Tools(upload_verify_enabled=False).execute(
 			"upload_file", {"index": 8, "path": tmp_upload}, browser, browser_state=state,
 		)
 
@@ -602,7 +607,7 @@ class TestUploadFileDiscover:
 		state = _make_state({7: entry}, file_input_backend_ids=[7])
 		browser = _make_browser()
 
-		result = await Tools().execute(
+		result = await Tools(upload_verify_enabled=False).execute(
 			"upload_file", {"index": 7, "path": tmp_upload}, browser, browser_state=state,
 		)
 
@@ -674,7 +679,7 @@ class TestUploadFileAccept:
 	async def test_accept_ext_match_no_note(self, tmp_upload):
 		entry = _make_entry(attributes={"type": "file", "accept": ".png"})
 		state = _make_state({1: entry})
-		result = await Tools().execute(
+		result = await Tools(upload_verify_enabled=False).execute(
 			"upload_file", {"index": 1, "path": tmp_upload}, _make_browser(), browser_state=state,
 		)
 		assert result.error is None
@@ -684,7 +689,7 @@ class TestUploadFileAccept:
 	async def test_accept_full_mime_match_no_note(self, tmp_upload):
 		entry = _make_entry(attributes={"type": "file", "accept": "image/png"})
 		state = _make_state({1: entry})
-		result = await Tools().execute(
+		result = await Tools(upload_verify_enabled=False).execute(
 			"upload_file", {"index": 1, "path": tmp_upload}, _make_browser(), browser_state=state,
 		)
 		assert "accept=" not in result.extracted_content
@@ -693,7 +698,7 @@ class TestUploadFileAccept:
 	async def test_accept_wildcard_match_no_note(self, tmp_upload):
 		entry = _make_entry(attributes={"type": "file", "accept": "image/*"})
 		state = _make_state({1: entry})
-		result = await Tools().execute(
+		result = await Tools(upload_verify_enabled=False).execute(
 			"upload_file", {"index": 1, "path": tmp_upload}, _make_browser(), browser_state=state,
 		)
 		assert "accept=" not in result.extracted_content
@@ -704,7 +709,7 @@ class TestUploadFileAccept:
 		p.write_bytes(b"x")
 		entry = _make_entry(attributes={"type": "file", "accept": ".pdf"})
 		state = _make_state({1: entry})
-		result = await Tools().execute(
+		result = await Tools(upload_verify_enabled=False).execute(
 			"upload_file", {"index": 1, "path": str(p)}, _make_browser(), browser_state=state,
 		)
 		assert result.error is None
@@ -718,7 +723,7 @@ class TestUploadFileAccept:
 	async def test_no_accept_attr_no_note(self, tmp_upload):
 		entry = _make_entry(attributes={"type": "file"})
 		state = _make_state({1: entry})
-		result = await Tools().execute(
+		result = await Tools(upload_verify_enabled=False).execute(
 			"upload_file", {"index": 1, "path": tmp_upload}, _make_browser(), browser_state=state,
 		)
 		assert "accept=" not in result.extracted_content
@@ -734,7 +739,7 @@ class TestUploadFileAccept:
 		)
 		state = _make_state({3: btn}, file_input_backend_ids=[9])
 		state.dom_state.selector_map[9] = fin
-		result = await Tools().execute(
+		result = await Tools(upload_verify_enabled=False).execute(
 			"upload_file", {"index": 3, "path": str(p)}, _make_browser(), browser_state=state,
 		)
 		assert result.error is None
@@ -752,7 +757,7 @@ class TestUploadFileErrorMapping:
 		state = _make_state({1: entry})
 		browser = _make_browser(set_side_effect=RuntimeError("CDP down"))
 
-		result = await Tools().execute(
+		result = await Tools(upload_verify_enabled=False).execute(
 			"upload_file", {"index": 1, "path": tmp_upload}, browser, browser_state=state,
 		)
 
@@ -799,10 +804,188 @@ class TestAcceptNeverBlocks:
 		entry = _make_entry(attributes={"type": "file", "accept": ".pdf"})
 		state = _make_state({1: entry})
 		browser = _make_browser()
-		result = await Tools().execute(
+		result = await Tools(upload_verify_enabled=False).execute(
 			"upload_file", {"index": 1, "path": str(p)}, browser, browser_state=state,
 		)
 		assert result.error is None
 		browser.set_file_input.assert_awaited_once()
 		assert browser.set_file_input.call_args.kwargs["backend_node_id"] == entry.backend_node_id
 		assert "do not enforce accept" in result.extracted_content
+
+
+# ── P1 三次修订：upload_file 页面级验证（canvas/img 探针 + inconclusive 引导）─────
+
+
+class TestUploadVerification:
+	"""upload_file 上传后页面级验证：canvas/img 预览探测 + inconclusive 引导文案。
+
+	参考 docs/agent-loop-optimize/上传失败诊断-P1对文件上传影响分析.md 三次修订 §4。
+	"""
+
+	@pytest.mark.asyncio
+	async def test_verify_success_canvas_appeared(self, tmp_upload):
+		entry = _make_entry(attributes={"type": "file"})
+		state = _make_state({5: entry})
+		browser = _make_browser(execute_js_side_effect=[
+			'{"canvases": 0, "imgPreviews": 0}',   # before
+			'{"canvases": 1, "imgPreviews": 0}',   # after — canvas preview appeared
+		])
+		result = await Tools().execute(
+			"upload_file", {"index": 5, "path": tmp_upload}, browser, browser_state=state,
+		)
+		assert result.error is None
+		assert "✅ Upload verified" in result.extracted_content
+		assert "new <canvas> preview appeared" in result.extracted_content
+		assert "count 0→1" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_verify_success_img_preview_appeared(self, tmp_upload):
+		entry = _make_entry(attributes={"type": "file"})
+		state = _make_state({5: entry})
+		browser = _make_browser(execute_js_side_effect=[
+			'{"canvases": 0, "imgPreviews": 0}',
+			'{"canvases": 0, "imgPreviews": 1}',   # img preview appeared
+		])
+		result = await Tools().execute(
+			"upload_file", {"index": 5, "path": tmp_upload}, browser, browser_state=state,
+		)
+		assert result.error is None
+		assert "✅ Upload verified" in result.extracted_content
+		assert "new <img> preview appeared" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_verify_inconclusive_no_signal(self, tmp_upload):
+		entry = _make_entry(attributes={"type": "file"})
+		state = _make_state({5: entry})
+		# Polling runs all attempts → bound to 2 polls (0.2s) for test speed; lambda 恒返 0
+		# 避免列表耗尽。无 delta → advisory。
+		browser = _make_browser(execute_js_side_effect=lambda *a, **k: '{"canvases": 0, "imgPreviews": 0, "bgPreviews": 0}')
+		result = await Tools(upload_verify_wait_s=0.2, upload_verify_interval_s=0.1).execute(
+			"upload_file", {"index": 5, "path": tmp_upload}, browser, browser_state=state,
+		)
+		assert result.error is None
+		# Advisory must carry the three keywords that break the screenshot loop.
+		assert "Do NOT conclude" in result.extracted_content
+		assert "placeholder" in result.extracted_content
+		assert "screenshot" in result.extracted_content
+		assert "✅" not in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_verify_exception_does_not_block(self, tmp_upload):
+		entry = _make_entry(attributes={"type": "file"})
+		state = _make_state({5: entry})
+
+		def raise_each(*a, **kw):
+			raise RuntimeError("cdp eval blew up")
+
+		browser = _make_browser(execute_js_side_effect=raise_each)
+		result = await Tools().execute(
+			"upload_file", {"index": 5, "path": tmp_upload}, browser, browser_state=state,
+		)
+		# Verification raised but upload itself succeeded; advisory path taken.
+		assert result.error is None
+		assert "Uploaded" in result.extracted_content
+		assert "Do NOT conclude" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_verify_disabled_no_evidence(self, tmp_upload):
+		entry = _make_entry(attributes={"type": "file"})
+		state = _make_state({5: entry})
+		browser = _make_browser()  # default execute_js, but should never be called
+		result = await Tools(upload_verify_enabled=False).execute(
+			"upload_file", {"index": 5, "path": tmp_upload}, browser, browser_state=state,
+		)
+		assert result.error is None
+		assert "✅" not in result.extracted_content
+		assert "Do NOT conclude" not in result.extracted_content
+		# Disabled → no probe at all.
+		browser.execute_js.assert_not_awaited()
+
+	@pytest.mark.asyncio
+	async def test_verify_probe_failure_treated_inconclusive(self, tmp_upload):
+		entry = _make_entry(attributes={"type": "file"})
+		state = _make_state({5: entry})
+		browser = _make_browser(execute_js_side_effect=[
+			'not-json',   # before-probe returns garbage → _probe returns None
+		])
+		result = await Tools().execute(
+			"upload_file", {"index": 5, "path": tmp_upload}, browser, browser_state=state,
+		)
+		assert result.error is None
+		# before=None → advisory, no crash, no second probe needed.
+		assert "Do NOT conclude" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_verify_after_probe_fails_returns_advisory(self, tmp_upload):
+		"""before-probe OK but after-probes raise (e.g. page navigated) → advisory.
+
+		Polling means after-probe is called multiple times → use a function that raises
+		on every poll (not a single-error list, which would exhaust).
+		"""
+		entry = _make_entry(attributes={"type": "file"})
+		state = _make_state({5: entry})
+		calls = {"n": 0}
+
+		def before_ok_then_raise(*a, **k):
+			if calls["n"] == 0:
+				calls["n"] += 1
+				return '{"canvases": 0, "imgPreviews": 0, "bgPreviews": 0}'
+			raise RuntimeError("page navigated during wait")
+
+		browser = _make_browser(execute_js_side_effect=before_ok_then_raise)
+		result = await Tools(upload_verify_wait_s=0.2, upload_verify_interval_s=0.1).execute(
+			"upload_file", {"index": 5, "path": tmp_upload}, browser, browser_state=state,
+		)
+		assert result.error is None
+		# All after-probes None → advisory, upload still counts as set.
+		assert "Do NOT conclude" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_verify_probe_dict_return_handled(self, tmp_upload):
+		"""execute_js returning a parsed dict (not JSON string) is also accepted."""
+		entry = _make_entry(attributes={"type": "file"})
+		state = _make_state({5: entry})
+		browser = _make_browser(execute_js_side_effect=[
+			{"canvases": 0, "imgPreviews": 0},  # dict before
+			{"canvases": 1, "imgPreviews": 0},  # dict after — canvas appeared
+		])
+		result = await Tools().execute(
+			"upload_file", {"index": 5, "path": tmp_upload}, browser, browser_state=state,
+		)
+		assert result.error is None
+		assert "✅ Upload verified" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_verify_success_bg_image_appeared(self, tmp_upload):
+		"""background-image preview delta → ✅ (四次修订扩的信号)."""
+		entry = _make_entry(attributes={"type": "file"})
+		state = _make_state({5: entry})
+		browser = _make_browser(execute_js_side_effect=[
+			'{"canvases": 0, "imgPreviews": 0, "bgPreviews": 0}',
+			'{"canvases": 0, "imgPreviews": 0, "bgPreviews": 1}',  # bg-image appeared
+		])
+		result = await Tools().execute(
+			"upload_file", {"index": 5, "path": tmp_upload}, browser, browser_state=state,
+		)
+		assert result.error is None
+		assert "✅ Upload verified" in result.extracted_content
+		assert "background-image preview appeared" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_verify_polling_early_exit(self, tmp_upload):
+		"""Poll 1 no delta, poll 2 delta → ✅ and stops polling (no further probe)."""
+		entry = _make_entry(attributes={"type": "file"})
+		state = _make_state({5: entry})
+		browser = _make_browser(execute_js_side_effect=[
+			'{"canvases": 0, "imgPreviews": 0, "bgPreviews": 0}',  # before
+			'{"canvases": 0, "imgPreviews": 0, "bgPreviews": 0}',  # poll 1: no delta
+			'{"canvases": 1, "imgPreviews": 0, "bgPreviews": 0}',  # poll 2: delta → ✅
+		])
+		result = await Tools(upload_verify_wait_s=1.0, upload_verify_interval_s=0.1).execute(
+			"upload_file", {"index": 5, "path": tmp_upload}, browser, browser_state=state,
+		)
+		assert result.error is None
+		assert "✅ Upload verified" in result.extracted_content
+		assert "new <canvas>" in result.extracted_content
+		# before-probe + 2 polls = 3 execute_js calls; early-exit means no 4th.
+		assert browser.execute_js.call_count == 3
