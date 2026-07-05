@@ -41,6 +41,48 @@ class TestSetStateMessage:
 		assert state_msgs[-2]["content"] == "dom-step-3"  # 上一步
 		assert len(agent.messages) == 2  # 仅 2 份 state，更老的已删
 
+	def test_retains_before_after_states_around_action_douyin_regression(self):
+		"""🎯 回归守护｜抖音封面上传成功判定（2026-07-05，PR #104）。
+
+		动作后必须保留【上一份 state + 当前 state】夹住 assistant 消息，让 LLM 能 diff
+		「上传前空画布 vs 上传后有 ``<img>``」来判定成功。P0 的 ``_set_state_message`` 纯
+		替换（仅留 1 份）让模型丧失前后对比，被其他空槽位残留的"点击上传文件或拖拽文件到这里"
+		占位文 + Semi UI hidden-input 重建导致的 input 索引变化误导，误判上传失败而死循环。
+
+		本测试用抖音封面的真实噪声构造前后两份 state——上传前无 ``<img>``、input=58462；
+		上传后新增 ``<img>`` 但其他槽位"点击上传"仍在、input 变成 59245。断言两份 state 都在
+		messages 里、且夹住 assistant（顺序 user→assistant→user）。若未来误把
+		``_set_state_message`` 改回纯替换（state 只剩 1 条），本测试会挂——CI 即可拦住，
+		不必等手动跑 ``examples/upload_file.py`` 才发现。详见
+		``docs/agent-loop-optimize/上传失败诊断-P1对文件上传影响分析.md``。
+		"""
+		agent = _FakeAgent()
+		# step N（上传前）：封面画布空，file input=58462
+		agent._set_state_message(
+			"[Page DOM] cover-modal input[58462 type=file] "
+			"上传区: 点击上传文件或拖拽文件到这里"
+		)
+		agent.messages.append({
+			"role": "assistant",
+			"content": "[eval] 上传横封面 | Action: upload_file(index=58462)",
+		})
+		# step N+1（上传后）：画布新增 <img>；但其他槽位（竖封面）的"点击上传"占位文仍在；
+		# 且 Semi UI 重建了 hidden-input，索引变成 59245——这正是误导模型的噪声。
+		agent._set_state_message(
+			"[Page DOM] cover-modal <img src='blob:https://creator.douyin.com/x' /> "
+			"上传区(竖封面): 点击上传文件或拖拽文件到这里 input[59245 type=file]"
+		)
+
+		state_msgs = [m for m in agent.messages if m.get(_MSG_TYPE) == TYPE_STATE]
+		# 核心不变量：前后两份 state 都在 → LLM 能 diff 出 <img> 是新出现的 = 上传成功
+		assert len(state_msgs) == 2, (
+			"动作后必须保留上一份 state 供前后对比，否则抖音封面上传会因'看不到变化'而死循环"
+		)
+		assert "<img" not in state_msgs[-2]["content"]  # 上传前（上一份）：无 img
+		assert "<img" in state_msgs[-1]["content"]      # 上传后（当前份）：有 img
+		# 顺序：state_{N-1}(user) → assistant → state_N(user)，前后两份 state 夹住动作
+		assert [m.get("role") for m in agent.messages] == ["user", "assistant", "user"]
+
 	def test_first_step_no_error(self):
 		"""首步（无旧 state）不报错。"""
 		agent = _FakeAgent()
