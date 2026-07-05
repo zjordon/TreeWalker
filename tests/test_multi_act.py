@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -102,6 +103,7 @@ def _make_agent(results: list[ActionResult] | None = None) -> Any:
 	agent._obs_bus = None
 	agent._obs_session_id = "test"
 	agent._current_model_call_id = ""
+	agent._sensitive_map_for_log = None  # P1-2：默认无 sensitive → 日志脱敏 no-op
 	return agent
 
 
@@ -412,6 +414,219 @@ class TestExecuteActionsLoop:
 		# 两个 click 都不在 _NO_URL_CHECK_ACTIONS 集合里（实际上 click 在里面 - 修正预期）
 		# 看 step.py: _NO_URL_CHECK_ACTIONS 包含 click，所以不会被检测。改用 input_text
 		# 这里只验证循环本身不会因 url check 失败
+
+
+# ── 3b. P0-1 per-action stop/pause check ─────────────────────────────────
+
+
+class TestPerActionStopCheck:
+	"""P0-1：循环内 per-action stop/pause 检查（对齐 browser-use ``_check_stop_or_pause``）。
+
+	入口检查（``_execute_actions`` L747）已在 ``test_stopped_state_returns_early`` 覆盖；
+	这里覆盖**循环内** action 之间的 stop/pause 响应——02 期 P0-1 给 LLM 阶段修过的对称漏洞。
+	"""
+
+	@pytest.mark.asyncio
+	async def test_stopped_between_actions_raises_interrupted(self):
+		"""action 1 执行后、action 2 执行前置 stopped=True → raise InterruptedError，后续动作未执行。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = _make_agent()
+
+		# action 1 执行时把 stopped 置 True（模拟用户在动作间按停止），同时记录调用
+		async def stop_after_first(name, params, browser, browser_state):
+			agent.tools.calls.append((name, dict(params)))
+			agent.state.stopped = True
+			return ActionResult()
+
+		agent.tools.execute = stop_after_first
+
+		model_output = {
+			"actions": [
+				{"name": "click", "params": {"index": 1}},
+				{"name": "click", "params": {"index": 2}},
+				{"name": "click", "params": {"index": 3}},
+			],
+		}
+		browser_state = MagicMock()
+		browser_state.url = "https://example.com"
+
+		with pytest.raises(InterruptedError):
+			await StepPipeline._execute_actions(agent, model_output, browser_state)
+
+		# P0-1 检查在 tools.execute 之前 → action 2/3 未触达，仅 action 1 执行
+		assert len(agent.tools.calls) == 1
+
+	@pytest.mark.asyncio
+	async def test_paused_between_actions_raises_interrupted(self):
+		"""paused 信号同样在动作间触发 InterruptedError。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = _make_agent()
+
+		async def pause_after_first(name, params, browser, browser_state):
+			agent.tools.calls.append((name, dict(params)))
+			agent.state.paused = True
+			return ActionResult()
+
+		agent.tools.execute = pause_after_first
+
+		model_output = {
+			"actions": [
+				{"name": "click", "params": {}},
+				{"name": "click", "params": {}},
+			],
+		}
+		browser_state = MagicMock()
+		browser_state.url = "https://example.com"
+
+		with pytest.raises(InterruptedError):
+			await StepPipeline._execute_actions(agent, model_output, browser_state)
+
+		assert len(agent.tools.calls) == 1
+
+	@pytest.mark.asyncio
+	async def test_stop_at_entry_returns_error_result_not_raise(self):
+		"""入口（执行任何 action 前）已 stopped → 返回 error result 列表（既有行为，回归）。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = _make_agent()
+		agent.state.stopped = True
+
+		model_output = {
+			"actions": [{"name": "click", "params": {}}, {"name": "click", "params": {}}],
+		}
+		browser_state = MagicMock()
+		browser_state.url = "https://example.com"
+
+		results = await StepPipeline._execute_actions(agent, model_output, browser_state)
+
+		# 入口检查走 L747 返回路径（不抛 InterruptedError）；未进入循环
+		assert len(results) == 1
+		assert results[0].error is not None
+		assert len(agent.tools.calls) == 0
+
+	@pytest.mark.asyncio
+	async def test_no_stop_executes_all_actions(self):
+		"""无 stop/pause → 全部动作执行（回归：P0-1 不影响正常流程）。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = _make_agent([ActionResult(), ActionResult(), ActionResult()])
+		model_output = {
+			"actions": [
+				{"name": "click", "params": {"index": 1}},
+				{"name": "click", "params": {"index": 2}},
+				{"name": "click", "params": {"index": 3}},
+			],
+		}
+		browser_state = MagicMock()
+		browser_state.url = "https://example.com"
+
+		results = await StepPipeline._execute_actions(agent, model_output, browser_state)
+
+		assert len(results) == 3
+		assert len(agent.tools.calls) == 3
+
+
+# ── 3c. P1-2 per-action log + secret redaction ───────────────────────────
+
+
+class TestPerActionLog:
+	"""P1-2：per-action 执行日志（``[i/total] name: params``）+ 秘密脱敏。"""
+
+	@pytest.mark.asyncio
+	async def test_per_action_log_shows_position(self, caplog):
+		"""多动作 → caplog 出现 [1/3] / [2/3] / [3/3] 进度行。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = _make_agent([ActionResult(), ActionResult(), ActionResult()])
+		model_output = {
+			"actions": [
+				{"name": "click", "params": {"index": 1}},
+				{"name": "scroll", "params": {}},
+				{"name": "click", "params": {"index": 2}},
+			],
+		}
+		browser_state = MagicMock()
+		browser_state.url = "https://example.com"
+
+		with caplog.at_level(logging.INFO):
+			await StepPipeline._execute_actions(agent, model_output, browser_state)
+
+		assert "[1/3]" in caplog.text
+		assert "[2/3]" in caplog.text
+		assert "[3/3]" in caplog.text
+		assert "click" in caplog.text
+		assert "scroll" in caplog.text
+
+	@pytest.mark.asyncio
+	async def test_sensitive_field_redacted_in_log(self, caplog):
+		"""input_text 的敏感 text 字段在日志中脱敏为 ``<secret>pw</secret>``，真值不出现。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = _make_agent([ActionResult()])
+		# {placeholder: real_value} 方向（_redact_params_for_log 期望的方向）
+		agent._sensitive_map_for_log = {"pw": "secret123"}
+
+		model_output = {
+			"actions": [
+				{"name": "input_text", "params": {"index": 1, "text": "secret123"}},
+			],
+		}
+		browser_state = MagicMock()
+		browser_state.url = "https://example.com"
+
+		with caplog.at_level(logging.INFO):
+			await StepPipeline._execute_actions(agent, model_output, browser_state)
+
+		# 真值绝不进日志；占位符标记必须出现
+		assert "secret123" not in caplog.text
+		assert "<secret>pw</secret>" in caplog.text
+		# 非敏感字段保留
+		assert "index" in caplog.text
+
+	@pytest.mark.asyncio
+	async def test_non_sensitive_action_unchanged_without_secrets(self, caplog):
+		"""无 sensitive 配置 → 非敏感字段原样打印（脱敏 no-op，回归）。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = _make_agent([ActionResult()])
+		# _sensitive_map_for_log=None（_make_agent 默认）→ _redact_params_for_log no-op
+		model_output = {
+			"actions": [
+				{"name": "click", "params": {"index": 5}},
+			],
+		}
+		browser_state = MagicMock()
+		browser_state.url = "https://example.com"
+
+		with caplog.at_level(logging.INFO):
+			await StepPipeline._execute_actions(agent, model_output, browser_state)
+
+		assert "index" in caplog.text
+		assert "5" in caplog.text
+
+	@pytest.mark.asyncio
+	async def test_real_action_params_not_mutated_by_redaction(self, caplog):
+		"""脱敏返回副本：真实 params 未被改动 → tools.execute 拿到真值（动作正常执行）。"""
+		from tree_walker.agent.step import StepPipeline
+
+		agent = _make_agent([ActionResult()])
+		agent._sensitive_map_for_log = {"pw": "secret123"}
+
+		model_output = {
+			"actions": [
+				{"name": "input_text", "params": {"index": 1, "text": "secret123"}},
+			],
+		}
+		browser_state = MagicMock()
+		browser_state.url = "https://example.com"
+
+		with caplog.at_level(logging.INFO):
+			await StepPipeline._execute_actions(agent, model_output, browser_state)
+
+		# _FakeTools.execute 在 calls 里记录的是真实 params（脱敏只在日志副本）
+		assert agent.tools.calls[0][1]["text"] == "secret123"
 
 
 # ── 4. Post-process loop detector ───────────────────────────────────────
