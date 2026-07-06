@@ -2,6 +2,8 @@
 
 import time
 
+import pytest
+
 from tree_walker.agent.step import StepPipeline
 from tree_walker.agent.views import ActionResult, AgentHistoryList, AgentState
 from tree_walker.browser.views import BrowserStateSummary, SerializedDOMState
@@ -41,48 +43,55 @@ def _browser_state(tree_text):
 
 
 class TestFinalizeDomExcerpt:
-    def _run(self, agent, tree_text, *, done=False):
+    async def _run(self, agent, tree_text, *, done=False):
         model_output = {
             "next_goal": "g",
             "action": {"name": "done" if done else "click", "params": {}},
         }
         results = [ActionResult(is_done=True)] if done else [ActionResult()]
-        StepPipeline._finalize(agent, _browser_state(tree_text), model_output, results)
+        await StepPipeline._finalize(agent, _browser_state(tree_text), model_output, results)
         return agent.history.history[-1]
 
-    def test_done_step_persists_dom_excerpt(self):
-        last = self._run(_FakeAgent(), "<body>real content here</body>", done=True)
+    @pytest.mark.asyncio
+    async def test_done_step_persists_dom_excerpt(self):
+        last = await self._run(_FakeAgent(), "<body>real content here</body>", done=True)
         assert last.state_summary["dom_excerpt"] == "<body>real content here</body>"
 
-    def test_non_done_step_has_no_dom_excerpt(self):
+    @pytest.mark.asyncio
+    async def test_non_done_step_has_no_dom_excerpt(self):
         # 对标修复方案 §3.1:仅 done 步存 dom_excerpt,其余步只 url/title
-        last = self._run(_FakeAgent(), "<body>real content here</body>", done=False)
+        last = await self._run(_FakeAgent(), "<body>real content here</body>", done=False)
         assert "dom_excerpt" not in last.state_summary
         # url/title 仍然记录
         assert last.state_summary["url"] == "https://example.com"
 
-    def test_done_step_truncates_to_dom_excerpt_max_chars(self):
+    @pytest.mark.asyncio
+    async def test_done_step_truncates_to_dom_excerpt_max_chars(self):
         agent = _FakeAgent(truncation=TruncationSettings(dom_excerpt_max_chars=10))
-        last = self._run(agent, "X" * 100, done=True)
+        last = await self._run(agent, "X" * 100, done=True)
         assert len(last.state_summary["dom_excerpt"]) == 10
 
-    def test_done_step_empty_string_when_dom_state_is_none(self):
+    @pytest.mark.asyncio
+    async def test_done_step_empty_string_when_dom_state_is_none(self):
         # 断路器开启 (EMPTY_DOM_STATE) 或 dom_state 缺失 → 兜底空串
-        last = self._run(_FakeAgent(), None, done=True)
+        last = await self._run(_FakeAgent(), None, done=True)
         assert last.state_summary["dom_excerpt"] == ""
 
-    def test_state_summary_none_when_browser_state_is_none(self):
+    @pytest.mark.asyncio
+    async def test_state_summary_none_when_browser_state_is_none(self):
         agent = _FakeAgent()
         model_output = {"next_goal": "g", "action": {"name": "click", "params": {}}}
-        StepPipeline._finalize(agent, None, model_output, [ActionResult()])
+        await StepPipeline._finalize(agent, None, model_output, [ActionResult()])
         assert agent.history.history[-1].state_summary is None
 
-    def test_also_records_url_and_title(self):
-        last = self._run(_FakeAgent(), "content", done=False)
+    @pytest.mark.asyncio
+    async def test_also_records_url_and_title(self):
+        last = await self._run(_FakeAgent(), "content", done=False)
         assert last.state_summary["url"] == "https://example.com"
         assert last.state_summary["title"] == "Example"
 
-    def test_advances_step_counter(self):
+    @pytest.mark.asyncio
+    async def test_advances_step_counter(self):
         agent = _FakeAgent()
-        self._run(agent, "content", done=True)
+        await self._run(agent, "content", done=True)
         assert agent.state.n_steps == 1

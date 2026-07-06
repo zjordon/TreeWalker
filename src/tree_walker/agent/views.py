@@ -107,7 +107,10 @@ class AgentHistory(BaseModel):
     # 与 model_output 的 actions 列表【等长、按位对应】；无 index 的动作为 None。
     interacted_element: list[dict[str, Any] | None] | None = None
     metadata: StepMetadata | None = None
-    # 注：本方案「无截图」，故不含 screenshot_path 字段。
+    # 当步页面截图的存盘路径（phase 5 P1 集成点）。当前恒为 None —— 截图采集依赖
+    # screenshot.md 阶段二（LLM 视觉通道），未打通前 _finalize 不写入；字段先就位，
+    # 避免 _finalize async 化时再动模型层。
+    screenshot_path: str | None = None
 
     class Config:
         arbitrary_types_allowed = True

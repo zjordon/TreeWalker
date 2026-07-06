@@ -153,7 +153,7 @@ class StepPipeline:
             await self._handle_step_error(e)
             return False
         finally:
-            self._finalize(browser_state, model_output, results)
+            await self._finalize(browser_state, model_output, results)
 
         return False
 
@@ -1003,7 +1003,7 @@ class StepPipeline:
 
     # ── Stage 5: Finalize ─────────────────────────────────────────────
 
-    def _finalize(
+    async def _finalize(
         self,
         browser_state: BrowserStateSummary | None,
         model_output: dict[str, Any] | None,
@@ -1013,6 +1013,9 @@ class StepPipeline:
 
         Called from finally block — runs regardless of success or exception.
         n_steps is incremented last so all consumers see the current value.
+
+        Async in preparation for screenshot persistence (phase 5 P1); no await
+        sites yet — screenshot storage lands with screenshot.md stage 2.
         """
         if model_output is not None:
             state_summary: dict[str, Any] | None = None
