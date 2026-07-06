@@ -5,6 +5,24 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.9.0] - 2026-07-06
+
+### Added
+
+**Agent Loop 6 阶段对齐 browser-use**（按 browser-use 的 step pipeline 重构循环，对齐行为语义并在多处领先）：
+
+- **P0 消息分类管理 + 状态消息替换 + 上下文清理**（#101，#102）：消息分类归并、状态消息替换、上下文清理
+- **P1 感知/注入增强**（#103，#104）：并修复 P0 state 替换导致的封面上传回归
+- **Phase 2 LLM 决策对齐**（#107）：post-LLM stop 检查 + 动作硬截断 + 对话持久化 + fallback 注释
+- **Phase 3 执行动作对齐**（#111）：循环内 stop 检查 + per-action 日志脱敏 + log_response 修复；新增 5 道中断门 + runtime drift 检测 + per-action 超时（领先 browser-use）
+- **Phase 4 后处理对齐**（#113）：失败计数 len==1 对齐 + 完成日志 attachments 文案
+- **Phase 5 终结化对齐**（#116）：async prep + screenshot_path 字段
+- **Phase 6 异常处理对齐**（#118）：format_step_error 错误格式化器（适配 anthropic.RateLimitError + TreeWalker 自有解析文案「no parseable response」，不照搬 browser-use）+ 条件 traceback + 解析错误模型名日志 + 中断消息拼接
+
+### Fixed
+
+- **upload_file 页面级验证**（#109）：探针 polling + bg-image 识别 + 引导文案 + example 读 env，上传目标缺失/不可见时给可操作引导而非盲选失败
+
 ## [0.8.0] - 2026-07-02
 
 ### Added
@@ -189,6 +207,8 @@
 - 编程接口（`Agent`、`LLMClient`、`BrowserSession` 可独立使用）
 - 498 项单元测试
 
+[0.9.0]: https://github.com/zjordon/TreeWalker/releases/tag/v0.9.0
+[0.8.0]: https://github.com/zjordon/TreeWalker/releases/tag/v0.8.0
 [0.7.0]: https://github.com/zjordon/TreeWalker/releases/tag/v0.7.0
 [0.6.0]: https://github.com/zjordon/TreeWalker/releases/tag/v0.6.0
 [0.5.0]: https://github.com/zjordon/TreeWalker/releases/tag/v0.5.0
