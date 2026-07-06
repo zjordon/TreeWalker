@@ -1,4 +1,4 @@
-﻿"""Step pipeline: 5-stage decomposition of the agent step."""
+"""Step pipeline: 5-stage decomposition of the agent step."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import time
+import traceback
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -1129,7 +1130,10 @@ class StepPipeline:
         """
         # Branch 1: User interrupt — not a failure
         if isinstance(error, InterruptedError):
-            logger.warning("Agent interrupted mid-step")
+            msg = "Agent interrupted mid-step"
+            if str(error):
+                msg = f"{msg} - {error}"
+            logger.warning(msg)
             return
 
         # Branch 2: Connection errors — attempt reconnect, stop on timeout
@@ -1148,18 +1152,25 @@ class StepPipeline:
             return
 
         # Branch 3: All other errors — count and log
+        include_trace = logger.isEnabledFor(logging.DEBUG)
+        error_msg = format_step_error(error, include_trace=include_trace)
         self.state.consecutive_failures += 1
         is_final = self.state.consecutive_failures >= self.max_failures
         log_level = logging.ERROR if is_final else logging.WARNING
+        # Parse-class errors get an extra model-name line for diagnosis
+        if any(marker in error_msg for marker in _LLM_PARSE_ERROR_MARKERS):
+            logger.log(
+                log_level, "Model %s failed to produce valid output", self.llm.model
+            )
         logger.log(
             log_level,
             "Step %d failed (%d/%d): %s",
             self.state.n_steps,
             self.state.consecutive_failures,
             self.max_failures,
-            error,
+            error_msg,
         )
-        self.state.last_result = [ActionResult(error=str(error))]
+        self.state.last_result = [ActionResult(error=error_msg)]
 
 
 # ── Helpers ────────────────────────────────────────────────────────────
@@ -1199,6 +1210,61 @@ def _redact_params_for_log(
         if isinstance(redacted.get(f), str):
             redacted[f] = redact_sensitive_string(redacted[f], sensitive_map)
     return redacted
+
+
+_LLM_PARSE_ERROR_MARKERS = (
+    "no parseable response",
+    "Could not parse",
+    "tool_use_failed",
+    "invalid output structure",
+)
+
+
+def format_step_error(error: Exception, include_trace: bool = False) -> str:
+    """Format a step-level error with guidance for the LLM.
+
+    Mirrors browser-use ``AgentError.format_error`` (``service.py`` L1284 call
+    site) but adapted to TreeWalker's Anthropic SDK + its own parse-failure
+    wording (``client.py:232`` "LLM returned no parseable response"), NOT
+    browser-use's ``'Expected format: AgentOutput'`` string (would never match
+    here, since TreeWalker's LLM parser uses different wording).
+
+    Trigger notes: most LLM parse errors are absorbed upstream by
+    ``_FALLBACK_DONE_OUTPUT`` and ``RateLimitError``/``APIError`` by
+    ``_try_switch_to_fallback`` (``client.py:58-70``); what reaches Branch 3 is
+    mainly fallback-also-failed / ``_prepare_context`` exceptions / unexpected
+    errors. This formatter serves those.
+    """
+    # Pydantic validation error (already imported at step.py:13).
+    if isinstance(error, ValidationError):
+        return (
+            "Invalid model output format. Please follow the correct schema.\n"
+            f"Details: {error}"
+        )
+
+    # Anthropic rate limit — lazy import (step.py doesn't import anthropic at
+    # module level; only client.py does). browser-use uses openai's; we use anthropic's.
+    try:
+        from anthropic import RateLimitError as _AnthropicRateLimit
+    except ImportError:
+        _AnthropicRateLimit = ()  # type: ignore[assignment]
+    if isinstance(error, _AnthropicRateLimit):
+        return "Rate limit reached. Waiting before retry."
+
+    error_str = str(error)
+    if any(marker in error_str for marker in _LLM_PARSE_ERROR_MARKERS):
+        main = error_str.split("\n", 1)[0]
+        msg = (
+            f"{main}\n\nThe previous response had an invalid output structure. "
+            "Please stick to the required output format."
+        )
+        if include_trace:
+            msg += f"\n\nFull stacktrace:\n{traceback.format_exc()}"
+        return msg
+
+    if include_trace:
+        return f"{error_str}\nStacktrace:\n{traceback.format_exc()}"
+    return error_str
 
 
 def _is_connection_error(error: Exception) -> bool:
