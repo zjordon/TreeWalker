@@ -311,7 +311,7 @@ def load_settings() -> Settings:
             eval_output_dir=os.environ.get("AGENT_EVAL_OUTPUT_DIR", "evaluate_output"),
             done_attachment_max_chars=int(os.environ.get("AGENT_DONE_ATTACHMENT_MAX_CHARS", "2000")),
         ),
-        enable_planning=os.environ.get("AGENT_ENABLE_PLANNING", "").lower() == "true",
+        enable_planning=os.environ.get("AGENT_ENABLE_PLANNING", "true").lower() == "true",
         exploration_threshold=int(os.environ.get("AGENT_EXPLORATION_THRESHOLD", "5")),
         replan_failure_threshold=int(os.environ.get("AGENT_REPLAN_FAILURE_THRESHOLD", "3")),
         enable_observability=os.environ.get("AGENT_ENABLE_OBSERVABILITY", "").lower() == "true",
