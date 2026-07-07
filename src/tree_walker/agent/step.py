@@ -185,8 +185,13 @@ class StepPipeline:
         # 2b. Update action models based on current page URL
         self._update_action_models_for_page(browser_state.url)
 
-        # 3. Record page for loop detection
-        self.loop_detector.record_page(browser_state.url)
+        # 3. Record page state for loop detection (3-dim: url + element_count + dom text hash)
+        dom = browser_state.dom_state
+        self.loop_detector.record_page_state(
+            browser_state.url,
+            dom.element_tree_text if dom else "",
+            len(dom.selector_map) if dom else 0,
+        )
 
         # 3b. Build plan description and planning nudge (if planning enabled)
         plan_description: str | None = None
@@ -207,6 +212,12 @@ class StepPipeline:
 
         # 4. Build state message (includes loop detection nudge inline)
         nudge = self.loop_detector.get_nudge_message()
+        if nudge:
+            logger.debug(
+                "Loop detection nudge injected (repetition=%d, stagnation=%d)",
+                self.loop_detector.max_repetition_count,
+                self.loop_detector.consecutive_stagnant_pages,
+            )
 
         # 4b. Check for new downloads
         download_notice: str | None = None
