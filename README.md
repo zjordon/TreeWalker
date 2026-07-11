@@ -172,6 +172,32 @@ FALLBACK_LLM_MODEL=claude-sonnet-4-6
 FALLBACK_LLM_API_KEY=sk-xxx
 ```
 
+## 用户操作录制 → 历史重放
+
+除了让 Agent 自动探索，也可以**录制你自己的真实操作**生成可重放的历史——路径稳定可靠，消除 LLM 决策随机带来的不稳定。
+
+Chrome 扩展采集操作 → Python 后端经 CDP 算指纹 → 落盘 `AgentHistory` → 用不同数据重放（重放时不再调 LLM 决策）。
+
+```bash
+# 1. Chrome 以远程调试端口启动（建议用录制专用 profile，提前登录目标站点）
+chrome --remote-debugging-port=9222 --user-data-dir=<录制 profile>
+
+# 2. 启动录制后端（监听 http://127.0.0.1:8765）
+uv run python examples/record_user_actions.py --out myflow.json
+
+# 3. 加载 recording_extension/ 扩展 → 点「开始录制」→ 操作 → 「停止」
+#    产物落 rerun-history/myflow.json
+```
+
+换数据重放：
+
+```python
+await agent.load_and_rerun("myflow.json", variables={"email": "new@x.com"})
+```
+
+> 录制产物与 agent 自录同址（`rerun-history/`），指纹录制/重放同源（全对齐）。
+> 完整设计、架构与实施路线见 [docs/user_recording/README.md](docs/user_recording/README.md)。
+
 ## 配置
 
 所有配置通过环境变量或 `.env` 文件设置，参见 [.env.example](.env.example) 获取完整配置项。
