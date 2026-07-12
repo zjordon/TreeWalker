@@ -320,3 +320,62 @@ class TestSetFileInputAsciiSafe:
 		await session.stop()
 		assert not os.path.exists(pending)
 		assert list(tmp_path.glob("tw_upload_*")) == []
+
+
+class TestRediscoverWsUrl:
+	"""Chrome 重启后 ws_url 过期（HTTP 404）时 _connect 的自愈重试。"""
+
+	@pytest.mark.asyncio
+	async def test_rediscover_new_url_retries_and_connects(self):
+		"""首次握手失败 + 重新发现到不同 ws_url → 重建 client 重试成功，ws_url 更新。"""
+		fail_client = MagicMock()
+		fail_client.start = AsyncMock(side_effect=RuntimeError("HTTP 404"))
+		ok_client = _make_mock_cdp_client(target_id="t2", session_id="s2")
+		old_url = "ws://localhost:9222/devtools/browser/old-uuid"
+		new_url = "ws://localhost:9222/devtools/browser/new-uuid"
+
+		with patch("tree_walker.browser.session.CDPClient", side_effect=[fail_client, ok_client]):
+			session = BrowserSession(ws_url=old_url)
+			session._rediscover_ws_url = MagicMock(return_value=new_url)
+			await session.start()
+
+		assert session.is_connected
+		assert session.ws_url == new_url
+		assert session.client is ok_client
+		fail_client.start.assert_awaited_once()
+		ok_client.start.assert_awaited_once()
+		session._rediscover_ws_url.assert_called_once()
+
+	@pytest.mark.asyncio
+	async def test_rediscover_none_reraises_original(self):
+		"""重新发现失败（Chrome 真没开 /json/version）→ 抛原连接异常，不重试，ws_url 不变。"""
+		fail_client = MagicMock()
+		fail_client.start = AsyncMock(side_effect=RuntimeError("HTTP 404"))
+
+		with patch("tree_walker.browser.session.CDPClient", return_value=fail_client):
+			session = BrowserSession(ws_url="ws://localhost:9222/devtools/browser/old")
+			session._rediscover_ws_url = MagicMock(return_value=None)
+			with pytest.raises(RuntimeError, match="HTTP 404"):
+				await session.start()
+
+		# 没进重试分支：ws_url 未改，握手只发生一次
+		assert session.ws_url == "ws://localhost:9222/devtools/browser/old"
+		fail_client.start.assert_awaited_once()
+		session._rediscover_ws_url.assert_called_once()
+
+	@pytest.mark.asyncio
+	async def test_rediscover_same_url_reraises_original(self):
+		"""重新发现到的 url 与旧相同 → 非 Chrome 重启，不重试，抛原异常。"""
+		same_url = "ws://localhost:9222/devtools/browser/same-uuid"
+		fail_client = MagicMock()
+		fail_client.start = AsyncMock(side_effect=RuntimeError("HTTP 404"))
+
+		with patch("tree_walker.browser.session.CDPClient", return_value=fail_client):
+			session = BrowserSession(ws_url=same_url)
+			session._rediscover_ws_url = MagicMock(return_value=same_url)
+			with pytest.raises(RuntimeError, match="HTTP 404"):
+				await session.start()
+
+		assert session.ws_url == same_url
+		fail_client.start.assert_awaited_once()
+		session._rediscover_ws_url.assert_called_once()

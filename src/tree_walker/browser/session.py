@@ -1193,8 +1193,26 @@ class BrowserSession:
                 self._enable_recent_events = False
 
     async def _connect(self) -> None:
-        """Perform CDP connection, target discovery, and session setup."""
-        await self.client.start()
+        """Perform CDP connection, target discovery, and session setup.
+
+        若 ``client.start()`` 握手失败，按当前 ws_url 重新发现一次（Chrome 重启后旧
+        ws_url 失效，见 ``_rediscover_ws_url``），拿得到不同的新 ws_url 就重建 client
+        重试；否则抛原异常。
+        """
+        try:
+            await self.client.start()
+        except Exception as connect_err:
+            new_url = await asyncio.to_thread(self._rediscover_ws_url)
+            if new_url and new_url != self.ws_url:
+                logger.warning(
+                    "CDP 握手失败（%s），Chrome 疑似重启；重新发现 ws_url 重试：%s → %s",
+                    connect_err, self.ws_url, new_url,
+                )
+                self.ws_url = new_url
+                self.client = CDPClient(self.ws_url)
+                await self.client.start()
+            else:
+                raise
 
         targets = await self.client.send.Target.getTargets({})
         for t in targets.get("targetInfos", []):
@@ -1234,6 +1252,29 @@ class BrowserSession:
         # Wire up highlight manager with live CDP client
         self._highlight._client = self.client
         self._highlight._session_id = self.current_session_id
+
+    def _rediscover_ws_url(self) -> str | None:
+        """从当前 ws_url 解析 host:port，重新 GET ``/json/version`` 拿最新 ws_url。
+
+        Chrome 远程调试的 ws_url = ``ws://host:port/devtools/browser/<UUID>``，UUID 是
+        进程级的——Chrome 一重启就变，旧 ws_url 握手会 HTTP 404（后端启动时缓存的
+        ws_url，若点开始录制前 Chrome 已重启即触发）。这里按 host:port 重新发现当前
+        ws_url 供 ``_connect`` 自愈。ws_url 解析不出 host/port（非标准形态）或请求失败
+        时返回 None，由调用方按原连接异常抛出。
+        """
+        try:
+            from urllib.parse import urlparse
+
+            from tree_walker.config import _fetch_ws_url
+
+            parsed = urlparse(self.ws_url)
+            host, port = parsed.hostname, parsed.port
+            if not host or not port:
+                return None
+            return _fetch_ws_url(host, port)
+        except Exception as e:
+            logger.debug("重新发现 ws_url 失败: %s", e)
+            return None
 
     async def _enable_file_chooser_intercept(self) -> None:
         """Enable OS file-chooser interception on the current CDP session.
