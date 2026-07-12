@@ -393,6 +393,16 @@ class RerunMixin:
         # 冗余重试
         if self._is_redundant_retry_step(item, previous_item, previous_succeeded):
             return "冗余重试（同元素同动作且上步已成功）"
+        # 需 index 的 action 但无 index 且无 interacted_element（录制定位失败的噪声 click/input）
+        # → 跳过：回放 _action_click 等无 index 必报错，是无意义噪声步（recorded.json 里
+        # click {} interacted=null 这类）
+        first = next((a for a in actions if isinstance(a, dict) and a.get("name")), None)
+        if first and first.get("name") in ("click", "input_text", "select_dropdown", "upload_file"):
+            fp = first.get("params") or {}
+            if fp.get("index") is None and fp.get("element_id") is None:
+                ie = item.interacted_element or []
+                if not ie or ie[0] is None:
+                    return "无 index 且无 interacted_element（录制定位失败的噪声步）"
         return None
 
     async def _execute_history_step(
