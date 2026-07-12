@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -106,6 +107,146 @@ def _within_gap(a: dict[str, Any], b: dict[str, Any], gap_ms: float) -> bool:
 		return True
 
 
+def _is_file_input_elem(elem: Any) -> bool:
+	"""interacted_element dict 是否指向 <input type=file>。"""
+	if not isinstance(elem, dict):
+		return False
+	attrs = elem.get("attributes") or {}
+	return elem.get("node_name") == "INPUT" and attrs.get("type", "").lower() == "file"
+
+
+def dedupe_uploads(
+	steps: "list[AgentHistory]",
+	gap_s: float = 10.0,
+	max_clicks: int = 2,
+) -> "list[AgentHistory]":
+	"""合并 upload_file 操作：吸收其前的冗余 click / fakepath input_text，并补 index。
+
+	录制时一次文件上传会被误录成多步（点上传按钮 / 点隐藏 file input / fakepath
+	input_text / upload_file），回放只有 upload_file 有效。本 pass 在落盘前把这些冗余
+	步骤吸收掉，只留 upload_file：
+
+	- 向前吸收紧邻 upload_file 的连续段：
+	  - ``input_text`` 且 text 含 ``fakepath`` 或 basename 与 upload path 一致（file input
+	    的 value 变化被误录，扩展端 A1 未修时兜底）。
+	  - ``click``（上限 ``max_clicks`` 个：上传按钮 + file input click 两步足够；再多通常
+	    是无关点击，不吸收防误删）。
+	- 跨非 {click, input_text} 步骤或时间窗（``gap_s``，覆盖用户在原生文件框挑文件的耗时）
+	  外即停。
+	- upload_file 若无 index，从被吸收的 click 里找命中的 file input，借其 index 与
+	  interacted_element 指纹（回放走 ``is_file_input`` 直传，与 agent 手录等价）。
+
+	重排 step_number 交给 ``denoise_steps`` 统一处理。
+	"""
+	def _name(s: "AgentHistory") -> str | None:
+		acts = (s.model_output or {}).get("actions") or []
+		return acts[0].get("name") if acts else None
+
+	def _params(s: "AgentHistory") -> dict[str, Any]:
+		acts = (s.model_output or {}).get("actions") or []
+		return acts[0].get("params") if acts else {}
+
+	def _t(s: "AgentHistory") -> float | None:
+		m = s.metadata
+		return getattr(m, "step_start_time", None) if m else None
+
+	out: "list[AgentHistory]" = []
+	for step in steps:
+		if _name(step) != "upload_file":
+			out.append(step)
+			continue
+		u_base = os.path.basename(_params(step).get("path") or "")
+		file_inputs: list[tuple[Any, dict]] = []
+		clicks = 0
+		while out:
+			prev = out[-1]
+			pname = _name(prev)
+			pparams = _params(prev)
+			ta, tb = _t(prev), _t(step)
+			if ta is not None and tb is not None and (tb - ta) > gap_s:
+				break
+			if pname == "input_text":
+				text = pparams.get("text", "")
+				if "fakepath" in text.lower() or (u_base and os.path.basename(text) == u_base):
+					out.pop()
+					continue
+				break
+			if pname == "click" and clicks < max_clicks:
+				out.pop()
+				clicks += 1
+				ie = prev.interacted_element or []
+				pe = ie[0] if ie else None
+				if _is_file_input_elem(pe):
+					idx = pparams.get("index")
+					if idx is not None:
+						file_inputs.append((idx, pe))
+				continue
+			break
+		uparams = _params(step)
+		if uparams.get("index") is None and file_inputs:
+			idx, elem = file_inputs[0]  # 紧邻 U 的 file input 候选（最先 pop）
+			uparams["index"] = idx
+			step.interacted_element = [elem]
+		out.append(step)
+	return out
+
+
+def dedupe_auto_navigates(
+	steps: "list[AgentHistory]",
+	gap_s: float = 3.0,
+) -> "list[AgentHistory]":
+	"""丢弃自动跳转的 navigate 步骤。
+
+	上一步操作（upload_file / click 提交等）后页面 JS 自动跳转，会被 navigation-recorder
+	录成 navigate；回放时上一步会再次触发同样跳转，再回放这个 navigate（CDP ``Page.navigate``
+	不幂等）会整页重载、丢页面状态。本 pass 把这种副作用 navigate 丢掉。
+
+	规则（对每个 ``new_tab=False`` 的 navigate）：
+	- 首步（前面无保留步骤）保留；
+	- 紧邻前一步也是 navigate（连续导航）→ 保留，避免连锁误丢；
+	- 紧邻前一步非 navigate 且时间间隔 ≤ ``gap_s`` → 判为副作用，丢弃；
+	- 否则（间隔超 ``gap_s``）保留。
+	``new_tab=True`` 始终保留（主动开新 tab，非副作用）。
+
+	依据：录到的 navigate 要么是首步、要么是前置动作的副作用（地址栏整页导航录不到），
+	所以"紧邻非 navigate 前步"必是副作用——回放前置动作会再次触发跳转，navigate 冗余。
+
+	重排 step_number 交给 ``denoise_steps`` 统一处理。
+	"""
+	def _name(s: "AgentHistory") -> str | None:
+		acts = (s.model_output or {}).get("actions") or []
+		return acts[0].get("name") if acts else None
+
+	def _params(s: "AgentHistory") -> dict[str, Any]:
+		acts = (s.model_output or {}).get("actions") or []
+		return acts[0].get("params") if acts else {}
+
+	def _t(s: "AgentHistory") -> float | None:
+		m = s.metadata
+		return getattr(m, "step_start_time", None) if m else None
+
+	out: "list[AgentHistory]" = []
+	for step in steps:
+		if _name(step) != "navigate":
+			out.append(step)
+			continue
+		if _params(step).get("new_tab"):  # 主动开新 tab，非副作用
+			out.append(step)
+			continue
+		if not out:  # 首步 navigate 保留
+			out.append(step)
+			continue
+		prev = out[-1]
+		if _name(prev) == "navigate":  # 连续 navigate，保留避免连锁误丢
+			out.append(step)
+			continue
+		ta, tb = _t(prev), _t(step)
+		if ta is not None and tb is not None and (tb - ta) <= gap_s:
+			continue  # 副作用跳转，丢弃
+		out.append(step)
+	return out
+
+
 def denoise_steps(
 	steps: "list[AgentHistory]",
 	click_gap_s: float = 0.5,
@@ -123,7 +264,13 @@ def denoise_steps(
 	与 ``coalesce_inputs`` 的区别：后者作用于原始事件流（批处理，仅合并 input_text），
 	本函数作用于已拼接的 ``AgentHistory`` steps（含 click 折叠 / scroll 合并），是实时管线
 	落盘前的安全网。``AgentHistory`` 非冻结、``model_output`` 为普通 dict，原地改写安全。
+
+	开头先走 ``dedupe_uploads`` 合并 upload_file 操作（吸收冗余 click / fakepath
+	input_text + 补 index），再走 ``dedupe_auto_navigates`` 丢弃自动跳转的 navigate，
+	最后做下面的 input/click/scroll 合并。
 	"""
+	steps = dedupe_uploads(steps)
+	steps = dedupe_auto_navigates(steps)
 	def _action(step: "AgentHistory") -> dict[str, Any] | None:
 		acts = (step.model_output or {}).get("actions") or []
 		return acts[0] if acts else None

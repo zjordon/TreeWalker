@@ -249,3 +249,157 @@ def test_denoise_renumbers_step_numbers_after_merge():
 	# input 合并为 1 + 两个不相邻 click = 3 条
 	assert [s.step_number for s in out] == [0, 1, 2]
 	assert all(s.metadata.step_number == s.step_number for s in out)
+
+
+# ── dedupe_uploads：合并 upload_file 操作（吸收冗余 click/fakepath + 补 index）──
+
+
+def _step_elem(name, params, elem, step_number=0, t=0.0):
+	"""带 interacted_element 的 AgentHistory（upload dedupe 测试用）。"""
+	s = _step(name, params, step_number, t)
+	s.interacted_element = [elem]
+	return s
+
+
+def _file_input_elem(backend_id=1293):
+	return {
+		"backend_node_id": backend_id,
+		"node_name": "INPUT",
+		"attributes": {"type": "file", "accept": "video/*"},
+	}
+
+
+def _button_elem(backend_id=1283):
+	return {"backend_node_id": backend_id, "node_name": "BUTTON", "attributes": {}}
+
+
+def test_dedupe_upload_absorbs_clicks_fakepath_and_borrows_index():
+	"""仿 recorded.json：上传按钮click + file input click + fakepath + upload → 单步 upload。
+
+	upload 借 file input 的 index；更早的无关 click（clicks 达 max=2 后）不被误吸收。
+	"""
+	steps = [
+		_step("navigate", {"url": "https://x.com", "new_tab": False}, 0, 0.0),
+		_step("click", {}, 1, 1.0),  # 更早无效 click（interacted null），不应被吸收
+		_step_elem("click", {"index": 1283}, _button_elem(), 2, 2.0),
+		_step_elem("click", {"index": 1293}, _file_input_elem(), 3, 3.0),
+		_step("input_text", {"text": "C:\\fakepath\\v.mp4", "clear": True}, 4, 4.0),
+		_step("upload_file", {"path": "uploads/v.mp4"}, 5, 5.0),  # 无 index
+	]
+	out = denoise_steps(steps)
+	# navigate + 更早无效 click 保留；中间 click×2 + fakepath 吸收；upload 借 index
+	assert [s.model_output["actions"][0]["name"] for s in out] == ["navigate", "click", "upload_file"]
+	upload = out[-1]
+	assert upload.model_output["actions"][0]["params"]["index"] == 1293
+	assert upload.model_output["actions"][0]["params"]["path"] == "uploads/v.mp4"
+	assert upload.interacted_element == [_file_input_elem()]
+
+
+def test_dedupe_upload_keeps_non_fakepath_input_text():
+	"""upload 前的普通 input_text（非 fakepath、basename 不匹配）不吸收。"""
+	steps = [
+		_step("input_text", {"text": "正常输入", "clear": True}, 0, 0.0),
+		_step("upload_file", {"path": "uploads/v.mp4"}, 1, 1.0),
+	]
+	out = denoise_steps(steps)
+	assert len(out) == 2
+
+
+def test_dedupe_upload_keeps_existing_index():
+	"""upload 自带 index 时不向被吸收的 file input click 借。"""
+	steps = [
+		_step_elem("click", {"index": 1293}, _file_input_elem(), 0, 0.0),
+		_step("upload_file", {"path": "uploads/v.mp4", "index": 5000}, 1, 1.0),
+	]
+	out = denoise_steps(steps)
+	assert len(out) == 1
+	assert out[0].model_output["actions"][0]["params"]["index"] == 5000
+
+
+def test_dedupe_upload_time_window_breaks_absorption():
+	"""超 gap_s（默认 10s）的前置 click 不吸收；upload 无候选 → 不借 index。"""
+	steps = [
+		_step_elem("click", {"index": 1293}, _file_input_elem(), 0, 0.0),
+		_step("upload_file", {"path": "uploads/v.mp4"}, 1, 20.0),
+	]
+	out = denoise_steps(steps)
+	assert len(out) == 2
+	assert out[1].model_output["actions"][0]["params"].get("index") is None
+
+
+def test_dedupe_two_uploads_merge_independently():
+	"""两个 upload 各自吸收前置 file input click、各自借 index（多 file input 不串扰）。"""
+	steps = [
+		_step_elem("click", {"index": 100}, _file_input_elem(100), 0, 0.0),
+		_step("upload_file", {"path": "uploads/a.mp4"}, 1, 1.0),
+		_step_elem("click", {"index": 200}, _file_input_elem(200), 2, 2.0),
+		_step("upload_file", {"path": "uploads/b.mp4"}, 3, 3.0),
+	]
+	out = denoise_steps(steps)
+	assert len(out) == 2
+	assert out[0].model_output["actions"][0]["params"]["index"] == 100
+	assert out[1].model_output["actions"][0]["params"]["index"] == 200
+
+
+# ── dedupe_auto_navigates：丢弃自动跳转的 navigate（上一步副作用的 SPA 跳转）──
+
+
+def test_denoise_drops_navigate_after_upload_within_gap():
+	"""上传后自动跳转的 navigate（紧邻 upload_file ≤gap）丢弃。"""
+	steps = [
+		_step("navigate", {"url": "https://x.com/upload", "new_tab": False}, 0, 0.0),
+		_step("upload_file", {"path": "uploads/v.mp4"}, 1, 1.0),
+		_step("navigate", {"url": "https://x.com/post", "new_tab": False}, 2, 1.9),  # 0.9s 后
+	]
+	out = denoise_steps(steps)
+	assert [s.model_output["actions"][0]["name"] for s in out] == ["navigate", "upload_file"]
+
+
+def test_denoise_drops_navigate_after_click_within_gap():
+	"""提交 click 后自动跳转的 navigate（0.04s）丢弃。"""
+	steps = [
+		_step("click", {"index": 5}, 0, 1000.0),
+		_step("navigate", {"url": "https://x.com/after", "new_tab": False}, 1, 1000.04),
+	]
+	out = denoise_steps(steps)
+	assert [s.model_output["actions"][0]["name"] for s in out] == ["click"]
+
+
+def test_denoise_keeps_navigate_after_long_gap():
+	"""前一步间隔超 gap（默认 3s）→ 视为地址栏式主动导航，保留。"""
+	steps = [
+		_step("click", {"index": 5}, 0, 0.0),
+		_step("navigate", {"url": "https://x.com/manual", "new_tab": False}, 1, 5.0),
+	]
+	out = denoise_steps(steps)
+	assert len(out) == 2
+
+
+def test_denoise_keeps_consecutive_navigates():
+	"""连续 navigate 不连锁丢弃（前一步也是 navigate → 保留当前）。"""
+	steps = [
+		_step("navigate", {"url": "https://x.com/a", "new_tab": False}, 0, 0.0),
+		_step("navigate", {"url": "https://x.com/b", "new_tab": False}, 1, 1.0),
+	]
+	out = denoise_steps(steps)
+	assert len(out) == 2
+
+
+def test_denoise_keeps_new_tab_navigate():
+	"""new_tab=True 是主动开新 tab，始终保留（即使紧邻 click）。"""
+	steps = [
+		_step("click", {"index": 5}, 0, 0.0),
+		_step("navigate", {"url": "https://x.com/tab", "new_tab": True}, 1, 0.5),
+	]
+	out = denoise_steps(steps)
+	assert len(out) == 2
+	assert out[1].model_output["actions"][0]["params"]["new_tab"] is True
+
+
+def test_denoise_keeps_first_step_navigate():
+	"""首步 navigate（前面无保留步骤）保留。"""
+	steps = [
+		_step("navigate", {"url": "https://x.com/start", "new_tab": False}, 0, 0.0),
+	]
+	out = denoise_steps(steps)
+	assert len(out) == 1
