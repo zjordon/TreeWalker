@@ -5,6 +5,9 @@
 //   3. contenteditable 富文本（如 Slate，内部 span[data-leaf]/[data-string] 结构）：
 //      Slate 用 beforeinput 接管输入、标准 input 事件不派发 → 用 MutationObserver 直接观察
 //      textContent 变化（不依赖事件传播，最可靠）。
+//
+// 结构对齐 Browser-BC：on() 工厂 + cleanup 收集器、emit() 统一填 ts；IME compositionstart/end
+// 抑制 composing 中的 input，只录最终值。
 
 import type { RecorderEvent } from '../shared/types';
 import { buildElementRef } from './selector';
@@ -38,6 +41,10 @@ const EDIT_KEYS = new Set([
   'Home', 'End', 'PageUp', 'PageDown',
 ]);
 
+const INPUT_COALESCE_MS = 400;
+const SCROLL_IDLE_MS = 500;
+let installed = false;
+
 /** 从 el 向上找最近的可交互祖先；找不到回退到 el 本身。 */
 function findInteractiveAncestor(el: Element | null): Element | null {
   let cur: Element | null = el;
@@ -70,46 +77,13 @@ interface PendingInput {
   timer: number;
 }
 
-let pendingInput: PendingInput | null = null;
-const INPUT_COALESCE_MS = 400;
-let installed = false;
-
-function flushInput(sendEvent: (event: RecorderEvent) => void): void {
-  if (!pendingInput) return;
-  const { xpath, value, attrs } = pendingInput;
-  clearTimeout(pendingInput.timer);
-  pendingInput = null;
-  if (!value) return; // 空值不发（避免噪声 input_text 步，如框被清空后 flush）
-  console.log('[TW Recorder] flush input_text value=%s', JSON.stringify(value.slice(0, 30)));
-  sendEvent({
-    type: 'input_text',
-    xpath,
-    params: { text: value, clear: true },
-    ...attrs,
-    ts: Date.now(),
-  });
-}
-
-/** 取 target 的当前值（input/textarea → value；contenteditable → textContent）。 */
+/** 取 target 的当前值（input/textarea → value；contenteditable → innerText，对齐 Browser-BC
+ *  valueFor——比 textContent 更接近用户可见文本，去掉 Slate 零宽字符等噪声）。 */
 function readValue(target: Element): string {
-  if ((target as HTMLElement).isContentEditable) return target.textContent ?? '';
+  const html = target as HTMLElement;
+  if (html.isContentEditable) return html.innerText ?? '';
   if ('value' in target) return String((target as HTMLInputElement).value);
   return '';
-}
-
-/** 合并/启动 pendingInput（同 xpath 连续输入合并，延迟 400ms 发最终值）。 */
-function setPending(sendEvent: (event: RecorderEvent) => void, target: Element): void {
-  const ref = buildElementRef(target);
-  const value = readValue(target);
-  if (pendingInput && pendingInput.xpath === ref.xpath) {
-    pendingInput.value = value;
-    pendingInput.attrs = refAttrs(target);
-    clearTimeout(pendingInput.timer);
-  } else {
-    flushInput(sendEvent);
-    pendingInput = { xpath: ref.xpath, value, attrs: refAttrs(target), timer: 0 };
-  }
-  pendingInput.timer = setTimeout(() => flushInput(sendEvent), INPUT_COALESCE_MS);
 }
 
 export function installActionRecorder(opts: InstallOptions): () => void {
@@ -117,8 +91,49 @@ export function installActionRecorder(opts: InstallOptions): () => void {
   installed = true;
   const { sendEvent } = opts;
 
+  let pendingInput: PendingInput | null = null;
+  // IME（中文等输入法）composing 中——抑制 input/MutationObserver 的 setPending，
+  // 避免中间拼音值被录（只录 compositionend 后的最终值）。
+  let isComposing = false;
+
+  /** 统一发送：填 ts。对齐 Browser-BC emit()。 */
+  const emit = (partial: Omit<RecorderEvent, 'ts'>) => {
+    sendEvent({ ...partial, ts: Date.now() });
+  };
+
+  const flushInput = () => {
+    if (!pendingInput) return;
+    const { xpath, value, attrs } = pendingInput;
+    clearTimeout(pendingInput.timer);
+    pendingInput = null;
+    if (!value) return; // 空值不发（避免噪声 input_text 步，如框被清空后 flush）
+    console.log('[TW Recorder] flush input_text value=%s', JSON.stringify(value.slice(0, 30)));
+    emit({
+      type: 'input_text',
+      xpath,
+      params: { text: value, clear: true },
+      ...attrs,
+    });
+  };
+
+  /** 合并/启动 pendingInput（同 xpath 连续输入合并，延迟 400ms 发最终值）。 */
+  const setPending = (target: Element) => {
+    if (isComposing) return; // IME composing 中——等 compositionend 后的最终值
+    const ref = buildElementRef(target);
+    const value = readValue(target);
+    if (pendingInput && pendingInput.xpath === ref.xpath) {
+      pendingInput.value = value;
+      pendingInput.attrs = refAttrs(target);
+      clearTimeout(pendingInput.timer);
+    } else {
+      flushInput();
+      pendingInput = { xpath: ref.xpath, value, attrs: refAttrs(target), timer: 0 };
+    }
+    pendingInput.timer = setTimeout(flushInput, INPUT_COALESCE_MS) as unknown as number;
+  };
+
   const onClick = (e: Event) => {
-    flushInput(sendEvent);
+    flushInput();
     const raw = e.composedPath()[0] as Element || (e.target as Element | null);
     if (!raw || raw.nodeType !== Node.ELEMENT_NODE) return;
     // file input 的 click 几乎都是上传按钮 JS 触发的 input.click()（非用户直接点），
@@ -126,69 +141,64 @@ export function installActionRecorder(opts: InstallOptions): () => void {
     if (raw.tagName === 'INPUT' && (raw.getAttribute('type') || '').toLowerCase() === 'file') return;
     const target = findInteractiveAncestor(raw) ?? raw;
     const ref = buildElementRef(target);
-    sendEvent({
+    emit({
       type: 'click',
       xpath: ref.xpath,
       rect: ref.rect,
       ...refAttrs(target),
-      ts: Date.now(),
     });
   };
 
   const onInput = (e: Event) => {
-    const raw = (e.composedPath()[0] as Element) || (e.target as Element | null);
+    const raw = e.composedPath()[0] as Element || (e.target as Element | null);
     if (!raw || raw.nodeType !== Node.ELEMENT_NODE) return;
     // file input 选文件后 value 变为 C:\fakepath\<名>，不是用户文本输入 ——
     // 交给 onFileChange 录 upload_file，这里跳过避免误录 input_text。
     if (raw.tagName === 'INPUT' && (raw.getAttribute('type') || '').toLowerCase() === 'file') return;
     const target = findInteractiveAncestor(raw) ?? raw;
     console.log('[TW Recorder] %s on <%s> ce=%s', e.type, target.tagName, (target as HTMLElement).isContentEditable);
-    setPending(sendEvent, target);
+    setPending(target);
   };
 
   // ── select_dropdown：<select> 的 change → 选中项 value（对齐重放侧 value 属性匹配）──
   const onSelect = (e: Event) => {
     const raw = e.target as Element | null;
     if (!raw || raw.tagName !== 'SELECT') return;
-    flushInput(sendEvent);
+    flushInput();
     const target = findInteractiveAncestor(raw) ?? raw;
     const ref = buildElementRef(target);
     const value = (target as HTMLSelectElement).value;
     console.log('[TW Recorder] select_dropdown value=%s', value);
-    sendEvent({
+    emit({
       type: 'select_dropdown',
       xpath: ref.xpath,
       ...refAttrs(target),
       params: { value },
-      ts: Date.now(),
     });
   };
 
   // ── send_keys：仅 ctrl/alt/meta 组合键 + 命名非打印键；可打印字符归 input_text ──
-  // 对齐 Browser-BC isShortcut：Shift 不算独立组合键修饰符——Shift+字母=大写归 input，
-  // Shift+Process 是 IME 处理键。否则 IME 打字/大写输入会逐键发 send_keys 并 flushInput
-  // 打断 onInput 的 400ms 合并，导致一次输入被录成十几步（recorded.json step 3-14 即此问题）。
-  const onKeyDown = (e: KeyboardEvent) => {
-    if (e.repeat) return;
-    const k = e.key;
+  const onKeyDown = (e: Event) => {
+    const ke = e as KeyboardEvent;
+    if (ke.repeat) return;
+    const k = ke.key;
     // 裸修饰键按下（如只按 Shift）等组合，不发
     if (k === 'Control' || k === 'Alt' || k === 'Shift' || k === 'Meta') return;
-    const hasMod = e.ctrlKey || e.altKey || e.metaKey; // Shift 不计入（见上注释）
+    const hasMod = ke.ctrlKey || ke.altKey || ke.metaKey; // Shift 不计入
     // 编辑键（Backspace/Delete/方向/Home/End/PageUp/Down）无修饰符时归 input 最终值——
-    // 其删除/移动效果已反映在后续 input 事件的 value 里；单独发会 flushInput 打断 400ms
-    // 合并，导致一次输入被切成多步（recorded.json step 4-12 即 Backspace 打断）。
+    // 其删除/移动效果已反映在后续 input 事件的 value 里；单独发会 flushInput 打断 400ms 合并。
     if (!hasMod && EDIT_KEYS.has(k)) return;
     const isNamed = NAMED_KEYS.has(k) || /^F([1-9]|10|11|12)$/.test(k);
     if (!hasMod && !isNamed) return; // 普通可打印 / Shift+字符 / IME Process → 由 input 处理
-    flushInput(sendEvent);
+    flushInput();
     const mods: string[] = [];
-    if (e.ctrlKey) mods.push('Control');
-    if (e.altKey) mods.push('Alt');
-    if (e.shiftKey && hasMod) mods.push('Shift'); // Shift 仅在配合 ctrl/alt/meta 时计入
-    if (e.metaKey) mods.push('Meta');
+    if (ke.ctrlKey) mods.push('Control');
+    if (ke.altKey) mods.push('Alt');
+    if (ke.shiftKey && hasMod) mods.push('Shift'); // Shift 仅在配合 ctrl/alt/meta 时计入
+    if (ke.metaKey) mods.push('Meta');
     const keys = (mods.length ? [...mods, k] : [k]).join('+');
     console.log('[TW Recorder] send_keys %s', keys);
-    sendEvent({ type: 'send_keys', params: { keys }, ts: Date.now() });
+    emit({ type: 'send_keys', params: { keys } });
   };
 
   // ── upload_file：<input type=file> 的 change → 文件名（浏览器安全限制只给文件名）──
@@ -197,23 +207,25 @@ export function installActionRecorder(opts: InstallOptions): () => void {
     if (!raw || raw.tagName !== 'INPUT' || (raw.getAttribute('type') || '').toLowerCase() !== 'file') return;
     const file = (raw as HTMLInputElement).files?.[0];
     if (!file) return;
-    flushInput(sendEvent);
+    flushInput();
     const target = findInteractiveAncestor(raw) ?? raw;
     const ref = buildElementRef(target);
     console.log('[TW Recorder] upload_file name=%s', file.name);
-    sendEvent({
+    emit({
       type: 'upload_file',
       xpath: ref.xpath,
       ...refAttrs(target),
       params: { path: file.name },
-      ts: Date.now(),
     });
   };
+
+  // ── IME：compositionstart/end 维护 isComposing flag（composing 中 setPending 抑制）──
+  const onCompositionStart = () => { isComposing = true; };
+  const onCompositionEnd = () => { isComposing = false; };
 
   // ── scroll：wheel 累计 → 一次 scroll(amount, direction)；方向反转/空闲 500ms flush ──
   let scrollY = 0; // 累计 deltaY（带符号）
   let scrollTimer = 0;
-  const SCROLL_IDLE_MS = 500;
   const flushScroll = () => {
     if (scrollTimer) {
       clearTimeout(scrollTimer);
@@ -225,23 +237,33 @@ export function installActionRecorder(opts: InstallOptions): () => void {
     const direction = scrollY > 0 ? 'down' : 'up';
     scrollY = 0;
     console.log('[TW Recorder] scroll %s amount=%d', direction, amount);
-    sendEvent({ type: 'scroll', params: { amount, direction }, ts: Date.now() });
+    emit({ type: 'scroll', params: { amount, direction } });
   };
-  const onWheel = (e: WheelEvent) => {
+  const onWheel = (e: Event) => {
+    const we = e as WheelEvent;
     // 方向反转：先冲刷上一段（避免 up/down 互相抵消成 amount=0），再累计新方向
-    if (scrollY !== 0 && Math.sign(e.deltaY) !== Math.sign(scrollY)) flushScroll();
-    scrollY += e.deltaY;
+    if (scrollY !== 0 && Math.sign(we.deltaY) !== Math.sign(scrollY)) flushScroll();
+    scrollY += we.deltaY;
     if (scrollTimer) clearTimeout(scrollTimer);
     scrollTimer = setTimeout(flushScroll, SCROLL_IDLE_MS) as unknown as number;
   };
 
-  window.addEventListener('click', onClick, { capture: true, passive: true });
-  window.addEventListener('input', onInput, { capture: true, passive: true });
-  window.addEventListener('keyup', onInput, { capture: true, passive: true });
-  window.addEventListener('change', onSelect, { capture: true, passive: true });
-  window.addEventListener('keydown', onKeyDown, { capture: true, passive: true });
-  window.addEventListener('change', onFileChange, { capture: true, passive: true });
-  window.addEventListener('wheel', onWheel, { capture: true, passive: true });
+  // ── on() 工厂 + cleanup 收集器（对齐 Browser-BC，替代手动 add/removeEventListener）──
+  const cleanup: Array<() => void> = [];
+  const on = (type: string, listener: (e: Event) => void) => {
+    window.addEventListener(type, listener, { capture: true, passive: true });
+    cleanup.push(() => window.removeEventListener(type, listener, { capture: true } as EventListenerOptions));
+  };
+
+  on('click', onClick);
+  on('input', onInput);
+  on('keyup', onInput);
+  on('change', onSelect);
+  on('keydown', onKeyDown);
+  on('change', onFileChange);
+  on('wheel', onWheel);
+  on('compositionstart', onCompositionStart);
+  on('compositionend', onCompositionEnd);
 
   // contenteditable 富文本（Slate 等）：标准 input 事件不派发，用 MutationObserver 直接观察
   // textContent 变化。content script 的 MutationObserver 观察 DOM（共享），不依赖事件传播。
@@ -249,8 +271,9 @@ export function installActionRecorder(opts: InstallOptions): () => void {
   const observeCe = (el: Element) => {
     if (ceObservers.some((o) => (o as unknown as { _el?: Element })._el === el)) return;
     const mo = new MutationObserver(() => {
-      console.log('[TW Recorder] ce-mutation on <%s> value=%s', el.tagName, JSON.stringify((el.textContent ?? '').slice(0, 30)));
-      setPending(sendEvent, el);
+      if (isComposing) return; // IME composing 中——等 compositionend 后的最终值
+      console.log('[TW Recorder] ce-mutation on <%s> value=%s', el.tagName, JSON.stringify((el.innerText ?? '').slice(0, 30)));
+      setPending(el);
     });
     (mo as unknown as { _el?: Element })._el = el;
     mo.observe(el, { subtree: true, characterData: true, childList: true });
@@ -272,15 +295,9 @@ export function installActionRecorder(opts: InstallOptions): () => void {
   docObs.observe(document.body, { subtree: true, childList: true });
 
   return () => {
-    flushInput(sendEvent);
+    flushInput();
     flushScroll();
-    window.removeEventListener('click', onClick, { capture: true } as EventListenerOptions);
-    window.removeEventListener('input', onInput, { capture: true } as EventListenerOptions);
-    window.removeEventListener('keyup', onInput, { capture: true } as EventListenerOptions);
-    window.removeEventListener('change', onSelect, { capture: true } as EventListenerOptions);
-    window.removeEventListener('keydown', onKeyDown, { capture: true } as EventListenerOptions);
-    window.removeEventListener('change', onFileChange, { capture: true } as EventListenerOptions);
-    window.removeEventListener('wheel', onWheel, { capture: true } as EventListenerOptions);
+    cleanup.splice(0).forEach((d) => d());
     ceObservers.forEach((o) => o.disconnect());
     docObs.disconnect();
     installed = false;
