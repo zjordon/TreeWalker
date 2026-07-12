@@ -19,6 +19,8 @@ export interface ElementRef {
 export interface RecorderEvent {
   /** 事件发生时所在页面 url（content script 的 location.href），后端据此定位 CDP target（避免读到 popup/扩展页）。 */
   url?: string;
+  /** 是否顶层 frame（window.top===window.self）。iframe 内的 content 为 false；后端 iframe 定位参考。 */
+  is_top_frame?: boolean;
   /** 目标元素定位线索：xpath 失败时后端用 tag+name/id/aria-label 做 ATTRIBUTE 级兜底。 */
   tag?: string;
   id?: string;

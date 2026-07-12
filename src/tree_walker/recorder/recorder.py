@@ -13,6 +13,7 @@ action → 拼一条 ``AgentHistory`` 追加。停止时经 ``resolve_rerun_path
 from __future__ import annotations
 
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,7 @@ from tree_walker.agent.rerun import resolve_rerun_path
 from tree_walker.agent.views import AgentHistory, AgentHistoryList, StepMetadata
 from tree_walker.browser.session import BrowserSession
 from tree_walker.browser.views import DOMInteractedElement
-from tree_walker.recorder.event_mapper import map_event, needs_target
+from tree_walker.recorder.event_mapper import denoise_steps, map_event, needs_target
 from tree_walker.recorder.locator import locate_by_ref, locate_by_xpath
 
 logger = logging.getLogger(__name__)
@@ -68,9 +69,12 @@ class Recorder:
 		browser: BrowserSession,
 		rerun_history_dir: str,
 		registry_version: str | None = None,
+		upload_dir: str = "",
 	) -> None:
 		self.browser = browser
 		self.rerun_history_dir = rerun_history_dir
+		# upload_file 约定目录：空 → <rerun_history_dir>/uploads（扩展只能拿文件名）
+		self.upload_dir = upload_dir or os.path.join(rerun_history_dir, "uploads")
 		self.registry_version = registry_version
 		self.history: AgentHistoryList = AgentHistoryList()
 		self._step = 0
@@ -94,6 +98,15 @@ class Recorder:
 			logger.debug("忽略不可映射事件: %s", event.get("type"))
 			return None
 		action_name, params = mapped
+		raw_params = event.get("params") or {}
+
+		# tab 动作：扩展发目标 tab 的 url，后端解析成 CDP targetId 后4位（重放侧期望格式）
+		if action_name in ("switch_tab", "close_tab"):
+			params["tab_id"] = await self._resolve_tab_id(raw_params.get("url"))
+
+		# upload_file：扩展只发文件名（浏览器安全限制），拼约定目录
+		if action_name == "upload_file":
+			params["path"] = self._resolve_upload_path(params.get("path") or raw_params.get("path") or "")
 
 		# 确保 BrowserSession 指向用户操作的 http page（而非 popup/扩展页）
 		await self._ensure_target(event.get("url"))
@@ -186,6 +199,36 @@ class Recorder:
 		except Exception as e:
 			logger.debug("禁用 file-chooser intercept 失败（旧版 Chrome 可能不支持）: %s", e)
 
+	async def _resolve_tab_id(self, url: str | None) -> str:
+		"""把目标 tab 的 url 解析成 CDP targetId 后4位（switch_tab/close_tab 用）。
+
+		扩展 ``chrome.tabs`` 事件给的是 Chrome tabId，重放侧要的是 CDP targetId 后4位；
+		这里用 url 在 CDP targets 里匹配 page，取 ``target_id[-4:]``。解析失败返回空串
+		（close_tab 空=关当前 tab，合法）。mock browser 无 ``get_tabs`` 时返回空。
+		"""
+		if not url:
+			return ""
+		get_tabs = getattr(self.browser, "get_tabs", None)
+		if get_tabs is None:
+			return ""
+		try:
+			tabs = await get_tabs()
+		except Exception as e:
+			logger.warning("get_tabs 失败: %s", e)
+			return ""
+		want = url.rstrip("/").split("#", 1)[0]
+		for t in tabs:
+			turl = (getattr(t, "url", "") or "").rstrip("/").split("#", 1)[0]
+			if turl and turl == want:
+				tid = getattr(t, "target_id", "") or ""
+				return tid[-4:]
+		return ""
+
+	def _resolve_upload_path(self, filename: str) -> str:
+		"""upload_file 的文件名拼约定目录（扩展只能拿文件名，``basename`` 防误发含路径）。"""
+		name = os.path.basename(filename or "")
+		return os.path.join(self.upload_dir, name) if name else ""
+
 	async def stop(
 		self,
 		file_path: str = "recorded.json",
@@ -198,6 +241,8 @@ class Recorder:
 		``file_path`` 必须相对（``resolve_rerun_path`` 拒绝绝对路径 / ``..`` 越界）。
 		"""
 		self._recording = False
+		# 落盘前去噪（合并相邻 input_text / 折叠短时重复 click / 合并同方向 scroll）
+		self.history.history = denoise_steps(self.history.history)
 		if mark_done:
 			now = time.time()
 			self.history.history.append(AgentHistory(

@@ -206,6 +206,14 @@ entrypoint 与本方案职责映射：
 - iframe / shadow DOM：content script 在 `defineContentScript` 设 `allFrames: true`；事件带上 `frame_path`（从顶层到当前 frame 的定位链），后端定位时跨 frame 解析。
 - 文件上传：拦截 `<input type=file>` 的 `change`，取文件名 → `upload_file`（扩展只能拿文件名不能拿完整路径，后端用约定目录解析）。
 
+> **✅ 阶段 2 已实现（2026-07-11，执行方案见 [stage2_plan.md](stage2_plan.md)）**。实现笔记（与上文的差异/澄清）：
+>
+> - **去噪分层**：扩展侧实时去噪（input 400ms 合并 / scroll wheel 累计节流 / send_keys 仅录组合键+命名非打印键）；后端 `event_mapper.denoise_steps` 在 `Recorder.stop()` 落盘前再过一遍——合并相邻同 index `input_text`、折叠短时（0.5s）重复 `click`、合并同方向 `scroll`（amount 求和 clamp 1-10）、重排 `step_number`。`hover/focus` 不在映射表（`map_event` 返回 `None` 即丢弃）。
+> - **upload 约定目录**：扩展只采 `files[0].name`（浏览器安全限制不给完整路径），后端 `_resolve_upload_path` 拼成 `<rerun_history_dir>/uploads/<文件名>`（`record_upload_dir` 配置 / `AGENT_RECORD_UPLOAD_DIR` 环境变量可覆盖）；重放前用户须把文件放进该目录。
+> - **go_back 折叠进 navigate**：`popstate` 无法可靠区分「后退按钮」vs「SPA 回退」，统一记 `navigate(url)`（重放落点同为某 URL，且 `navigate(url)` 比 `go_back` 依赖历史栈更稳）。navigate 的 SPA 捕获经 **MAIN-world 注入脚本** hook `pushState/replaceState`（content script 在 ISOLATED world 抓不到）+ content 直听 `popstate/hashchange`，跨 world 用 `tw:nav` CustomEvent 桥接（共享 window）。
+> - **iframe 走 rect 就近（best-effort）**：`allFrames:true` 采集 + 扩展发 `is_top_frame` 信号；后端不引入复杂 `frame_path` 解析，复用现有 rect 就近（`dom.py:758-767` 已把 iframe 内容节点 bounds 加 iframe 偏移成视口坐标，跨 frame 同名 `html/body/...` xpath 时能正确消歧）。深嵌套跨源 iframe 仍可能误选，阶段 3 滚动 `selector_map` 缓存可缓解。
+> - **switch_tab/close_tab 的 tabId 对齐**：扩展 `chrome.tabs` 事件给的是 Chrome tabId，background 发目标 tab 的 **url**；后端 `_resolve_tab_id` 用 `get_tabs()` 按 url 匹配 CDP page 取 `target_id[-4:]`（重放侧期望格式）。close_tab 的被关 tab url 由 background `tabUrlCache` 提前记住（onRemoved 时 tab 已销毁）。
+
 ### 阶段 3：鲁棒性（时序对齐）+ 多标签 + UX
 
 - **时序对齐**（关键风险）：后端维护**滚动 `selector_map` 缓存**——录制期间对每个活动 target 短间隔（如 300ms）刷新一次 `get_state()`；事件到达时用最近一次缓存（点击前的页面状态）定位，规避"SPA 跳转后页面已变、定位不到目标节点"的竞态。MVP 的"事件到达立即 get_state"作为 fallback。

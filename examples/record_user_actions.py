@@ -40,6 +40,10 @@ def main() -> None:
 	parser.add_argument("--host", default="127.0.0.1", help="后端 HTTP 监听 host")
 	parser.add_argument("--port", type=int, default=8765, help="后端 HTTP 监听端口")
 	parser.add_argument("--rerun-dir", default="rerun-history", help="落盘根目录")
+	parser.add_argument(
+		"--upload-dir", default="",
+		help="upload_file 约定目录（空→<rerun-dir>/uploads）；扩展只采文件名，重放前把文件放此",
+	)
 	args = parser.parse_args()
 
 	# Chrome 的 remote-debugging-port 暴露的是 HTTP 端点，不能直连裸 ws://host:port
@@ -54,11 +58,12 @@ def main() -> None:
 		sys.exit(1)
 
 	browser = BrowserSession(ws_url=ws_url)
-	recorder = Recorder(browser, rerun_history_dir=args.rerun_dir)
+	recorder = Recorder(browser, rerun_history_dir=args.rerun_dir, upload_dir=args.upload_dir)
 
 	print(f"✓ 浏览器 CDP: {ws_url}")
 	print(f"录制后端监听 http://{args.host}:{args.port}")
 	print(f"输出: {args.rerun_dir}/{args.out}")
+	print(f"上传约定目录: {recorder.upload_dir}")
 	print("加载扩展后点「开始录制」；Ctrl+C 退出。")
 
 	run_server(recorder, host=args.host, port=args.port, default_out=args.out)

@@ -22,6 +22,13 @@ const INTERACTIVE_SELECTOR = [
   '[role="switch"]', '[role="option"]',
 ].join(',');
 
+/** 命名非打印键（send_keys 录这些；可打印字符归 input_text）。F1-F12 用正则另判。 */
+const NAMED_KEYS = new Set([
+  'Enter', 'Tab', 'Escape', 'Backspace', 'Delete',
+  'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
+  'Home', 'End', 'PageUp', 'PageDown',
+]);
+
 /** 从 el 向上找最近的可交互祖先；找不到回退到 el 本身。 */
 function findInteractiveAncestor(el: Element | null): Element | null {
   let cur: Element | null = el;
@@ -123,9 +130,94 @@ export function installActionRecorder(opts: InstallOptions): () => void {
     setPending(sendEvent, target);
   };
 
+  // ── select_dropdown：<select> 的 change → 选中项 value（对齐重放侧 value 属性匹配）──
+  const onSelect = (e: Event) => {
+    const raw = e.target as Element | null;
+    if (!raw || raw.tagName !== 'SELECT') return;
+    flushInput(sendEvent);
+    const target = findInteractiveAncestor(raw) ?? raw;
+    const ref = buildElementRef(target);
+    const value = (target as HTMLSelectElement).value;
+    console.log('[TW Recorder] select_dropdown value=%s', value);
+    sendEvent({
+      type: 'select_dropdown',
+      xpath: ref.xpath,
+      ...refAttrs(target),
+      params: { value },
+      ts: Date.now(),
+    });
+  };
+
+  // ── send_keys：仅组合键(Ctrl/Alt/Meta) + 命名非打印键；可打印字符归 input_text ──
+  const onKeyDown = (e: KeyboardEvent) => {
+    if (e.repeat) return;
+    const k = e.key;
+    // 裸修饰键按下（如只按 Shift）等组合，不发
+    if (k === 'Control' || k === 'Alt' || k === 'Shift' || k === 'Meta') return;
+    const mods: string[] = [];
+    if (e.ctrlKey) mods.push('Control');
+    if (e.altKey) mods.push('Alt');
+    if (e.shiftKey) mods.push('Shift');
+    if (e.metaKey) mods.push('Meta');
+    const isNamed = NAMED_KEYS.has(k) || /^F([1-9]|10|11|12)$/.test(k);
+    if (mods.length === 0 && !isNamed) return; // 普通可打印字符 → 由 input 处理走 input_text
+    flushInput(sendEvent);
+    const keys = (mods.length ? [...mods, k] : [k]).join('+');
+    console.log('[TW Recorder] send_keys %s', keys);
+    sendEvent({ type: 'send_keys', params: { keys }, ts: Date.now() });
+  };
+
+  // ── upload_file：<input type=file> 的 change → 文件名（浏览器安全限制只给文件名）──
+  const onFileChange = (e: Event) => {
+    const raw = e.target as Element | null;
+    if (!raw || raw.tagName !== 'INPUT' || (raw.getAttribute('type') || '').toLowerCase() !== 'file') return;
+    const file = (raw as HTMLInputElement).files?.[0];
+    if (!file) return;
+    flushInput(sendEvent);
+    const target = findInteractiveAncestor(raw) ?? raw;
+    const ref = buildElementRef(target);
+    console.log('[TW Recorder] upload_file name=%s', file.name);
+    sendEvent({
+      type: 'upload_file',
+      xpath: ref.xpath,
+      ...refAttrs(target),
+      params: { path: file.name },
+      ts: Date.now(),
+    });
+  };
+
+  // ── scroll：wheel 累计 → 一次 scroll(amount, direction)；方向反转/空闲 500ms flush ──
+  let scrollY = 0; // 累计 deltaY（带符号）
+  let scrollTimer = 0;
+  const SCROLL_IDLE_MS = 500;
+  const flushScroll = () => {
+    if (scrollTimer) {
+      clearTimeout(scrollTimer);
+      scrollTimer = 0;
+    }
+    if (scrollY === 0) return;
+    const vh = window.innerHeight || 1;
+    const amount = Math.max(1, Math.min(10, Math.round(Math.abs(scrollY) / vh)));
+    const direction = scrollY > 0 ? 'down' : 'up';
+    scrollY = 0;
+    console.log('[TW Recorder] scroll %s amount=%d', direction, amount);
+    sendEvent({ type: 'scroll', params: { amount, direction }, ts: Date.now() });
+  };
+  const onWheel = (e: WheelEvent) => {
+    // 方向反转：先冲刷上一段（避免 up/down 互相抵消成 amount=0），再累计新方向
+    if (scrollY !== 0 && Math.sign(e.deltaY) !== Math.sign(scrollY)) flushScroll();
+    scrollY += e.deltaY;
+    if (scrollTimer) clearTimeout(scrollTimer);
+    scrollTimer = setTimeout(flushScroll, SCROLL_IDLE_MS) as unknown as number;
+  };
+
   window.addEventListener('click', onClick, { capture: true, passive: true });
   window.addEventListener('input', onInput, { capture: true, passive: true });
   window.addEventListener('keyup', onInput, { capture: true, passive: true });
+  window.addEventListener('change', onSelect, { capture: true, passive: true });
+  window.addEventListener('keydown', onKeyDown, { capture: true, passive: true });
+  window.addEventListener('change', onFileChange, { capture: true, passive: true });
+  window.addEventListener('wheel', onWheel, { capture: true, passive: true });
 
   // contenteditable 富文本（Slate 等）：标准 input 事件不派发，用 MutationObserver 直接观察
   // textContent 变化。content script 的 MutationObserver 观察 DOM（共享），不依赖事件传播。
@@ -157,9 +249,14 @@ export function installActionRecorder(opts: InstallOptions): () => void {
 
   return () => {
     flushInput(sendEvent);
+    flushScroll();
     window.removeEventListener('click', onClick, { capture: true } as EventListenerOptions);
     window.removeEventListener('input', onInput, { capture: true } as EventListenerOptions);
     window.removeEventListener('keyup', onInput, { capture: true } as EventListenerOptions);
+    window.removeEventListener('change', onSelect, { capture: true } as EventListenerOptions);
+    window.removeEventListener('keydown', onKeyDown, { capture: true } as EventListenerOptions);
+    window.removeEventListener('change', onFileChange, { capture: true } as EventListenerOptions);
+    window.removeEventListener('wheel', onWheel, { capture: true } as EventListenerOptions);
     ceObservers.forEach((o) => o.disconnect());
     docObs.disconnect();
     installed = false;

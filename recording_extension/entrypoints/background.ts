@@ -69,4 +69,44 @@ export default defineBackground(() => {
     })();
     return true; // 异步 sendResponse
   });
+
+  // ── tab 事件：switch_tab / close_tab ──────────────────────────────────
+  // 扩展 chrome.tabs 给的是 Chrome tabId；重放侧要 CDP targetId 后4位。
+  // 这里发目标 tab 的 url，后端用 get_tabs() 解析成 target_id[-4:]。
+  // onRemoved 时 tab 已销毁取不到 url，故用 tabUrlCache 提前记住。
+  const tabUrlCache = new Map<number, string>();
+
+  const postTabEvent = async (type: 'switch_tab' | 'close_tab', url: string, topUrl = false) => {
+    const { recording } = await getState();
+    if (!recording || !url) return;
+    console.log('[TW Recorder] bg tab %s url=%s', type, url);
+    // switch_tab 带 top-level url，让后端 _ensure_target 跟随到新 tab（get_state 读新页）
+    await postEvent(
+      topUrl
+        ? { type, url, params: { url }, ts: Date.now() }
+        : { type, params: { url }, ts: Date.now() },
+    );
+  };
+
+  chrome.tabs.onActivated.addListener(async (info) => {
+    try {
+      const t = await chrome.tabs.get(info.tabId);
+      if (t.url) tabUrlCache.set(info.tabId, t.url);
+      await postTabEvent('switch_tab', t.url ?? '', true);
+    } catch {
+      /* tab 已消失 */
+    }
+  });
+
+  chrome.tabs.onUpdated.addListener((tabId, change, tab) => {
+    if (change.url || change.status === 'complete') {
+      tabUrlCache.set(tabId, tab.url ?? tabUrlCache.get(tabId) ?? '');
+    }
+  });
+
+  chrome.tabs.onRemoved.addListener(async (tabId) => {
+    const url = tabUrlCache.get(tabId) ?? '';
+    tabUrlCache.delete(tabId);
+    await postTabEvent('close_tab', url);
+  });
 });

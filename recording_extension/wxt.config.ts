@@ -9,5 +9,7 @@ export default defineConfig({
     version: '0.1.0',
     permissions: ['activeTab', 'tabs', 'scripting', 'storage'],
     host_permissions: ['http://localhost:8765/*', 'http://*/*', 'https://*/*'],
+    // MAIN-world 注入脚本（hook SPA pushState/replaceState）需对页面可访问
+    web_accessible_resources: [{ resources: ['injected.js'], matches: ['<all_urls>'] }],
   },
 });

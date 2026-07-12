@@ -16,10 +16,11 @@ from tree_walker.recorder.recorder import Recorder, select_http_target
 class FakeBrowser:
 	"""mock BrowserSession：只实现 start/stop/get_state。"""
 
-	def __init__(self, selector_map=None, url="https://x.com", title="X"):
+	def __init__(self, selector_map=None, url="https://x.com", title="X", tabs=None):
 		self._map = selector_map or {}
 		self._url = url
 		self._title = title
+		self._tabs = tabs or []
 		self.started = False
 		self.stopped = False
 
@@ -32,6 +33,9 @@ class FakeBrowser:
 	async def get_state(self, include_screenshot=True):
 		dom = SimpleNamespace(selector_map=self._map)
 		return SimpleNamespace(url=self._url, title=self._title, dom_state=dom)
+
+	async def get_tabs(self):
+		return self._tabs
 
 
 class _FakeProj:
@@ -134,6 +138,59 @@ async def test_stop_rejects_absolute_path(tmp_path):
 	await rec.start()
 	with _pytest.raises(ValueError):
 		await rec.stop(file_path=str(tmp_path / "abs.json"))
+
+
+@pytest.mark.asyncio
+async def test_switch_tab_resolves_tab_id_from_url(tmp_path):
+	# 扩展发目标 tab 的 url；后端解析成 CDP targetId 后4位
+	tabs = [SimpleNamespace(url="https://a.com/page", target_id="ABCDEF1234")]
+	browser = FakeBrowser(tabs=tabs)
+	rec = Recorder(browser, rerun_history_dir=str(tmp_path))
+	await rec.start()
+	step = await rec.handle_event({"type": "switch_tab", "params": {"url": "https://a.com/page"}})
+	assert step is not None
+	assert step.model_output["actions"][0]["params"]["tab_id"] == "1234"
+
+
+@pytest.mark.asyncio
+async def test_close_tab_unknown_url_yields_empty_tab_id(tmp_path):
+	# url 在 tabs 里找不到 → tab_id 空（close_tab 空=关当前，合法）
+	browser = FakeBrowser(tabs=[])
+	rec = Recorder(browser, rerun_history_dir=str(tmp_path))
+	await rec.start()
+	step = await rec.handle_event({"type": "close_tab", "params": {"url": "https://none.com"}})
+	assert step is not None
+	assert step.model_output["actions"][0]["params"]["tab_id"] == ""
+
+
+@pytest.mark.asyncio
+async def test_upload_file_resolves_to_upload_dir(tmp_path, patch_projection):
+	browser = FakeBrowser(selector_map={5: SimpleNamespace(xpath="html/body/input")})
+	rec = Recorder(browser, rerun_history_dir=str(tmp_path))
+	await rec.start()
+	step = await rec.handle_event({
+		"type": "upload_file", "xpath": "html/body/input", "params": {"path": "video.mp4"},
+	})
+	assert step is not None
+	p = step.model_output["actions"][0]["params"]
+	assert p["index"] == 5  # upload_file 需 index，locate 命中
+	# 文件名拼约定目录 <rerun_history_dir>/uploads（basename 防误发路径）
+	assert p["path"].replace("\\", "/").endswith("uploads/video.mp4")
+
+
+@pytest.mark.asyncio
+async def test_stop_applies_denoise_to_history(tmp_path, patch_projection):
+	browser = FakeBrowser(selector_map={5: SimpleNamespace(xpath="html/body/inp")})
+	rec = Recorder(browser, rerun_history_dir=str(tmp_path), registry_version="v1")
+	await rec.start()
+	# 相邻同 index 两条 input_text → denoise 合一
+	await rec.handle_event({"type": "input_text", "xpath": "html/body/inp", "params": {"text": "a"}, "ts": 1})
+	await rec.handle_event({"type": "input_text", "xpath": "html/body/inp", "params": {"text": "ab"}, "ts": 2})
+
+	path = await rec.stop(file_path="out.json")
+	loaded = AgentHistoryList.load_from_file(path)
+	assert len(loaded.history) == 1  # 合并后 1 步（无 done）
+	assert loaded.history[0].model_output["actions"][0]["params"]["text"] == "ab"  # 取最终值
 
 
 # ── select_http_target：target 选择纯函数 ───────────────────────────────

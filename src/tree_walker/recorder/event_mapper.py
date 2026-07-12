@@ -11,7 +11,10 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+	from tree_walker.agent.views import AgentHistory
 
 # 需要 target 元素（带 xpath，recorder 用 locator 定位后填 index）的 action 集合
 _INDEX_ACTIONS = frozenset({
@@ -43,12 +46,17 @@ def map_event(event: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
 	if t == "select_dropdown":
 		return ("select_dropdown", {"value": str(ep.get("value", ""))})
 	if t == "scroll":
+		amount = int(ep.get("amount", 3))
+		direction = ep.get("direction", "down")
+		if direction not in ("up", "down"):
+			direction = "down"
 		return ("scroll", {
-			"amount": int(ep.get("amount", 3)),
-			"direction": ep.get("direction", "down"),
+			# 对齐 ScrollParams ge=1/le=10：扩展估算的 amount 可能越界，clamp 进合法区间
+			"amount": max(1, min(10, amount)),
+			"direction": direction,
 		})
 	if t == "navigate":
-		return ("navigate", {"url": str(ep.get("url", ""))})
+		return ("navigate", {"url": str(ep.get("url", "")), "new_tab": bool(ep.get("new_tab", False))})
 	if t == "go_back":
 		return ("go_back", {})
 	if t == "switch_tab":
@@ -96,3 +104,66 @@ def _within_gap(a: dict[str, Any], b: dict[str, Any], gap_ms: float) -> bool:
 		return abs(tb - ta) <= gap_ms
 	except TypeError:
 		return True
+
+
+def denoise_steps(
+	steps: "list[AgentHistory]",
+	click_gap_s: float = 0.5,
+) -> "list[AgentHistory]":
+	"""对最终 steps 列表做去噪后处理（``Recorder.stop()`` 落盘前调用）。
+
+	实时管线里每条事件立刻建一条 ``AgentHistory``，难免有冗余；这里在落盘前统一收口：
+
+	- 合并**相邻同 index 的 ``input_text``** → 取最后一条（``clear=True`` 本就覆盖）。
+- 折叠**相邻同 index 的 ``click``**（``click_gap_s`` 内，按 ``step_start_time``）→ 留一条。
+	- 合并**相邻同方向 ``scroll``** → amount 求和 clamp 1-10。
+
+	跨非可合并步骤不合并。最后**重排 ``step_number``**（0..N-1，同步 ``metadata.step_number``）。
+
+	与 ``coalesce_inputs`` 的区别：后者作用于原始事件流（批处理，仅合并 input_text），
+	本函数作用于已拼接的 ``AgentHistory`` steps（含 click 折叠 / scroll 合并），是实时管线
+	落盘前的安全网。``AgentHistory`` 非冻结、``model_output`` 为普通 dict，原地改写安全。
+	"""
+	def _action(step: "AgentHistory") -> dict[str, Any] | None:
+		acts = (step.model_output or {}).get("actions") or []
+		return acts[0] if acts else None
+
+	def _name(step: "AgentHistory") -> str | None:
+		a = _action(step)
+		return a.get("name") if a else None
+
+	def _params(step: "AgentHistory") -> dict[str, Any]:
+		a = _action(step)
+		return a.get("params") if a else {}
+
+	def _t(step: "AgentHistory") -> float | None:
+		m = step.metadata
+		return getattr(m, "step_start_time", None) if m else None
+
+	out: "list[AgentHistory]" = []
+	for step in steps:
+		name = _name(step)
+		last = out[-1] if out else None
+		merged = False
+		if last is not None and _name(last) == name and name is not None:
+			if name == "input_text" and _params(last).get("index") == _params(step).get("index"):
+				out[-1] = step  # 取最终值
+				merged = True
+			elif name == "click" and _params(last).get("index") == _params(step).get("index") and _params(step).get("index") is not None:
+				ta, tb = _t(last), _t(step)
+				if ta is None or tb is None or abs(tb - ta) <= click_gap_s:
+					out[-1] = step  # 短时重复点击归一，留最后一条
+					merged = True
+			elif name == "scroll" and _params(last).get("direction") == _params(step).get("direction"):
+				total = max(1, min(10, int(_params(last).get("amount", 1)) + int(_params(step).get("amount", 1))))
+				_action(last)["params"]["amount"] = total  # 同方向滚动求和
+				merged = True
+		if not merged:
+			out.append(step)
+
+	# 重排 step_number（合并后序号有空洞）
+	for i, s in enumerate(out):
+		s.step_number = i
+		if s.metadata is not None:
+			s.metadata.step_number = i
+	return out
