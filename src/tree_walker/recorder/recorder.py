@@ -89,6 +89,33 @@ class Recorder:
 		self._step = 0
 		logger.info("录制开始")
 
+	def _prepend_initial_navigation(self) -> None:
+		"""落盘前在 history[0] 插一条起始页 navigate（仿 Browser-BC 的 load 事件）。
+
+		用 denoise 后 ``history[0].state_summary.url``——第一条事件到达时 ``_ensure_target``
+		已把 BrowserSession attach 修正到用户操作的 http page，URL 真实可靠。**不在 start 时
+		插**：start 时 attach 的可能是 Chrome new-tab-page 等非用户页（``get_current_url`` 会
+		拿到错误 URL）。插入后重排 step_number。无 history 或 url 为空则跳过。
+		"""
+		if not self.history.history:
+			return
+		first_url = (self.history.history[0].state_summary or {}).get("url")
+		if not first_url:
+			return
+		now = time.time()
+		self.history.history.insert(0, AgentHistory(
+			step_number=0,
+			model_output={"actions": [{"name": "navigate", "params": {"url": first_url, "new_tab": False}}]},
+			result=[],
+			state_summary={"url": first_url, "title": "", "duration": 0.0},
+			interacted_element=None,
+			metadata=StepMetadata(step_start_time=now, step_end_time=now, step_number=0),
+		))
+		for i, s in enumerate(self.history.history):
+			s.step_number = i
+			if s.metadata is not None:
+				s.metadata.step_number = i
+
 	async def handle_event(self, event: dict[str, Any]) -> AgentHistory | None:
 		"""处理一条扩展事件，拼一条 ``AgentHistory`` 追加；不可映射事件返回 None。"""
 		if not self._recording:
@@ -243,15 +270,17 @@ class Recorder:
 		self._recording = False
 		# 落盘前去噪（合并相邻 input_text / 折叠短时重复 click / 合并同方向 scroll）
 		self.history.history = denoise_steps(self.history.history)
+		self._prepend_initial_navigation()  # 起始页 navigate 作 history[0]
 		if mark_done:
 			now = time.time()
+			next_step = len(self.history.history)  # denoise + 初始 navigate 后的下一个序号（避免跳号）
 			self.history.history.append(AgentHistory(
-				step_number=self._step,
+				step_number=next_step,
 				model_output={"actions": [{"name": "done", "params": {"text": done_text, "success": success}}]},
 				result=[],
 				state_summary=None,
 				interacted_element=[None],
-				metadata=StepMetadata(step_start_time=now, step_end_time=now, step_number=self._step),
+				metadata=StepMetadata(step_start_time=now, step_end_time=now, step_number=next_step),
 			))
 		path = resolve_rerun_path(self.rerun_history_dir, file_path)
 		self.history.save_to_file(path, action_registry_version=self.registry_version)

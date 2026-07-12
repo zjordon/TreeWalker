@@ -59,11 +59,11 @@ async def test_server_start_event_stop(tmp_path, monkeypatch):
 		resp = await client.post("/event", json={"type": "hover"})
 		assert (await resp.json())["ok"] is False
 
-		# stop → 落盘（click + done = 2 步）
+		# stop → 落盘（初始 navigate + click + done = 3 步）
 		resp = await client.post("/stop", json={"mark_done": True, "done_text": "done"})
 		data = await resp.json()
 		assert data["ok"] is True
-		assert data["steps"] == 2
+		assert data["steps"] == 3
 		assert browser.stopped
 	finally:
 		await client.close()

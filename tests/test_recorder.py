@@ -124,9 +124,10 @@ async def test_stop_writes_file_and_can_reload(tmp_path, patch_projection):
 	assert path == tmp_path / "out.json"
 
 	loaded = AgentHistoryList.load_from_file(path)
-	assert len(loaded.history) == 2  # click + done
-	assert loaded.history[0].model_output["actions"][0]["name"] == "click"
-	assert loaded.history[1].model_output["actions"][0]["name"] == "done"
+	assert len(loaded.history) == 3  # 初始 navigate + click + done
+	assert loaded.history[0].model_output["actions"][0]["name"] == "navigate"
+	assert loaded.history[1].model_output["actions"][0]["name"] == "click"
+	assert loaded.history[2].model_output["actions"][0]["name"] == "done"
 	assert loaded.action_registry_version == "v1"
 
 
@@ -189,8 +190,9 @@ async def test_stop_applies_denoise_to_history(tmp_path, patch_projection):
 
 	path = await rec.stop(file_path="out.json")
 	loaded = AgentHistoryList.load_from_file(path)
-	assert len(loaded.history) == 1  # 合并后 1 步（无 done）
-	assert loaded.history[0].model_output["actions"][0]["params"]["text"] == "ab"  # 取最终值
+	assert len(loaded.history) == 2  # 初始 navigate + 合并后的 input_text
+	assert loaded.history[0].model_output["actions"][0]["name"] == "navigate"
+	assert loaded.history[1].model_output["actions"][0]["params"]["text"] == "ab"  # 取最终值
 
 
 # ── select_http_target：target 选择纯函数 ───────────────────────────────
@@ -234,3 +236,41 @@ def test_select_http_target_ignores_non_page_types():
 		{"type": "page", "url": "https://x.com", "targetId": "ok"},
 	]
 	assert select_http_target(infos) == "ok"
+
+
+# ── recorder.start 插初始 navigate（仿 Browser-BC load 事件）──
+
+
+@pytest.mark.asyncio
+async def test_start_does_not_insert_initial_navigate(tmp_path):
+	"""初始 navigate 在 stop 落盘前插（_prepend_initial_navigation），start 不插。"""
+	rec = Recorder(FakeBrowser(), rerun_history_dir=str(tmp_path))
+	await rec.start()
+	assert len(rec.history.history) == 0
+
+
+@pytest.mark.asyncio
+async def test_stop_prepends_initial_navigation(tmp_path, patch_projection):
+	"""stop 落盘前用 history[0].state_summary.url 插起始页 navigate 作 history[0]。"""
+	browser = FakeBrowser(selector_map={5: SimpleNamespace(xpath="html/body/btn")}, url="https://start.page")
+	rec = Recorder(browser, rerun_history_dir=str(tmp_path))
+	await rec.start()
+	await rec.handle_event({"type": "click", "xpath": "html/body/btn"})
+	await rec.stop(file_path="out.json")
+	# 初始 navigate（用 click 的 state_summary.url）+ click
+	assert len(rec.history.history) == 2
+	assert rec.history.history[0].model_output["actions"][0]["name"] == "navigate"
+	assert rec.history.history[0].model_output["actions"][0]["params"]["url"] == "https://start.page"
+	assert rec.history.history[1].model_output["actions"][0]["name"] == "click"
+
+
+@pytest.mark.asyncio
+async def test_stop_done_step_number_continuous(tmp_path, patch_projection):
+	"""stop 追加的 done 用 denoise+初始navigate 后的 len 作 step_number，不跳号。"""
+	browser = FakeBrowser(selector_map={5: SimpleNamespace(xpath="html/body/btn")}, url="https://x.com")
+	rec = Recorder(browser, rerun_history_dir=str(tmp_path))
+	await rec.start()
+	await rec.handle_event({"type": "click", "xpath": "html/body/btn"})
+	await rec.stop(file_path="out.json", mark_done=True, done_text="完成")
+	nums = [s.step_number for s in rec.history.history]
+	assert nums == list(range(len(nums)))  # 0..N-1 连续，无跳号
