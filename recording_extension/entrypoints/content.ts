@@ -1,9 +1,10 @@
-// Content script —— 装配 action 采集器，把 DOM 事件归一化后发给 background。
+// Content script —— 装配 action 采集器 + 副作用观察器，把 DOM 事件/信号归一化后发给 background。
 // allFrames: true 穿透 iframe（MVP）；runAt: document_idle 不阻塞首屏。
 
 import { installActionRecorder } from '../capture/action-recorder';
 import { installNavigationRecorder } from '../capture/navigation-recorder';
-import type { RecorderEvent } from '../shared/types';
+import { installSideEffectObserver } from '../capture/side-effect-observer';
+import type { RecorderEvent, SignalEvent } from '../shared/types';
 
 export default defineContentScript({
   matches: ['<all_urls>'],
@@ -21,12 +22,20 @@ export default defineContentScript({
       });
     };
 
+    const sendSignal = (signal: SignalEvent) => {
+      chrome.runtime.sendMessage({ kind: 'signal', signal: { ...signal, url: location.href } });
+    };
+
     const install = (): (() => void) => {
-      const u1 = installActionRecorder({ sendEvent });
+      // 先建副作用观察器，把它的 markAction 作 onAction 传给 action 采集器——
+      // 每发一个动作就开启 1s 观察窗口，捕获该动作引发的 modal/dropdown 打开。
+      const se = installSideEffectObserver({ sendSignal });
+      const u1 = installActionRecorder({ sendEvent, onAction: se.markAction });
       const u2 = installNavigationRecorder({ sendEvent });
       return () => {
         u1();
         u2();
+        se.uninstall();
       };
     };
 

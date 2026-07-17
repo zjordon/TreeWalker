@@ -29,6 +29,7 @@ from tree_walker.agent.views import (
     RerunSummaryAction,
 )
 from tree_walker.prompts.rerun_summary import get_rerun_summary_prompt
+from tree_walker.recorder.locator import normalize_xpath
 
 if TYPE_CHECKING:
     from tree_walker.browser.session import BrowserSession
@@ -46,6 +47,7 @@ class MatchLevel(Enum):
     XPATH = 3      # x_path 字符串相等
     AX_NAME = 4    # node_name + ax_name 相等（动态菜单/SPA 救星）
     ATTRIBUTE = 5  # node_name + name/id/aria-label 相等（兜底）
+    CLASS = 6      # node_name + class token 超集（最末兜底：无 name/id/aria-label 的 SPA 按钮）
 
 
 def _substitute_in_dict(data: dict[str, Any], replacements: dict[str, str]) -> int:
@@ -112,13 +114,26 @@ def _elem_bounds(elem: Any) -> Any:
 
 
 def _nearest_idx(hist: dict[str, Any], candidates: list[tuple[int, Any]]) -> int:
-    """同一匹配级有多个候选时，按「录制 bounds 中心就近」选一个；无 bounds 退回第一个。
+    """同一匹配级有多个候选时选一个。
 
-    消除哈希碰撞（如多个相似下拉触发器同 ``element_hash``）时「按迭代顺序取到错误元素」
-    的问题——多个同款元素里，离录制时位置最近的那个最可能是正确目标。
+    优先级：
+    1. **xpath 精确匹配**——区分「指纹碰撞但 xpath 不同」的同款元素（典型：抖音封面编辑器
+       横版/竖版上传区 ``semi-upload-drag-area-icon`` 同 ``element_hash``，但 xpath div[2] vs div[3]；
+       横版/竖版步骤 tab 同 ``step-dXVbPX``）。仅靠 bounds 就近无法区分（切 tab 后两者同屏位），
+       xpath 是录制时唯一定位线索。
+    2. **录制 bounds 中心就近**——消除哈希碰撞时「按迭代顺序取到错误元素」；无 bounds 退回第一个。
     """
     if len(candidates) == 1:
         return candidates[0][0]
+    # 优先：录制 xpath 唯一命中某个候选——区分「指纹碰撞但 xpath 不同」的同款元素
+    # （典型：抖音封面编辑器横/竖版上传区 semi-upload-drag-area-icon 同 element_hash，
+    # xpath div[2] vs div[3]；横/竖版步骤 tab 同 step-dXVbPX）。仅当**恰好一个**候选 xpath
+    # 匹配时才采用——全部匹配（真·无区分碰撞）或都不匹配（xpath 漂移）则退回 bounds 就近。
+    h_xpath = hist.get("x_path")
+    if h_xpath:
+        xpath_hits = [idx for idx, elem in candidates if getattr(elem, "xpath", None) == h_xpath]
+        if len(xpath_hits) == 1:
+            return xpath_hits[0]
     rc = _bounds_center(hist.get("bounds"))
     if rc is None:
         return candidates[0][0]
@@ -131,6 +146,10 @@ def _nearest_idx(hist: dict[str, Any], candidates: list[tuple[int, Any]]) -> int
         if d < best_d:
             best_d, best_idx = d, idx
     return best_idx
+
+
+_UPLOAD_VIDEO_EXTS = frozenset({"mp4", "mov", "avi", "mkv", "webm", "flv", "wmv", "m4v", "ts", "3gp", "mpeg", "mpg"})
+_UPLOAD_IMAGE_EXTS = frozenset({"png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "svg", "heic"})
 
 
 def resolve_rerun_path(rerun_history_dir: str, file_path: str | Path) -> Path:
@@ -395,9 +414,11 @@ class RerunMixin:
             return "冗余重试（同元素同动作且上步已成功）"
         # 需 index 的 action 但无 index 且无 interacted_element（录制定位失败的噪声 click/input）
         # → 跳过：回放 _action_click 等无 index 必报错，是无意义噪声步（recorded.json 里
-        # click {} interacted=null 这类）
+        # click {} interacted=null 这类）。upload_file 例外——file input 隐藏 1×1、xpath 常失配，
+        # 录制侧 locate 易失败致 interacted 缺失，但回放时可从 selector_map 兜底找 file input
+        # （见 _execute_history_step 的 upload_file 兜底），故不在此跳过。
         first = next((a for a in actions if isinstance(a, dict) and a.get("name")), None)
-        if first and first.get("name") in ("click", "input_text", "select_dropdown", "upload_file"):
+        if first and first.get("name") in ("click", "input_text", "select_dropdown"):
             fp = first.get("params") or {}
             if fp.get("index") is None and fp.get("element_id") is None:
                 ie = item.interacted_element or []
@@ -441,11 +462,36 @@ class RerunMixin:
                 if hist_elem and has_index:
                     updated = self._update_action_indices(hist_elem, action, selector_map)
                     if updated is None:
-                        raise ValueError(self._format_match_failure(hist_elem, i, selector_map))
-                    name = updated.get("name", name)
-                    params = dict(updated.get("params", {}))
+                        if name == "upload_file":
+                            fb = self._resolve_file_input_by_accept(
+                                state, raw_params.get("path", ""),
+                                raw_params.get("xpath", ""), raw_params.get("accept", ""),
+                            )
+                            if fb is not None:
+                                params = dict(raw_params)
+                                params["index"] = fb
+                                logger.info("upload_file 匹配失败，按 accept 解析 file input index=%s", fb)
+                            else:
+                                raise ValueError(self._format_match_failure(hist_elem, i, selector_map))
+                        else:
+                            raise ValueError(self._format_match_failure(hist_elem, i, selector_map))
+                    else:
+                        name = updated.get("name", name)
+                        params = dict(updated.get("params", {}))
                 else:
                     params = dict(action.get("params", {}))
+                    if (
+                        name == "upload_file"
+                        and params.get("index") is None
+                        and params.get("element_id") is None
+                    ):
+                        fb = self._resolve_file_input_by_accept(
+                            state, params.get("path", ""),
+                            params.get("xpath", ""), params.get("accept", ""),
+                        )
+                        if fb is not None:
+                            params["index"] = fb
+                            logger.info("upload_file 无指纹，按 accept 解析 file input index=%s", fb)
 
             logger.info("▶️  %s: %s", name, _format_action_params(params))
             result = await self._exec_one(name, params, state)
@@ -579,7 +625,65 @@ class RerunMixin:
                     ]
                     if matches:
                         return _nearest_idx(hist, matches), MatchLevel.ATTRIBUTE
+        # Level 6: CLASS（最末兜底）
+        # 适用 SPA 按钮/触发器只有 CSS 类、无 name/id/aria-label 的场景（如抖音「确定」
+        # class="semi-button semi-button-primary btn-xtdEbg"）。要求候选 class token ⊇ 录制
+        # token（顺序无关、可多不可少，容忍候选额外加的状态类），多候选按 bounds 就近。
+        # 仅作最末兜底（前 5 级全失败才到这），跨构建的 CSS-module 哈希后缀漂移会失效。
+        h_class = (h_attrs.get("class") or "").strip() if h_attrs else ""
+        if h_class:
+            want_tokens = {t for t in h_class.split() if t}
+            if want_tokens:
+                matches = []
+                for idx, e in selector_map.items():
+                    if e.node_name.lower() != h_name:
+                        continue
+                    e_cls = (e.attributes or {}).get("class") or ""
+                    if want_tokens.issubset({t for t in e_cls.split() if t}):
+                        matches.append((idx, e))
+                if matches:
+                    return _nearest_idx(hist, matches), MatchLevel.CLASS
         return None
+
+    def _resolve_file_input_by_accept(
+        self, state: Any, path: str, xpath_hint: str = "", accept_hint: str = "",
+    ) -> int | None:
+        """按 accept(文件类型) + xpath 从当前页 selector_map 解析 file input 的 index。
+
+        upload_file 在录制端不 get_state 定位（B 方案：选完文件抖音立即 /upload→/post/video
+        跳转，get_state 会抓到跳转后页面致 file input 错位），改存 accept+xpath 签名（change
+        瞬间扩展捕获）。重放时页面已稳定、file input 在 selector_map，按签名解析：
+        - kind 优先取自 ``accept_hint``（扩展捕获的真实 accept），否则按 path 扩展名
+          （mp4→video、png→image）推断；
+        - 同 accept 多个（横/竖封面）→ ``xpath_hint`` normalize 后唯一命中区分。
+        无匹配返回 None。
+        """
+        sm = state.dom_state.selector_map if state and state.dom_state else {}
+        if accept_hint:
+            ah = accept_hint.lower()
+            kind = "video" if "video" in ah else ("image" if "image" in ah else None)
+        else:
+            ext = Path(path or "").suffix.lower().lstrip(".")
+            kind = "video" if ext in _UPLOAD_VIDEO_EXTS else ("image" if ext in _UPLOAD_IMAGE_EXTS else None)
+        candidates: list[tuple[int, Any]] = []
+        for idx, node in sm.items():
+            attrs = getattr(node, "attributes", None) or {}
+            if (getattr(node, "node_name", "") or "").upper() != "INPUT" \
+                    or attrs.get("type", "").lower() != "file":
+                continue
+            if kind is None or kind in (attrs.get("accept", "") or "").lower():
+                candidates.append((idx, node))
+        if not candidates:
+            return None
+        # 同 accept 多个 → xpath_hint 唯一命中区分
+        if xpath_hint and len(candidates) > 1:
+            want = normalize_xpath(xpath_hint)
+            if want:
+                hits = [idx for idx, node in candidates
+                        if normalize_xpath(getattr(node, "xpath", "")) == want]
+                if len(hits) == 1:
+                    return hits[0]
+        return candidates[0][0]
 
     def _update_action_indices(
         self,
@@ -647,7 +751,7 @@ class RerunMixin:
             f"xpath={hist_elem.get('x_path')} ax_name={hist_elem.get('ax_name')!r}. "
             f"Page has {len(selector_map)} interactive elements. "
             f"Same-<{name}> candidates: {cand_block}. "
-            f"Tried: EXACT -> STABLE -> XPATH -> AX_NAME -> ATTRIBUTE"
+            f"Tried: EXACT -> STABLE -> XPATH -> AX_NAME -> ATTRIBUTE -> CLASS"
         )
 
     # ── 跳过/重试辅助 ──────────────────────────────────────────────────

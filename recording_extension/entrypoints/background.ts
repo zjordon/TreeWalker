@@ -1,13 +1,14 @@
 // Background service worker —— 录制中枢：维护录制状态、转发事件到后端、广播状态给 content。
 // MV3 友好：与后端用无状态 HTTP（SW 按需唤醒），不持有 WebSocket 长连接。
 
-import { postEvent, postStart, postStop } from '../shared/backend';
-import type { RecorderEvent } from '../shared/types';
+import { postEvent, postSignal, postStart, postStop } from '../shared/backend';
+import type { RecorderEvent, SignalEvent } from '../shared/types';
 
 const STATE_KEY = 'tw_recording_state';
 
 type Message =
   | { kind: 'event'; event: RecorderEvent }
+  | { kind: 'signal'; signal: SignalEvent }
   | { kind: 'query-state' }
   | { kind: 'start-recording' }
   | { kind: 'stop-recording' };
@@ -44,6 +45,13 @@ export default defineBackground(() => {
           const { recording } = await getState();
           console.log('[TW Recorder] bg recv event type=%s recording=%s', msg.event.type, recording);
           if (recording) await postEvent(msg.event);
+          sendResponse({ ok: true });
+          return;
+        }
+        case 'signal': {
+          // SideEffectObserver 检测到的 modal/dropdown 信号 → 后端 attach_signal
+          const { recording } = await getState();
+          if (recording) await postSignal(msg.signal);
           sendResponse({ ok: true });
           return;
         }

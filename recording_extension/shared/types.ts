@@ -48,9 +48,19 @@ export interface RecorderEvent {
   ts: number;
 }
 
+/** 副作用信号（SideEffectObserver 检测到动作引发的 DOM 变化，POST 后端 /signal）。
+ *  后端 attach_signal 把它附到最近动作的 signals 列表，供翻译规则判断意图
+ *  （如 modal_opened 让 rule_file_upload 确认前置 click 是编辑器触发器，不吸收）。 */
+export interface SignalEvent {
+  type: 'modal_opened' | 'dropdown_opened';
+  selector: string;
+  ts: number;
+}
+
 /** content → background 的消息。 */
 export type ContentMessage =
   | { kind: 'event'; event: RecorderEvent }
+  | { kind: 'signal'; signal: SignalEvent }
   | { kind: 'query-state' };
 
 /** background → content 的录制状态广播。 */

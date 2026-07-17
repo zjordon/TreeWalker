@@ -1,17 +1,26 @@
-"""录制核心：扩展事件 → CDP 算指纹 → 拼 AgentHistory → 落盘。
+"""录制核心：扩展事件 → 翻译管线 → CDP 算指纹 → Recording → flatten → 落盘。
 
-``Recorder`` 连接用户浏览器（remote-debugging-port CDP），每收到一条扩展事件就：
-``get_state`` 拉当前页 → ``locator`` 按 xpath 在 ``selector_map`` 定位节点 →
-``DOMInteractedElement.load_from_enhanced_dom_tree`` 算指纹投影 → ``event_mapper`` 映射成
-action → 拼一条 ``AgentHistory`` 追加。停止时经 ``resolve_rerun_path`` 落盘到 ``rerun-history/``。
+架构（见 ``docs/user_recording/redesign.md`` / ``redesign-impl-plan.md``）：
 
-指纹（``element_hash``/``stable_hash``）由 TreeWalker 自身代码算（``load_from_enhanced_dom_tree``
-调 ``hash(node)`` / ``node.compute_stable_hash()``），录制侧与重放侧同源 → EXACT/STABLE
-匹配天然有效（这就是「全对齐」路线的核心）。
+    扩展事件 → handle_event
+                 ├─ Stage1 translate_event（映射 + 连续 input 聚合 + 状态机）
+                 ├─ 实时 locate + 指纹投影（modal DOM 活着时算，存 ActionRecord）
+                 └─ → Recording.actions
+    /signal → attach_signal（modal/dropdown 信号附到最近动作）
+    stop → Stage3 apply_rules（signal 感知去噪）→ flatten → AgentHistoryList → 落盘
+
+``Recorder`` 连接用户浏览器（remote-debugging-port CDP）。指纹（``element_hash``/``stable_hash``）
+由 TreeWalker 自身代码算（``DOMInteractedElement.load_from_enhanced_dom_tree``），录制侧与重放侧
+同源 → EXACT/STABLE 匹配天然有效。
+
+**定位 + 指纹在事件到达时实时做**（而非落盘时），因为 modal 打开时 DOM 是活的——stop 时
+modal 已关、DOM 里没了，落盘再 locate 必失败。结果存进 ``ActionRecord.interacted_element`` 与
+``params['index']``，``flatten`` 纯 reshape 不再二次定位。
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -22,10 +31,38 @@ from tree_walker.agent.rerun import resolve_rerun_path
 from tree_walker.agent.views import AgentHistory, AgentHistoryList, StepMetadata
 from tree_walker.browser.session import BrowserSession
 from tree_walker.browser.views import DOMInteractedElement
-from tree_walker.recorder.event_mapper import denoise_steps, map_event, needs_target
-from tree_walker.recorder.locator import locate_by_ref, locate_by_xpath
+from tree_walker.recorder.event_mapper import needs_target
+from tree_walker.recorder.flatten import flatten
+from tree_walker.recorder.locator import locate_by_ref
+from tree_walker.recorder.models import ActionRecord, Recording, RecordingState, SignalKind, signal_from_payload
+from tree_walker.recorder.rules import apply_rules
+from tree_walker.recorder.translation import translate_event
 
 logger = logging.getLogger(__name__)
+
+# /signal 来的副作用信号附到最近动作的时间窗（秒）；超窗视为陈旧，丢弃。
+_SIGNAL_WINDOW_S = 2.0
+# 首次定位失败后，重试前等页面渲染的延时（秒），递增。SPA 元素常在事件后几百 ms 才出现
+# （video file input 瞬态、modal 关闭后才渲染的按钮等）；录到无指纹噪声步多为 get_state
+# 抢在元素渲染前/页面过渡态——等几档重新 get_state + 定位救回。两档兼顾「渲染慢」与
+# 「modal/动画收尾」。
+_LOCATE_RETRY_DELAYS = (0.6, 1.5)
+# upload_file 后追加的 wait 秒数（对齐 agent 经验值：上传后页面处理需要时间，否则下一步
+# 如「打开封面编辑器」会因视频未处理完而失败）。按文件类型给——视频更大更慢。
+_UPLOAD_WAIT_SECONDS = {"video": 5, "image": 3}
+
+_VIDEO_EXTS = frozenset({"mp4", "mov", "avi", "mkv", "webm", "flv", "wmv", "m4v", "ts", "3gp", "mpeg", "mpg"})
+_IMAGE_EXTS = frozenset({"png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "svg", "heic"})
+
+
+def _file_kind(path: str) -> str | None:
+	"""文件扩展名 → ``"video"`` / ``"image"`` / ``None``（供 file-input 兜底按 accept 匹配）。"""
+	ext = os.path.splitext(path or "")[1].lower().lstrip(".")
+	if ext in _VIDEO_EXTS:
+		return "video"
+	if ext in _IMAGE_EXTS:
+		return "image"
+	return None
 
 
 def select_http_target(
@@ -58,7 +95,7 @@ def select_http_target(
 
 
 class Recorder:
-	"""录制用户操作 → ``AgentHistory``。
+	"""录制用户操作 → ``AgentHistory``（经 ``Recording`` 内部模型）。
 
 	依赖注入 ``browser``（``BrowserSession`` 或任何带 ``start``/``stop``/``get_state`` 的对象，
 	便于测试 mock）。
@@ -76,64 +113,47 @@ class Recorder:
 		# upload_file 约定目录：空 → <rerun_history_dir>/uploads（扩展只能拿文件名）
 		self.upload_dir = upload_dir or os.path.join(rerun_history_dir, "uploads")
 		self.registry_version = registry_version
+		# 内部模型：事件 → ActionRecord 累积于此（承载 signal + 状态机）
+		self.recording = Recording(state=RecordingState())
+		# 落盘格式：stop 时 flatten 赋值；server.py 的 /stop 响应读 len(self.history.history)
 		self.history: AgentHistoryList = AgentHistoryList()
-		self._step = 0
 		self._recording = False
 
 	async def start(self) -> None:
-		"""开始录制：连浏览器，初始化空历史。"""
+		"""开始录制：连浏览器，初始化空录制。"""
 		await self.browser.start()
 		await self._disable_file_chooser_intercept()  # 让原生文件选择框正常弹出
 		self._recording = True
+		self.recording = Recording(state=RecordingState())
 		self.history = AgentHistoryList()
-		self._step = 0
 		logger.info("录制开始")
 
-	def _prepend_initial_navigation(self) -> None:
-		"""落盘前在 history[0] 插一条起始页 navigate（仿 Browser-BC 的 load 事件）。
+	async def handle_event(self, event: dict[str, Any]) -> Any:
+		"""处理一条扩展事件 → 映射成 ``ActionRecord`` 追加；不可映射/已聚合返回 None。
 
-		用 denoise 后 ``history[0].state_summary.url``——第一条事件到达时 ``_ensure_target``
-		已把 BrowserSession attach 修正到用户操作的 http page，URL 真实可靠。**不在 start 时
-		插**：start 时 attach 的可能是 Chrome new-tab-page 等非用户页（``get_current_url`` 会
-		拿到错误 URL）。插入后重排 step_number。无 history 或 url 为空则跳过。
+		实时做定位 + 指纹投影（modal DOM 活着时），结果填进 ``ActionRecord.params['index']``
+		与 ``interacted_element``。连续同框 ``input_text`` 由 ``translate_event`` 聚合（取最终值，
+		返回 None 不追加）。返回追加的 ``ActionRecord`` 或 None。
 		"""
-		if not self.history.history:
-			return
-		first_url = (self.history.history[0].state_summary or {}).get("url")
-		if not first_url:
-			return
-		now = time.time()
-		self.history.history.insert(0, AgentHistory(
-			step_number=0,
-			model_output={"actions": [{"name": "navigate", "params": {"url": first_url, "new_tab": False}}]},
-			result=[],
-			state_summary={"url": first_url, "title": "", "duration": 0.0},
-			interacted_element=None,
-			metadata=StepMetadata(step_start_time=now, step_end_time=now, step_number=0),
-		))
-		for i, s in enumerate(self.history.history):
-			s.step_number = i
-			if s.metadata is not None:
-				s.metadata.step_number = i
-
-	async def handle_event(self, event: dict[str, Any]) -> AgentHistory | None:
-		"""处理一条扩展事件，拼一条 ``AgentHistory`` 追加；不可映射事件返回 None。"""
 		if not self._recording:
 			return None
-		mapped = map_event(event)
-		if mapped is None:
-			logger.debug("忽略不可映射事件: %s", event.get("type"))
+		# Stage 1：事件 → ActionRecord（含聚合判定 + 状态机更新）。聚合/不可映射 → None。
+		action = translate_event(event, self.recording)
+		if action is None:
+			logger.debug("忽略事件（不可映射或已聚合进前一步）: %s", event.get("type"))
 			return None
-		action_name, params = mapped
+
 		raw_params = event.get("params") or {}
 
 		# tab 动作：扩展发目标 tab 的 url，后端解析成 CDP targetId 后4位（重放侧期望格式）
-		if action_name in ("switch_tab", "close_tab"):
-			params["tab_id"] = await self._resolve_tab_id(raw_params.get("url"))
+		if action.action_name in ("switch_tab", "close_tab"):
+			action.params["tab_id"] = await self._resolve_tab_id(raw_params.get("url"))
 
 		# upload_file：扩展只发文件名（浏览器安全限制），拼约定目录
-		if action_name == "upload_file":
-			params["path"] = self._resolve_upload_path(params.get("path") or raw_params.get("path") or "")
+		if action.action_name == "upload_file":
+			action.params["path"] = self._resolve_upload_path(
+				action.params.get("path") or raw_params.get("path") or "",
+			)
 
 		# 确保 BrowserSession 指向用户操作的 http page（而非 popup/扩展页）
 		await self._ensure_target(event.get("url"))
@@ -141,50 +161,101 @@ class Recorder:
 		state = await self.browser.get_state(include_screenshot=False)
 		selector_map = state.dom_state.selector_map if state and state.dom_state else {}
 
-		interacted: list[dict[str, Any] | None]
-		if needs_target(action_name):
-			located = locate_by_ref(
-				{
-					"xpath": event.get("xpath"),
-					"rect": event.get("rect"),
-					"tag": event.get("tag"),
-					"id": event.get("id"),
-					"name": event.get("name"),
-					"ariaLabel": event.get("ariaLabel"),
-					"role": event.get("role"),
-				},
-				selector_map,
-			)
+		# 实时定位 + 指纹投影（modal 打开时 DOM 活着，此时算才准）。
+		# upload_file 不算指纹（导航竞态 + Semi-UI 上传后重建 input，录制端算指纹结构性不可达——
+		# 见 docs/user_recording/recorder-timing-solutions.md）：存 accept+xpath 签名，重放端按 accept
+		# 解析（_resolve_file_input_by_accept）。click/input/select_dropdown 走 locate_by_ref
+		# （xpath→属性→RECT），支持重试（modal 后渲染的按钮等，首次 get_state 抢前）。
+		if action.action_name == "upload_file":
+			action.params["accept"] = action.params.get("accept") or ""
+			action.params["xpath"] = event.get("xpath") or ""
+			locate = None
+		elif needs_target(action.action_name):
+			ref_dict = action.element_ref.to_ref_dict() if action.element_ref is not None else {}
+			locate = lambda sm: locate_by_ref(ref_dict, sm)
+		else:
+			locate = None
+
+		if locate is not None:
+			located = locate(selector_map)
+			retried = False
+			if located is None:
+				# 重试：等页面渲染/动画收尾，重新 get_state + 定位
+				for delay in _LOCATE_RETRY_DELAYS:
+					await asyncio.sleep(delay)
+					state = await self.browser.get_state(include_screenshot=False)
+					selector_map = state.dom_state.selector_map if state and state.dom_state else {}
+					located = locate(selector_map)
+					retried = True
+					if located is not None:
+						break
 			if located is None:
 				logger.warning(
-					"定位失败 action=%s xpath=%s（该步 interacted_element 置空）",
-					action_name, event.get("xpath"),
+					"定位失败 action=%s xpath=%s tag=%s rect=%s%s（该步 interacted_element 置空；记 locate_miss）",
+					action.action_name, event.get("xpath"), event.get("tag"), event.get("rect"),
+					"（重试后仍失败）" if retried else "",
 				)
-				interacted = [None]
+				action.interacted_element = [None]
+				# 诊断落盘：定位未命中时，记下事件线索 + map 规模，便于事后分析
+				action.locate_miss = {
+					"xpath": event.get("xpath"),
+					"tag": event.get("tag"),
+					"name": event.get("name"),
+					"id": event.get("id"),
+					"ariaLabel": event.get("ariaLabel"),
+					"role": event.get("role"),
+					"rect": event.get("rect"),
+					"path": action.params.get("path") if action.action_name == "upload_file" else None,
+					"selector_map_size": len(selector_map),
+					"retried": retried,
+				}
 			else:
 				index, node = located
-				params = {**params, "index": index}
-				interacted = [DOMInteractedElement.load_from_enhanced_dom_tree(node).to_dict()]
+				action.params["index"] = index
+				action.interacted_element = [DOMInteractedElement.load_from_enhanced_dom_tree(node).to_dict()]
 		else:
-			interacted = []
+			# 无定位（upload_file 不 get_state 定位 / navigate 等无 target 动作）。
+			# upload_file 置 [None]（有目标但重放端解析）；其余置 []（无 target）。
+			action.interacted_element = [None] if action.action_name == "upload_file" else []
 
-		now = time.time()
-		step = AgentHistory(
-			step_number=self._step,
-			model_output={"actions": [{"name": action_name, "params": params}]},
-			result=[],
-			state_summary={
-				"url": state.url if state else "",
-				"title": state.title if state else "",
-				"duration": 0.0,
-			},
-			interacted_element=interacted if interacted else None,
-			metadata=StepMetadata(step_start_time=now, step_end_time=now, step_number=self._step),
-		)
-		self.history.history.append(step)
-		self._step += 1
-		logger.info("录进步 %d: %s", step.step_number, action_name)
-		return step
+		action.page_url = state.url if state else ""
+		action.page_title = state.title if state else ""
+		# upload_file 后追加 wait（上传耗时，给页面处理时间；对齐 agent 经验值）。视频 5s 图片 3s。
+		if action.action_name == "upload_file":
+			seconds = _UPLOAD_WAIT_SECONDS.get(_file_kind(action.params.get("path", "")), 3)
+			self.recording.actions.append(ActionRecord(
+				action_name="wait",
+				params={"seconds": seconds},
+				element_ref=None,
+				timestamp=action.timestamp,
+				interacted_element=[],
+				page_url=action.page_url,
+				page_title=action.page_title,
+			))
+			logger.info("录进步 %d: wait（upload 后 %ds）", len(self.recording.actions) - 1, seconds)
+		# translate_event 已把 action 追加进 recording.actions；此处填的字段原地生效
+		logger.info("录进步 %d: %s", len(self.recording.actions) - 1, action.action_name)
+		return action
+
+	def attach_signal(self, payload: dict[str, Any]) -> bool:
+		"""把扩展 SideEffectObserver 的信号（modal_opened/dropdown_opened）附到最近动作。
+
+		仅当录制中、有动作、且信号时间距最近动作 ≤ ``_SIGNAL_WINDOW_S`` 时附加（防陈旧信号
+		误附）。``MODAL_OPENED`` 同时更新 ``state.pending_modal``。返回是否成功附加。
+		"""
+		if not self._recording or not self.recording.actions:
+			return False
+		sig = signal_from_payload(payload)
+		if sig is None:
+			return False
+		last = self.recording.actions[-1]
+		if sig.timestamp > 0 and last.timestamp > 0 and abs(sig.timestamp - last.timestamp) > _SIGNAL_WINDOW_S:
+			return False
+		last.signals.append(sig)
+		if sig.kind == SignalKind.MODAL_OPENED:
+			self.recording.state.pending_modal = sig.detail.get("selector")
+		logger.info("附信号 %s 到步 %d", sig.kind.value, len(self.recording.actions) - 1)
+		return True
 
 	async def _ensure_target(self, event_url: str | None) -> None:
 		"""确保 BrowserSession 指向用户操作的 http page target（非 popup/扩展页）。
@@ -256,6 +327,36 @@ class Recorder:
 		name = os.path.basename(filename or "")
 		return os.path.join(self.upload_dir, name) if name else ""
 
+	def _prepend_initial_navigation(self) -> None:
+		"""落盘前在 history[0] 插一条起始页 navigate（仿 Browser-BC 的 load 事件）。
+
+		用 flatten 后 ``history[0].state_summary.url``。**不在 start 时插**：start 时 attach
+		的可能是 Chrome new-tab-page 等非用户页。首步已是 navigate（扩展 navigation-recorder
+		发的）→ 不补，避免回放重复导航。插入后重排 step_number。无 history 或 url 为空则跳过。
+		"""
+		if not self.history.history:
+			return
+		# 首步已是 navigate（扩展 navigation-recorder 发的）→ 不补，避免回放重复导航
+		first_acts = (self.history.history[0].model_output or {}).get("actions") or []
+		if first_acts and first_acts[0].get("name") == "navigate":
+			return
+		first_url = (self.history.history[0].state_summary or {}).get("url")
+		if not first_url:
+			return
+		now = time.time()
+		self.history.history.insert(0, AgentHistory(
+			step_number=0,
+			model_output={"actions": [{"name": "navigate", "params": {"url": first_url, "new_tab": False}}]},
+			result=[],
+			state_summary={"url": first_url, "title": "", "duration": 0.0},
+			interacted_element=None,
+			metadata=StepMetadata(step_start_time=now, step_end_time=now, step_number=0),
+		))
+		for i, s in enumerate(self.history.history):
+			s.step_number = i
+			if s.metadata is not None:
+				s.metadata.step_number = i
+
 	async def stop(
 		self,
 		file_path: str = "recorded.json",
@@ -263,17 +364,19 @@ class Recorder:
 		done_text: str = "",
 		success: bool = True,
 	) -> Path:
-		"""停止录制，可选补一条 ``done``，落盘到 ``rerun_history_dir/file_path``。
+		"""停止录制：跑翻译规则 → flatten 成 ``AgentHistoryList`` → 可选补 ``done`` → 落盘。
 
 		``file_path`` 必须相对（``resolve_rerun_path`` 拒绝绝对路径 / ``..`` 越界）。
 		"""
 		self._recording = False
-		# 落盘前去噪（合并相邻 input_text / 折叠短时重复 click / 合并同方向 scroll）
-		self.history.history = denoise_steps(self.history.history)
+		# Stage 3：signal 感知去噪（导航关联 / upload 去噪 / click 折叠 / input·scroll 合并）
+		self.recording.actions = apply_rules(self.recording.actions)
+		# 落盘 reshape：Recording → AgentHistoryList（纯映射，不再二次定位）
+		self.history = flatten(self.recording)
 		self._prepend_initial_navigation()  # 起始页 navigate 作 history[0]
 		if mark_done:
 			now = time.time()
-			next_step = len(self.history.history)  # denoise + 初始 navigate 后的下一个序号（避免跳号）
+			next_step = len(self.history.history)  # flatten + 初始 navigate 后的下一个序号（避免跳号）
 			self.history.history.append(AgentHistory(
 				step_number=next_step,
 				model_output={"actions": [{"name": "done", "params": {"text": done_text, "success": success}}]},

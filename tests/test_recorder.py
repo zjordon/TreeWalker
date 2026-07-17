@@ -1,7 +1,7 @@
-"""recorder 单元测试：事件 → 定位 → 拼接 → 落盘。
+"""recorder 单元测试：事件 → 翻译管线 → 定位 → Recording → flatten → 落盘。
 
 用 FakeBrowser（带 start/stop/get_state）+ monkeypatch DOMInteractedElement.load_from_enhanced_dom_tree，
-聚焦 Recorder 的「事件→定位→拼接→落盘」逻辑，不依赖真 CDP/DOMInteractedElement 内部。
+聚焦 Recorder 的「事件→翻译→定位→落盘」逻辑，不依赖真 CDP/DOMInteractedElement 内部。
 """
 
 from types import SimpleNamespace
@@ -10,6 +10,7 @@ import pytest
 
 from tree_walker.agent.views import AgentHistoryList
 from tree_walker.recorder import recorder as rec_mod
+from tree_walker.recorder.models import SignalKind
 from tree_walker.recorder.recorder import Recorder, select_http_target
 
 
@@ -68,13 +69,12 @@ async def test_click_event_locates_and_fills_index(tmp_path, patch_projection):
 	await rec.start()
 	assert browser.started
 
-	step = await rec.handle_event({"type": "click", "xpath": "html/body/btn", "rect": None})
-	assert step is not None
-	action = step.model_output["actions"][0]
-	assert action["name"] == "click"
-	assert action["params"]["index"] == 5
-	assert step.interacted_element[0]["element_hash"] == 123
-	assert step.state_summary["url"] == "https://x.com"
+	action = await rec.handle_event({"type": "click", "xpath": "html/body/btn", "rect": None})
+	assert action is not None
+	assert action.action_name == "click"
+	assert action.params["index"] == 5
+	assert action.interacted_element[0]["element_hash"] == 123
+	assert action.page_url == "https://x.com"
 	assert len(patch_projection) == 1  # 投影被调用一次
 
 
@@ -83,22 +83,23 @@ async def test_navigate_event_has_no_interacted_element(tmp_path):
 	browser = FakeBrowser()
 	rec = Recorder(browser, rerun_history_dir=str(tmp_path))
 	await rec.start()
-	step = await rec.handle_event({"type": "navigate", "params": {"url": "https://y.com"}})
-	assert step is not None
-	assert step.model_output["actions"][0]["name"] == "navigate"
-	assert "index" not in step.model_output["actions"][0]["params"]
-	assert step.interacted_element is None  # 无 target
+	action = await rec.handle_event({"type": "navigate", "params": {"url": "https://y.com"}})
+	assert action is not None
+	assert action.action_name == "navigate"
+	assert "index" not in action.params
+	assert not action.interacted_element  # 无 target → []（falsy）
 
 
 @pytest.mark.asyncio
-async def test_locate_failure_keeps_action_without_index(tmp_path, patch_projection):
+async def test_locate_failure_keeps_action_without_index(tmp_path, patch_projection, monkeypatch):
+	monkeypatch.setattr(rec_mod, "_LOCATE_RETRY_DELAYS", (0.0, 0.0))  # 跳过重试 sleep 加速
 	browser = FakeBrowser(selector_map={5: SimpleNamespace(xpath="html/body/other")})
 	rec = Recorder(browser, rerun_history_dir=str(tmp_path))
 	await rec.start()
-	step = await rec.handle_event({"type": "click", "xpath": "html/body/missing"})
-	assert step is not None
-	assert step.interacted_element == [None]
-	assert "index" not in step.model_output["actions"][0]["params"]
+	action = await rec.handle_event({"type": "click", "xpath": "html/body/missing"})
+	assert action is not None
+	assert action.interacted_element == [None]
+	assert "index" not in action.params
 	assert len(patch_projection) == 0  # 定位失败，投影未调用
 
 
@@ -107,9 +108,9 @@ async def test_unmappable_event_returns_none(tmp_path):
 	browser = FakeBrowser()
 	rec = Recorder(browser, rerun_history_dir=str(tmp_path))
 	await rec.start()
-	step = await rec.handle_event({"type": "hover", "xpath": "html/x"})
-	assert step is None
-	assert len(rec.history.history) == 0
+	action = await rec.handle_event({"type": "hover", "xpath": "html/x"})
+	assert action is None
+	assert len(rec.recording.actions) == 0
 
 
 @pytest.mark.asyncio
@@ -148,9 +149,9 @@ async def test_switch_tab_resolves_tab_id_from_url(tmp_path):
 	browser = FakeBrowser(tabs=tabs)
 	rec = Recorder(browser, rerun_history_dir=str(tmp_path))
 	await rec.start()
-	step = await rec.handle_event({"type": "switch_tab", "params": {"url": "https://a.com/page"}})
-	assert step is not None
-	assert step.model_output["actions"][0]["params"]["tab_id"] == "1234"
+	action = await rec.handle_event({"type": "switch_tab", "params": {"url": "https://a.com/page"}})
+	assert action is not None
+	assert action.params["tab_id"] == "1234"
 
 
 @pytest.mark.asyncio
@@ -159,40 +160,166 @@ async def test_close_tab_unknown_url_yields_empty_tab_id(tmp_path):
 	browser = FakeBrowser(tabs=[])
 	rec = Recorder(browser, rerun_history_dir=str(tmp_path))
 	await rec.start()
-	step = await rec.handle_event({"type": "close_tab", "params": {"url": "https://none.com"}})
-	assert step is not None
-	assert step.model_output["actions"][0]["params"]["tab_id"] == ""
+	action = await rec.handle_event({"type": "close_tab", "params": {"url": "https://none.com"}})
+	assert action is not None
+	assert action.params["tab_id"] == ""
 
 
 @pytest.mark.asyncio
-async def test_upload_file_resolves_to_upload_dir(tmp_path, patch_projection):
-	browser = FakeBrowser(selector_map={5: SimpleNamespace(xpath="html/body/input")})
+async def test_upload_file_records_signature_no_fingerprint(tmp_path, patch_projection):
+	"""B 方案：upload_file 不 get_state 定位（导航竞态），存 accept+xpath 签名、无指纹、无 index。
+
+	扩展 change 瞬间捕获 accept（真实 file input）+ xpath，后端原样落盘；重放端按 accept+xpath
+	解析。selector_map 里有什么 input 都不影响录制——故故意塞个错位 image input 证明不被带偏。
+	视频后追加 wait(5s)。
+	"""
+	browser = FakeBrowser(selector_map={  # 发布页错位 image input（导航竞态残留）
+		6: SimpleNamespace(node_name="INPUT",
+		                   attributes={"type": "file", "accept": "image/png,image/jpeg"},
+		                   xpath="html/body/div[3]/input", snapshot_node=None),
+	})
 	rec = Recorder(browser, rerun_history_dir=str(tmp_path))
 	await rec.start()
-	step = await rec.handle_event({
-		"type": "upload_file", "xpath": "html/body/input", "params": {"path": "video.mp4"},
+	action = await rec.handle_event({
+		"type": "upload_file", "xpath": "html/body/div[2]/input",
+		"params": {"path": "video.mp4", "accept": "video/*"},
 	})
-	assert step is not None
-	p = step.model_output["actions"][0]["params"]
-	assert p["index"] == 5  # upload_file 需 index，locate 命中
+	assert action is not None
+	p = action.params
+	assert "index" not in p                      # 不再录制时定位
+	assert action.interacted_element == [None]   # 无指纹（重放端解析）
+	assert action.locate_miss is None            # 非定位失败，是设计如此
+	# 签名落盘：accept + xpath（change 瞬间扩展捕获，未被 selector_map 的 image input 带偏）
+	assert p["accept"] == "video/*"
+	assert p["xpath"] == "html/body/div[2]/input"
 	# 文件名拼约定目录 <rerun_history_dir>/uploads（basename 防误发路径）
 	assert p["path"].replace("\\", "/").endswith("uploads/video.mp4")
+	# upload 后追加 wait（视频 5s）
+	assert rec.recording.actions[-1].action_name == "wait"
+	assert rec.recording.actions[-1].params == {"seconds": 5}
 
 
 @pytest.mark.asyncio
-async def test_stop_applies_denoise_to_history(tmp_path, patch_projection):
+async def test_upload_file_wait_seconds_image(tmp_path, patch_projection):
+	"""图片上传后追加 wait(3s)（_file_kind 按扩展名定秒数）。accept 签名原样落盘。"""
+	browser = FakeBrowser(selector_map={})
+	rec = Recorder(browser, rerun_history_dir=str(tmp_path))
+	await rec.start()
+	action = await rec.handle_event({
+		"type": "upload_file", "xpath": "html/body/cov/input",
+		"params": {"path": "cover.png", "accept": "image/png,image/jpeg"},
+	})
+	assert action is not None
+	assert action.params["accept"] == "image/png,image/jpeg"
+	assert action.params["xpath"] == "html/body/cov/input"
+	assert rec.recording.actions[-1].action_name == "wait"
+	assert rec.recording.actions[-1].params == {"seconds": 3}
+
+
+@pytest.mark.asyncio
+async def test_upload_file_missing_accept_defaults_empty(tmp_path, patch_projection):
+	"""扩展未带 accept（旧扩展）→ accept 签名空串，重放端退回按 path 扩展名解析。不报错。"""
+	browser = FakeBrowser(selector_map={})
+	rec = Recorder(browser, rerun_history_dir=str(tmp_path))
+	await rec.start()
+	action = await rec.handle_event({
+		"type": "upload_file", "xpath": "html/body/x/input", "params": {"path": "v.mp4"},
+	})
+	assert action is not None
+	assert action.params["accept"] == ""
+	assert action.params["xpath"] == "html/body/x/input"
+	assert action.interacted_element == [None]
+
+
+@pytest.mark.asyncio
+async def test_stop_applies_aggregation_to_history(tmp_path, patch_projection):
+	"""相邻同 xpath input_text 经 Stage1 聚合取最终值，flatten 后落盘。"""
 	browser = FakeBrowser(selector_map={5: SimpleNamespace(xpath="html/body/inp")})
 	rec = Recorder(browser, rerun_history_dir=str(tmp_path), registry_version="v1")
 	await rec.start()
-	# 相邻同 index 两条 input_text → denoise 合一
+	# 同 xpath 连续 input（ts ms，0.001s 间隔 < 1.5s gap）→ Stage1 聚合
 	await rec.handle_event({"type": "input_text", "xpath": "html/body/inp", "params": {"text": "a"}, "ts": 1})
-	await rec.handle_event({"type": "input_text", "xpath": "html/body/inp", "params": {"text": "ab"}, "ts": 2})
+	a2 = await rec.handle_event({"type": "input_text", "xpath": "html/body/inp", "params": {"text": "ab"}, "ts": 2})
+	assert a2 is None  # 聚合进前一步，不新增
+	assert len(rec.recording.actions) == 1
 
 	path = await rec.stop(file_path="out.json")
 	loaded = AgentHistoryList.load_from_file(path)
-	assert len(loaded.history) == 2  # 初始 navigate + 合并后的 input_text
+	assert len(loaded.history) == 2  # 初始 navigate + 聚合后的 input_text
 	assert loaded.history[0].model_output["actions"][0]["name"] == "navigate"
 	assert loaded.history[1].model_output["actions"][0]["params"]["text"] == "ab"  # 取最终值
+
+
+@pytest.mark.asyncio
+async def test_attach_signal_attaches_to_last_action(tmp_path, patch_projection):
+	"""扩展 SideEffectObserver 的 modal 信号经 attach_signal 附到最近动作。"""
+	browser = FakeBrowser(selector_map={5: SimpleNamespace(xpath="html/body/btn")})
+	rec = Recorder(browser, rerun_history_dir=str(tmp_path))
+	await rec.start()
+	await rec.handle_event({"type": "click", "xpath": "html/body/btn", "ts": 1000})  # ts→1.0s
+
+	# 信号 ts=1500ms → 1.5s，距动作 0.5s < 2s 窗口 → 附加
+	assert rec.attach_signal({"type": "modal_opened", "selector": ".editor", "ts": 1500}) is True
+	last = rec.recording.actions[-1]
+	assert len(last.signals) == 1
+	assert last.signals[0].kind is SignalKind.MODAL_OPENED
+	assert rec.recording.state.pending_modal == ".editor"
+
+	# 超窗（ts=5000ms → 5.0s，距动作 4.0s > 2s）→ 拒绝
+	assert rec.attach_signal({"type": "modal_opened", "selector": ".late", "ts": 5000}) is False
+
+
+@pytest.mark.asyncio
+async def test_attach_signal_unknown_type_rejected(tmp_path, patch_projection):
+	browser = FakeBrowser(selector_map={5: SimpleNamespace(xpath="html/body/btn")})
+	rec = Recorder(browser, rerun_history_dir=str(tmp_path))
+	await rec.start()
+	await rec.handle_event({"type": "click", "xpath": "html/body/btn", "ts": 1000})
+	assert rec.attach_signal({"type": "mystery", "ts": 1100}) is False
+
+
+@pytest.mark.asyncio
+async def test_locate_retries_when_element_appears_later(tmp_path, patch_projection, monkeypatch):
+	"""定位失败时重试 get_state：元素第一次不在 selector_map（SPA 未渲染），重试后出现 → 捕获指纹。
+
+	对应「暂存离开」按钮场景：modal 关闭后按钮才渲染，首次 get_state 抢在前面 → 重试救回。
+	"""
+	monkeypatch.setattr(rec_mod, "_LOCATE_RETRY_DELAYS", (0.0, 0.0))  # 跳过 sleep 加速
+	state_seq = [
+		{},  # 首次：元素未渲染
+		{5: SimpleNamespace(xpath="html/body/btn")},  # 重试后：元素出现
+	]
+	calls = {"n": 0}
+
+	class LateBrowser(FakeBrowser):
+		async def get_state(self, include_screenshot=True):
+			sm = state_seq[min(calls["n"], len(state_seq) - 1)]
+			calls["n"] += 1
+			dom = SimpleNamespace(selector_map=sm)
+			return SimpleNamespace(url="https://x.com", title="X", dom_state=dom)
+
+	rec = Recorder(LateBrowser(), rerun_history_dir=str(tmp_path))
+	await rec.start()
+	action = await rec.handle_event({"type": "click", "xpath": "html/body/btn"})
+	assert action is not None
+	assert action.params["index"] == 5      # 重试后定位成功
+	assert action.locate_miss is None
+	assert action.interacted_element[0]["element_hash"] == 123
+	assert calls["n"] == 2                   # get_state 调了两次（初试 + 重试）
+
+
+@pytest.mark.asyncio
+async def test_locate_retry_exhausted_records_miss(tmp_path, patch_projection, monkeypatch):
+	"""重试后仍找不到 → 记 locate_miss（retried=True），interacted 置空。"""
+	monkeypatch.setattr(rec_mod, "_LOCATE_RETRY_DELAYS", (0.0, 0.0))
+	browser = FakeBrowser(selector_map={5: SimpleNamespace(xpath="html/body/other")})
+	rec = Recorder(browser, rerun_history_dir=str(tmp_path))
+	await rec.start()
+	action = await rec.handle_event({"type": "click", "xpath": "html/body/missing"})
+	assert action is not None
+	assert action.interacted_element == [None]
+	assert action.locate_miss is not None
+	assert action.locate_miss["retried"] is True
 
 
 # ── select_http_target：target 选择纯函数 ───────────────────────────────
@@ -238,7 +365,7 @@ def test_select_http_target_ignores_non_page_types():
 	assert select_http_target(infos) == "ok"
 
 
-# ── recorder.start 插初始 navigate（仿 Browser-BC load 事件）──
+# ── recorder.start 不插初始 navigate（落盘前才插）──
 
 
 @pytest.mark.asyncio
@@ -246,12 +373,12 @@ async def test_start_does_not_insert_initial_navigate(tmp_path):
 	"""初始 navigate 在 stop 落盘前插（_prepend_initial_navigation），start 不插。"""
 	rec = Recorder(FakeBrowser(), rerun_history_dir=str(tmp_path))
 	await rec.start()
-	assert len(rec.history.history) == 0
+	assert len(rec.recording.actions) == 0
 
 
 @pytest.mark.asyncio
 async def test_stop_prepends_initial_navigation(tmp_path, patch_projection):
-	"""stop 落盘前用 history[0].state_summary.url 插起始页 navigate 作 history[0]。"""
+	"""stop 落盘前用 flatten 后 history[0].state_summary.url 插起始页 navigate 作 history[0]。"""
 	browser = FakeBrowser(selector_map={5: SimpleNamespace(xpath="html/body/btn")}, url="https://start.page")
 	rec = Recorder(browser, rerun_history_dir=str(tmp_path))
 	await rec.start()
@@ -266,7 +393,7 @@ async def test_stop_prepends_initial_navigation(tmp_path, patch_projection):
 
 @pytest.mark.asyncio
 async def test_stop_done_step_number_continuous(tmp_path, patch_projection):
-	"""stop 追加的 done 用 denoise+初始navigate 后的 len 作 step_number，不跳号。"""
+	"""stop 追加的 done 用 flatten+初始navigate 后的 len 作 step_number，不跳号。"""
 	browser = FakeBrowser(selector_map={5: SimpleNamespace(xpath="html/body/btn")}, url="https://x.com")
 	rec = Recorder(browser, rerun_history_dir=str(tmp_path))
 	await rec.start()

@@ -1,7 +1,7 @@
 // 后端 HTTP 通信封装。background 是唯一与后端通信的入口（content 不直连）。
 // 后端：aiohttp，默认 http://127.0.0.1:8765（见 examples/record_user_actions.py）。
 
-import type { RecorderEvent } from './types';
+import type { RecorderEvent, SignalEvent } from './types';
 
 const DEFAULT_ENDPOINT = 'http://127.0.0.1:8765';
 
@@ -30,6 +30,21 @@ export async function postEvent(event: RecorderEvent): Promise<boolean> {
     return r.ok;
   } catch (e) {
     console.error('[TW Recorder] /event 失败', e);
+    return false;
+  }
+}
+
+/** 副作用信号（modal/dropdown 打开）→ 后端 attach_signal 附到最近动作。 */
+export async function postSignal(signal: SignalEvent): Promise<boolean> {
+  try {
+    const r = await fetch(`${getEndpoint()}/signal`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(signal),
+    });
+    return r.ok;
+  } catch (e) {
+    console.error('[TW Recorder] /signal 失败', e);
     return false;
   }
 }

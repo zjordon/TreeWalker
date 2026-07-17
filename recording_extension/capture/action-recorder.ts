@@ -14,6 +14,8 @@ import { buildElementRef } from './selector';
 
 interface InstallOptions {
   sendEvent: (event: RecorderEvent) => void;
+  /** 动作发出时通知（传 ts），供 SideEffectObserver.markAction 打开观察窗口。 */
+  onAction?: (ts: number) => void;
 }
 
 /** 可交互元素选择器（对齐 TreeWalker selector_map 的可交互元素范围）。 */
@@ -51,6 +53,14 @@ function findInteractiveAncestor(el: Element | null): Element | null {
   while (cur && cur !== document.body) {
     try {
       if (cur.matches(INTERACTIVE_SELECTOR)) return cur;
+      // 对齐后端 is_interactive 规则 14/10：cursor:pointer / onclick 属性。
+      // INTERACTIVE_SELECTOR 不含 div 模拟组件，Semi select 触发器 / 抖音 cover-Jg3T4p 等
+      // cursor:pointer div 靠这俩识别，否则会录到内部 span/div，回放点击不开 modal。
+      // 但 cursor:pointer 只对 div 检查——span/svg 等内联元素常继承父按钮的 cursor:pointer，
+      // 若命中会阻断向上找真正的 button/input（实测点上传按钮录到内部 span → locate 失败）。
+      if (cur.tagName === 'DIV' && window.getComputedStyle(cur).cursor === 'pointer') return cur;
+      const html = cur as HTMLElement;
+      if (html.onclick || cur.getAttribute('onclick') || cur.getAttribute('onmousedown')) return cur;
     } catch {
       /* 非元素节点，继续向上 */
     }
@@ -89,16 +99,18 @@ function readValue(target: Element): string {
 export function installActionRecorder(opts: InstallOptions): () => void {
   if (installed) return () => {};
   installed = true;
-  const { sendEvent } = opts;
+  const { sendEvent, onAction } = opts;
 
   let pendingInput: PendingInput | null = null;
   // IME（中文等输入法）composing 中——抑制 input/MutationObserver 的 setPending，
   // 避免中间拼音值被录（只录 compositionend 后的最终值）。
   let isComposing = false;
 
-  /** 统一发送：填 ts。对齐 Browser-BC emit()。 */
+  /** 统一发送：填 ts。对齐 Browser-BC emit()。同时通知 SideEffectObserver 开观察窗口。 */
   const emit = (partial: Omit<RecorderEvent, 'ts'>) => {
-    sendEvent({ ...partial, ts: Date.now() });
+    const ts = Date.now();
+    sendEvent({ ...partial, ts });
+    onAction?.(ts); // 通知副作用观察器：动作已发，开启 1s 观察窗口
   };
 
   const flushInput = () => {
@@ -152,9 +164,14 @@ export function installActionRecorder(opts: InstallOptions): () => void {
   const onInput = (e: Event) => {
     const raw = e.composedPath()[0] as Element || (e.target as Element | null);
     if (!raw || raw.nodeType !== Node.ELEMENT_NODE) return;
-    // file input 选文件后 value 变为 C:\fakepath\<名>，不是用户文本输入 ——
-    // 交给 onFileChange 录 upload_file，这里跳过避免误录 input_text。
-    if (raw.tagName === 'INPUT' && (raw.getAttribute('type') || '').toLowerCase() === 'file') return;
+    // file input 选文件后 value 变为 C:\fakepath\<名>，不是用户文本输入 → 交给 onFileChange 录
+    // upload_file。radio/checkbox 勾选时浏览器也派发 input 事件（checked 变化），但语义是"勾选"
+    // 不是"文本输入"，由 onClick 录 click；这里都跳过，避免把勾选误录成 input_text
+    // （否则 checkbox 重放会被 input_text 的 clear/type 干扰，toggle 回未选状态）。
+    if (raw.tagName === 'INPUT') {
+      const t = (raw.getAttribute('type') || '').toLowerCase();
+      if (t === 'file' || t === 'radio' || t === 'checkbox') return;
+    }
     const target = findInteractiveAncestor(raw) ?? raw;
     console.log('[TW Recorder] %s on <%s> ce=%s', e.type, target.tagName, (target as HTMLElement).isContentEditable);
     setPending(target);
@@ -210,12 +227,16 @@ export function installActionRecorder(opts: InstallOptions): () => void {
     flushInput();
     const target = findInteractiveAncestor(raw) ?? raw;
     const ref = buildElementRef(target);
-    console.log('[TW Recorder] upload_file name=%s', file.name);
+    // accept 在 change 瞬间从真实 file input 读（页面此刻还没因上传跳转）。
+    // 后端据此 + xpath 落盘签名，重放端按 accept+xpath 解析——彻底不依赖「导航后 get_state」
+    // 定位（选完视频抖音立即 /upload→/post/video 跳转，get_state 会抓到跳转后页面致 file input 错位）。
+    const accept = raw.getAttribute('accept') ?? '';
+    console.log('[TW Recorder] upload_file name=%s accept=%s', file.name, accept);
     emit({
       type: 'upload_file',
       xpath: ref.xpath,
       ...refAttrs(target),
-      params: { path: file.name },
+      params: { path: file.name, accept },
     });
   };
 

@@ -112,3 +112,69 @@ def test_locate_by_ref_returns_none_when_nothing_matches():
 	sm = {1: node}
 	r = locate_by_ref({"xpath": "/html/y", "tag": "button", "name": "z"}, sm)
 	assert r is None
+
+
+# ── locate_by_ref Level 3：RECT（位置）兜底 ──────────────────────────────
+
+
+def _ref_node_b(xpath, tag, bounds):
+	"""带 bounds 的 ref 节点（Level 3 RECT 用）。"""
+	return SimpleNamespace(xpath=xpath, node_name=tag, attributes={}, snapshot_node=SimpleNamespace(bounds=bounds))
+
+
+def test_locate_by_ref_rect_fallback_picks_matching_sized_node():
+	# xpath/属性都失配，节点 bounds 与点击 rect 高度重合（IoU≈1）→ RECT 兜底命中
+	node = _ref_node_b("html/x", "DIV", _rect(100, 100, 160, 120))
+	sm = {9: node}
+	r = locate_by_ref(
+		{"xpath": "/html/missing", "tag": "div", "rect": _rect(102, 102, 156, 116)},  # IoU 高
+		sm,
+	)
+	assert r == (9, node)
+
+
+def test_locate_by_ref_rect_fallback_picks_size_match_not_tiny_icon():
+	# 点击 cover(160×120) 触发器，中心落在其内 18×18 svg 图标上——
+	# IoU 选 cover（bounds≈点击 rect），不选 svg（IoU 极低）。这是「选择封面」场景的核心。
+	cover = _ref_node_b("html/cover", "DIV", _rect(100, 100, 160, 120))
+	svg = _ref_node_b("html/svg", "SVG", _rect(150, 130, 18, 18))  # 在 cover 内
+	sm = {1: cover, 2: svg}
+	# ref rect = cover（findInteractiveAncestor 返回的触发器），中心 (180,160) 落在 svg 区
+	r = locate_by_ref({"xpath": "/html/missing", "tag": "div", "rect": _rect(100, 100, 160, 120)}, sm)
+	assert r == (1, cover)
+
+
+def test_locate_by_ref_rect_fallback_rejects_huge_ancestor():
+	# 点击 rect 只占 root 极小比例（IoU < 0.1）→ 不认 root（避免误匹配整页容器）
+	root = _ref_node_b("html/root", "DIV", _rect(0, 0, 1000, 800))
+	sm = {1: root}
+	# 小点击 (100,100,50,50) 落在 root 内但 IoU≈0.003；root 中心远 → None
+	r = locate_by_ref({"xpath": "/html/missing", "tag": "div", "rect": _rect(100, 100, 50, 50)}, sm)
+	assert r is None
+
+
+def test_locate_by_ref_rect_fallback_nearest_when_no_high_iou():
+	# 无节点含点击中心（IoU 通道空）→ 就近（阈值 150px 内）
+	a = _ref_node_b("html/a", "DIV", _rect(0, 0, 10, 10))     # 中心 (5,5)
+	b = _ref_node_b("html/b", "DIV", _rect(100, 100, 10, 10))  # 中心 (105,105)
+	sm = {1: a, 2: b}
+	# 点击中心 (110,110)：不在任何节点内，距 b(105,105) ≈ 7px < 150 → 选 b
+	r = locate_by_ref({"xpath": "/html/missing", "tag": "div", "rect": _rect(108, 108, 4, 4)}, sm)
+	assert r == (2, b)
+
+
+def test_locate_by_ref_rect_fallback_threshold_exceeded():
+	# 最近节点也超过 150px → 返回 None（不乱点远处元素）
+	a = _ref_node_b("html/a", "DIV", _rect(0, 0, 10, 10))  # 中心 (5,5)
+	sm = {1: a}
+	# 点击中心 (300,300)：距 a ≈ 417px > 150 → None
+	r = locate_by_ref({"xpath": "/html/missing", "tag": "div", "rect": _rect(298, 298, 4, 4)}, sm)
+	assert r is None
+
+
+def test_locate_by_ref_rect_no_rect_returns_none():
+	# ref 无 rect → Level 3 不触发（保持旧行为，不引入误匹配）
+	node = _ref_node("html/x", "DIV", {"name": "other"})
+	sm = {1: node}
+	r = locate_by_ref({"xpath": "/html/y", "tag": "div"}, sm)
+	assert r is None

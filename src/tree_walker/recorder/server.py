@@ -5,10 +5,11 @@ WebSocket 长连接在 SW 休眠时断开的麻烦）。
 
 端点：
 
-- ``POST /start``  开始录制（连浏览器）
-- ``POST /event``  接收一条扩展事件 → ``Recorder.handle_event``
-- ``POST /stop``   停止录制，落盘（可选补 ``done``）
-- ``GET  /health`` 健康检查
+- ``POST /start``   开始录制（连浏览器）
+- ``POST /event``   接收一条扩展事件 → ``Recorder.handle_event``
+- ``POST /signal``  接收一条副作用信号（modal/dropdown 打开）→ ``Recorder.attach_signal``
+- ``POST /stop``    停止录制，落盘（可选补 ``done``）
+- ``GET  /health``  健康检查
 
 请求体均为 JSON；事件线索格式见 ``docs/user_recording/README.md`` §6.2。
 """
@@ -35,6 +36,7 @@ async def make_app(recorder: Recorder, default_out: str = "recorded.json") -> we
 	app[_DEFAULT_OUT_KEY] = default_out
 	app.router.add_post("/start", _handle_start)
 	app.router.add_post("/event", _handle_event)
+	app.router.add_post("/signal", _handle_signal)
 	app.router.add_post("/stop", _handle_stop)
 	app.router.add_get("/health", _handle_health)
 	return app
@@ -53,8 +55,23 @@ async def _handle_event(request: web.Request) -> web.Response:
 		event = await request.json()
 	except Exception:
 		return web.json_response({"ok": False, "error": "invalid json"}, status=400)
-	step = await rec.handle_event(event)
-	return web.json_response({"ok": step is not None, "step": step.step_number if step else None})
+	action = await rec.handle_event(event)
+	# ActionRecord 无 step_number；用刚追加动作的 0-based 索引作进度序号（不可映射/已聚合 → None）
+	return web.json_response({
+		"ok": action is not None,
+		"step": len(rec.recording.actions) - 1 if action is not None else None,
+	})
+
+
+async def _handle_signal(request: web.Request) -> web.Response:
+	"""接收扩展 SideEffectObserver 的副作用信号（modal/dropdown 打开），附到最近动作。"""
+	rec: Recorder = request.app[_RECORDER_KEY]
+	try:
+		payload = await request.json()
+	except Exception:
+		return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+	attached = rec.attach_signal(payload)
+	return web.json_response({"ok": attached})
 
 
 async def _handle_stop(request: web.Request) -> web.Response:
