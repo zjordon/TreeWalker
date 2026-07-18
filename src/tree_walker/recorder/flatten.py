@@ -20,13 +20,19 @@ from tree_walker.recorder.models import ActionRecord, Recording
 def flatten(recording: Recording) -> AgentHistoryList:
 	"""``Recording`` → ``AgentHistoryList``（step_number 重排 0..N-1）。"""
 	steps = [
-		_action_to_history(action, step_number=i)
+		_action_to_history(
+			action,
+			step_number=i,
+			prev_ts=recording.actions[i - 1].timestamp if i > 0 else None,
+		)
 		for i, action in enumerate(recording.actions)
 	]
 	return AgentHistoryList(history=steps)
 
 
-def _action_to_history(action: ActionRecord, step_number: int) -> AgentHistory:
+def _action_to_history(
+	action: ActionRecord, step_number: int, prev_ts: float | None
+) -> AgentHistory:
 	# interacted_element 复刻旧 Recorder.handle_event 的取值：
 	#   [proj]（定位成功）/ [None]（定位失败）/ []（无 target 动作）→ [] 归一为 None。
 	interacted = action.interacted_element
@@ -50,6 +56,10 @@ def _action_to_history(action: ActionRecord, step_number: int) -> AgentHistory:
 			step_start_time=action.timestamp,
 			step_end_time=action.timestamp,
 			step_number=step_number,
+			# 录制回放专用：step_interval = 相邻 action 的 timestamp 差（人类操作间隔近似）。
+			# 不能用 prev.metadata.duration_seconds——flatten 里 start==end==timestamp，恒 0。
+			# timestamp 已是秒（translation._ts_seconds /1000），减法直接得秒。
+			step_interval=action.timestamp - prev_ts if prev_ts is not None else None,
 		),
 	)
 

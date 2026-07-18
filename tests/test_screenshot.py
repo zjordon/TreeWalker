@@ -172,6 +172,48 @@ class TestTakeScreenshotParams:
 			state = await session.get_state(include_screenshot=True)
 		assert state.screenshot is None
 
+	@pytest.mark.asyncio
+	async def test_get_state_wait_settle_invokes_page_settle(self):
+		"""get_state(wait_settle=True) 在读 DOM 前调用 _wait_for_page_settle。"""
+		from tree_walker.browser.views import SerializedDOMState
+		client = _make_mock_cdp_client()
+		session = await _start_session(client)
+		session._wait_for_page_settle = AsyncMock()
+		empty_state = SerializedDOMState(
+			_root=None, selector_map={}, element_tree_text="", file_input_backend_ids=[],
+		)
+		with patch("tree_walker.browser.session.build_dom_state", return_value=(empty_state, MagicMock())):
+			await session.get_state(include_screenshot=False, wait_settle=True)
+		session._wait_for_page_settle.assert_awaited_once()
+
+	@pytest.mark.asyncio
+	async def test_get_state_wait_settle_false_skips(self):
+		"""默认 wait_settle=False 不触发 settle（零行为变更保证）。"""
+		from tree_walker.browser.views import SerializedDOMState
+		client = _make_mock_cdp_client()
+		session = await _start_session(client)
+		session._wait_for_page_settle = AsyncMock()
+		empty_state = SerializedDOMState(
+			_root=None, selector_map={}, element_tree_text="", file_input_backend_ids=[],
+		)
+		with patch("tree_walker.browser.session.build_dom_state", return_value=(empty_state, MagicMock())):
+			await session.get_state(include_screenshot=False, wait_settle=False)
+		session._wait_for_page_settle.assert_not_awaited()
+
+	@pytest.mark.asyncio
+	async def test_get_state_wait_settle_failure_does_not_block(self):
+		"""_wait_for_page_settle 抛异常时 get_state 仍正常返回（仿 screenshot 容错）。"""
+		from tree_walker.browser.views import SerializedDOMState
+		client = _make_mock_cdp_client()
+		session = await _start_session(client)
+		session._wait_for_page_settle = AsyncMock(side_effect=RuntimeError("settle boom"))
+		empty_state = SerializedDOMState(
+			_root=None, selector_map={}, element_tree_text="", file_input_backend_ids=[],
+		)
+		with patch("tree_walker.browser.session.build_dom_state", return_value=(empty_state, MagicMock())):
+			state = await session.get_state(include_screenshot=False, wait_settle=True)
+		assert state is not None
+
 
 # ── _action_screenshot: tool layer ────────────────────────────────────
 

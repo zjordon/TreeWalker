@@ -824,3 +824,91 @@ def test_agent_rerun_path_default_and_rejection():
 def test_agentsettings_default_rerun_history_dir():
 	from tree_walker.config import AgentSettings
 	assert AgentSettings().rerun_history_dir == "rerun-history"
+
+
+def test_agentsettings_default_rerun_timing():
+	from tree_walker.config import AgentSettings
+	s = AgentSettings()
+	# 阶段 1：默认值对齐 CLI/TUI 现状硬编码（1/5），避免改变现有重放行为
+	assert s.rerun_delay_between_actions == 1.0
+	assert s.rerun_max_step_interval == 5.0
+	assert s.rerun_wait_for_elements is False
+	assert s.rerun_wait_for_page_settle is False
+
+
+def test_agent_wires_rerun_timing_from_settings():
+	# Agent.__init__ 把 AgentSettings 的时序字段拷到 self（与 rerun_history_dir 同范式），
+	# 供 rerun_history 的 None 哨兵默认值回落使用。
+	from tree_walker.agent import Agent
+	from tree_walker.browser.session import BrowserSettings
+	from tree_walker.config import AgentSettings, JudgeSettings
+	browser = MagicMock()
+	browser._settings = BrowserSettings()
+	agent = Agent(
+		task="x", llm=MagicMock(), browser=browser,
+		settings=AgentSettings(
+			judge=JudgeSettings(enabled=False),
+			rerun_delay_between_actions=2.5,
+			rerun_max_step_interval=30.0,
+			rerun_wait_for_elements=True,
+			rerun_wait_for_page_settle=True,
+		),
+	)
+	assert agent.rerun_delay_between_actions == 2.5
+	assert agent.rerun_max_step_interval == 30.0
+	assert agent.rerun_wait_for_elements is True
+	assert agent.rerun_wait_for_page_settle is True
+
+
+@pytest.mark.asyncio
+async def test_rerun_history_timing_defaults_to_settings_when_kwargs_omitted(make_node):
+	# 不传时序 kwargs → rerun_history 用 self.rerun_xxx（AgentSettings）归一化，
+	# 再传给 _compute_step_delay（覆盖 None 哨兵的 4 个分支）。
+	from tree_walker.agent.agent import Agent
+	from tree_walker.config import AgentSettings, JudgeSettings
+
+	rec_node = make_node(tag="input", node_id=2, backend_node_id=2,
+	                     attributes={"name": "email", "type": "email"})
+	hist_elem = DOMInteractedElement.load_from_enhanced_dom_tree(rec_node).to_dict()
+	history = AgentHistoryList(history=[
+		AgentHistory(step_number=0,
+		             model_output={"action": {"name": "input_text", "params": {"index": 2, "text": "a@b.com"}}},
+		             result=[ActionResult()],
+		             state_summary={"url": "http://example.com"},
+		             interacted_element=[hist_elem]),
+	])
+	live_node = make_node(tag="input", node_id=7, backend_node_id=7,
+	                      attributes={"name": "email", "type": "email"})
+	state = SimpleNamespace(url="http://example.com",
+	                        dom_state=SimpleNamespace(selector_map={7: live_node}))
+
+	browser = MagicMock()
+	browser._settings = SimpleNamespace(wait_between_actions=0)
+	browser.start = AsyncMock()
+	browser.stop = AsyncMock()
+	browser.navigate = AsyncMock()
+	browser.get_state = AsyncMock(return_value=state)
+	browser.get_current_url = AsyncMock(return_value="http://example.com")
+
+	agent = Agent(task="do x", llm=MagicMock(), browser=browser,
+	              settings=AgentSettings(judge=JudgeSettings(enabled=False),
+	                                    rerun_delay_between_actions=7.0,
+	                                    rerun_max_step_interval=9.0))
+
+	async def fake_execute(name, params, br, st):
+		return ActionResult()
+	agent.tools.execute = fake_execute
+	agent.llm = _StructuredLLM()
+
+	captured: dict = {}
+	def fake_compute(item, dba, msi):
+		captured["dba"] = dba
+		captured["msi"] = msi
+		return 0.0
+	agent._compute_step_delay = fake_compute
+
+	# 注意：不传任何时序 kwargs → 走 self.rerun_xxx 归一化
+	await agent.rerun_history(history, summary_llm=_StructuredLLM())
+
+	assert captured["dba"] == 7.0    # delay_between_actions 来自 AgentSettings
+	assert captured["msi"] == 9.0    # max_step_interval 来自 AgentSettings

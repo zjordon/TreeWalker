@@ -195,6 +195,11 @@ class RerunMixin:
     _obs_bus: Any
     _obs_session_id: str
     rerun_history_dir: str
+    # 重放时序（阶段 1）：由 Agent.__init__ 从 AgentSettings 拷贝
+    rerun_delay_between_actions: float
+    rerun_max_step_interval: float
+    rerun_wait_for_elements: bool
+    rerun_wait_for_page_settle: bool
 
     # ── 公共 API ───────────────────────────────────────────────────────
 
@@ -256,9 +261,10 @@ class RerunMixin:
         *,
         max_retries: int = 3,
         skip_failures: bool = False,
-        delay_between_actions: float = 2.0,
-        max_step_interval: float = 45.0,
-        wait_for_elements: bool = False,
+        delay_between_actions: float | None = None,
+        max_step_interval: float | None = None,
+        wait_for_elements: bool | None = None,
+        wait_for_page_settle: bool | None = None,
         summary_llm: LLMClient | None = None,
         ai_step_llm: LLMClient | None = None,
     ) -> list[ActionResult]:
@@ -266,7 +272,19 @@ class RerunMixin:
 
         重放不调决策 LLM（``get_action`` 次数为 0）；``extract`` 动作走 ``tools._extract_llm``
         在当前页重算；结尾 1 次 LLM 调用生成摘要。
+
+        时序参数（``delay_between_actions`` / ``max_step_interval`` / ``wait_for_elements`` /
+        ``wait_for_page_settle``）默认 ``None`` → 回落到 ``AgentSettings`` 同名字段；显式传值
+        （含测试的 ``=0``）仍优先。
         """
+        if delay_between_actions is None:
+            delay_between_actions = self.rerun_delay_between_actions
+        if max_step_interval is None:
+            max_step_interval = self.rerun_max_step_interval
+        if wait_for_elements is None:
+            wait_for_elements = self.rerun_wait_for_elements
+        if wait_for_page_settle is None:
+            wait_for_page_settle = self.rerun_wait_for_page_settle
         await self.browser.start(track_downloads=self._track_downloads)
         await self._rerun_initial_navigation(history)
         self.state.n_steps = 0
@@ -304,7 +322,8 @@ class RerunMixin:
                             item.step_number, i, total, delay_src, goal)
                 self.state.n_steps += 1
                 step_results = await self._rerun_step_with_retries(
-                    item, step_delay, max_retries, previous_item, ai_step_llm, wait_for_elements
+                    item, step_delay, max_retries, previous_item, ai_step_llm,
+                    wait_for_elements, wait_for_page_settle,
                 )
                 results.extend(step_results)
                 previous_succeeded = bool(step_results) and not any(
@@ -351,6 +370,7 @@ class RerunMixin:
         previous_item: AgentHistory | None,
         ai_step_llm: LLMClient | None,
         wait_for_elements: bool,
+        wait_for_page_settle: bool,
     ) -> list[ActionResult]:
         attempt = 0
         menu_reopens = 0
@@ -358,7 +378,7 @@ class RerunMixin:
         while True:
             try:
                 return await self._execute_history_step(
-                    item, cur_delay, ai_step_llm, wait_for_elements
+                    item, cur_delay, ai_step_llm, wait_for_elements, wait_for_page_settle
                 )
             except Exception as e:
                 err_str = str(e)
@@ -374,7 +394,9 @@ class RerunMixin:
                         or self._is_option_element(item)
                     )
                 ):
-                    if await self._reexecute_menu_opener(previous_item, ai_step_llm):
+                    if await self._reexecute_menu_opener(
+                        previous_item, ai_step_llm, wait_for_page_settle
+                    ):
                         menu_reopens += 1
                         cur_delay = 0.5
                         continue
@@ -432,10 +454,13 @@ class RerunMixin:
         delay: float,
         ai_step_llm: LLMClient | None,
         wait_for_elements: bool,
+        wait_for_page_settle: bool,
     ) -> list[ActionResult]:
         """执行单步：取当前 selector_map → 逐动作重定位/重算并执行，带 guard。"""
         await asyncio.sleep(delay)
-        state = await self.browser.get_state(include_screenshot=False)
+        state = await self.browser.get_state(
+            include_screenshot=False, wait_settle=wait_for_page_settle
+        )
 
         if wait_for_elements:
             min_elements = self._count_expected_elements(item)
@@ -860,12 +885,14 @@ class RerunMixin:
         return "option" in cls or "select-item" in cls
 
     async def _reexecute_menu_opener(
-        self, opener_item: AgentHistory, ai_step_llm: LLMClient | None
+        self, opener_item: AgentHistory, ai_step_llm: LLMClient | None,
+        wait_for_page_settle: bool,
     ) -> bool:
         logger.info("🔁 菜单重打开：重执行上一步（opener）以重新展开下拉，随后立即重试")
         try:
             await self._execute_history_step(
-                opener_item, delay=0.5, ai_step_llm=ai_step_llm, wait_for_elements=False
+                opener_item, delay=0.5, ai_step_llm=ai_step_llm, wait_for_elements=False,
+                wait_for_page_settle=wait_for_page_settle,
             )
             await asyncio.sleep(0.3)  # 等菜单渲染
             return True

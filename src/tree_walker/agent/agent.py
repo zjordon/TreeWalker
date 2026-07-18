@@ -76,6 +76,11 @@ class Agent(StepPipeline, RerunMixin):
         self.max_actions_per_step = _settings.max_actions_per_step
         self.wait_between_actions = browser._settings.wait_between_actions
         self.rerun_history_dir = _settings.rerun_history_dir
+        # 重放时序（阶段 1）：rerun_history 的 kwargs 默认值（None 哨兵）回落到这些
+        self.rerun_delay_between_actions = _settings.rerun_delay_between_actions
+        self.rerun_max_step_interval = _settings.rerun_max_step_interval
+        self.rerun_wait_for_elements = _settings.rerun_wait_for_elements
+        self.rerun_wait_for_page_settle = _settings.rerun_wait_for_page_settle
         self._save_conversation_path = _settings.save_conversation_path
 
         self.state = AgentState()
