@@ -176,7 +176,15 @@ FALLBACK_LLM_API_KEY=sk-xxx
 
 除了让 Agent 自动探索，也可以**录制你自己的真实操作**生成可重放的历史——路径稳定可靠，消除 LLM 决策随机带来的不稳定。
 
-Chrome 扩展采集操作 → Python 后端经 CDP 算指纹 → 落盘 `AgentHistory` → 用不同数据重放（重放时不再调 LLM 决策）。
+Chrome 扩展采集操作 → Python 后端翻译流水线（Signal 模型，意图感知去噪）+ 经 CDP 算指纹 → 落盘 `AgentHistory` → 用不同数据重放（重放时不再调 LLM 决策）。
+
+**重放三路径降级链**（自动选择，对各类操作稳健）：
+
+- **指纹匹配**：稳定可见元素（按钮、输入框等）走 `element_hash` 精准匹配。
+- **语义线索回放**：点 submit/链接等触发跳转的操作，录制时元素虽消失，重放时凭语义线索（xpath/属性/位置）在稳定页面重新定位——利用重放的主动时序优势。
+- **accept 兜底**：文件上传等隐藏 input 按 `accept` 类型解析。
+
+**录制端去噪与健壮性**：连续输入合并、重复点击折叠、副作用导航吸收；自动跳过非可交互的噪声点击（点到段落空白等）；`get_state` 异常容错（跳转导致 CDP target 卸载时不中断）。
 
 ```bash
 # 1. Chrome 以远程调试端口启动（建议用录制专用 profile，提前登录目标站点）
@@ -187,6 +195,9 @@ uv run python examples/record_user_actions.py --out myflow.json
 
 # 3. 加载 recording_extension/ 扩展 → 点「开始录制」→ 操作 → 「停止」
 #    产物落 rerun-history/myflow.json
+
+# 4. 重放
+uv run python examples/replay.py myflow.json
 ```
 
 换数据重放：
@@ -196,7 +207,8 @@ await agent.load_and_rerun("myflow.json", variables={"email": "new@x.com"})
 ```
 
 > 录制产物与 agent 自录同址（`rerun-history/`），指纹录制/重放同源（全对齐）。
-> 完整设计、架构与实施路线见 [docs/user_recording/README.md](docs/user_recording/README.md)。
+> 完整设计、架构、方案演进与架构反思见 [docs/user_recording/](docs/user_recording/)：
+> [`README.md`](docs/user_recording/README.md) · [`redesign.md`](docs/user_recording/redesign.md) · [`semantic-clue-replay.md`](docs/user_recording/semantic-clue-replay.md) · [`recorder-timing-solutions.md`](docs/user_recording/recorder-timing-solutions.md)
 
 ## 配置
 
