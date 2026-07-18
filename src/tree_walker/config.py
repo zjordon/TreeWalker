@@ -118,6 +118,15 @@ class AgentSettings:
     # LLM 决策。空=禁用。与 rerun_history_dir（机器重放）/ observability JsonlRecorder（事件流）
     # 定位不同，可并存。browser-use parity（service.py save_conversation_path）。
     save_conversation_path: str = ""
+    # ── 重放时序（阶段 1）：默认值对齐 CLI/TUI 现状硬编码，避免改变现有行为 ──
+    # 步间兜底延迟（秒）；对齐原 CLI/TUI 的 1（非 rerun_history 自身默认 2.0）
+    rerun_delay_between_actions: float = 1.0
+    # step_interval 封顶（秒）；对齐原 CLI/TUI 的 5（非 rerun_history 自身默认 45.0）
+    rerun_max_step_interval: float = 5.0
+    # 等元素数量（既有粗粒度等待）；对齐 rerun_history 默认 False
+    rerun_wait_for_elements: bool = False
+    # get_state 前等 readyState（缺口 1）；默认关 = 零行为变更
+    rerun_wait_for_page_settle: bool = False
 
 
 @dataclass
@@ -331,6 +340,11 @@ def load_settings() -> Settings:
         rerun_history_dir=os.environ.get("AGENT_RERUN_HISTORY_DIR", "rerun-history"),
         record_upload_dir=os.environ.get("AGENT_RECORD_UPLOAD_DIR", ""),
         save_conversation_path=os.environ.get("AGENT_SAVE_CONVERSATION_PATH", ""),
+        # 重放时序（阶段 1）
+        rerun_delay_between_actions=float(os.environ.get("AGENT_RERUN_DELAY_BETWEEN_ACTIONS", "1.0")),
+        rerun_max_step_interval=float(os.environ.get("AGENT_RERUN_MAX_STEP_INTERVAL", "5.0")),
+        rerun_wait_for_elements=os.environ.get("AGENT_RERUN_WAIT_FOR_ELEMENTS", "").lower() == "true",
+        rerun_wait_for_page_settle=os.environ.get("AGENT_RERUN_WAIT_FOR_PAGE_SETTLE", "").lower() == "true",
         judge=JudgeSettings(
             enabled=os.environ.get("AGENT_JUDGE_ENABLED", "1") == "1",
             model=os.environ.get("AGENT_JUDGE_MODEL", ""),

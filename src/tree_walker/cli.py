@@ -87,8 +87,6 @@ async def _rerun(settings, rerun_path: str, variables: dict[str, str], debug: bo
 	results = await agent.load_and_rerun(
 		rerun_path,
 		variables=variables or None,
-		max_step_interval=5,
-		delay_between_actions=1,
 		summary_llm=llm,
 	)
 

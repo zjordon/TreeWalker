@@ -1525,8 +1525,19 @@ class BrowserSession:
         except Exception:
             return ""
 
-    async def get_state(self, include_screenshot: bool = True) -> BrowserStateSummary:
-        """Get full browser state: URL, title, tabs, DOM, optional screenshot."""
+    async def get_state(
+        self, include_screenshot: bool = True, wait_settle: bool = False
+    ) -> BrowserStateSummary:
+        """Get full browser state: URL, title, tabs, DOM, optional screenshot.
+
+        wait_settle: poll document.readyState to 'complete' before reading state
+        (mirrors screenshot/save_as_pdf). 失败只打 warning，不阻断 get_state。
+        """
+        if wait_settle:
+            try:
+                await self._wait_for_page_settle()
+            except Exception as e:
+                logger.warning("Pre-get_state wait_settle failed: %s", e)
         sid = self.current_session_id
 
         # 轮转缓存：当前 → 前一步（用于新元素检测）

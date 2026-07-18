@@ -308,8 +308,6 @@ class TreeWalkerApp(App):
 			results = await self._agent.load_and_rerun(
 				self._rerun_file,
 				variables=self._rerun_vars,
-				max_step_interval=5,
-				delay_between_actions=1,
 				summary_llm=self._llm,
 			)
 			if results and results[-1].is_done:

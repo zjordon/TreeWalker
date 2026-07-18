@@ -70,3 +70,19 @@ def test_flatten_state_summary_and_metadata():
     assert s.state_summary["duration"] == 0.0
     assert s.metadata.step_start_time == 42.5
     assert s.metadata.step_end_time == 42.5
+    # 单 action（首步）→ step_interval 为 None（无上一步）
+    assert s.metadata.step_interval is None
+
+
+def test_flatten_sets_step_interval_from_prev_ts():
+    # 相邻 action 的 timestamp 差 → step_interval（首步 None）；用非均匀 ts 抓错位 bug
+    rec = Recording(actions=[
+        _action("navigate", {"url": "https://x.com", "new_tab": False}, interacted=[], ts=10.0),
+        _action("click", {"index": 5}, interacted=[{"element_hash": 1}], ts=12.0),
+        _action("input_text", {"text": "a", "index": 9}, interacted=[{"element_hash": 2}], ts=17.0),
+    ])
+    out = flatten(rec)
+    intervals = [s.metadata.step_interval for s in out.history]
+    assert intervals[0] is None            # 首步无上一步
+    assert intervals[1] == 2.0             # 12.0 - 10.0
+    assert intervals[2] == 5.0             # 17.0 - 12.0
