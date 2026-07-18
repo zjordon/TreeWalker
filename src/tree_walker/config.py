@@ -111,6 +111,9 @@ class AgentSettings:
     # 历史重放文件根目录：save_history/load_and_rerun 的相对路径都相对此根解析。
     # 相对路径=相对 CWD(项目根)；可用绝对路径覆盖。默认 "rerun-history"。
     rerun_history_dir: str = "rerun-history"
+    # 用户操作录制：upload_file 的约定目录。空→运行时解析为 <rerun_history_dir>/uploads。
+    # 扩展只能拿到文件名（浏览器安全限制），录制产物存文件名，重放前用户须把文件放进此目录。
+    record_upload_dir: str = ""
     # P1-3：每步对话 dump（input messages + model output 的人类可读文本快照），用于离线审计
     # LLM 决策。空=禁用。与 rerun_history_dir（机器重放）/ observability JsonlRecorder（事件流）
     # 定位不同，可并存。browser-use parity（service.py save_conversation_path）。
@@ -326,6 +329,7 @@ def load_settings() -> Settings:
         upload_verify_wait_s=float(os.environ.get("AGENT_UPLOAD_VERIFY_WAIT_S", "1.5")),
         upload_verify_interval_s=float(os.environ.get("AGENT_UPLOAD_VERIFY_INTERVAL_S", "0.25")),
         rerun_history_dir=os.environ.get("AGENT_RERUN_HISTORY_DIR", "rerun-history"),
+        record_upload_dir=os.environ.get("AGENT_RECORD_UPLOAD_DIR", ""),
         save_conversation_path=os.environ.get("AGENT_SAVE_CONVERSATION_PATH", ""),
         judge=JudgeSettings(
             enabled=os.environ.get("AGENT_JUDGE_ENABLED", "1") == "1",

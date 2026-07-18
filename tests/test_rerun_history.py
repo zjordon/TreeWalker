@@ -148,6 +148,38 @@ def test_match_none(make_node):
     ) is None
 
 
+def test_match_class_fallback(make_node):
+    # SPA 按钮只有 CSS 类、无 name/id/aria-label → 前 5 级全失败，CLASS 兜底（抖音「确定」场景）
+    rm = RerunMixin()
+    live = make_node(tag="button", attributes={"class": "semi-button semi-button-primary btn-xtdEbg"})
+    hist = {"node_name": "BUTTON", "attributes": {"class": "semi-button semi-button-primary btn-xtdEbg"}}
+    assert rm._match_element_index(hist, {9: live}) == (9, MatchLevel.CLASS)
+
+
+def test_match_class_superset_tolerates_extra_state_class(make_node):
+    # 候选 class 含录制全部 token（外加 focused-xxx 状态类）→ 仍匹配
+    rm = RerunMixin()
+    live = make_node(tag="button", attributes={"class": "semi-button semi-button-primary btn-xtdEbg focused-abc"})
+    hist = {"node_name": "BUTTON", "attributes": {"class": "semi-button semi-button-primary btn-xtdEbg"}}
+    assert rm._match_element_index(hist, {5: live}) == (5, MatchLevel.CLASS)
+
+
+def test_match_class_rejects_missing_token(make_node):
+    # 候选缺一个 token（primary 换成 tertiary）→ 不匹配（不会误选「取消」按钮当「确定」）
+    rm = RerunMixin()
+    live = make_node(tag="button", attributes={"class": "semi-button semi-button-tertiary btn-xtdEbg"})
+    hist = {"node_name": "BUTTON", "attributes": {"class": "semi-button semi-button-primary btn-xtdEbg"}}
+    assert rm._match_element_index(hist, {5: live}) is None
+
+
+def test_match_class_skipped_when_name_id_present(make_node):
+    # 有 name 时 ATTRIBUTE 命中，不走 CLASS（CLASS 只是无 name/id/aria-label 的兜底）
+    rm = RerunMixin()
+    live = make_node(tag="input", attributes={"name": "email", "class": "inp"})
+    hist = {"node_name": "INPUT", "attributes": {"name": "email", "class": "inp"}}
+    assert rm._match_element_index(hist, {3: live}) == (3, MatchLevel.ATTRIBUTE)
+
+
 def test_match_tiebreak_by_position(make_node, make_snapshot_node, make_dom_rect):
     # 哈希碰撞：两个同 attrs、同 parent(无) 的 div → element_hash 相同。
     # 同级多个候选时，按「录制 bounds 中心就近」选——不能取迭代顺序里靠前的那个。
@@ -173,6 +205,28 @@ def test_match_tiebreak_falls_back_to_first_without_bounds(make_node):
             "element_hash": a.element_hash, "bounds": None}
     match = rm._match_element_index(hist, {1: a, 2: b})
     assert match == (1, MatchLevel.EXACT)          # 退回第一个
+
+
+def test_match_tiebreak_prefers_unique_xpath_match():
+    # 指纹碰撞（同 element_hash）+ xpath 不同 → 优先「恰好一个 xpath 命中」的候选
+    # 抖音封面编辑器横/竖版上传区场景：同 hash，xpath div[2] vs div[3]
+    from tree_walker.agent.rerun import _nearest_idx
+    horiz = SimpleNamespace(xpath="html/body/div[2]/icon", snapshot_node=None)
+    vert = SimpleNamespace(xpath="html/body/div[3]/icon", snapshot_node=None)
+    hist = {"x_path": "html/body/div[3]/icon", "bounds": None}  # 录制的是竖版
+    assert _nearest_idx(hist, [(1, horiz), (2, vert)]) == 2
+
+
+def test_match_tiebreak_xpath_all_match_falls_back_to_position(make_node):
+    # 所有候选 xpath 都相同（真·无区分碰撞）→ xpath tie-break 不触发，退回 bounds 就近
+    rm = RerunMixin()
+    # 两个同 attrs 的 div（element_hash 碰撞、xpath 同为 "div"）
+    a = make_node(tag="div", attributes={"class": "x"})
+    b = make_node(tag="div", attributes={"class": "x"})
+    assert a.element_hash == b.element_hash
+    hist = {"node_name": "DIV", "attributes": {"class": "x"}, "element_hash": a.element_hash,
+            "x_path": "div", "bounds": None}  # xpath "div" 对 a/b 都匹配 → 不是唯一 → 退回第一个
+    assert rm._match_element_index(hist, {1: a, 2: b}) == (1, MatchLevel.EXACT)
 
 
 def test_update_action_indices_relocates_and_preserves_params(make_node):
@@ -485,7 +539,248 @@ async def test_rerun_history_relocates_and_runs(make_node):
     assert results[-1].success is True
 
 
-# ── 重放文件根目录 + 相对路径校验 ──────────────────────────────────────
+# ── upload_file 回放兜底（录制无定位 → 从 selector_map 找 file input）──
+
+
+def test_skip_reason_keeps_upload_file_without_index():
+    """upload_file 无 index/interacted 不跳过——回放时可从 selector_map 兜底找 file input。"""
+    rm = RerunMixin()
+    item = AgentHistory(
+        step_number=0,
+        model_output={"action": {"name": "upload_file", "params": {"path": "v.mp4"}}},
+        result=[ActionResult()],
+        state_summary={"url": "http://x"},
+        interacted_element=[None],
+    )
+    assert rm._skip_reason(item, None, False, False) is None
+
+
+def test_skip_reason_skips_click_without_index():
+    """click 无 index/interacted 仍跳过（噪声步，回放无法兜底）。"""
+    rm = RerunMixin()
+    item = AgentHistory(
+        step_number=0,
+        model_output={"action": {"name": "click", "params": {}}},
+        result=[ActionResult()],
+        state_summary={"url": "http://x"},
+        interacted_element=[None],
+    )
+    assert rm._skip_reason(item, None, False, False) is not None
+
+
+@pytest.mark.asyncio
+async def test_rerun_upload_file_with_correct_fingerprint_matches(make_node):
+    """录制正确的 upload_file（accept 定位出的 file input 真实指纹）→ 重放正常 EXACT 匹配
+    命中，无需任何兜底。file input 本就在 selector_map。"""
+    from tree_walker.agent.agent import Agent
+    from tree_walker.config import AgentSettings, JudgeSettings
+
+    file_input = make_node(tag="input", node_id=4490, backend_node_id=4490,
+                           attributes={"type": "file", "accept": "video/*"})
+    # 录制指纹 = 该 file input 的真实投影（accept 定位产出）
+    hist_elem = DOMInteractedElement.load_from_enhanced_dom_tree(file_input).to_dict()
+    history = AgentHistoryList(history=[
+        AgentHistory(step_number=0,
+                     model_output={"action": {"name": "upload_file",
+                                              "params": {"path": "v.mp4", "index": 4490}}},
+                     result=[ActionResult()],
+                     state_summary={"url": "http://x"},
+                     interacted_element=[hist_elem]),
+    ])
+    state = SimpleNamespace(
+        url="http://x",
+        dom_state=SimpleNamespace(selector_map={4490: file_input}),
+    )
+
+    browser = MagicMock()
+    browser._settings = SimpleNamespace(wait_between_actions=0)
+    browser.start = AsyncMock()
+    browser.stop = AsyncMock()
+    browser.navigate = AsyncMock()
+    browser.get_state = AsyncMock(return_value=state)
+    browser.get_current_url = AsyncMock(return_value="http://x")
+
+    agent = Agent(task="upload", llm=MagicMock(), browser=browser,
+                  settings=AgentSettings(judge=JudgeSettings(enabled=False)))
+    captured: dict = {}
+
+    async def fake_execute(name, params, br, st):
+        captured["name"] = name
+        captured["params"] = dict(params)
+        return ActionResult()
+
+    agent.tools.execute = fake_execute
+    agent.llm = _StructuredLLM()
+
+    await agent.rerun_history(
+        history, max_step_interval=0, delay_between_actions=0, summary_llm=_StructuredLLM()
+    )
+
+    assert captured["name"] == "upload_file"
+    assert captured["params"]["index"] == 4490   # EXACT 匹配命中（无兜底）
+    assert captured["params"]["path"] == "v.mp4"
+
+
+@pytest.mark.asyncio
+async def test_rerun_upload_file_no_fingerprint_resolves_by_accept(make_node):
+    """upload_file 无指纹（file input 录制时瞬态不在 selector_map）→ 重放按 accept(文件类型)
+    从当前页 selector_map 解析 file input。对应「视频上传时 video input 未渲染」场景。"""
+    from tree_walker.agent.agent import Agent
+    from tree_walker.config import AgentSettings, JudgeSettings
+
+    history = AgentHistoryList(history=[
+        AgentHistory(step_number=0,
+                     model_output={"action": {"name": "upload_file", "params": {"path": "v.mp4"}}},
+                     result=[ActionResult()],
+                     state_summary={"url": "http://x"},
+                     interacted_element=[None]),  # 录制无指纹（file input 瞬态）
+    ])
+    video = make_node(tag="input", node_id=4490, backend_node_id=4490,
+                      attributes={"type": "file", "accept": "video/x-flv,video/mp4,video/*"})
+    state = SimpleNamespace(
+        url="http://x",
+        dom_state=SimpleNamespace(selector_map={4490: video}),
+    )
+
+    browser = MagicMock()
+    browser._settings = SimpleNamespace(wait_between_actions=0)
+    browser.start = AsyncMock()
+    browser.stop = AsyncMock()
+    browser.navigate = AsyncMock()
+    browser.get_state = AsyncMock(return_value=state)
+    browser.get_current_url = AsyncMock(return_value="http://x")
+
+    agent = Agent(task="upload", llm=MagicMock(), browser=browser,
+                  settings=AgentSettings(judge=JudgeSettings(enabled=False)))
+    captured: dict = {}
+
+    async def fake_execute(name, params, br, st):
+        captured["name"] = name
+        captured["params"] = dict(params)
+        return ActionResult()
+
+    agent.tools.execute = fake_execute
+    agent.llm = _StructuredLLM()
+
+    await agent.rerun_history(
+        history, max_step_interval=0, delay_between_actions=0, summary_llm=_StructuredLLM()
+    )
+
+    assert captured["name"] == "upload_file"
+    assert captured["params"]["index"] == 4490   # 按 accept=video 解析命中
+    assert captured["params"]["path"] == "v.mp4"
+
+
+# ── _resolve_file_input_by_accept：accept + xpath 签名解析（B 方案）──────
+
+
+def test_resolve_file_input_by_accept_xpath_disambiguates_covers():
+    """同 accept（横/竖封面都 image）多个 → xpath_hint normalize 后唯一命中区分。"""
+    rm = RerunMixin()
+    heng = SimpleNamespace(node_name="INPUT",
+                           attributes={"type": "file", "accept": "image/png,image/jpeg"},
+                           xpath="html/body/div[12]/div[2]/input")
+    shu = SimpleNamespace(node_name="INPUT",
+                          attributes={"type": "file", "accept": "image/png,image/jpeg"},
+                          xpath="html/body/div[12]/div[3]/input")
+    state = _state({10: heng, 11: shu})
+    # 竖封面 xpath（前导 / 经 normalize_xpath strip）→ idx 11
+    assert rm._resolve_file_input_by_accept(
+        state, "shu.png", "/html/body/div[12]/div[3]/input", "image/png,image/jpeg") == 11
+    # 横封面 xpath → idx 10
+    assert rm._resolve_file_input_by_accept(
+        state, "heng.png", "html/body/div[12]/div[2]/input", "image/png,image/jpeg") == 10
+
+
+def test_resolve_file_input_by_accept_accept_hint_overrides_path():
+    """accept_hint 优先定 kind：path 是 .mp4 但 accept_hint=image → 取 image input；
+    无 accept_hint 时退回 path 扩展名（.mp4→video，无 video input → None）。"""
+    rm = RerunMixin()
+    img = SimpleNamespace(node_name="INPUT",
+                          attributes={"type": "file", "accept": "image/png,image/jpeg"}, xpath="x")
+    state = _state({7: img})
+    assert rm._resolve_file_input_by_accept(state, "weird.mp4", "", "image/png,image/jpeg") == 7
+    assert rm._resolve_file_input_by_accept(state, "weird.mp4", "", "") is None
+
+
+def test_resolve_file_input_by_accept_single_video_input():
+    """唯一 video 候选 → 无需 xpath_hint（视频上传只有 1 个 video input）。"""
+    rm = RerunMixin()
+    vid = SimpleNamespace(node_name="INPUT",
+                          attributes={"type": "file", "accept": "video/*"}, xpath="x")
+    state = _state({9: vid})
+    assert rm._resolve_file_input_by_accept(state, "v.mp4", "", "") == 9
+
+
+# ── 语义线索重定位（_semantic_clue → locate_by_ref）─────────────────
+
+
+@pytest.mark.asyncio
+async def test_rerun_semantic_clue_relocates_via_attribute(make_node):
+    """录制失败步存语义线索，重放在稳定页面用 locate_by_ref 重新定位（ATTRIBUTE 级匹配）。
+
+    模拟 submit 场景：录制时 get_state 抓跳转后页、button 消失 → 存语义线索；重放到 click 步页面
+    稳定、button 在，xpath 虽漂移但 name 命中 → 重定位成功。详见 semantic-clue-replay.md。
+    """
+    from tree_walker.agent.agent import Agent
+    from tree_walker.config import AgentSettings, JudgeSettings
+
+    history = AgentHistoryList(history=[
+        AgentHistory(step_number=0,
+                     model_output={"action": {"name": "click", "params": {}}},
+                     result=[ActionResult()],
+                     state_summary={"url": "http://x"},
+                     interacted_element=[{
+                         "_semantic_clue": True,
+                         "xpath": "/drifted/xpath",          # Level 1 xpath 漂移失配
+                         "tag": "button", "name": "submit",   # Level 2 ATTRIBUTE 命中
+                         "id": "", "ariaLabel": "", "role": "", "rect": None,
+                     }]),
+    ])
+    btn = make_node(tag="button", node_id=7069, backend_node_id=7069,
+                    attributes={"name": "submit"})
+    state = SimpleNamespace(url="http://x", dom_state=SimpleNamespace(selector_map={7069: btn}))
+
+    browser = MagicMock()
+    browser._settings = SimpleNamespace(wait_between_actions=0)
+    browser.start = AsyncMock()
+    browser.stop = AsyncMock()
+    browser.navigate = AsyncMock()
+    browser.get_state = AsyncMock(return_value=state)
+    browser.get_current_url = AsyncMock(return_value="http://x")
+
+    agent = Agent(task="x", llm=MagicMock(), browser=browser,
+                  settings=AgentSettings(judge=JudgeSettings(enabled=False)))
+    captured: dict = {}
+
+    async def fake_execute(name, params, br, st):
+        captured["name"] = name
+        captured["params"] = dict(params)
+        return ActionResult()
+
+    agent.tools.execute = fake_execute
+    agent.llm = _StructuredLLM()
+
+    await agent.rerun_history(
+        history, max_step_interval=0, delay_between_actions=0, summary_llm=_StructuredLLM()
+    )
+
+    assert captured["name"] == "click"
+    assert captured["params"]["index"] == 7069   # 语义线索重定位命中 button
+
+
+def test_rerun_semantic_clue_failure_format():
+    """语义线索重定位失败 → _format_semantic_clue_failure 给诊断信息（不静默 skip）。"""
+    rm = RerunMixin()
+    clue = {"_semantic_clue": True, "tag": "button", "xpath": "/x",
+            "name": "submit", "id": "", "ariaLabel": "", "role": "", "rect": None}
+    msg = rm._format_semantic_clue_failure(clue, {})
+    assert "button" in msg.lower()
+    assert "submit" in msg
+    assert "locate_by_ref" in msg
+
+
+# ── 重放文件根目录 + 相对路径校验 ─────────────────────────────────────
 
 
 def test_resolve_rerun_path_relative():
