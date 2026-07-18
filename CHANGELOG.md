@@ -5,6 +5,23 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.10.0] - 2026-07-18
+
+### Added
+
+**用户操作录制重设计 + 语义线索回放**（#122）：
+
+- recorder 重设计：Signal 模型 + 翻译流水线（`models`/`translation`/`rules`/`flatten`）；实时定位指纹保留在 `handle_event`（modal DOM 活着时算）；扩展 `side-effect-observer`（modal/dropdown 信号）+ `onAction` 钩子
+- **语义线索回放**：点 submit/链接等触发跳转的操作，录制时元素消失也能在重放时重新定位——利用重放的主动时序优势（重放到该步页面稳定），复用 `locate_by_ref` 凭语义线索（xpath/属性/位置）定位
+- 重放三路径降级链：指纹匹配（稳定元素，最优）> 语义线索（录制失败）> accept 兜底（文件上传）
+- 录制端去噪与健壮性：连续输入合并、重复点击折叠、副作用导航吸收；跳过非可交互噪声点击；`get_state` 异常容错（跳转致 CDP target 卸载时不中断）
+
+**循环检测对齐 browser-use**（#120）：P1-1 动作类型语义归一化 + P1-2 三维页面指纹 + P1-3 双维度 nudge（实际计数 + 文案）+ P1-4 检测窗口 15→20
+
+### Changed
+
+- 计划模式默认启用（原需 `AGENT_ENABLE_PLANNING=true`，现默认开）
+
 ## [0.9.0] - 2026-07-06
 
 ### Added
