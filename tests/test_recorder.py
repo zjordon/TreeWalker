@@ -98,7 +98,10 @@ async def test_locate_failure_keeps_action_without_index(tmp_path, patch_project
 	await rec.start()
 	action = await rec.handle_event({"type": "click", "xpath": "html/body/missing"})
 	assert action is not None
-	assert action.interacted_element == [None]
+	# locate 失败 → 存语义线索（非 [None]），重放端重新定位（详见 semantic-clue-replay.md）
+	assert action.interacted_element[0] is not None
+	assert action.interacted_element[0]["_semantic_clue"] is True
+	assert action.interacted_element[0]["xpath"] == "html/body/missing"
 	assert "index" not in action.params
 	assert len(patch_projection) == 0  # 定位失败，投影未调用
 
@@ -310,16 +313,39 @@ async def test_locate_retries_when_element_appears_later(tmp_path, patch_project
 
 @pytest.mark.asyncio
 async def test_locate_retry_exhausted_records_miss(tmp_path, patch_projection, monkeypatch):
-	"""重试后仍找不到 → 记 locate_miss（retried=True），interacted 置空。"""
+	"""重试后仍找不到 → 记 locate_miss（retried=True），存语义线索。"""
 	monkeypatch.setattr(rec_mod, "_LOCATE_RETRY_DELAYS", (0.0, 0.0))
 	browser = FakeBrowser(selector_map={5: SimpleNamespace(xpath="html/body/other")})
 	rec = Recorder(browser, rerun_history_dir=str(tmp_path))
 	await rec.start()
 	action = await rec.handle_event({"type": "click", "xpath": "html/body/missing"})
 	assert action is not None
-	assert action.interacted_element == [None]
+	assert action.interacted_element[0] is not None   # 存语义线索
+	assert action.interacted_element[0]["_semantic_clue"] is True
 	assert action.locate_miss is not None
 	assert action.locate_miss["retried"] is True
+
+
+@pytest.mark.asyncio
+async def test_locate_get_state_failure_records_semantic_clue(tmp_path, patch_projection, monkeypatch):
+	"""get_state 抛异常（submit 跳转致 CDP target 卸载）→ 容错为空 selector_map，locate 失败存语义线索。
+
+	修复 submit click 录制时 get_state 异常致 handle_event 中断、interacted 以默认 None 落盘（重放
+	skip、submit 没点）。容错后即使 get_state 异常也存语义线索，重放端可重新定位。"""
+	monkeypatch.setattr(rec_mod, "_LOCATE_RETRY_DELAYS", (0.0, 0.0))
+
+	class FailGetStateBrowser(FakeBrowser):
+		async def get_state(self, include_screenshot=True):
+			raise RuntimeError("target closed")
+
+	rec = Recorder(FailGetStateBrowser(), rerun_history_dir=str(tmp_path))
+	await rec.start()
+	action = await rec.handle_event({"type": "click", "xpath": "html/body/form/button", "tag": "button"})
+	assert action is not None
+	# get_state 异常 → 容错（不中断）→ locate 失败存语义线索（非默认 None）
+	assert action.interacted_element[0] is not None
+	assert action.interacted_element[0]["_semantic_clue"] is True
+	assert action.interacted_element[0]["xpath"] == "html/body/form/button"
 
 
 # ── select_http_target：target 选择纯函数 ───────────────────────────────

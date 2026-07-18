@@ -712,6 +712,74 @@ def test_resolve_file_input_by_accept_single_video_input():
     assert rm._resolve_file_input_by_accept(state, "v.mp4", "", "") == 9
 
 
+# ── 语义线索重定位（_semantic_clue → locate_by_ref）─────────────────
+
+
+@pytest.mark.asyncio
+async def test_rerun_semantic_clue_relocates_via_attribute(make_node):
+    """录制失败步存语义线索，重放在稳定页面用 locate_by_ref 重新定位（ATTRIBUTE 级匹配）。
+
+    模拟 submit 场景：录制时 get_state 抓跳转后页、button 消失 → 存语义线索；重放到 click 步页面
+    稳定、button 在，xpath 虽漂移但 name 命中 → 重定位成功。详见 semantic-clue-replay.md。
+    """
+    from tree_walker.agent.agent import Agent
+    from tree_walker.config import AgentSettings, JudgeSettings
+
+    history = AgentHistoryList(history=[
+        AgentHistory(step_number=0,
+                     model_output={"action": {"name": "click", "params": {}}},
+                     result=[ActionResult()],
+                     state_summary={"url": "http://x"},
+                     interacted_element=[{
+                         "_semantic_clue": True,
+                         "xpath": "/drifted/xpath",          # Level 1 xpath 漂移失配
+                         "tag": "button", "name": "submit",   # Level 2 ATTRIBUTE 命中
+                         "id": "", "ariaLabel": "", "role": "", "rect": None,
+                     }]),
+    ])
+    btn = make_node(tag="button", node_id=7069, backend_node_id=7069,
+                    attributes={"name": "submit"})
+    state = SimpleNamespace(url="http://x", dom_state=SimpleNamespace(selector_map={7069: btn}))
+
+    browser = MagicMock()
+    browser._settings = SimpleNamespace(wait_between_actions=0)
+    browser.start = AsyncMock()
+    browser.stop = AsyncMock()
+    browser.navigate = AsyncMock()
+    browser.get_state = AsyncMock(return_value=state)
+    browser.get_current_url = AsyncMock(return_value="http://x")
+
+    agent = Agent(task="x", llm=MagicMock(), browser=browser,
+                  settings=AgentSettings(judge=JudgeSettings(enabled=False)))
+    captured: dict = {}
+
+    async def fake_execute(name, params, br, st):
+        captured["name"] = name
+        captured["params"] = dict(params)
+        return ActionResult()
+
+    agent.tools.execute = fake_execute
+    agent.llm = _StructuredLLM()
+
+    await agent.rerun_history(
+        history, max_step_interval=0, delay_between_actions=0, summary_llm=_StructuredLLM()
+    )
+
+    assert captured["name"] == "click"
+    assert captured["params"]["index"] == 7069   # 语义线索重定位命中 button
+
+
+def test_rerun_semantic_clue_failure_format():
+    """语义线索重定位失败 → _format_semantic_clue_failure 给诊断信息（不静默 skip）。"""
+    rm = RerunMixin()
+    clue = {"_semantic_clue": True, "tag": "button", "xpath": "/x",
+            "name": "submit", "id": "", "ariaLabel": "", "role": "", "rect": None}
+    msg = rm._format_semantic_clue_failure(clue, {})
+    assert "button" in msg.lower()
+    assert "submit" in msg
+    assert "locate_by_ref" in msg
+
+
 # ── 重放文件根目录 + 相对路径校验 ─────────────────────────────────────
 
 

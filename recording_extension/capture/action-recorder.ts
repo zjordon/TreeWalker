@@ -47,7 +47,11 @@ const INPUT_COALESCE_MS = 400;
 const SCROLL_IDLE_MS = 500;
 let installed = false;
 
-/** 从 el 向上找最近的可交互祖先；找不到回退到 el 本身。 */
+/** 从 el 向上找最近的可交互祖先；找不到返回 null（调用方据此跳过非可交互的噪声点击）。
+ *
+ * 找不到 = el 及祖先都非可交互（非 INTERACTIVE_SELECTOR、非 div cursor:pointer、无 onclick），
+ * 典型如点 <p> 段落空白——onClick 应跳过这类噪声，避免录到 selector_map 永不在的非可交互元素
+ * （录制/重放都定位失败）。button/label/input/div 触发器都能在向上找时命中返回。 */
 function findInteractiveAncestor(el: Element | null): Element | null {
   let cur: Element | null = el;
   while (cur && cur !== document.body) {
@@ -66,7 +70,7 @@ function findInteractiveAncestor(el: Element | null): Element | null {
     }
     cur = cur.parentElement;
   }
-  return el;
+  return null;
 }
 
 /** 取元素的原始定位属性（后端 ATTRIBUTE 级兜底用）。 */
@@ -151,7 +155,10 @@ export function installActionRecorder(opts: InstallOptions): () => void {
     // file input 的 click 几乎都是上传按钮 JS 触发的 input.click()（非用户直接点），
     // 后续 change 会录 upload_file；跳过避免冗余 click（回放 upload_file 不需要先点）。
     if (raw.tagName === 'INPUT' && (raw.getAttribute('type') || '').toLowerCase() === 'file') return;
-    const target = findInteractiveAncestor(raw) ?? raw;
+    // 找不到可交互祖先（点 <p> 段落空白等非可交互区域）→ 跳过，避免录到 selector_map 永不在的
+    // 噪声点击（录制/重放都定位失败）。
+    const target = findInteractiveAncestor(raw);
+    if (!target) return;
     const ref = buildElementRef(target);
     emit({
       type: 'click',

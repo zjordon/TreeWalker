@@ -158,7 +158,14 @@ class Recorder:
 		# 确保 BrowserSession 指向用户操作的 http page（而非 popup/扩展页）
 		await self._ensure_target(event.get("url"))
 
-		state = await self.browser.get_state(include_screenshot=False)
+		try:
+			state = await self.browser.get_state(include_screenshot=False)
+		except Exception as e:
+			# get_state 可能因动作触发跳转（submit/链接）致 CDP target 卸载/切换而抛异常。
+			# 容错为 None，让后续 locate loop 走"失败存语义线索"路径（重放端重新定位），
+			# 而非让该步以默认 interacted=None 落盘（重放被 skip，跳转/提交丢失）。
+			logger.warning("get_state 失败（%s）——用空 selector_map，locate 将存语义线索", e)
+			state = None
 		selector_map = state.dom_state.selector_map if state and state.dom_state else {}
 
 		# 实时定位 + 指纹投影（modal 打开时 DOM 活着，此时算才准）。
@@ -183,7 +190,11 @@ class Recorder:
 				# 重试：等页面渲染/动画收尾，重新 get_state + 定位
 				for delay in _LOCATE_RETRY_DELAYS:
 					await asyncio.sleep(delay)
-					state = await self.browser.get_state(include_screenshot=False)
+					try:
+						state = await self.browser.get_state(include_screenshot=False)
+					except Exception as e:
+						logger.debug("retry get_state 失败: %s", e)
+						state = None
 					selector_map = state.dom_state.selector_map if state and state.dom_state else {}
 					located = locate(selector_map)
 					retried = True
@@ -191,11 +202,23 @@ class Recorder:
 						break
 			if located is None:
 				logger.warning(
-					"定位失败 action=%s xpath=%s tag=%s rect=%s%s（该步 interacted_element 置空；记 locate_miss）",
+					"定位失败 action=%s xpath=%s tag=%s rect=%s%s（存语义线索，重放端重新定位；记 locate_miss）",
 					action.action_name, event.get("xpath"), event.get("tag"), event.get("rect"),
 					"（重试后仍失败）" if retried else "",
 				)
-				action.interacted_element = [None]
+				# 语义线索：locate 失败（get_state 抓到变化后页/元素消失），但扩展在事件瞬间握住了
+				# e.target 的特征（xpath/tag/attr/rect = locate_by_ref 的输入）。存为语义线索，重放端在
+				# 稳定页面重新定位（重放有主动时序优势，元素完好）。详见 semantic-clue-replay.md。
+				action.interacted_element = [{
+					"_semantic_clue": True,
+					"xpath": event.get("xpath"),
+					"tag": event.get("tag"),
+					"name": event.get("name"),
+					"id": event.get("id"),
+					"ariaLabel": event.get("ariaLabel"),
+					"role": event.get("role"),
+					"rect": event.get("rect"),
+				}]
 				# 诊断落盘：定位未命中时，记下事件线索 + map 规模，便于事后分析
 				action.locate_miss = {
 					"xpath": event.get("xpath"),

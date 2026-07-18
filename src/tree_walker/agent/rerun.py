@@ -29,7 +29,7 @@ from tree_walker.agent.views import (
     RerunSummaryAction,
 )
 from tree_walker.prompts.rerun_summary import get_rerun_summary_prompt
-from tree_walker.recorder.locator import normalize_xpath
+from tree_walker.recorder.locator import locate_by_ref, normalize_xpath
 
 if TYPE_CHECKING:
     from tree_walker.browser.session import BrowserSession
@@ -459,7 +459,18 @@ class RerunMixin:
                 hist_elem = interacted[i] if i < len(interacted) else None
                 raw_params = action.get("params") if isinstance(action.get("params"), dict) else {}
                 has_index = raw_params.get("index") is not None or raw_params.get("element_id") is not None
-                if hist_elem and has_index:
+                if hist_elem and hist_elem.get("_semantic_clue"):
+                    # 语义线索路径：录制时 locate 失败（get_state 抓变化后页），存了 e.target 的
+                    # xpath/tag/attr/rect 线索。重放有主动时序优势（到这步页面稳定、元素完好），
+                    # 复用 locate_by_ref 三道防线重新定位。详见 semantic-clue-replay.md。
+                    matched = locate_by_ref(hist_elem, selector_map)
+                    if matched is not None:
+                        params = dict(raw_params)
+                        params["index"] = matched[0]
+                        logger.info("语义线索重定位 idx=%s（action=%s）", matched[0], name)
+                    else:
+                        raise ValueError(self._format_semantic_clue_failure(hist_elem, selector_map))
+                elif hist_elem and has_index:
                     updated = self._update_action_indices(hist_elem, action, selector_map)
                     if updated is None:
                         if name == "upload_file":
@@ -752,6 +763,26 @@ class RerunMixin:
             f"Page has {len(selector_map)} interactive elements. "
             f"Same-<{name}> candidates: {cand_block}. "
             f"Tried: EXACT -> STABLE -> XPATH -> AX_NAME -> ATTRIBUTE -> CLASS"
+        )
+
+    def _format_semantic_clue_failure(self, clue: dict[str, Any], selector_map: dict[int, Any]) -> str:
+        """语义线索重定位失败的诊断信息（录制失败步在重放端重新定位也没找到）。"""
+        tag = (clue.get("tag") or "?").upper()
+        attr_str = " ".join(
+            f'{k}="{clue[k]}"' for k in ("name", "id", "ariaLabel", "role") if clue.get(k)
+        )
+        candidates = [
+            f"[{idx}] class={(e.attributes or {}).get('class', '')!r}"
+            f" name={(e.attributes or {}).get('name', '')!r}"
+            for idx, e in selector_map.items()
+            if (getattr(e, "node_name", "") or "").upper() == tag
+        ][:10]
+        cand_block = "; ".join(candidates) if candidates else "(无同标签候选)"
+        return (
+            f"Semantic-clue relocate failed for <{tag}> {attr_str} "
+            f"xpath={clue.get('xpath')!r}. Page has {len(selector_map)} interactive elements. "
+            f"Same-<{tag}> candidates: {cand_block}. "
+            f"Tried: XPATH -> ATTRIBUTE -> RECT (locate_by_ref)"
         )
 
     # ── 跳过/重试辅助 ──────────────────────────────────────────────────
