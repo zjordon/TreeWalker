@@ -1255,3 +1255,166 @@ def test_agent_wires_actionability_from_settings():
 	assert agent.rerun_actionability_check is True
 	assert agent.rerun_actionability_timeout == 5.0
 	assert agent.rerun_actionability_poll == 0.5
+
+
+# ── 阶段 3：networkidle 开关 + 重放端 upload 等待 ──────────────────────────
+
+
+def test_agentsettings_default_networkidle():
+	from tree_walker.config import AgentSettings
+	s = AgentSettings()
+	assert s.rerun_wait_for_networkidle is False    # 默认关 = 零行为变更
+	assert s.rerun_upload_wait_video == 5.0         # 默认 = 原录制端硬编码（零差异）
+	assert s.rerun_upload_wait_image == 3.0
+
+
+def test_browsersettings_default_network_idle_tuning():
+	from tree_walker.config import BrowserSettings
+	s = BrowserSettings()
+	assert s.network_idle_timeout == 5.0
+	assert s.network_idle_stability_window == 0.5
+	assert s.network_idle_poll_interval == 0.1
+
+
+def test_agent_wires_networkidle_from_settings():
+	from tree_walker.agent import Agent
+	from tree_walker.browser.session import BrowserSettings
+	from tree_walker.config import AgentSettings, JudgeSettings
+	browser = MagicMock()
+	browser._settings = BrowserSettings()
+	agent = Agent(task="x", llm=MagicMock(), browser=browser,
+		settings=AgentSettings(judge=JudgeSettings(enabled=False),
+			rerun_wait_for_networkidle=True,
+			rerun_upload_wait_video=8.0,
+			rerun_upload_wait_image=4.0))
+	assert agent.rerun_wait_for_networkidle is True
+	assert agent.rerun_upload_wait_video == 8.0
+	assert agent.rerun_upload_wait_image == 4.0
+
+
+def _build_agent_with_done_step():
+	"""单步 done 历史（无定位动作），隔离测 get_state 的 wait_networkidle 透传。"""
+	from tree_walker.agent.agent import Agent
+	from tree_walker.config import AgentSettings, JudgeSettings
+	history = AgentHistoryList(history=[
+		AgentHistory(step_number=0,
+			model_output={"action": {"name": "done", "params": {}}},
+			result=[ActionResult()], state_summary={"url": "http://x"},
+			interacted_element=[None]),
+	])
+	state = SimpleNamespace(url="http://x", dom_state=SimpleNamespace(selector_map={}))
+	browser = MagicMock()
+	browser._settings = SimpleNamespace(wait_between_actions=0)
+	browser.start = AsyncMock(); browser.stop = AsyncMock(); browser.navigate = AsyncMock()
+	browser.get_state = AsyncMock(return_value=state)
+	browser.get_current_url = AsyncMock(return_value="http://x")
+	agent = Agent(task="x", llm=MagicMock(), browser=browser,
+		settings=AgentSettings(judge=JudgeSettings(enabled=False)))
+	agent.llm = _StructuredLLM()
+	return agent, history, browser
+
+
+@pytest.mark.asyncio
+async def test_networkidle_default_off_passes_false_to_get_state():
+	"""rerun_wait_for_networkidle=False（默认）→ get_state 收到 wait_networkidle=False（不等待）。"""
+	agent, history, browser = _build_agent_with_done_step()
+	await agent.rerun_history(history, delay_between_actions=0, max_step_interval=0,
+		summary_llm=_StructuredLLM())
+	waits = [c.kwargs.get("wait_networkidle") for c in browser.get_state.call_args_list]
+	assert waits                                    # get_state 至少被调一次
+	assert all(w is False for w in waits)           # 默认关，全部不等待
+
+
+@pytest.mark.asyncio
+async def test_networkidle_on_passes_true_to_get_state():
+	"""rerun_wait_for_networkidle=True → get_state 收到 wait_networkidle=True（透传）。"""
+	agent, history, browser = _build_agent_with_done_step()
+	agent.rerun_wait_for_networkidle = True
+	await agent.rerun_history(history, delay_between_actions=0, max_step_interval=0,
+		summary_llm=_StructuredLLM())
+	waits = [c.kwargs.get("wait_networkidle") for c in browser.get_state.call_args_list]
+	assert any(w is True for w in waits)
+
+
+def _build_agent_with_upload_step(make_node, *, video_wait=5.0, path="v.mp4"):
+	"""单步 upload_file 历史（accept 兜底路径），用于测重放端 upload 等待。"""
+	from tree_walker.agent.agent import Agent
+	from tree_walker.config import AgentSettings, JudgeSettings
+	history = AgentHistoryList(history=[
+		AgentHistory(step_number=0,
+			model_output={"action": {"name": "upload_file",
+				"params": {"path": path, "accept": "video/*"}}},
+			result=[ActionResult()], state_summary={"url": "http://x"},
+			interacted_element=[{"accept": "video/*"}]),
+	])
+	state = SimpleNamespace(url="http://x", dom_state=SimpleNamespace(selector_map={}))
+	browser = MagicMock()
+	browser._settings = SimpleNamespace(wait_between_actions=0)
+	browser.start = AsyncMock(); browser.stop = AsyncMock(); browser.navigate = AsyncMock()
+	browser.get_state = AsyncMock(return_value=state)
+	browser.get_current_url = AsyncMock(return_value="http://x")
+	agent = Agent(task="x", llm=MagicMock(), browser=browser,
+		settings=AgentSettings(judge=JudgeSettings(enabled=False),
+			rerun_upload_wait_video=video_wait))
+	agent.llm = _StructuredLLM()
+	return agent, history
+
+
+@pytest.mark.asyncio
+async def test_upload_wait_sleeps_after_successful_upload(make_node, monkeypatch):
+	"""upload_file 成功 → 按 rerun_upload_wait_video 等待（video 默认 5.0）。"""
+	agent, history = _build_agent_with_upload_step(make_node, video_wait=5.0)
+	executed: list = []
+
+	async def fake_execute(name, params, br, st):
+		executed.append(name)
+		return ActionResult()                        # 成功，无 error
+	agent.tools.execute = fake_execute
+
+	sleeps: list = []
+
+	async def fake_sleep(s):
+		sleeps.append(s)
+	monkeypatch.setattr("tree_walker.agent.rerun.asyncio.sleep", fake_sleep)
+	await agent.rerun_history(history, delay_between_actions=0, max_step_interval=0,
+		summary_llm=_StructuredLLM())
+	assert "upload_file" in executed
+	assert 5.0 in sleeps                            # video upload 后等待 5s
+
+
+@pytest.mark.asyncio
+async def test_upload_wait_skipped_on_upload_error(make_node, monkeypatch):
+	"""upload_file 失败（result.error）→ 跳过等待（比原"无条件睡"更合理）。"""
+	agent, history = _build_agent_with_upload_step(make_node, video_wait=5.0)
+
+	async def fake_execute(name, params, br, st):
+		return ActionResult(error="upload failed")  # 失败
+	agent.tools.execute = fake_execute
+
+	sleeps: list = []
+
+	async def fake_sleep(s):
+		sleeps.append(s)
+	monkeypatch.setattr("tree_walker.agent.rerun.asyncio.sleep", fake_sleep)
+	await agent.rerun_history(history, delay_between_actions=0, max_step_interval=0,
+		summary_llm=_StructuredLLM())
+	assert 5.0 not in sleeps                        # 失败不 sleep
+
+
+@pytest.mark.asyncio
+async def test_upload_wait_zero_for_unknown_kind(make_node, monkeypatch):
+	"""path 无可识别扩展名 → _upload_file_kind=None → wait_s=0（不睡）。"""
+	agent, history = _build_agent_with_upload_step(make_node, video_wait=5.0, path="noext")
+
+	async def fake_execute(name, params, br, st):
+		return ActionResult()
+	agent.tools.execute = fake_execute
+
+	sleeps: list = []
+
+	async def fake_sleep(s):
+		sleeps.append(s)
+	monkeypatch.setattr("tree_walker.agent.rerun.asyncio.sleep", fake_sleep)
+	await agent.rerun_history(history, delay_between_actions=0, max_step_interval=0,
+		summary_llm=_StructuredLLM())
+	assert 5.0 not in sleeps                        # 未知类型不等（原 .get(kind,3) 太武断）

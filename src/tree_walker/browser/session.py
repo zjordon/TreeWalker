@@ -25,6 +25,7 @@ from tree_walker.browser.dom import (
     build_dom_state,
 )
 from tree_walker.browser.highlight import HighlightManager
+from tree_walker.browser.network_idle import NetworkIdleTracker
 from tree_walker.config import BrowserSettings
 from tree_walker.browser.views import (
     BrowserEvent,
@@ -1165,6 +1166,13 @@ class BrowserSession:
         self._recent_events: deque[BrowserEvent] = deque(maxlen=20)
         self._recent_events_lock = threading.Lock()
         self._enable_recent_events: bool = False
+        # 阶段3：networkidle 追踪（always-on；wait 由 get_state(wait_networkidle=...) 显式触发）。
+        # tracker 维护 inflight 请求集合；Network.enable + 回调注册在 _connect 内完成。
+        self._network_idle_tracker = NetworkIdleTracker(
+            timeout=_settings.network_idle_timeout,
+            stability_window=_settings.network_idle_stability_window,
+            poll_interval=_settings.network_idle_poll_interval,
+        )
 
     async def start(
         self,
@@ -1199,6 +1207,8 @@ class BrowserSession:
         ws_url 失效，见 ``_rediscover_ws_url``），拿得到不同的新 ws_url 就重建 client
         重试；否则抛原异常。
         """
+        # 阶段3：新会话清旧 inflight 残留（inflight 是 per-session 的）。
+        self._network_idle_tracker.reset()
         try:
             await self.client.start()
         except Exception as connect_err:
@@ -1229,6 +1239,13 @@ class BrowserSession:
 
         await self.client.send.Page.enable({}, session_id=self.current_session_id)
         await self.client.send.DOM.enable({}, session_id=self.current_session_id)
+        # 阶段3：启用 Network 域 + 注册空闲追踪回调（always-on；wait 由 get_state 显式触发）。
+        # 失败 → tracker 降级 disabled，wait_until_idle 即时返回（对齐 recent_events 降级）。
+        try:
+            await self.client.send.Network.enable({}, session_id=self.current_session_id)
+            self._network_idle_tracker.register(self.client, self.current_session_id)
+        except Exception as e:
+            logger.warning("Network.enable / tracker register failed (degrading): %s", e)
 
         # 自动发现 iframe target，确保跨源 iframe 可被 Target.getTargets 发现
         try:
@@ -1526,18 +1543,26 @@ class BrowserSession:
             return ""
 
     async def get_state(
-        self, include_screenshot: bool = True, wait_settle: bool = False
+        self, include_screenshot: bool = True, wait_settle: bool = False,
+        wait_networkidle: bool = False,
     ) -> BrowserStateSummary:
         """Get full browser state: URL, title, tabs, DOM, optional screenshot.
 
         wait_settle: poll document.readyState to 'complete' before reading state
         (mirrors screenshot/save_as_pdf). 失败只打 warning，不阻断 get_state。
+        wait_networkidle: 阶段3——等 inflight 网络请求归零（+稳定窗口）再读 state。
+        默认关；开启时排在 wait_settle 之后（先 readyState 后 AJAX）。失败只 warning。
         """
         if wait_settle:
             try:
                 await self._wait_for_page_settle()
             except Exception as e:
                 logger.warning("Pre-get_state wait_settle failed: %s", e)
+        if wait_networkidle:
+            try:
+                await self._network_idle_tracker.wait_until_idle()
+            except Exception as e:
+                logger.warning("Pre-get_state wait_networkidle failed: %s", e)
         sid = self.current_session_id
 
         # 轮转缓存：当前 → 前一步（用于新元素检测）
