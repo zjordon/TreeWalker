@@ -134,6 +134,14 @@ class AgentSettings:
     rerun_actionability_timeout: float = 2.0
     # actionability 轮询间隔（秒）；每次 poll 一次 get_state，0.3s 折中
     rerun_actionability_poll: float = 0.3
+    # ── 等待机制 阶段 3：networkidle（默认关）+ 重放端 upload 等待 ──
+    # get_state 前等 networkidle（缺口 2）；默认关 = 零行为变更。
+    # 开启条件：页面变化由 AJAX 驱动（readyState 常年 complete 的 SPA）。超时降级不抛错。
+    rerun_wait_for_networkidle: bool = False
+    # 重放端 upload_file 后等待（秒）；替代原录制端硬编码注入（缺口 6）。
+    # 默认 = 原 _UPLOAD_WAIT_SECONDS（video 5 / image 3），旧录制（无注入）与新录制零差异。
+    rerun_upload_wait_video: float = 5.0
+    rerun_upload_wait_image: float = 3.0
 
 
 @dataclass
@@ -186,6 +194,11 @@ class BrowserSettings:
     highlight: HighlightSettings = field(default_factory=HighlightSettings)
     page_settle_timeout: float = 2.0
     page_settle_poll_interval: float = 0.1
+    # 等待机制 阶段 3：networkidle 追踪调参（tracker always-on；wait 由 get_state 显式触发）。
+    # 不暴露 env（仅 dataclass 默认），与 page_settle_* 一致。
+    network_idle_timeout: float = 5.0  # 单步 networkidle 等待上限（秒）；AJAX 常 <2s，慢网/大文件 5s 兜底
+    network_idle_stability_window: float = 0.5  # "无新请求 N 秒"判 idle（秒）；§6 推荐；Playwright 0.5
+    network_idle_poll_interval: float = 0.1  # wait_until_idle 轮询间隔（秒）；对齐 page_settle_poll
     wait_between_actions: float = 0.0
 
 
@@ -356,6 +369,10 @@ def load_settings() -> Settings:
         rerun_actionability_check=os.environ.get("AGENT_RERUN_ACTIONABILITY_CHECK", "").lower() == "true",
         rerun_actionability_timeout=float(os.environ.get("AGENT_RERUN_ACTIONABILITY_TIMEOUT", "2.0")),
         rerun_actionability_poll=float(os.environ.get("AGENT_RERUN_ACTIONABILITY_POLL", "0.3")),
+        # 等待机制 阶段 3：networkidle 开关 + 重放端 upload 等待（默认值对齐现状 = 零行为变更）
+        rerun_wait_for_networkidle=os.environ.get("AGENT_RERUN_WAIT_FOR_NETWORKIDLE", "").lower() == "true",
+        rerun_upload_wait_video=float(os.environ.get("AGENT_RERUN_UPLOAD_WAIT_VIDEO", "5.0")),
+        rerun_upload_wait_image=float(os.environ.get("AGENT_RERUN_UPLOAD_WAIT_IMAGE", "3.0")),
         judge=JudgeSettings(
             enabled=os.environ.get("AGENT_JUDGE_ENABLED", "1") == "1",
             model=os.environ.get("AGENT_JUDGE_MODEL", ""),

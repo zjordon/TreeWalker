@@ -85,6 +85,10 @@ class Agent(StepPipeline, RerunMixin):
         self.rerun_actionability_check = _settings.rerun_actionability_check
         self.rerun_actionability_timeout = _settings.rerun_actionability_timeout
         self.rerun_actionability_poll = _settings.rerun_actionability_poll
+        # 等待机制 阶段 3：networkidle 开关 + 重放端 upload 等待（默认关 / 默认值对齐现状）
+        self.rerun_wait_for_networkidle = _settings.rerun_wait_for_networkidle
+        self.rerun_upload_wait_video = _settings.rerun_upload_wait_video
+        self.rerun_upload_wait_image = _settings.rerun_upload_wait_image
         self._save_conversation_path = _settings.save_conversation_path
 
         self.state = AgentState()

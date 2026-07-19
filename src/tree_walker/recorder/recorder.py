@@ -47,22 +47,6 @@ _SIGNAL_WINDOW_S = 2.0
 # 抢在元素渲染前/页面过渡态——等几档重新 get_state + 定位救回。两档兼顾「渲染慢」与
 # 「modal/动画收尾」。
 _LOCATE_RETRY_DELAYS = (0.6, 1.5)
-# upload_file 后追加的 wait 秒数（对齐 agent 经验值：上传后页面处理需要时间，否则下一步
-# 如「打开封面编辑器」会因视频未处理完而失败）。按文件类型给——视频更大更慢。
-_UPLOAD_WAIT_SECONDS = {"video": 5, "image": 3}
-
-_VIDEO_EXTS = frozenset({"mp4", "mov", "avi", "mkv", "webm", "flv", "wmv", "m4v", "ts", "3gp", "mpeg", "mpg"})
-_IMAGE_EXTS = frozenset({"png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "svg", "heic"})
-
-
-def _file_kind(path: str) -> str | None:
-	"""文件扩展名 → ``"video"`` / ``"image"`` / ``None``（供 file-input 兜底按 accept 匹配）。"""
-	ext = os.path.splitext(path or "")[1].lower().lstrip(".")
-	if ext in _VIDEO_EXTS:
-		return "video"
-	if ext in _IMAGE_EXTS:
-		return "image"
-	return None
 
 
 def select_http_target(
@@ -134,40 +118,48 @@ class Recorder:
 		实时做定位 + 指纹投影（modal DOM 活着时），结果填进 ``ActionRecord.params['index']``
 		与 ``interacted_element``。连续同框 ``input_text`` 由 ``translate_event`` 聚合（取最终值，
 		返回 None 不追加）。返回追加的 ``ActionRecord`` 或 None。
+
+		target 动作（click/input_text/select_dropdown）三重兜底确保永不以
+		``interacted_element=null/[]`` 落盘被回放当噪声步跳过（issue #129）：①定位未命中/异常 →
+		``_store_semantic_clue``；②外层 except 捕获 translate_event / 定位块逃逸（含 CancelledError）
+		→ 存语义线索；③末尾保底——任何路径下 interacted 仍空则强制存。语义线索供重放端重新定位。
 		"""
 		if not self._recording:
 			return None
-		# Stage 1：事件 → ActionRecord（含聚合判定 + 状态机更新）。聚合/不可映射 → None。
-		action = translate_event(event, self.recording)
-		if action is None:
-			logger.debug("忽略事件（不可映射或已聚合进前一步）: %s", event.get("type"))
-			return None
-
-		raw_params = event.get("params") or {}
-
-		# tab 动作：扩展发目标 tab 的 url，后端解析成 CDP targetId 后4位（重放侧期望格式）
-		if action.action_name in ("switch_tab", "close_tab"):
-			action.params["tab_id"] = await self._resolve_tab_id(raw_params.get("url"))
-
-		# upload_file：扩展只发文件名（浏览器安全限制），拼约定目录
-		if action.action_name == "upload_file":
-			action.params["path"] = self._resolve_upload_path(
-				action.params.get("path") or raw_params.get("path") or "",
-			)
-
-		# translate_event 已 append 该 action 到 recording.actions。下面 _ensure_target + get_state +
-		# 定位 + 回填若因动作触发跳转（submit/链接/「暂存离开」）致 CDP target 卸载/切换而抛异常——其中
-		# asyncio.CancelledError 等属 BaseException，内层 except Exception 抓不到——会让 action 以默认
-		# interacted=null 落盘，回放被当噪声步跳过（issue #129）。故整段包 try：任何逃逸异常 → target 动作
-		# 兜底存语义线索后 re-raise（不吞取消/系统退出，但 action 已带线索，即使 _handle_event 返 500 落盘
-		# 也不丢这条操作）。_ensure_target 必须纳入兜底——submit 跳转时其 Target.getTargets/switch_tab 在
-		# target 切换瞬间会抛 BaseException（httpbin 表单 submit 实测复现，见 httpbin-5.json.json idx13）。
+		action: ActionRecord | None = None
 		state: Any = None
-		located = None
 		retried = False
 		pending_exc: BaseException | None = None
+		appended_at = len(self.recording.actions)  # translate_event 前；它抛时 action 变量为 None 但
+		#                                      recording.actions[-1] 是它已 append 的残缺 target，靠此定位兜底
 		try:
-			# 确保 BrowserSession 指向用户操作的 http page（而非 popup/扩展页）
+			# Stage 1：事件 → ActionRecord（含聚合判定 + 状态机更新）。聚合/不可映射 → None。
+			# translate_event 纳入外层 try：其自身异常（页面卸载瞬间的残缺事件等）也能被兜底，
+			# 避免已 append 的 target 动作以 interacted=null 落盘被回放跳过（issue #129 补全）。
+			action = translate_event(event, self.recording)
+			if action is None:
+				logger.debug("忽略事件（不可映射或已聚合进前一步）: %s", event.get("type"))
+				return None
+
+			raw_params = event.get("params") or {}
+
+			# tab 动作：扩展发目标 tab 的 url，后端解析成 CDP targetId 后4位（重放侧期望格式）
+			if action.action_name in ("switch_tab", "close_tab"):
+				action.params["tab_id"] = await self._resolve_tab_id(raw_params.get("url"))
+
+			# upload_file：扩展只发文件名（浏览器安全限制），拼约定目录
+			if action.action_name == "upload_file":
+				action.params["path"] = self._resolve_upload_path(
+					action.params.get("path") or raw_params.get("path") or "",
+				)
+
+			# 下面 _ensure_target + get_state + 定位 + 回填若因动作触发跳转（submit/链接/「暂存离开」）
+			# 致 CDP target 卸载/切换而抛 BaseException（CancelledError 等不被内层 except Exception 抓）
+			# → 由本层 except BaseException 兜底；末尾保底再补一刀。三重保证 target 动作永不以
+			# interacted=null 落盘（issue #129）。_ensure_target 纳入：submit 跳转时其
+			# Target.getTargets/switch_tab 在 target 切换瞬间会抛 BaseException（httpbin 表单 submit
+			# 实测复现，httpbin-5.json.json idx13）。
+			located = None
 			await self._ensure_target(event.get("url"))
 			try:
 				state = await self.browser.get_state(include_screenshot=False)
@@ -225,37 +217,41 @@ class Recorder:
 				# upload_file 置 [None]（有目标但重放端解析）；其余置 []（无 target）。
 				action.interacted_element = [None] if action.action_name == "upload_file" else []
 		except BaseException as e:
-			# 内层 except Exception 之外的逃逸（主要是 CancelledError 等 BaseException）：target 动作
-			# （click/input_text/select_dropdown）未成功回填时强制存语义线索，避免默认 null 落盘被回放
-			# 跳过；upload_file/navigate 等非 locate_by_ref 动作不覆盖（保持各自原值）。
+			# 任何逃逸（translate_event 阶段 / _ensure_target / 定位块 / CancelledError 等 BaseException）：
+			# 记下异常待重抛，target 动作在此兜底存语义线索；末尾保底再校验一次确保 interacted 非空。
+			# upload_file/navigate 等非 locate_by_ref 动作不在此覆盖（保持各自原值）。
 			pending_exc = e
-			if action.action_name in ("click", "input_text", "select_dropdown"):
-				logger.warning("定位块异常 action=%s（%s）：兜底存语义线索后重抛", action.action_name, e)
+			if action is not None and action.action_name in ("click", "input_text", "select_dropdown"):
+				logger.warning("handle_event 异常 action=%s（%s）：兜底存语义线索后重抛", action.action_name, e)
 				self._store_semantic_clue(action, event, True, 0)
 
-		action.page_url = state.url if state else ""
-		action.page_title = state.title if state else ""
-		# 异常兜底已存语义线索（target 动作），但异常仍要传播——不吞 asyncio.CancelledError / 系统退出。
-		# action 已 append 且 interacted_element 原地改过，即使 _handle_event 因异常返 500，该步落盘也
-		# 带语义线索，回放可重新定位（issue #129）。放 upload wait 之前：异常时跳过 upload 副作用追加。
+		# 统一兜底（issue #129 补全）：本事件 append 的 target 动作若经任何逃逸路径仍未回填
+		# interacted_element → 强制存语义线索。确保 click/input_text/select_dropdown 永不以
+		# interacted=null/[] 落盘被回放当噪声步跳过。this_action：正常路径 = action 变量；
+		# translate_event 抛（action 变量为 None，但它已 append 残缺 target）= recording.actions[-1]。
+		# upload_file 保持 [None]（重放端按 accept 解析）；navigate/scroll 等无 target 动作保持 []。
+		this_action = action if action is not None else (
+			self.recording.actions[-1] if len(self.recording.actions) > appended_at else None
+		)
+		if this_action is not None and this_action.action_name in ("click", "input_text", "select_dropdown"):
+			ie = this_action.interacted_element
+			if ie is None or (isinstance(ie, list) and not ie):
+				self._store_semantic_clue(this_action, event, True, 0)
+				logger.warning(
+					"兜底存语义线索 action=%s（逃逸未回填 interacted；pending=%s）",
+					this_action.action_name, pending_exc,
+				)
+
+		if this_action is not None:
+			this_action.page_url = state.url if state else ""
+			this_action.page_title = state.title if state else ""
+		# 异常仍要传播——不吞 asyncio.CancelledError / 系统退出。但 action 已带语义线索（target 动作），
+		# 即使 _handle_event 因异常返 500，该步落盘也可被回放重新定位（issue #129）。
 		if pending_exc is not None:
 			raise pending_exc
-		# upload_file 后追加 wait（上传耗时，给页面处理时间；对齐 agent 经验值）。视频 5s 图片 3s。
-		if action.action_name == "upload_file":
-			seconds = _UPLOAD_WAIT_SECONDS.get(_file_kind(action.params.get("path", "")), 3)
-			self.recording.actions.append(ActionRecord(
-				action_name="wait",
-				params={"seconds": seconds},
-				element_ref=None,
-				timestamp=action.timestamp,
-				interacted_element=[],
-				page_url=action.page_url,
-				page_title=action.page_title,
-			))
-			logger.info("录进步 %d: wait（upload 后 %ds）", len(self.recording.actions) - 1, seconds)
 		# translate_event 已把 action 追加进 recording.actions；此处填的字段原地生效
-		logger.info("录进步 %d: %s", len(self.recording.actions) - 1, action.action_name)
-		return action
+		logger.info("录进步 %d: %s", len(self.recording.actions) - 1, this_action.action_name if this_action else "?")
+		return this_action
 
 	def _store_semantic_clue(
 		self,

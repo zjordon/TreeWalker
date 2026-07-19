@@ -174,7 +174,7 @@ async def test_upload_file_records_signature_no_fingerprint(tmp_path, patch_proj
 
 	扩展 change 瞬间捕获 accept（真实 file input）+ xpath，后端原样落盘；重放端按 accept+xpath
 	解析。selector_map 里有什么 input 都不影响录制——故故意塞个错位 image input 证明不被带偏。
-	视频后追加 wait(5s)。
+	视频后不再追加 wait（阶段3 缺口6：upload wait 移至重放端可配置）。
 	"""
 	browser = FakeBrowser(selector_map={  # 发布页错位 image input（导航竞态残留）
 		6: SimpleNamespace(node_name="INPUT",
@@ -197,14 +197,17 @@ async def test_upload_file_records_signature_no_fingerprint(tmp_path, patch_proj
 	assert p["xpath"] == "html/body/div[2]/input"
 	# 文件名拼约定目录 <rerun_history_dir>/uploads（basename 防误发路径）
 	assert p["path"].replace("\\", "/").endswith("uploads/video.mp4")
-	# upload 后追加 wait（视频 5s）
-	assert rec.recording.actions[-1].action_name == "wait"
-	assert rec.recording.actions[-1].params == {"seconds": 5}
+	# 阶段3 缺口6：录制端不再注入 upload wait（改重放端可配置）。末尾 action 即 upload_file 本身。
+	assert len(rec.recording.actions) == 1
+	assert rec.recording.actions[-1].action_name == "upload_file"
 
 
 @pytest.mark.asyncio
-async def test_upload_file_wait_seconds_image(tmp_path, patch_projection):
-	"""图片上传后追加 wait(3s)（_file_kind 按扩展名定秒数）。accept 签名原样落盘。"""
+async def test_upload_file_no_wait_injected(tmp_path, patch_projection):
+	"""阶段3 缺口6：image upload 后不再注入 wait 动作（改重放端 rerun_upload_wait_image）。
+
+	无论 video/image，录制端只落一条 upload_file；等待由重放端按类型可配置决定。
+	"""
 	browser = FakeBrowser(selector_map={})
 	rec = Recorder(browser, rerun_history_dir=str(tmp_path))
 	await rec.start()
@@ -213,10 +216,12 @@ async def test_upload_file_wait_seconds_image(tmp_path, patch_projection):
 		"params": {"path": "cover.png", "accept": "image/png,image/jpeg"},
 	})
 	assert action is not None
+	assert action.action_name == "upload_file"
 	assert action.params["accept"] == "image/png,image/jpeg"
 	assert action.params["xpath"] == "html/body/cov/input"
-	assert rec.recording.actions[-1].action_name == "wait"
-	assert rec.recording.actions[-1].params == {"seconds": 3}
+	# 仅一条 action（不再追加 wait）
+	assert len(rec.recording.actions) == 1
+	assert rec.recording.actions[-1].action_name == "upload_file"
 
 
 @pytest.mark.asyncio
@@ -432,6 +437,35 @@ async def test_ensure_target_exception_stores_semantic_clue(tmp_path, monkeypatc
 	assert action.interacted_element[0]["_semantic_clue"] is True
 	assert action.interacted_element[0]["xpath"] == "html/body/form/button"
 	assert action.locate_miss is not None
+
+
+@pytest.mark.asyncio
+async def test_translate_event_exception_keeps_click_semantic_clue(tmp_path, patch_projection, monkeypatch):
+	"""translate_event 阶段抛 BaseException（页面卸载瞬间的残缺事件 / 状态机异常）→ 它已 append
+	残缺 click（interacted=null）后抛，此时 action 变量为 None 但 recording.actions[-1] 是残缺
+	target。统一兜底用 appended_at 定位它、强制存语义线索 → 重放不再当噪声步跳过。
+
+	回归 douyin_redesign10.json step 20：发布 click 录制残缺（params={}/interacted=null/url=空），
+	重放被 _skip_reason 跳过、最后一步没执行。旧代码 translate_event 在 try 外、抛则逃逸不兜底。"""
+	monkeypatch.setattr(rec_mod, "_LOCATE_RETRY_DELAYS", (0.0, 0.0))
+	real_translate = rec_mod.translate_event
+
+	def boom(event, recording):
+		action = real_translate(event, recording)  # 真实映射 click（已 append 到 recording.actions）
+		if action is not None:
+			raise _BaseExcError("translate_event phase crash")
+		return action
+	monkeypatch.setattr(rec_mod, "translate_event", boom)
+
+	rec = Recorder(FakeBrowser(selector_map={}), rerun_history_dir=str(tmp_path))
+	await rec.start()
+	with pytest.raises(_BaseExcError):
+		await rec.handle_event({"type": "click", "xpath": "html/body/publish", "tag": "button"})
+	action = rec.recording.actions[-1]
+	assert action.action_name == "click"
+	assert action.interacted_element is not None            # 非默认 null（统一兜底用 appended_at 救回）
+	assert action.interacted_element[0]["_semantic_clue"] is True
+	assert action.interacted_element[0]["xpath"] == "html/body/publish"
 
 
 # ── select_http_target：target 选择纯函数 ───────────────────────────────

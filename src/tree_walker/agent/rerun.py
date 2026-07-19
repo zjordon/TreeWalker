@@ -188,6 +188,19 @@ _UPLOAD_VIDEO_EXTS = frozenset({"mp4", "mov", "avi", "mkv", "webm", "flv", "wmv"
 _UPLOAD_IMAGE_EXTS = frozenset({"png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "svg", "heic"})
 
 
+def _upload_file_kind(path: str) -> str | None:
+    """文件扩展名 → ``"video"`` / ``"image"`` / ``None``。
+
+    重放端 upload_file 后等待按类型给秒数用（阶段3 缺口6）；复用既存扩展名集，零重复。
+    """
+    ext = Path(path or "").suffix.lower().lstrip(".")
+    if ext in _UPLOAD_VIDEO_EXTS:
+        return "video"
+    if ext in _UPLOAD_IMAGE_EXTS:
+        return "image"
+    return None
+
+
 def resolve_rerun_path(rerun_history_dir: str, file_path: str | Path) -> Path:
     """相对路径 → 相对根目录的路径；拒绝绝对路径与 ``..`` 越界。
 
@@ -240,6 +253,10 @@ class RerunMixin:
     rerun_actionability_check: bool
     rerun_actionability_timeout: float
     rerun_actionability_poll: float
+    # 等待机制 阶段 3：networkidle 开关 + 重放端 upload 等待（由 Agent.__init__ 从 AgentSettings 拷贝）
+    rerun_wait_for_networkidle: bool
+    rerun_upload_wait_video: float
+    rerun_upload_wait_image: float
 
     # ── 公共 API ───────────────────────────────────────────────────────
 
@@ -306,6 +323,7 @@ class RerunMixin:
         wait_for_elements: bool | None = None,
         wait_for_page_settle: bool | None = None,
         rerun_actionability_check: bool | None = None,
+        wait_for_networkidle: bool | None = None,
         summary_llm: LLMClient | None = None,
         ai_step_llm: LLMClient | None = None,
     ) -> list[ActionResult]:
@@ -328,6 +346,8 @@ class RerunMixin:
             wait_for_page_settle = self.rerun_wait_for_page_settle
         if rerun_actionability_check is None:
             rerun_actionability_check = self.rerun_actionability_check
+        if wait_for_networkidle is None:
+            wait_for_networkidle = self.rerun_wait_for_networkidle
         await self.browser.start(track_downloads=self._track_downloads)
         await self._rerun_initial_navigation(history)
         self.state.n_steps = 0
@@ -367,6 +387,7 @@ class RerunMixin:
                 step_results = await self._rerun_step_with_retries(
                     item, step_delay, max_retries, previous_item, ai_step_llm,
                     wait_for_elements, wait_for_page_settle, rerun_actionability_check,
+                    wait_for_networkidle,
                 )
                 results.extend(step_results)
                 previous_succeeded = bool(step_results) and not any(
@@ -415,6 +436,7 @@ class RerunMixin:
         wait_for_elements: bool,
         wait_for_page_settle: bool,
         rerun_actionability_check: bool,
+        wait_for_networkidle: bool,
     ) -> list[ActionResult]:
         attempt = 0
         menu_reopens = 0
@@ -424,6 +446,7 @@ class RerunMixin:
                 return await self._execute_history_step(
                     item, cur_delay, ai_step_llm,
                     wait_for_elements, wait_for_page_settle, rerun_actionability_check,
+                    wait_for_networkidle,
                 )
             except Exception as e:
                 err_str = str(e)
@@ -441,7 +464,7 @@ class RerunMixin:
                 ):
                     if await self._reexecute_menu_opener(
                         previous_item, ai_step_llm, wait_for_page_settle,
-                        rerun_actionability_check,
+                        rerun_actionability_check, wait_for_networkidle,
                     ):
                         menu_reopens += 1
                         cur_delay = 0.5
@@ -502,11 +525,13 @@ class RerunMixin:
         wait_for_elements: bool,
         wait_for_page_settle: bool,
         rerun_actionability_check: bool,
+        wait_for_networkidle: bool,
     ) -> list[ActionResult]:
         """执行单步：取当前 selector_map → 逐动作重定位/重算并执行，带 guard。"""
         await asyncio.sleep(delay)
         state = await self.browser.get_state(
-            include_screenshot=False, wait_settle=wait_for_page_settle
+            include_screenshot=False, wait_settle=wait_for_page_settle,
+            wait_networkidle=wait_for_networkidle,
         )
 
         if wait_for_elements:
@@ -608,6 +633,20 @@ class RerunMixin:
             logger.info("▶️  %s: %s", name, _format_action_params(params))
             result = await self._exec_one(name, params, state)
             results.append(result)
+
+            # 阶段3 缺口6：upload_file 成功后可配置等待（替代原录制端硬编码注入）。
+            # 仅成功时等（result.error 跳过）——比原"独立 wait 步无条件睡"更合理：失败时 step
+            # 会重试/break，不等避免 retry×sleep 叠加浪费。语义覆盖"upload 与下一动作之间"。
+            if name == "upload_file" and not result.error:
+                kind = _upload_file_kind(params.get("path", ""))
+                wait_s = (
+                    self.rerun_upload_wait_video if kind == "video"
+                    else self.rerun_upload_wait_image if kind == "image"
+                    else 0.0
+                )  # 未知类型不等（原 .get(kind, 3) 太武断）
+                if wait_s > 0:
+                    logger.info("upload 后等待 %.1fs（%s）", wait_s, kind or "unknown")
+                    await asyncio.sleep(wait_s)
 
             # guard：done/error → 停
             last = results[-1]
@@ -963,6 +1002,7 @@ class RerunMixin:
     async def _reexecute_menu_opener(
         self, opener_item: AgentHistory, ai_step_llm: LLMClient | None,
         wait_for_page_settle: bool, rerun_actionability_check: bool,
+        wait_for_networkidle: bool,
     ) -> bool:
         logger.info("🔁 菜单重打开：重执行上一步（opener）以重新展开下拉，随后立即重试")
         try:
@@ -970,6 +1010,7 @@ class RerunMixin:
                 opener_item, delay=0.5, ai_step_llm=ai_step_llm, wait_for_elements=False,
                 wait_for_page_settle=wait_for_page_settle,
                 rerun_actionability_check=rerun_actionability_check,
+                wait_for_networkidle=wait_for_networkidle,
             )
             await asyncio.sleep(0.3)  # 等菜单渲染
             return True

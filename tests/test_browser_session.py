@@ -178,6 +178,48 @@ class TestFileChooserIntercept:
         assert "intercepted" in caplog.text.lower()
 
 
+def _make_network_mock_client() -> MagicMock:
+    """Mock CDPClient including Network.enable + the 4 networkidle callbacks."""
+    client = _make_intercept_mock_client()
+    client.send.Network.enable = AsyncMock(return_value={})
+    client.register.Network.requestWillBeSent = MagicMock()
+    client.register.Network.responseReceived = MagicMock()
+    client.register.Network.loadingFinished = MagicMock()
+    client.register.Network.loadingFailed = MagicMock()
+    return client
+
+
+class TestNetworkIdleTracking:
+    """阶段3：_connect 启用 Network 域 + 注册 4 回调（always-on）；失败降级。
+    tracker 本身见 tests/test_network_idle_tracker.py；get_state 透传见
+    tests/test_rerun_history.py::test_networkidle_on_passes_true_to_get_state。"""
+
+    @pytest.mark.asyncio
+    async def test_connect_enables_network_and_registers_callbacks(self):
+        client = _make_network_mock_client()
+        with patch("tree_walker.browser.session.CDPClient", return_value=client):
+            session = BrowserSession(ws_url="ws://localhost:9222")
+            await session.start()
+        client.send.Network.enable.assert_awaited_once()
+        assert client.send.Network.enable.call_args.kwargs.get("session_id") == "test-session-1"
+        client.register.Network.requestWillBeSent.assert_called_once()
+        client.register.Network.responseReceived.assert_called_once()
+        client.register.Network.loadingFinished.assert_called_once()
+        client.register.Network.loadingFailed.assert_called_once()
+        assert session._network_idle_tracker.enabled is True
+
+    @pytest.mark.asyncio
+    async def test_connect_tolerates_network_enable_failure(self):
+        """Network.enable 抛错 → start() 不崩，tracker 降级 disabled（对齐 recent_events）。"""
+        client = _make_network_mock_client()
+        client.send.Network.enable = AsyncMock(side_effect=RuntimeError("Network domain unavailable"))
+        with patch("tree_walker.browser.session.CDPClient", return_value=client):
+            session = BrowserSession(ws_url="ws://localhost:9222")
+            await session.start()  # 必须不抛
+        assert session.is_connected
+        assert session._network_idle_tracker.enabled is False
+
+
 class TestDiscoverFileInputViaClick:
     """discover_file_input_via_click (issue #34 Bug 2): click a dropzone and
     capture the file input the page opens via Page.fileChooserOpened. Refuses to
