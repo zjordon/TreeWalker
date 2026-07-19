@@ -127,6 +127,13 @@ class AgentSettings:
     rerun_wait_for_elements: bool = False
     # get_state 前等 readyState（缺口 1）；默认关 = 零行为变更
     rerun_wait_for_page_settle: bool = False
+    # ── actionability 阶段一（阶段 2）：visible+enabled 检查，默认关 = 零行为变更 ──
+    # 超时降级（不抛错），永不引入新失败。详见 docs/wait-and-timing/02-阶段2-...md
+    rerun_actionability_check: bool = False
+    # 单 action 等元素 actionable 的超时（秒）；元素已定位只等 visible，2s 够
+    rerun_actionability_timeout: float = 2.0
+    # actionability 轮询间隔（秒）；每次 poll 一次 get_state，0.3s 折中
+    rerun_actionability_poll: float = 0.3
 
 
 @dataclass
@@ -345,6 +352,10 @@ def load_settings() -> Settings:
         rerun_max_step_interval=float(os.environ.get("AGENT_RERUN_MAX_STEP_INTERVAL", "5.0")),
         rerun_wait_for_elements=os.environ.get("AGENT_RERUN_WAIT_FOR_ELEMENTS", "").lower() == "true",
         rerun_wait_for_page_settle=os.environ.get("AGENT_RERUN_WAIT_FOR_PAGE_SETTLE", "").lower() == "true",
+        # actionability 阶段一（阶段 2）
+        rerun_actionability_check=os.environ.get("AGENT_RERUN_ACTIONABILITY_CHECK", "").lower() == "true",
+        rerun_actionability_timeout=float(os.environ.get("AGENT_RERUN_ACTIONABILITY_TIMEOUT", "2.0")),
+        rerun_actionability_poll=float(os.environ.get("AGENT_RERUN_ACTIONABILITY_POLL", "0.3")),
         judge=JudgeSettings(
             enabled=os.environ.get("AGENT_JUDGE_ENABLED", "1") == "1",
             model=os.environ.get("AGENT_JUDGE_MODEL", ""),
