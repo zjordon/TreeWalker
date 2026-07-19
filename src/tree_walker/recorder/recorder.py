@@ -155,94 +155,91 @@ class Recorder:
 				action.params.get("path") or raw_params.get("path") or "",
 			)
 
-		# 确保 BrowserSession 指向用户操作的 http page（而非 popup/扩展页）
-		await self._ensure_target(event.get("url"))
-
+		# translate_event 已 append 该 action 到 recording.actions。下面 _ensure_target + get_state +
+		# 定位 + 回填若因动作触发跳转（submit/链接/「暂存离开」）致 CDP target 卸载/切换而抛异常——其中
+		# asyncio.CancelledError 等属 BaseException，内层 except Exception 抓不到——会让 action 以默认
+		# interacted=null 落盘，回放被当噪声步跳过（issue #129）。故整段包 try：任何逃逸异常 → target 动作
+		# 兜底存语义线索后 re-raise（不吞取消/系统退出，但 action 已带线索，即使 _handle_event 返 500 落盘
+		# 也不丢这条操作）。_ensure_target 必须纳入兜底——submit 跳转时其 Target.getTargets/switch_tab 在
+		# target 切换瞬间会抛 BaseException（httpbin 表单 submit 实测复现，见 httpbin-5.json.json idx13）。
+		state: Any = None
+		located = None
+		retried = False
+		pending_exc: BaseException | None = None
 		try:
-			state = await self.browser.get_state(include_screenshot=False)
-		except Exception as e:
-			# get_state 可能因动作触发跳转（submit/链接）致 CDP target 卸载/切换而抛异常。
-			# 容错为 None，让后续 locate loop 走"失败存语义线索"路径（重放端重新定位），
-			# 而非让该步以默认 interacted=None 落盘（重放被 skip，跳转/提交丢失）。
-			logger.warning("get_state 失败（%s）——用空 selector_map，locate 将存语义线索", e)
-			state = None
-		selector_map = state.dom_state.selector_map if state and state.dom_state else {}
+			# 确保 BrowserSession 指向用户操作的 http page（而非 popup/扩展页）
+			await self._ensure_target(event.get("url"))
+			try:
+				state = await self.browser.get_state(include_screenshot=False)
+			except Exception as e:
+				# get_state 可能因动作触发跳转（submit/链接）致 CDP target 卸载/切换而抛异常。
+				# 容错为 None，让后续 locate loop 走"失败存语义线索"路径（重放端重新定位）。
+				logger.warning("get_state 失败（%s）——用空 selector_map，locate 将存语义线索", e)
+				state = None
+			selector_map = state.dom_state.selector_map if state and state.dom_state else {}
 
-		# 实时定位 + 指纹投影（modal 打开时 DOM 活着，此时算才准）。
-		# upload_file 不算指纹（导航竞态 + Semi-UI 上传后重建 input，录制端算指纹结构性不可达——
-		# 见 docs/user_recording/recorder-timing-solutions.md）：存 accept+xpath 签名，重放端按 accept
-		# 解析（_resolve_file_input_by_accept）。click/input/select_dropdown 走 locate_by_ref
-		# （xpath→属性→RECT），支持重试（modal 后渲染的按钮等，首次 get_state 抢前）。
-		if action.action_name == "upload_file":
-			action.params["accept"] = action.params.get("accept") or ""
-			action.params["xpath"] = event.get("xpath") or ""
-			locate = None
-		elif needs_target(action.action_name):
-			ref_dict = action.element_ref.to_ref_dict() if action.element_ref is not None else {}
-			locate = lambda sm: locate_by_ref(ref_dict, sm)
-		else:
-			locate = None
-
-		if locate is not None:
-			located = locate(selector_map)
-			retried = False
-			if located is None:
-				# 重试：等页面渲染/动画收尾，重新 get_state + 定位
-				for delay in _LOCATE_RETRY_DELAYS:
-					await asyncio.sleep(delay)
-					try:
-						state = await self.browser.get_state(include_screenshot=False)
-					except Exception as e:
-						logger.debug("retry get_state 失败: %s", e)
-						state = None
-					selector_map = state.dom_state.selector_map if state and state.dom_state else {}
-					located = locate(selector_map)
-					retried = True
-					if located is not None:
-						break
-			if located is None:
-				logger.warning(
-					"定位失败 action=%s xpath=%s tag=%s rect=%s%s（存语义线索，重放端重新定位；记 locate_miss）",
-					action.action_name, event.get("xpath"), event.get("tag"), event.get("rect"),
-					"（重试后仍失败）" if retried else "",
-				)
-				# 语义线索：locate 失败（get_state 抓到变化后页/元素消失），但扩展在事件瞬间握住了
-				# e.target 的特征（xpath/tag/attr/rect = locate_by_ref 的输入）。存为语义线索，重放端在
-				# 稳定页面重新定位（重放有主动时序优势，元素完好）。详见 semantic-clue-replay.md。
-				action.interacted_element = [{
-					"_semantic_clue": True,
-					"xpath": event.get("xpath"),
-					"tag": event.get("tag"),
-					"name": event.get("name"),
-					"id": event.get("id"),
-					"ariaLabel": event.get("ariaLabel"),
-					"role": event.get("role"),
-					"rect": event.get("rect"),
-				}]
-				# 诊断落盘：定位未命中时，记下事件线索 + map 规模，便于事后分析
-				action.locate_miss = {
-					"xpath": event.get("xpath"),
-					"tag": event.get("tag"),
-					"name": event.get("name"),
-					"id": event.get("id"),
-					"ariaLabel": event.get("ariaLabel"),
-					"role": event.get("role"),
-					"rect": event.get("rect"),
-					"path": action.params.get("path") if action.action_name == "upload_file" else None,
-					"selector_map_size": len(selector_map),
-					"retried": retried,
-				}
+			# 实时定位 + 指纹投影（modal 打开时 DOM 活着，此时算才准）。
+			# upload_file 不算指纹（导航竞态 + Semi-UI 上传后重建 input，录制端算指纹结构性不可达——
+			# 见 docs/user_recording/recorder-timing-solutions.md）：存 accept+xpath 签名，重放端按 accept
+			# 解析（_resolve_file_input_by_accept）。click/input/select_dropdown 走 locate_by_ref
+			# （xpath→属性→RECT），支持重试（modal 后渲染的按钮等，首次 get_state 抢前）。
+			if action.action_name == "upload_file":
+				action.params["accept"] = action.params.get("accept") or ""
+				action.params["xpath"] = event.get("xpath") or ""
+				locate = None
+			elif needs_target(action.action_name):
+				ref_dict = action.element_ref.to_ref_dict() if action.element_ref is not None else {}
+				locate = lambda sm: locate_by_ref(ref_dict, sm)
 			else:
-				index, node = located
-				action.params["index"] = index
-				action.interacted_element = [DOMInteractedElement.load_from_enhanced_dom_tree(node).to_dict()]
-		else:
-			# 无定位（upload_file 不 get_state 定位 / navigate 等无 target 动作）。
-			# upload_file 置 [None]（有目标但重放端解析）；其余置 []（无 target）。
-			action.interacted_element = [None] if action.action_name == "upload_file" else []
+				locate = None
+
+			if locate is not None:
+				located = locate(selector_map)
+				if located is None:
+					# 重试：等页面渲染/动画收尾，重新 get_state + 定位
+					for delay in _LOCATE_RETRY_DELAYS:
+						await asyncio.sleep(delay)
+						try:
+							state = await self.browser.get_state(include_screenshot=False)
+						except Exception as e:
+							logger.debug("retry get_state 失败: %s", e)
+							state = None
+						selector_map = state.dom_state.selector_map if state and state.dom_state else {}
+						located = locate(selector_map)
+						retried = True
+						if located is not None:
+							break
+				if located is None:
+					logger.warning(
+						"定位失败 action=%s xpath=%s tag=%s rect=%s%s（存语义线索，重放端重新定位；记 locate_miss）",
+						action.action_name, event.get("xpath"), event.get("tag"), event.get("rect"),
+						"（重试后仍失败）" if retried else "",
+					)
+					self._store_semantic_clue(action, event, retried, len(selector_map))
+				else:
+					index, node = located
+					action.params["index"] = index
+					action.interacted_element = [DOMInteractedElement.load_from_enhanced_dom_tree(node).to_dict()]
+			else:
+				# 无定位（upload_file 不 get_state 定位 / navigate 等无 target 动作）。
+				# upload_file 置 [None]（有目标但重放端解析）；其余置 []（无 target）。
+				action.interacted_element = [None] if action.action_name == "upload_file" else []
+		except BaseException as e:
+			# 内层 except Exception 之外的逃逸（主要是 CancelledError 等 BaseException）：target 动作
+			# （click/input_text/select_dropdown）未成功回填时强制存语义线索，避免默认 null 落盘被回放
+			# 跳过；upload_file/navigate 等非 locate_by_ref 动作不覆盖（保持各自原值）。
+			pending_exc = e
+			if action.action_name in ("click", "input_text", "select_dropdown"):
+				logger.warning("定位块异常 action=%s（%s）：兜底存语义线索后重抛", action.action_name, e)
+				self._store_semantic_clue(action, event, True, 0)
 
 		action.page_url = state.url if state else ""
 		action.page_title = state.title if state else ""
+		# 异常兜底已存语义线索（target 动作），但异常仍要传播——不吞 asyncio.CancelledError / 系统退出。
+		# action 已 append 且 interacted_element 原地改过，即使 _handle_event 因异常返 500，该步落盘也
+		# 带语义线索，回放可重新定位（issue #129）。放 upload wait 之前：异常时跳过 upload 副作用追加。
+		if pending_exc is not None:
+			raise pending_exc
 		# upload_file 后追加 wait（上传耗时，给页面处理时间；对齐 agent 经验值）。视频 5s 图片 3s。
 		if action.action_name == "upload_file":
 			seconds = _UPLOAD_WAIT_SECONDS.get(_file_kind(action.params.get("path", "")), 3)
@@ -259,6 +256,38 @@ class Recorder:
 		# translate_event 已把 action 追加进 recording.actions；此处填的字段原地生效
 		logger.info("录进步 %d: %s", len(self.recording.actions) - 1, action.action_name)
 		return action
+
+	def _store_semantic_clue(
+		self,
+		action: ActionRecord,
+		event: dict[str, Any],
+		retried: bool,
+		selector_map_size: int,
+	) -> None:
+		"""target 动作（click/input_text/select_dropdown）定位未命中或异常时，存语义线索 + 诊断。
+
+		语义线索 = 扩展在事件瞬间握住的 e.target 特征（xpath/tag/attr/rect = locate_by_ref 的输入）；
+		重放端据其在稳定的新页面重新定位（见 docs/user_recording/semantic-clue-replay.md）。这是 target
+		动作定位失败的统一兜底——无论 locate 三级未命中，还是 get_state/locate 块抛异常（含
+		CancelledError 等 BaseException，内层 except Exception 抓不到，issue #129），都走这里，保证
+		action 不以默认 interacted=null 落盘被回放跳过。
+		"""
+		base = {
+			"xpath": event.get("xpath"),
+			"tag": event.get("tag"),
+			"name": event.get("name"),
+			"id": event.get("id"),
+			"ariaLabel": event.get("ariaLabel"),
+			"role": event.get("role"),
+			"rect": event.get("rect"),
+		}
+		action.interacted_element = [{"_semantic_clue": True, **base}]
+		action.locate_miss = {
+			**base,
+			"path": action.params.get("path") if action.action_name == "upload_file" else None,
+			"selector_map_size": selector_map_size,
+			"retried": retried,
+		}
 
 	def attach_signal(self, payload: dict[str, Any]) -> bool:
 		"""把扩展 SideEffectObserver 的信号（modal_opened/dropdown_opened）附到最近动作。

@@ -348,6 +348,92 @@ async def test_locate_get_state_failure_records_semantic_clue(tmp_path, patch_pr
 	assert action.interacted_element[0]["xpath"] == "html/body/form/button"
 
 
+class _BaseExcError(BaseException):
+	"""非 Exception 的异常（模拟 asyncio.CancelledError 这类）——内层 except Exception 抓不到。"""
+
+
+@pytest.mark.asyncio
+async def test_locate_block_base_exception_stores_semantic_clue(tmp_path, monkeypatch):
+	"""get_state 抛 BaseException（非 Exception，如 CancelledError）→ 内层 except Exception 抓不到，
+	外层兜底仍保证 click 带语义线索（handle_event 重抛异常，但 action 已 append 且带线索）。
+
+	复现 issue #129：触发跳转的 click（如「暂存离开」）录制时 get_state 在卸载的 target 上抛
+	非 Exception，旧代码让 action 以默认 interacted=null 落盘 → 回放被当噪声步跳过。
+	"""
+	monkeypatch.setattr(rec_mod, "_LOCATE_RETRY_DELAYS", (0.0, 0.0))
+
+	class TeardownBrowser(FakeBrowser):
+		async def get_state(self, include_screenshot=True):
+			raise _BaseExcError("target detached")
+
+	rec = Recorder(TeardownBrowser(), rerun_history_dir=str(tmp_path))
+	await rec.start()
+	# handle_event 重抛（不吞取消/系统退出），但 action 已 append 且兜底存了语义线索
+	with pytest.raises(_BaseExcError):
+		await rec.handle_event({"type": "click", "xpath": "html/body/leave", "tag": "button"})
+	action = rec.recording.actions[-1]
+	assert action.action_name == "click"
+	assert action.interacted_element is not None            # 非默认 None
+	assert action.interacted_element[0]["_semantic_clue"] is True
+	assert action.interacted_element[0]["xpath"] == "html/body/leave"
+	assert action.locate_miss is not None
+	assert action.locate_miss["retried"] is True
+
+
+@pytest.mark.asyncio
+async def test_nav_click_base_exception_survives_to_flatten(tmp_path, monkeypatch):
+	"""端到端：触发跳转的 click 抛 BaseException → 兜底存线索 → stop 落盘后该步带语义线索
+	（非默认 null，flatten 不归一为 None）→ 回放 _skip_reason 不会当噪声步跳过。issue #129 回归。"""
+	monkeypatch.setattr(rec_mod, "_LOCATE_RETRY_DELAYS", (0.0, 0.0))
+
+	class TeardownBrowser(FakeBrowser):
+		async def get_state(self, include_screenshot=True):
+			raise _BaseExcError("target detached")
+
+	rec = Recorder(TeardownBrowser(), rerun_history_dir=str(tmp_path), registry_version="v1")
+	await rec.start()
+	with pytest.raises(_BaseExcError):
+		await rec.handle_event({"type": "click", "xpath": "html/body/leave", "tag": "button"})
+
+	path = await rec.stop(file_path="out.json", mark_done=True, done_text="完成")
+	loaded = AgentHistoryList.load_from_file(path)
+	click_step = next(
+		s for s in loaded.history
+		if (s.model_output or {}).get("actions", [{}])[0].get("name") == "click"
+	)
+	# 非默认 null：flatten 的 `interacted if interacted else None` 保留 truthy [{...}]
+	assert click_step.interacted_element is not None
+	assert click_step.interacted_element[0]["_semantic_clue"] is True
+
+
+@pytest.mark.asyncio
+async def test_ensure_target_exception_stores_semantic_clue(tmp_path, monkeypatch):
+	"""_ensure_target 抛 BaseException（submit 跳转时 Target.getTargets/switch_tab 在 target 切换瞬间
+	抛 CancelledError）→ 外层兜底保证 click 仍存语义线索。
+
+	_ensure_target 在 get_state 之前调用、且早于 locate。submit 触发跳转时它可能先抛异常；旧代码
+	（_ensure_target 在外层 try 之外）会让 action 以默认 null 落盘 → 回放跳过。复现 httpbin-5.json.json
+	idx13（httpbin 表单 Submit）。注意：异常仍 re-raise（不吞取消），但 action 已带线索落盘。
+	"""
+	monkeypatch.setattr(rec_mod, "_LOCATE_RETRY_DELAYS", (0.0, 0.0))
+
+	async def boom_ensure_target(self, url):
+		raise _BaseExcError("target switching")
+
+	monkeypatch.setattr(Recorder, "_ensure_target", boom_ensure_target)
+	browser = FakeBrowser(selector_map={})  # _ensure_target 先抛，get_state 不会被调到
+	rec = Recorder(browser, rerun_history_dir=str(tmp_path))
+	await rec.start()
+	with pytest.raises(_BaseExcError):
+		await rec.handle_event({"type": "click", "xpath": "html/body/form/button", "tag": "button"})
+	action = rec.recording.actions[-1]
+	assert action.action_name == "click"
+	assert action.interacted_element is not None            # 非默认 None
+	assert action.interacted_element[0]["_semantic_clue"] is True
+	assert action.interacted_element[0]["xpath"] == "html/body/form/button"
+	assert action.locate_miss is not None
+
+
 # ── select_http_target：target 选择纯函数 ───────────────────────────────
 
 
