@@ -912,3 +912,346 @@ async def test_rerun_history_timing_defaults_to_settings_when_kwargs_omitted(mak
 
 	assert captured["dba"] == 7.0    # delay_between_actions 来自 AgentSettings
 	assert captured["msi"] == 9.0    # max_step_interval 来自 AgentSettings
+
+
+# ── 阶段 2：_wait_until 通用轮询原语 ────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_wait_until_predicate_hits_returns_early():
+	"""谓词首次命中即返回，不 sleep / 不 get_state（乐观短路）。"""
+	rm = RerunMixin()
+	rm.browser = MagicMock()
+	rm.browser.get_state = AsyncMock(return_value=_state({}))
+	s1 = _state({5: "node"})
+	out = await rm._wait_until(s1, lambda s: bool(s.dom_state.selector_map), timeout=5.0, poll=0.01)
+	assert out is s1
+	rm.browser.get_state.assert_not_called()       # 命中即返，未刷新
+
+
+@pytest.mark.asyncio
+async def test_wait_until_timeout_degrades_to_state():
+	"""谓词永不命中 → 超时降级返回 state（不抛错）。"""
+	rm = RerunMixin()
+	rm.browser = MagicMock()
+	rm.browser.get_state = AsyncMock(return_value=_state({}))
+	out = await rm._wait_until(_state({}), lambda s: False, timeout=0.05, poll=0.01)
+	assert out is not None                          # 降级返回，非 None / 非 raise
+
+
+# ── 阶段 2：actionability 纯函数（_is_actionable / _is_file_input）───────
+
+
+def test_is_actionable_visible_enabled_passes():
+	from tree_walker.agent.rerun import _is_actionable
+	assert _is_actionable(SimpleNamespace(is_visible=True, ax_node=None, attributes={})) is True
+
+
+def test_is_actionable_visible_false_blocks():
+	from tree_walker.agent.rerun import _is_actionable
+	assert _is_actionable(SimpleNamespace(is_visible=False, ax_node=None, attributes={})) is False
+
+
+def test_is_actionable_none_is_visible_passes():
+	"""is_visible=None（未知）保守放过——永不引入新失败。"""
+	from tree_walker.agent.rerun import _is_actionable
+	assert _is_actionable(SimpleNamespace(is_visible=None, ax_node=None, attributes={})) is True
+
+
+def test_is_actionable_ax_disabled_blocks():
+	from tree_walker.agent.rerun import _is_actionable
+	prop = SimpleNamespace(name="disabled", value=True)
+	ax = SimpleNamespace(properties=[prop])
+	assert _is_actionable(SimpleNamespace(is_visible=True, ax_node=ax, attributes={})) is False
+	# AX disabled value=False 不阻断
+	prop_f = SimpleNamespace(name="disabled", value=False)
+	assert _is_actionable(SimpleNamespace(is_visible=True,
+		ax_node=SimpleNamespace(properties=[prop_f]), attributes={})) is True
+
+
+def test_is_actionable_html_disabled_blocks():
+	from tree_walker.agent.rerun import _is_actionable
+	assert _is_actionable(SimpleNamespace(is_visible=True, ax_node=None, attributes={"disabled": ""})) is False
+
+
+def test_is_file_input_detection():
+	from tree_walker.agent.rerun import _is_file_input
+	assert _is_file_input(SimpleNamespace(node_name="INPUT", attributes={"type": "file"})) is True
+	assert _is_file_input(SimpleNamespace(node_name="INPUT", attributes={"type": "text"})) is False
+	assert _is_file_input(SimpleNamespace(node_name="BUTTON", attributes={"type": "file"})) is False
+
+
+# ── 阶段 2：_locate_target 统一只读谓词 ──────────────────────────────────
+
+
+def test_locate_target_none_hist_returns_none():
+	rm = RerunMixin()
+	assert rm._locate_target(None, {5: "x"}) is None
+
+
+def test_locate_target_semantic_clue_path(make_node):
+	rm = RerunMixin()
+	node = make_node(tag="button", node_id=5, backend_node_id=5, attributes={"aria-label": "保存"})
+	hist = {"_semantic_clue": True, "tag": "button", "ariaLabel": "保存"}
+	out = rm._locate_target(hist, {5: node})
+	assert out is not None and out[0] == 5 and out[1] is node
+
+
+def test_locate_target_fingerprint_path(make_node):
+	rm = RerunMixin()
+	node = make_node(tag="input", node_id=7, backend_node_id=7, attributes={"name": "email"})
+	hist = DOMInteractedElement.load_from_enhanced_dom_tree(node).to_dict()
+	out = rm._locate_target(hist, {7: node})
+	assert out is not None and out[0] == 7
+
+
+def test_locate_target_fingerprint_miss_returns_none(make_node):
+	rm = RerunMixin()
+	# 不同 tag → 六级匹配都要求 node_name 相同 → 全失配
+	# （同 tag 无 name/class 会被 CLASS 级「空 class 超集」兜底命中，不能用来测 miss）
+	node = make_node(tag="button", node_id=7, backend_node_id=7, attributes={"aria-label": "x"})
+	hist = DOMInteractedElement.load_from_enhanced_dom_tree(
+		make_node(tag="input", node_id=9, backend_node_id=9, attributes={"name": "email"})
+	).to_dict()
+	assert rm._locate_target(hist, {7: node}) is None
+
+
+# ── 阶段 2 缺口 5：等目标元素 ────────────────────────────────────────────
+
+
+def test_collect_target_hists_skips_upload_and_no_fingerprint():
+	rm = RerunMixin()
+	item = AgentHistory(step_number=0, model_output={"actions": [
+		{"name": "click", "params": {"index": 5}},
+		{"name": "upload_file", "params": {"path": "x.mp4"}},
+		{"name": "extract", "params": {}},
+	]}, result=[], interacted_element=[
+		{"element_hash": 1, "x_path": "a"},   # click 有指纹 → 收
+		None,                                   # upload_file → 剔除
+		None,                                   # extract 无指纹 → 不收
+	])
+	out = rm._collect_target_hists(item)
+	assert len(out) == 1 and out[0]["element_hash"] == 1
+
+
+@pytest.mark.asyncio
+async def test_wait_for_target_elements_all_located_returns_early(make_node):
+	rm = RerunMixin()
+	rm.browser = MagicMock()
+	node = make_node(tag="button", node_id=5, backend_node_id=5, attributes={"aria-label": "go"})
+	hist = {"_semantic_clue": True, "tag": "button", "ariaLabel": "go"}
+	item = AgentHistory(step_number=0,
+		model_output={"actions": [{"name": "click", "params": {}}]},
+		result=[], interacted_element=[hist])
+	out = await rm._wait_for_target_elements(_state({5: node}), item, timeout=5.0, poll=0.01)
+	assert out.dom_state.selector_map[5] is node
+	rm.browser.get_state.assert_not_called()       # 首帧命中，未 poll
+
+
+@pytest.mark.asyncio
+async def test_wait_for_target_elements_timeout_degrades(make_node):
+	rm = RerunMixin()
+	rm.browser = MagicMock()
+	rm.browser.get_state = AsyncMock(return_value=_state({}))   # 永远找不到
+	hist = {"_semantic_clue": True, "tag": "button", "ariaLabel": "missing"}
+	item = AgentHistory(step_number=0,
+		model_output={"actions": [{"name": "click", "params": {}}]},
+		result=[], interacted_element=[hist])
+	out = await rm._wait_for_target_elements(_state({}), item, timeout=0.05, poll=0.01)
+	assert out is not None                          # 降级，不抛错
+
+
+@pytest.mark.asyncio
+async def test_wait_for_target_elements_no_targets_no_poll():
+	"""纯 extract（无目标）→ 立即返回，不 poll。"""
+	rm = RerunMixin()
+	rm.browser = MagicMock()
+	item = AgentHistory(step_number=0,
+		model_output={"actions": [{"name": "extract", "params": {}}]},
+		result=[], interacted_element=[None])
+	s0 = _state({})
+	out = await rm._wait_for_target_elements(s0, item, timeout=5.0, poll=0.01)
+	assert out is s0
+	rm.browser.get_state.assert_not_called()
+
+
+# ── 阶段 2：_wait_for_actionability（index 漂移重解析 + 降级）────────────
+
+
+@pytest.mark.asyncio
+async def test_wait_for_actionability_waits_until_visible(make_node):
+	rm = RerunMixin()
+	rm.browser = MagicMock()
+	visible = make_node(tag="button", node_id=5, backend_node_id=5, is_visible=True,
+		attributes={"aria-label": "go"})
+	hidden = make_node(tag="button", node_id=5, backend_node_id=5, is_visible=False,
+		attributes={"aria-label": "go"})
+	rm.browser.get_state = AsyncMock(return_value=_state({5: visible}))
+	hist = {"_semantic_clue": True, "tag": "button", "ariaLabel": "go"}
+	out_state, idx, node = await rm._wait_for_actionability(
+		_state({5: hidden}), hist, 5, timeout=2.0, poll=0.01)
+	assert idx == 5
+	from tree_walker.agent.rerun import _is_actionable
+	assert _is_actionable(node) is True             # 等到了 visible
+
+
+@pytest.mark.asyncio
+async def test_wait_for_actionability_timeout_degrades(make_node):
+	rm = RerunMixin()
+	rm.browser = MagicMock()
+	hidden = make_node(tag="button", node_id=5, backend_node_id=5, is_visible=False,
+		attributes={"aria-label": "go"})
+	rm.browser.get_state = AsyncMock(return_value=_state({5: hidden}))
+	hist = {"_semantic_clue": True, "tag": "button", "ariaLabel": "go"}
+	out_state, idx, node = await rm._wait_for_actionability(
+		_state({5: hidden}), hist, 5, timeout=0.05, poll=0.01)
+	assert idx == 5                                  # 降级返回最新（仍 hidden），不抛错
+
+
+@pytest.mark.asyncio
+async def test_wait_for_actionability_index_drift_relocates(make_node):
+	"""poll 刷新 state 后目标从 idx 5 漂移到 7；用 hist 重解析命中 7。"""
+	rm = RerunMixin()
+	rm.browser = MagicMock()
+	node5_hidden = make_node(tag="button", node_id=5, backend_node_id=5, is_visible=False,
+		attributes={"aria-label": "go"})
+	node7_visible = make_node(tag="button", node_id=7, backend_node_id=7, is_visible=True,
+		attributes={"aria-label": "go"})
+	rm.browser.get_state = AsyncMock(return_value=_state({7: node7_visible}))
+	hist = {"_semantic_clue": True, "tag": "button", "ariaLabel": "go"}
+	out_state, idx, node = await rm._wait_for_actionability(
+		_state({5: node5_hidden}), hist, 5, timeout=2.0, poll=0.01)
+	assert idx == 7                                  # 漂移后重解析到 7
+
+
+# ── 阶段 2：actionability 编排（默认关零行为变更 + upload_file 不误杀）──
+
+
+def _build_agent_with_click_step(make_node, *, live_visible: bool, actionability: bool):
+	"""构造 Agent + 单步 click 历史（不可见按钮），返回 (agent, executed)。"""
+	from tree_walker.agent.agent import Agent
+	from tree_walker.config import AgentSettings, JudgeSettings
+
+	rec_node = make_node(tag="button", node_id=5, backend_node_id=5,
+		attributes={"aria-label": "go"})
+	hist_elem = DOMInteractedElement.load_from_enhanced_dom_tree(rec_node).to_dict()
+	history = AgentHistoryList(history=[
+		AgentHistory(step_number=0,
+			model_output={"action": {"name": "click", "params": {"index": 5}}},
+			result=[ActionResult()], state_summary={"url": "http://x"},
+			interacted_element=[hist_elem]),
+	])
+	live_node = make_node(tag="button", node_id=5, backend_node_id=5,
+		is_visible=live_visible, attributes={"aria-label": "go"})
+	state = SimpleNamespace(url="http://x",
+		dom_state=SimpleNamespace(selector_map={5: live_node}))
+	browser = MagicMock()
+	browser._settings = SimpleNamespace(wait_between_actions=0)
+	browser.start = AsyncMock()
+	browser.stop = AsyncMock()
+	browser.navigate = AsyncMock()
+	browser.get_state = AsyncMock(return_value=state)
+	browser.get_current_url = AsyncMock(return_value="http://x")
+	agent = Agent(task="x", llm=MagicMock(), browser=browser,
+		settings=AgentSettings(judge=JudgeSettings(enabled=False),
+			rerun_actionability_check=actionability))
+	executed: list = []
+
+	async def fake_execute(name, params, br, st):
+		executed.append((name, dict(params)))
+		return ActionResult()
+	agent.tools.execute = fake_execute
+	agent.llm = _StructuredLLM()
+	return agent, history, executed
+
+
+@pytest.mark.asyncio
+async def test_actionability_default_off_executes_invisible(make_node):
+	"""rerun_actionability_check=False（默认）→ 即使元素不可见也直接执行（零行为变更）。"""
+	agent, history, executed = _build_agent_with_click_step(
+		make_node, live_visible=False, actionability=False)
+	await agent.rerun_history(history, summary_llm=_StructuredLLM())
+	assert executed and executed[0][0] == "click"    # 不可见仍执行（与改造前一致）
+
+
+@pytest.mark.asyncio
+async def test_actionability_on_still_executes_on_timeout(make_node):
+	"""开启 actionability + 元素持续不可见 → 超时降级，仍执行（永不引入新失败）。"""
+	agent, history, executed = _build_agent_with_click_step(
+		make_node, live_visible=False, actionability=True)
+	# 缩短超时让降级快（直接改 self 上的值）
+	agent.rerun_actionability_timeout = 0.05
+	agent.rerun_actionability_poll = 0.01
+	await agent.rerun_history(history, summary_llm=_StructuredLLM())
+	assert executed and executed[0][0] == "click"    # 降级后照常执行
+
+
+@pytest.mark.asyncio
+async def test_actionability_skips_upload_file_invisible_fileinput(make_node):
+	"""upload_file 的隐藏 file input 不被 actionability 误杀（白名单 + _is_file_input 双保险）。"""
+	from tree_walker.agent.agent import Agent
+	from tree_walker.config import AgentSettings, JudgeSettings
+
+	rec_node = make_node(tag="input", node_id=3, backend_node_id=3,
+		attributes={"type": "file", "accept": "video/*"})
+	hist_elem = DOMInteractedElement.load_from_enhanced_dom_tree(rec_node).to_dict()
+	hist_elem["accept"] = "video/*"                  # upload_file 走 accept 兜底路径
+	history = AgentHistoryList(history=[
+		AgentHistory(step_number=0,
+			model_output={"action": {"name": "upload_file",
+				"params": {"path": "x.mp4", "accept": "video/*"}}},
+			result=[ActionResult()], state_summary={"url": "http://x"},
+			interacted_element=[hist_elem]),
+	])
+	# file input 隐藏（is_visible=False）
+	file_node = make_node(tag="input", node_id=3, backend_node_id=3, is_visible=False,
+		attributes={"type": "file", "accept": "video/*"})
+	state = SimpleNamespace(url="http://x",
+		dom_state=SimpleNamespace(selector_map={3: file_node}))
+	browser = MagicMock()
+	browser._settings = SimpleNamespace(wait_between_actions=0)
+	browser.start = AsyncMock(); browser.stop = AsyncMock(); browser.navigate = AsyncMock()
+	browser.get_state = AsyncMock(return_value=state)
+	browser.get_current_url = AsyncMock(return_value="http://x")
+	agent = Agent(task="x", llm=MagicMock(), browser=browser,
+		settings=AgentSettings(judge=JudgeSettings(enabled=False),
+			rerun_actionability_check=True))          # 开启 actionability
+	agent.rerun_actionability_timeout = 0.05
+	agent.rerun_actionability_poll = 0.01
+	executed: list = []
+
+	async def fake_execute(name, params, br, st):
+		executed.append((name, dict(params)))
+		return ActionResult()
+	agent.tools.execute = fake_execute
+	agent.llm = _StructuredLLM()
+	await agent.rerun_history(history, summary_llm=_StructuredLLM())
+	# upload_file 被执行（未被 visible 检查误杀）
+	assert executed and executed[0][0] == "upload_file"
+
+
+# ── 阶段 2：配置（actionability 3 字段）─────────────────────────────────
+
+
+def test_agentsettings_default_actionability():
+	from tree_walker.config import AgentSettings
+	s = AgentSettings()
+	assert s.rerun_actionability_check is False       # 默认关 = 零行为变更
+	assert s.rerun_actionability_timeout == 2.0
+	assert s.rerun_actionability_poll == 0.3
+
+
+def test_agent_wires_actionability_from_settings():
+	from tree_walker.agent import Agent
+	from tree_walker.browser.session import BrowserSettings
+	from tree_walker.config import AgentSettings, JudgeSettings
+	browser = MagicMock()
+	browser._settings = BrowserSettings()
+	agent = Agent(task="x", llm=MagicMock(), browser=browser,
+		settings=AgentSettings(judge=JudgeSettings(enabled=False),
+			rerun_actionability_check=True,
+			rerun_actionability_timeout=5.0,
+			rerun_actionability_poll=0.5))
+	assert agent.rerun_actionability_check is True
+	assert agent.rerun_actionability_timeout == 5.0
+	assert agent.rerun_actionability_poll == 0.5

@@ -81,6 +81,10 @@ class Agent(StepPipeline, RerunMixin):
         self.rerun_max_step_interval = _settings.rerun_max_step_interval
         self.rerun_wait_for_elements = _settings.rerun_wait_for_elements
         self.rerun_wait_for_page_settle = _settings.rerun_wait_for_page_settle
+        # actionability 阶段一（阶段 2）：visible+enabled 检查，默认关 = 零行为变更
+        self.rerun_actionability_check = _settings.rerun_actionability_check
+        self.rerun_actionability_timeout = _settings.rerun_actionability_timeout
+        self.rerun_actionability_poll = _settings.rerun_actionability_poll
         self._save_conversation_path = _settings.save_conversation_path
 
         self.state = AgentState()

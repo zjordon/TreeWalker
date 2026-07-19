@@ -50,6 +50,42 @@ class MatchLevel(Enum):
     CLASS = 6      # node_name + class token 超集（最末兜底：无 name/id/aria-label 的 SPA 按钮）
 
 
+# ── actionability 阶段一（阶段 2）：visible + enabled 检查的纯函数辅助 ──
+# 详见 docs/wait-and-timing/02-阶段2-等目标元素与actionability阶段一.md
+_ACTIONABILITY_ACTIONS: frozenset[str] = frozenset({"click", "input_text", "select_dropdown"})
+
+
+def _is_file_input(node: Any) -> bool:
+    """防御短路：INPUT[type=file] 永远跳过 actionability（仿 serializer.py:264-271）。
+
+    upload_file 的 file input 因 opacity:0/display:none/1×1 → node.is_visible=False（serializer
+    仅对 LLM 简化树强制可见，不改 node.is_visible）。白名单已排除 upload_file，本函数是第二层
+    防御——避免未来白名单逻辑变更或 LLM 误把 file input 当 click 目标时被 visible 检查误杀。
+    """
+    return (
+        (getattr(node, "node_name", "") or "").upper() == "INPUT"
+        and (getattr(node, "attributes", None) or {}).get("type", "").lower() == "file"
+    )
+
+
+def _is_actionable(node: Any) -> bool:
+    """visible + enabled 判定。None 字段保守放过（不引入新失败）。
+
+    - visible：``is_visible`` 为 ``bool|None``。``False``=明确不可见→阻断；``None``=未知→放过。
+    - enabled：AX ``ax_node.properties`` 里 ``name=='disabled'`` 且真值，或 HTML ``attributes`` 含 ``disabled``。
+    """
+    if getattr(node, "is_visible", None) is False:
+        return False
+    ax = getattr(node, "ax_node", None)
+    if ax is not None:
+        for prop in (ax.properties or []):
+            if getattr(prop, "name", "") == "disabled" and prop.value:
+                return False
+    if "disabled" in (getattr(node, "attributes", None) or {}):
+        return False
+    return True
+
+
 def _substitute_in_dict(data: dict[str, Any], replacements: dict[str, str]) -> int:
     """递归替换——【仅精确整串匹配】，不做子串替换。返回替换次数。"""
     count = 0
@@ -200,6 +236,10 @@ class RerunMixin:
     rerun_max_step_interval: float
     rerun_wait_for_elements: bool
     rerun_wait_for_page_settle: bool
+    # actionability 阶段一（阶段 2）：由 Agent.__init__ 从 AgentSettings 拷贝
+    rerun_actionability_check: bool
+    rerun_actionability_timeout: float
+    rerun_actionability_poll: float
 
     # ── 公共 API ───────────────────────────────────────────────────────
 
@@ -265,6 +305,7 @@ class RerunMixin:
         max_step_interval: float | None = None,
         wait_for_elements: bool | None = None,
         wait_for_page_settle: bool | None = None,
+        rerun_actionability_check: bool | None = None,
         summary_llm: LLMClient | None = None,
         ai_step_llm: LLMClient | None = None,
     ) -> list[ActionResult]:
@@ -285,6 +326,8 @@ class RerunMixin:
             wait_for_elements = self.rerun_wait_for_elements
         if wait_for_page_settle is None:
             wait_for_page_settle = self.rerun_wait_for_page_settle
+        if rerun_actionability_check is None:
+            rerun_actionability_check = self.rerun_actionability_check
         await self.browser.start(track_downloads=self._track_downloads)
         await self._rerun_initial_navigation(history)
         self.state.n_steps = 0
@@ -323,7 +366,7 @@ class RerunMixin:
                 self.state.n_steps += 1
                 step_results = await self._rerun_step_with_retries(
                     item, step_delay, max_retries, previous_item, ai_step_llm,
-                    wait_for_elements, wait_for_page_settle,
+                    wait_for_elements, wait_for_page_settle, rerun_actionability_check,
                 )
                 results.extend(step_results)
                 previous_succeeded = bool(step_results) and not any(
@@ -371,6 +414,7 @@ class RerunMixin:
         ai_step_llm: LLMClient | None,
         wait_for_elements: bool,
         wait_for_page_settle: bool,
+        rerun_actionability_check: bool,
     ) -> list[ActionResult]:
         attempt = 0
         menu_reopens = 0
@@ -378,7 +422,8 @@ class RerunMixin:
         while True:
             try:
                 return await self._execute_history_step(
-                    item, cur_delay, ai_step_llm, wait_for_elements, wait_for_page_settle
+                    item, cur_delay, ai_step_llm,
+                    wait_for_elements, wait_for_page_settle, rerun_actionability_check,
                 )
             except Exception as e:
                 err_str = str(e)
@@ -395,7 +440,8 @@ class RerunMixin:
                     )
                 ):
                     if await self._reexecute_menu_opener(
-                        previous_item, ai_step_llm, wait_for_page_settle
+                        previous_item, ai_step_llm, wait_for_page_settle,
+                        rerun_actionability_check,
                     ):
                         menu_reopens += 1
                         cur_delay = 0.5
@@ -455,6 +501,7 @@ class RerunMixin:
         ai_step_llm: LLMClient | None,
         wait_for_elements: bool,
         wait_for_page_settle: bool,
+        rerun_actionability_check: bool,
     ) -> list[ActionResult]:
         """执行单步：取当前 selector_map → 逐动作重定位/重算并执行，带 guard。"""
         await asyncio.sleep(delay)
@@ -463,9 +510,10 @@ class RerunMixin:
         )
 
         if wait_for_elements:
-            min_elements = self._count_expected_elements(item)
-            if min_elements > 0:
-                state = await self._wait_for_minimum_elements(state, min_elements, timeout=15.0)
+            # 语义升级（阶段2）：从"数数量"改为"等目标元素匹配成功"。默认关=零行为变更。
+            # _wait_for_target_elements 用 _match_element_index / locate_by_ref 轮询直到本步所有
+            # 需定位 action 的目标定位成功，超时降级照原样执行。
+            state = await self._wait_for_target_elements(state, item, timeout=15.0)
 
         selector_map = state.dom_state.selector_map if state and state.dom_state else {}
         actions = item.model_output.get("actions") or [item.model_output.get("action", {})]
@@ -476,6 +524,7 @@ class RerunMixin:
             if not isinstance(action, dict):
                 continue
             name = action.get("name", "done")
+            hist_elem = None  # extract 分支不设；下方 actionability 块据此安全引用
 
             if name == "extract":
                 # extract 自带 LLM 且读当前页（tools/_action_extract）→ 直接 re-execute 即在当前页重算
@@ -528,6 +577,33 @@ class RerunMixin:
                         if fb is not None:
                             params["index"] = fb
                             logger.info("upload_file 无指纹，按 accept 解析 file input index=%s", fb)
+
+            # actionability 阶段一（阶段2）：定位成功后、_exec_one 前查 visible+enabled。
+            # 默认关（rerun_actionability_check）= 零行为变更；超时降级照原样执行。
+            # 白名单（click/input_text/select_dropdown）+ hist_elem（poll 期间重解析漂移 index）
+            # + _is_file_input 防御短路（upload_file 的隐藏 file input）三层保护。
+            if (
+                rerun_actionability_check
+                and name in _ACTIONABILITY_ACTIONS
+                and hist_elem
+            ):
+                node_now = selector_map.get(params.get("index"))
+                if (
+                    node_now is not None
+                    and not _is_file_input(node_now)
+                    and not _is_actionable(node_now)
+                ):
+                    state, fresh_idx, _ = await self._wait_for_actionability(
+                        state, hist_elem, params["index"],
+                        timeout=self.rerun_actionability_timeout,
+                        poll=self.rerun_actionability_poll,
+                    )
+                    if fresh_idx is not None and fresh_idx != params.get("index"):
+                        logger.info(
+                            "actionability 等待后 index 漂移 %s→%s（%s）",
+                            params.get("index"), fresh_idx, name,
+                        )
+                        params["index"] = fresh_idx
 
             logger.info("▶️  %s: %s", name, _format_action_params(params))
             result = await self._exec_one(name, params, state)
@@ -886,13 +962,14 @@ class RerunMixin:
 
     async def _reexecute_menu_opener(
         self, opener_item: AgentHistory, ai_step_llm: LLMClient | None,
-        wait_for_page_settle: bool,
+        wait_for_page_settle: bool, rerun_actionability_check: bool,
     ) -> bool:
         logger.info("🔁 菜单重打开：重执行上一步（opener）以重新展开下拉，随后立即重试")
         try:
             await self._execute_history_step(
                 opener_item, delay=0.5, ai_step_llm=ai_step_llm, wait_for_elements=False,
                 wait_for_page_settle=wait_for_page_settle,
+                rerun_actionability_check=rerun_actionability_check,
             )
             await asyncio.sleep(0.3)  # 等菜单渲染
             return True
@@ -914,19 +991,123 @@ class RerunMixin:
                 max_index = idx
         return max_index + 1 if max_index >= 0 else 0
 
+    async def _wait_until(
+        self, state: Any, predicate: Any, timeout: float, poll: float = 1.0, refresh: bool = True
+    ) -> Any:
+        """通用轮询：谓词命中即返回；超时降级返回当前 state（不抛错）。
+
+        复用原 ``_wait_for_minimum_elements`` 的 deadline+poll+吞异常+降级 骨架。
+        ``predicate(state) -> bool``，每轮先判再 sleep；``refresh=True`` 时 poll 后调
+        ``get_state`` 刷新。缺口 5（等目标元素）/ actionability / 既有数量等待共用。
+        """
+        deadline = time.time() + timeout
+        while True:
+            if predicate(state):
+                return state
+            if time.time() >= deadline:
+                return state
+            await asyncio.sleep(poll)
+            if refresh:
+                try:
+                    state = await self.browser.get_state(include_screenshot=False)
+                except Exception:
+                    pass
+
     async def _wait_for_minimum_elements(
         self, state: Any, min_elements: int, timeout: float = 15.0, poll: float = 1.0
     ) -> Any:
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if state and state.dom_state and len(state.dom_state.selector_map) >= min_elements:
-                return state
-            await asyncio.sleep(poll)
-            try:
-                state = await self.browser.get_state(include_screenshot=False)
-            except Exception:
-                pass
-        return state
+        """等 selector_map 元素总数 ≥ min_elements（阶段2 前的粗粒度等待，保留为薄封装）。"""
+        return await self._wait_until(
+            state,
+            lambda s: bool(s and s.dom_state and len(s.dom_state.selector_map) >= min_elements),
+            timeout, poll,
+        )
+
+    def _locate_target(
+        self, hist_elem: dict[str, Any] | None, selector_map: dict[int, Any]
+    ) -> tuple[int, Any] | None:
+        """只读判定：能否在当前 selector_map 定位目标，返回 (idx, node) | None。
+
+        统一两条定位路径：语义线索→``locate_by_ref``（已返回 idx+node）；指纹→``_match_element_index``
+        得 idx 再取 node。``hist_elem`` 为 None（extract/wait/navigate/无指纹 upload_file）→ None。
+        仅供等待循环（缺口 5）与 actionability 重解析复用；动作循环的写入定位（``_update_action_indices``
+        深拷贝写回）不调用本函数，避免回归。
+        """
+        if not hist_elem:
+            return None
+        if hist_elem.get("_semantic_clue"):
+            matched = locate_by_ref(hist_elem, selector_map)
+            return matched if matched else None
+        m = self._match_element_index(hist_elem, selector_map)
+        if m is None:
+            return None
+        node = selector_map.get(m[0])
+        return (m[0], node) if node is not None else None
+
+    def _collect_target_hists(self, item: AgentHistory) -> list[dict[str, Any]]:
+        """枚举本步所有需定位 action 的 hist_elem（剔除 upload_file / 无指纹 action）。"""
+        actions = item.model_output.get("actions") or [item.model_output.get("action", {})]
+        interacted = item.interacted_element or []
+        out: list[dict[str, Any]] = []
+        for i, action in enumerate(actions):
+            if not isinstance(action, dict) or action.get("name") == "upload_file":
+                continue  # accept 路径兜底，无预判价值
+            h = interacted[i] if i < len(interacted) else None
+            if h and (
+                h.get("_semantic_clue") or h.get("element_hash") or h.get("stable_hash")
+                or h.get("x_path") or h.get("ax_name") or h.get("attributes")
+            ):
+                out.append(h)
+        return out
+
+    async def _wait_for_target_elements(
+        self, state: Any, item: AgentHistory, timeout: float = 15.0, poll: float = 1.0
+    ) -> Any:
+        """缺口 5：等本步所有需定位 action 的目标在 selector_map 能定位（all-or-nothing）。
+
+        超时降级返回最新 state（不抛错）；后续动作循环若仍定位不到，由既有 ValueError +
+        ``_rerun_step_with_retries`` 处理。本步无目标（纯 extract/wait）→ 立即返回不 poll。
+        """
+        targets = self._collect_target_hists(item)
+        if not targets:
+            return state
+
+        def _all_located(s: Any) -> bool:
+            sm = s.dom_state.selector_map if s and s.dom_state else {}
+            return all(self._locate_target(h, sm) is not None for h in targets)
+
+        return await self._wait_until(state, _all_located, timeout, poll)
+
+    async def _wait_for_actionability(
+        self,
+        state: Any,
+        hist_elem: dict[str, Any],
+        initial_idx: int,
+        timeout: float,
+        poll: float,
+    ) -> tuple[Any, int | None, Any | None]:
+        """actionability 阶段一：轮询直到目标 visible + enabled；超时降级返回最新 (state, idx, node)。
+
+        poll 刷新 state 后 index 可能漂移 → 每轮用 ``hist_elem`` 重 ``_locate_target`` 拿最新
+        ``(idx, node)`` 再查 ``_is_actionable``。降级不抛错，让 ``_exec_one`` 照常执行 →
+        ``_rerun_step_with_retries`` 兜底。
+        """
+        fresh_idx = initial_idx
+        fresh_node = (
+            state.dom_state.selector_map.get(initial_idx) if state and state.dom_state else None
+        )
+
+        def _actionable_now(s: Any) -> bool:
+            nonlocal fresh_idx, fresh_node
+            sm = s.dom_state.selector_map if s and s.dom_state else {}
+            located = self._locate_target(hist_elem, sm)
+            if located is None:
+                return False  # 目标暂时丢失 → 继续等
+            fresh_idx, fresh_node = located
+            return _is_actionable(fresh_node)
+
+        state = await self._wait_until(state, _actionable_now, timeout, poll)
+        return state, fresh_idx, fresh_node
 
     # ── 变量替换 ───────────────────────────────────────────────────────
 
