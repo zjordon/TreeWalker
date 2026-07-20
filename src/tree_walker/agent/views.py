@@ -84,14 +84,19 @@ class AgentState(BaseModel):
 class StepMetadata(BaseModel):
     """单步计时信息（重放步间延迟用）。
 
-    ⚠️ ``step_interval`` 存的是【上一步】的耗时（含 LLM 时间），不是当前步耗时。
-    重放时必须用 ``max_step_interval`` 封顶，否则会把首次运行的 LLM 等待时间再空等一遍。
+    ``step_interval`` = 上一步耗时（含 LLM 决策时间），仅 agent 自录路径填充（``step.py``）。
+    ``user_pause_seconds`` = 相邻用户操作的真实停顿，仅 recorder 路径填充（``flatten.py``）。
+    重放端 ``_compute_step_delay`` 优先用 ``user_pause_seconds``（忠实还原节奏，不封顶），
+    回落 ``step_interval``（封顶防 LLM 空等）；两者皆空走 ``delay_between_actions`` 兜底。
     """
 
     step_start_time: float
     step_end_time: float
     step_number: int
     step_interval: float | None = None
+    # 阶段4 / 缺口7：recorder 路径专用（相邻 action timestamp 差），与 step_interval 语义分离。
+    # 旧 AgentHistory.json 无此字段 → pydantic 反序列化走默认 None，向后兼容。
+    user_pause_seconds: float | None = None
 
     @property
     def duration_seconds(self) -> float:

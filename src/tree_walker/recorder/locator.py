@@ -138,7 +138,6 @@ def locate_by_ref(
 					return (idx, node)
 	# Level 3: RECT（位置兜底）
 	return _locate_by_rect(ref, selector_map)
-	return None
 
 
 def _node_bounds(node: Node) -> tuple[float, float, float, float] | None:

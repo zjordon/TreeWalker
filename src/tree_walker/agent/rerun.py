@@ -68,20 +68,40 @@ def _is_file_input(node: Any) -> bool:
     )
 
 
-def _is_actionable(node: Any) -> bool:
-    """visible + enabled 判定。None 字段保守放过（不引入新失败）。
+def _is_actionable(node: Any, *, check_receives_events: bool = False) -> bool:
+    """visible + enabled（+ receives-events）判定。None 字段保守放过（不引入新失败）。
 
     - visible：``is_visible`` 为 ``bool|None``。``False``=明确不可见→阻断；``None``=未知→放过。
-    - enabled：AX ``ax_node.properties`` 里 ``name=='disabled'`` 且真值，或 HTML ``attributes`` 含 ``disabled``。
+    - receives-events（阶段二，``check_receives_events=True`` 时启用）：L2 ``pointer-events:none`` →
+      不接收指针事件→阻断；L1 paint_order 判定被完全覆盖（``ignored_by_paint_order``）→阻断。
+      两者都读快照静态数据，零额外 CDP 开销；``snapshot_node`` 缺失时保守放过。
+    - enabled：AX ``ax_node.properties`` 里 ``name=='disabled'`` 且真值，HTML ``attributes`` 含
+      ``disabled``，或 ``aria-disabled="true"``（阶段4 遗留收编）。
+
+    ``check_receives_events`` 默认 ``False`` → 行为与阶段一一字不差（零回归基线）。
+    运行时遮挡（L3，``elementFromPoint``）是 async，不在此同步函数——见 ``_wait_for_actionability``。
     """
     if getattr(node, "is_visible", None) is False:
         return False
+    # ── 阶段二 receives-events（L2 pointer-events + L1 paint_order 静态遮挡）──
+    if check_receives_events:
+        snap = getattr(node, "snapshot_node", None)
+        if snap is not None:
+            pe = (getattr(snap, "computed_styles", None) or {}).get("pointer-events", "")
+            if str(pe).lower() == "none":
+                return False
+        if getattr(node, "ignored_by_paint_order", False):
+            return False
+    # ── enabled（阶段一 + 阶段4 遗留 aria-disabled）──
     ax = getattr(node, "ax_node", None)
     if ax is not None:
         for prop in (ax.properties or []):
             if getattr(prop, "name", "") == "disabled" and prop.value:
                 return False
-    if "disabled" in (getattr(node, "attributes", None) or {}):
+    attrs = getattr(node, "attributes", None) or {}
+    if "disabled" in attrs:
+        return False
+    if str(attrs.get("aria-disabled", "")).lower() == "true":
         return False
     return True
 
@@ -253,6 +273,12 @@ class RerunMixin:
     rerun_actionability_check: bool
     rerun_actionability_timeout: float
     rerun_actionability_poll: float
+    # actionability 阶段二/三（阶段 4）：receives-events + stable（由 Agent.__init__ 从 AgentSettings 拷贝）
+    rerun_actionability_receives_events: bool
+    rerun_actionability_runtime_occlusion: bool
+    rerun_actionability_stable: bool
+    rerun_actionability_stable_interval: float
+    rerun_actionability_stable_tolerance: float
     # 等待机制 阶段 3：networkidle 开关 + 重放端 upload 等待（由 Agent.__init__ 从 AgentSettings 拷贝）
     rerun_wait_for_networkidle: bool
     rerun_upload_wait_video: float
@@ -323,6 +349,9 @@ class RerunMixin:
         wait_for_elements: bool | None = None,
         wait_for_page_settle: bool | None = None,
         rerun_actionability_check: bool | None = None,
+        rerun_actionability_receives_events: bool | None = None,
+        rerun_actionability_runtime_occlusion: bool | None = None,
+        rerun_actionability_stable: bool | None = None,
         wait_for_networkidle: bool | None = None,
         summary_llm: LLMClient | None = None,
         ai_step_llm: LLMClient | None = None,
@@ -346,6 +375,12 @@ class RerunMixin:
             wait_for_page_settle = self.rerun_wait_for_page_settle
         if rerun_actionability_check is None:
             rerun_actionability_check = self.rerun_actionability_check
+        if rerun_actionability_receives_events is None:
+            rerun_actionability_receives_events = self.rerun_actionability_receives_events
+        if rerun_actionability_runtime_occlusion is None:
+            rerun_actionability_runtime_occlusion = self.rerun_actionability_runtime_occlusion
+        if rerun_actionability_stable is None:
+            rerun_actionability_stable = self.rerun_actionability_stable
         if wait_for_networkidle is None:
             wait_for_networkidle = self.rerun_wait_for_networkidle
         await self.browser.start(track_downloads=self._track_downloads)
@@ -367,11 +402,13 @@ class RerunMixin:
                     item, delay_between_actions, max_step_interval
                 )
                 goal = _truncate(item.model_output.get("next_goal", ""))
-                delay_src = (
-                    f"saved step_interval={item.metadata.step_interval:.1f}s"
-                    if item.metadata and item.metadata.step_interval is not None
-                    else f"default delay={delay_between_actions}s"
-                )
+                _md = item.metadata
+                if _md and _md.user_pause_seconds is not None:
+                    delay_src = f"user_pause={_md.user_pause_seconds:.1f}s"
+                elif _md and _md.step_interval is not None:
+                    delay_src = f"saved step_interval={_md.step_interval:.1f}s"
+                else:
+                    delay_src = f"default delay={delay_between_actions}s"
                 skip_reason = self._skip_reason(
                     item, previous_item, previous_succeeded, skip_failures
                 )
@@ -387,7 +424,8 @@ class RerunMixin:
                 step_results = await self._rerun_step_with_retries(
                     item, step_delay, max_retries, previous_item, ai_step_llm,
                     wait_for_elements, wait_for_page_settle, rerun_actionability_check,
-                    wait_for_networkidle,
+                    rerun_actionability_receives_events, rerun_actionability_runtime_occlusion,
+                    rerun_actionability_stable, wait_for_networkidle,
                 )
                 results.extend(step_results)
                 previous_succeeded = bool(step_results) and not any(
@@ -421,9 +459,14 @@ class RerunMixin:
     def _compute_step_delay(
         self, item: AgentHistory, delay_between_actions: float, max_step_interval: float
     ) -> float:
-        # step_interval 存的是【上一步】耗时（含 LLM 时间），必须封顶
-        if item.metadata and item.metadata.step_interval is not None:
-            return min(item.metadata.step_interval, max_step_interval)
+        # 阶段4 / 缺口7：优先级 user_pause_seconds（recorder 真实停顿，不封顶）>
+        # step_interval（agent 自录上一步耗时含 LLM，封顶防空等）> delay_between_actions 兜底
+        md = item.metadata
+        if md:
+            if md.user_pause_seconds is not None:
+                return md.user_pause_seconds
+            if md.step_interval is not None:
+                return min(md.step_interval, max_step_interval)
         return delay_between_actions
 
     async def _rerun_step_with_retries(
@@ -436,6 +479,9 @@ class RerunMixin:
         wait_for_elements: bool,
         wait_for_page_settle: bool,
         rerun_actionability_check: bool,
+        rerun_actionability_receives_events: bool,
+        rerun_actionability_runtime_occlusion: bool,
+        rerun_actionability_stable: bool,
         wait_for_networkidle: bool,
     ) -> list[ActionResult]:
         attempt = 0
@@ -446,7 +492,8 @@ class RerunMixin:
                 return await self._execute_history_step(
                     item, cur_delay, ai_step_llm,
                     wait_for_elements, wait_for_page_settle, rerun_actionability_check,
-                    wait_for_networkidle,
+                    rerun_actionability_receives_events, rerun_actionability_runtime_occlusion,
+                    rerun_actionability_stable, wait_for_networkidle,
                 )
             except Exception as e:
                 err_str = str(e)
@@ -464,7 +511,9 @@ class RerunMixin:
                 ):
                     if await self._reexecute_menu_opener(
                         previous_item, ai_step_llm, wait_for_page_settle,
-                        rerun_actionability_check, wait_for_networkidle,
+                        rerun_actionability_check, rerun_actionability_receives_events,
+                        rerun_actionability_runtime_occlusion, rerun_actionability_stable,
+                        wait_for_networkidle,
                     ):
                         menu_reopens += 1
                         cur_delay = 0.5
@@ -525,6 +574,9 @@ class RerunMixin:
         wait_for_elements: bool,
         wait_for_page_settle: bool,
         rerun_actionability_check: bool,
+        rerun_actionability_receives_events: bool,
+        rerun_actionability_runtime_occlusion: bool,
+        rerun_actionability_stable: bool,
         wait_for_networkidle: bool,
     ) -> list[ActionResult]:
         """执行单步：取当前 selector_map → 逐动作重定位/重算并执行，带 guard。"""
@@ -603,10 +655,10 @@ class RerunMixin:
                             params["index"] = fb
                             logger.info("upload_file 无指纹，按 accept 解析 file input index=%s", fb)
 
-            # actionability 阶段一（阶段2）：定位成功后、_exec_one 前查 visible+enabled。
-            # 默认关（rerun_actionability_check）= 零行为变更；超时降级照原样执行。
-            # 白名单（click/input_text/select_dropdown）+ hist_elem（poll 期间重解析漂移 index）
-            # + _is_file_input 防御短路（upload_file 的隐藏 file input）三层保护。
+            # actionability（阶段2 visible+enabled / 阶段4 receives-events + L3 运行时遮挡）：
+            # 定位成功后、_exec_one 前查。默认关（rerun_actionability_check）= 零行为变更；
+            # 超时降级照原样执行。白名单（click/input_text/select_dropdown）+ hist_elem（poll 期间
+            # 重解析漂移 index）+ _is_file_input 防御短路（upload_file 的隐藏 file input）三层保护。
             if (
                 rerun_actionability_check
                 and name in _ACTIONABILITY_ACTIONS
@@ -616,12 +668,17 @@ class RerunMixin:
                 if (
                     node_now is not None
                     and not _is_file_input(node_now)
-                    and not _is_actionable(node_now)
+                    and not _is_actionable(
+                        node_now,
+                        check_receives_events=rerun_actionability_receives_events,
+                    )
                 ):
                     state, fresh_idx, _ = await self._wait_for_actionability(
                         state, hist_elem, params["index"],
                         timeout=self.rerun_actionability_timeout,
                         poll=self.rerun_actionability_poll,
+                        receives_events=rerun_actionability_receives_events,
+                        runtime_occlusion=rerun_actionability_runtime_occlusion,
                     )
                     if fresh_idx is not None and fresh_idx != params.get("index"):
                         logger.info(
@@ -629,6 +686,29 @@ class RerunMixin:
                             params.get("index"), fresh_idx, name,
                         )
                         params["index"] = fresh_idx
+
+            # actionability 阶段三（stable，可选/默认关/优先级最低）：两次取 rect 比，
+            # 动画/重排中元素位置漂移时等稳定。定点单元素 get_element_coordinates，零性能影响。
+            # 在 actionability 块之后——用 actionability 更新后的 params["index"]；独立超时降级。
+            if (
+                rerun_actionability_check
+                and rerun_actionability_stable
+                and name in _ACTIONABILITY_ACTIONS
+                and hist_elem
+            ):
+                state, fresh_idx = await self._wait_for_stable(
+                    state, hist_elem, params.get("index"),
+                    timeout=self.rerun_actionability_timeout,
+                    poll=self.rerun_actionability_poll,
+                    interval=self.rerun_actionability_stable_interval,
+                    tolerance=self.rerun_actionability_stable_tolerance,
+                )
+                if fresh_idx is not None and fresh_idx != params.get("index"):
+                    logger.info(
+                        "stable 等待后 index 漂移 %s→%s（%s）",
+                        params.get("index"), fresh_idx, name,
+                    )
+                    params["index"] = fresh_idx
 
             logger.info("▶️  %s: %s", name, _format_action_params(params))
             result = await self._exec_one(name, params, state)
@@ -1002,7 +1082,8 @@ class RerunMixin:
     async def _reexecute_menu_opener(
         self, opener_item: AgentHistory, ai_step_llm: LLMClient | None,
         wait_for_page_settle: bool, rerun_actionability_check: bool,
-        wait_for_networkidle: bool,
+        rerun_actionability_receives_events: bool, rerun_actionability_runtime_occlusion: bool,
+        rerun_actionability_stable: bool, wait_for_networkidle: bool,
     ) -> bool:
         logger.info("🔁 菜单重打开：重执行上一步（opener）以重新展开下拉，随后立即重试")
         try:
@@ -1010,6 +1091,9 @@ class RerunMixin:
                 opener_item, delay=0.5, ai_step_llm=ai_step_llm, wait_for_elements=False,
                 wait_for_page_settle=wait_for_page_settle,
                 rerun_actionability_check=rerun_actionability_check,
+                rerun_actionability_receives_events=rerun_actionability_receives_events,
+                rerun_actionability_runtime_occlusion=rerun_actionability_runtime_occlusion,
+                rerun_actionability_stable=rerun_actionability_stable,
                 wait_for_networkidle=wait_for_networkidle,
             )
             await asyncio.sleep(0.3)  # 等菜单渲染
@@ -1126,29 +1210,102 @@ class RerunMixin:
         initial_idx: int,
         timeout: float,
         poll: float,
+        receives_events: bool = False,
+        runtime_occlusion: bool = False,
     ) -> tuple[Any, int | None, Any | None]:
-        """actionability 阶段一：轮询直到目标 visible + enabled；超时降级返回最新 (state, idx, node)。
+        """actionability（阶段一 visible+enabled / 阶段二 receives-events / L3 运行时遮挡）。
 
-        poll 刷新 state 后 index 可能漂移 → 每轮用 ``hist_elem`` 重 ``_locate_target`` 拿最新
-        ``(idx, node)`` 再查 ``_is_actionable``。降级不抛错，让 ``_exec_one`` 照常执行 →
-        ``_rerun_step_with_retries`` 兜底。
+        自带 deadline 循环（不再借 ``_wait_until``）——因为 L3 运行时遮挡需 ``await
+        _is_element_occluded``，而 ``_wait_until`` 的 predicate 是同步的。每轮用 ``hist_elem``
+        重 ``_locate_target`` 拿最新 ``(idx, node)``（poll 后 index 可能漂移），再依次查：
+
+        (1) ``_is_actionable``：visible + enabled + L1/L2 receives-events（同步，零开销静态）；
+        (2) L3 ``_is_element_occluded``：``elementFromPoint`` 运行时遮挡（async，
+            ``runtime_occlusion=True`` 时才查）。
+
+        命中即返回；超时降级返回最新 ``(state, idx, node)``，不抛错（让 ``_exec_one`` 照常执行 →
+        ``_rerun_step_with_retries`` 兜底）。
         """
         fresh_idx = initial_idx
         fresh_node = (
             state.dom_state.selector_map.get(initial_idx) if state and state.dom_state else None
         )
-
-        def _actionable_now(s: Any) -> bool:
-            nonlocal fresh_idx, fresh_node
-            sm = s.dom_state.selector_map if s and s.dom_state else {}
+        deadline = time.time() + timeout
+        while True:
+            sm = state.dom_state.selector_map if state and state.dom_state else {}
             located = self._locate_target(hist_elem, sm)
-            if located is None:
-                return False  # 目标暂时丢失 → 继续等
-            fresh_idx, fresh_node = located
-            return _is_actionable(fresh_node)
+            if located is not None:
+                fresh_idx, fresh_node = located
+                actionable = _is_actionable(fresh_node, check_receives_events=receives_events)
+                if actionable and runtime_occlusion and fresh_node is not None:
+                    # L3：运行时 elementFromPoint 遮挡判定（async，独立开关，默认关）
+                    occluded = await self.browser._is_element_occluded(
+                        fresh_node.backend_node_id, fresh_node.x, fresh_node.y,
+                    )
+                    actionable = not occluded
+                if actionable:
+                    return state, fresh_idx, fresh_node
+            if time.time() >= deadline:
+                return state, fresh_idx, fresh_node  # 超时降级，不抛错
+            await asyncio.sleep(poll)
+            try:
+                state = await self.browser.get_state(include_screenshot=False)
+            except Exception:
+                pass
 
-        state = await self._wait_until(state, _actionable_now, timeout, poll)
-        return state, fresh_idx, fresh_node
+    async def _is_rect_stable(
+        self, backend_node_id: int, interval: float = 0.1, tolerance: float = 1.0,
+    ) -> bool:
+        """两次取 rect 比（~interval 间隔），位置/尺寸变化 ≤ tolerance 视为稳定。
+
+        复用 ``session.get_element_coordinates`` 三级 fallback（getContentQuads → getBoxModel →
+        JS getBoundingClientRect），零新 CDP 封装。拿不到坐标（None）→ 视为不稳定（保守）。
+        """
+        r1 = await self.browser.get_element_coordinates(backend_node_id)
+        if r1 is None:
+            return False
+        await asyncio.sleep(interval)
+        r2 = await self.browser.get_element_coordinates(backend_node_id)
+        if r2 is None:
+            return False
+        return (
+            abs(r1.x - r2.x) <= tolerance and abs(r1.y - r2.y) <= tolerance
+            and abs(r1.width - r2.width) <= tolerance
+            and abs(r1.height - r2.height) <= tolerance
+        )
+
+    async def _wait_for_stable(
+        self,
+        state: Any,
+        hist_elem: dict[str, Any],
+        initial_idx: int,
+        timeout: float,
+        poll: float,
+        interval: float,
+        tolerance: float,
+    ) -> tuple[Any, int | None]:
+        """stable（阶段三）：轮询直到目标 rect 稳定；超时降级返回最新 (state, idx)。
+
+        仿 ``_wait_for_actionability`` 的 deadline 循环——每轮用 ``hist_elem`` 重 ``_locate_target``
+        拿最新 ``(idx, node)``（poll 后 index 可能漂移），再查 ``_is_rect_stable``。降级不抛错，
+        让 ``_exec_one`` 照常执行 → ``_rerun_step_with_retries`` 兜底。
+        """
+        fresh_idx = initial_idx
+        deadline = time.time() + timeout
+        while True:
+            sm = state.dom_state.selector_map if state and state.dom_state else {}
+            located = self._locate_target(hist_elem, sm)
+            if located is not None:
+                fresh_idx, node = located
+                if await self._is_rect_stable(node.backend_node_id, interval, tolerance):
+                    return state, fresh_idx
+            if time.time() >= deadline:
+                return state, fresh_idx  # 超时降级，不抛错
+            await asyncio.sleep(poll)
+            try:
+                state = await self.browser.get_state(include_screenshot=False)
+            except Exception:
+                pass
 
     # ── 变量替换 ───────────────────────────────────────────────────────
 

@@ -134,6 +134,19 @@ class AgentSettings:
     rerun_actionability_timeout: float = 2.0
     # actionability 轮询间隔（秒）；每次 poll 一次 get_state，0.3s 折中
     rerun_actionability_poll: float = 0.3
+    # ── actionability 阶段二/三（阶段 4）：receives-events + stable ──
+    # 总开关 rerun_actionability_check 关时整体不生效 → 默认值仍零行为变更。详见
+    # docs/wait-and-timing/05-阶段4-actionability完善与step_interval语义清理.md
+    # receives-events L1（paint_order 静态遮挡）+ L2（pointer-events:none），零开销静态判定
+    rerun_actionability_receives_events: bool = True
+    # receives-events L3（elementFromPoint 运行时遮挡），有 CDP 开销，默认关
+    rerun_actionability_runtime_occlusion: bool = False
+    # stable 检查（阶段三）：两次取 rect 比，动画/重排中元素。可选/优先级最低，默认关
+    rerun_actionability_stable: bool = False
+    # stable 两次取 rect 间隔（秒），对齐 Playwright ~100ms
+    rerun_actionability_stable_interval: float = 0.1
+    # stable rect 变化容差（像素）
+    rerun_actionability_stable_tolerance: float = 1.0
     # ── 等待机制 阶段 3：networkidle（默认关）+ 重放端 upload 等待 ──
     # get_state 前等 networkidle（缺口 2）；默认关 = 零行为变更。
     # 开启条件：页面变化由 AJAX 驱动（readyState 常年 complete 的 SPA）。超时降级不抛错。
@@ -369,6 +382,12 @@ def load_settings() -> Settings:
         rerun_actionability_check=os.environ.get("AGENT_RERUN_ACTIONABILITY_CHECK", "").lower() == "true",
         rerun_actionability_timeout=float(os.environ.get("AGENT_RERUN_ACTIONABILITY_TIMEOUT", "2.0")),
         rerun_actionability_poll=float(os.environ.get("AGENT_RERUN_ACTIONABILITY_POLL", "0.3")),
+        # actionability 阶段二/三（阶段 4）：receives-events（L1+L2 默认开，零开销）+ stable（默认关）
+        rerun_actionability_receives_events=os.environ.get("AGENT_RERUN_ACTIONABILITY_RECEIVES_EVENTS", "true").lower() == "true",
+        rerun_actionability_runtime_occlusion=os.environ.get("AGENT_RERUN_ACTIONABILITY_RUNTIME_OCCLUSION", "").lower() == "true",
+        rerun_actionability_stable=os.environ.get("AGENT_RERUN_ACTIONABILITY_STABLE", "").lower() == "true",
+        rerun_actionability_stable_interval=float(os.environ.get("AGENT_RERUN_ACTIONABILITY_STABLE_INTERVAL", "0.1")),
+        rerun_actionability_stable_tolerance=float(os.environ.get("AGENT_RERUN_ACTIONABILITY_STABLE_TOLERANCE", "1.0")),
         # 等待机制 阶段 3：networkidle 开关 + 重放端 upload 等待（默认值对齐现状 = 零行为变更）
         rerun_wait_for_networkidle=os.environ.get("AGENT_RERUN_WAIT_FOR_NETWORKIDLE", "").lower() == "true",
         rerun_upload_wait_video=float(os.environ.get("AGENT_RERUN_UPLOAD_WAIT_VIDEO", "5.0")),

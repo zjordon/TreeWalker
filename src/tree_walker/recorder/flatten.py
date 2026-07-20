@@ -56,10 +56,12 @@ def _action_to_history(
 			step_start_time=action.timestamp,
 			step_end_time=action.timestamp,
 			step_number=step_number,
-			# 录制回放专用：step_interval = 相邻 action 的 timestamp 差（人类操作间隔近似）。
+			# 录制回放专用：user_pause_seconds = 相邻 action 的 timestamp 差（人类操作间隔近似）。
 			# 不能用 prev.metadata.duration_seconds——flatten 里 start==end==timestamp，恒 0。
 			# timestamp 已是秒（translation._ts_seconds /1000），减法直接得秒。
-			step_interval=action.timestamp - prev_ts if prev_ts is not None else None,
+			# 阶段4 / 缺口7：与 agent 自录路径 step_interval（上一步耗时含 LLM）语义分离；
+			# 重放端 _compute_step_delay 优先读本字段（不封顶，忠实还原用户停顿）。
+			user_pause_seconds=action.timestamp - prev_ts if prev_ts is not None else None,
 		),
 	)
 

@@ -212,6 +212,11 @@ class TestPaintOrderRemover:
 		PaintOrderRemover(root).calculate_paint_order()
 		assert bg_simplified.ignored_by_paint_order is True
 		assert fg_simplified.ignored_by_paint_order is False
+		# 阶段4：标志回填到 original_node（EnhancedDOMTreeNode）——引用同一性验证。
+		# selector_map 存的是 original_node，rerun 侧 _is_actionable(check_receives_events=True)
+		# 必须能读到这个回填值，paint_order.py:182 的回填才能生效。
+		assert bg_node.ignored_by_paint_order is True
+		assert fg_node.ignored_by_paint_order is False
 
 	def test_transparent_background_no_occlusion(self):
 		bg_snap = _make_snapshot_node(
