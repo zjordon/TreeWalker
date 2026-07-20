@@ -177,6 +177,9 @@ class PaintOrderRemover:
 
 				if rect_union.contains(rect):
 					node.ignored_by_paint_order = True
+					# 阶段4：同步回填到 original_node（EnhancedDOMTreeNode）——selector_map 存的是
+					# original_node，rerun 侧 _is_actionable 才能直接查静态遮挡（L1）。
+					node.original_node.ignored_by_paint_order = True
 
 				# 透明或低不透明度的元素不会遮挡下方内容
 				styles = snap.computed_styles

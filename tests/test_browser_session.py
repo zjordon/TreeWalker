@@ -421,3 +421,22 @@ class TestRediscoverWsUrl:
 		assert session.ws_url == same_url
 		fail_client.start.assert_awaited_once()
 		session._rediscover_ws_url.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_is_element_occluded_three_states():
+    # Stage4 L3 primitive: elementFromPoint occlusion 3 states + exception degrade.
+    # Covers session._is_element_occluded Python wrapper (resolveNode -> callFunctionOn
+    # -> bool); JS ancestor walk is browser-side. 3 states: hit unrelated=occluded /
+    # hit target-or-ancestor=not occluded / CDP exception=best-effort degrade to False.
+    client = _make_mock_cdp_client()
+    client.send.DOM.resolveNode = AsyncMock(return_value={"object": {"objectId": "obj-1"}})
+    session = BrowserSession(ws_url="ws://localhost:9222")
+    session.client = client
+    session.current_session_id = "sid"
+    client.send.Runtime.callFunctionOn = AsyncMock(return_value={"result": {"value": True}})
+    assert await session._is_element_occluded(1, 10, 20) is True
+    client.send.Runtime.callFunctionOn = AsyncMock(return_value={"result": {"value": False}})
+    assert await session._is_element_occluded(1, 10, 20) is False
+    client.send.DOM.resolveNode = AsyncMock(side_effect=RuntimeError("boom"))
+    assert await session._is_element_occluded(1, 10, 20) is False

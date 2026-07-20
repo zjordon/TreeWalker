@@ -269,6 +269,9 @@ class EnhancedDOMTreeNode:
 	attributes: dict[str, str]
 	is_scrollable: bool | None = None
 	is_visible: bool | None = None
+	# 阶段4：paint_order 静态遮挡标志回填（SimplifiedNode 侧算好后镜像到 EnhancedDOMTreeNode，
+	# 让 selector_map 里的 node 能直接查 receives-events L1 判定）。默认 False 向后兼容。
+	ignored_by_paint_order: bool = False
 	absolute_position: DOMRect | None = None
 
 	# Frame management

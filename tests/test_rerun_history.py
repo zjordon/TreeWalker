@@ -391,11 +391,11 @@ def test_substitute_unknown_variable_skipped():
 # ── 步间延迟 / 跳过重试辅助 ─────────────────────────────────────────────
 
 
-def _item(step_interval=None, step_number=1):
+def _item(step_interval=None, step_number=1, user_pause_seconds=None):
     return AgentHistory(
         step_number=step_number, model_output={"action": {}}, result=[],
         metadata=StepMetadata(step_start_time=0.0, step_end_time=1.0, step_number=step_number,
-                              step_interval=step_interval),
+                              step_interval=step_interval, user_pause_seconds=user_pause_seconds),
     )
 
 
@@ -404,6 +404,19 @@ def test_compute_step_delay_caps_interval():
     assert rm._compute_step_delay(_item(step_interval=30.0), 2.0, 5.0) == 5.0    # 封顶
     assert rm._compute_step_delay(_item(step_interval=3.0), 2.0, 5.0) == 3.0     # 未达上限
     assert rm._compute_step_delay(_item(step_interval=None), 2.0, 5.0) == 2.0    # 兜底
+
+
+def test_compute_step_delay_user_pause_wins():
+    """阶段4 / 缺口7：user_pause_seconds（recorder 路径）优先于 step_interval，且不封顶。"""
+    rm = RerunMixin()
+    # 同时存在 → user_pause_seconds 胜出，不封顶（30 > max 5）
+    assert rm._compute_step_delay(
+        _item(user_pause_seconds=30.0, step_interval=3.0), 2.0, 5.0) == 30.0
+    # 仅 user_pause_seconds
+    assert rm._compute_step_delay(_item(user_pause_seconds=7.0), 2.0, 5.0) == 7.0
+    # user_pause_seconds=None → 回落 step_interval 封顶（agent 自录路径，与上测试一致）
+    assert rm._compute_step_delay(
+        _item(user_pause_seconds=None, step_interval=30.0), 2.0, 5.0) == 5.0
 
 
 def test_count_expected_elements():
@@ -974,6 +987,52 @@ def test_is_actionable_html_disabled_blocks():
 	assert _is_actionable(SimpleNamespace(is_visible=True, ax_node=None, attributes={"disabled": ""})) is False
 
 
+# ── 阶段 4：receives-events（L1 paint_order / L2 pointer-events）+ aria-disabled ──
+
+
+def test_is_actionable_aria_disabled_blocks():
+	"""阶段4 遗留收编：aria-disabled="true" 阻断（无需 check_receives_events）。"""
+	from tree_walker.agent.rerun import _is_actionable
+	assert _is_actionable(SimpleNamespace(
+		is_visible=True, ax_node=None, attributes={"aria-disabled": "true"})) is False
+	# aria-disabled="false" 不阻断
+	assert _is_actionable(SimpleNamespace(
+		is_visible=True, ax_node=None, attributes={"aria-disabled": "false"})) is True
+
+
+def test_is_actionable_pointer_events_none_blocks_when_checking():
+	"""阶段二 L2：check_receives_events=True 时 pointer-events:none 阻断。"""
+	from tree_walker.agent.rerun import _is_actionable
+	snap = SimpleNamespace(computed_styles={"pointer-events": "none"})
+	assert _is_actionable(SimpleNamespace(
+		is_visible=True, ax_node=None, attributes={}, snapshot_node=snap),
+		check_receives_events=True) is False
+
+
+def test_is_actionable_pointer_events_none_passes_when_not_checking():
+	"""零回归基线：check_receives_events=False（默认）→ pointer-events:none 不阻断。"""
+	from tree_walker.agent.rerun import _is_actionable
+	snap = SimpleNamespace(computed_styles={"pointer-events": "none"})
+	assert _is_actionable(SimpleNamespace(
+		is_visible=True, ax_node=None, attributes={}, snapshot_node=snap)) is True
+
+
+def test_is_actionable_paint_order_blocks_when_checking():
+	"""阶段二 L1：check_receives_events=True 时 ignored_by_paint_order 阻断。"""
+	from tree_walker.agent.rerun import _is_actionable
+	assert _is_actionable(SimpleNamespace(
+		is_visible=True, ax_node=None, attributes={}, ignored_by_paint_order=True),
+		check_receives_events=True) is False
+
+
+def test_is_actionable_snapshot_none_passes():
+	"""snapshot_node 缺失 → 保守放过（不引入新失败）。"""
+	from tree_walker.agent.rerun import _is_actionable
+	assert _is_actionable(SimpleNamespace(
+		is_visible=True, ax_node=None, attributes={}, snapshot_node=None),
+		check_receives_events=True) is True
+
+
 def test_is_file_input_detection():
 	from tree_walker.agent.rerun import _is_file_input
 	assert _is_file_input(SimpleNamespace(node_name="INPUT", attributes={"type": "file"})) is True
@@ -1124,6 +1183,87 @@ async def test_wait_for_actionability_index_drift_relocates(make_node):
 	assert idx == 7                                  # 漂移后重解析到 7
 
 
+@pytest.mark.asyncio
+async def test_wait_for_actionability_runtime_occlusion(make_node):
+	"""阶段二 L3：_is_actionable 通过但 _is_element_occluded=True → 继续等至超时降级。"""
+	rm = RerunMixin()
+	rm.browser = MagicMock()
+	visible = make_node(tag="button", node_id=5, backend_node_id=5, is_visible=True,
+		attributes={"aria-label": "go"})
+	rm.browser.get_state = AsyncMock(return_value=_state({5: visible}))
+	rm.browser._is_element_occluded = AsyncMock(return_value=True)   # 始终被遮挡
+	hist = {"_semantic_clue": True, "tag": "button", "ariaLabel": "go"}
+	out_state, idx, node = await rm._wait_for_actionability(
+		_state({5: visible}), hist, 5, timeout=0.05, poll=0.01,
+		receives_events=False, runtime_occlusion=True)
+	assert idx == 5                                  # 降级返回，不抛错
+	rm.browser._is_element_occluded.assert_called()  # L3 确实被调用
+
+
+# ── 阶段 4：stable（_is_rect_stable / _wait_for_stable）─────────────────
+
+
+@pytest.mark.asyncio
+async def test_is_rect_stable_stable():
+	rm = RerunMixin()
+	rm.browser = MagicMock()
+	rect = SimpleNamespace(x=1.0, y=2.0, width=10.0, height=20.0)
+	rm.browser.get_element_coordinates = AsyncMock(return_value=rect)
+	assert await rm._is_rect_stable(5, interval=0.0, tolerance=1.0) is True
+
+
+@pytest.mark.asyncio
+async def test_is_rect_stable_drift():
+	rm = RerunMixin()
+	rm.browser = MagicMock()
+	r1 = SimpleNamespace(x=1.0, y=2.0, width=10.0, height=20.0)
+	r2 = SimpleNamespace(x=50.0, y=2.0, width=10.0, height=20.0)   # x 漂移
+	rm.browser.get_element_coordinates = AsyncMock(side_effect=[r1, r2])
+	assert await rm._is_rect_stable(5, interval=0.0, tolerance=1.0) is False
+
+
+@pytest.mark.asyncio
+async def test_is_rect_stable_no_coords():
+	rm = RerunMixin()
+	rm.browser = MagicMock()
+	rm.browser.get_element_coordinates = AsyncMock(return_value=None)
+	assert await rm._is_rect_stable(5) is False     # 拿不到坐标 → 不稳定（保守）
+
+
+@pytest.mark.asyncio
+async def test_wait_for_stable_hits(make_node):
+	rm = RerunMixin()
+	rm.browser = MagicMock()
+	node = make_node(tag="button", node_id=5, backend_node_id=5, is_visible=True,
+		attributes={"aria-label": "go"})
+	rect = SimpleNamespace(x=1.0, y=2.0, width=10.0, height=20.0)
+	rm.browser.get_element_coordinates = AsyncMock(return_value=rect)
+	rm.browser.get_state = AsyncMock(return_value=_state({5: node}))
+	hist = {"_semantic_clue": True, "tag": "button", "ariaLabel": "go"}
+	out_state, idx = await rm._wait_for_stable(
+		_state({5: node}), hist, 5, timeout=2.0, poll=0.01,
+		interval=0.0, tolerance=1.0)
+	assert idx == 5
+
+
+@pytest.mark.asyncio
+async def test_wait_for_stable_timeout_degrades(make_node):
+	"""rect 始终漂移 → 轮询至超时降级返回最新 (state, idx)，不抛错（覆盖循环本体）。"""
+	rm = RerunMixin()
+	rm.browser = MagicMock()
+	node = make_node(tag="button", node_id=5, backend_node_id=5, is_visible=True,
+		attributes={"aria-label": "go"})
+	r1 = SimpleNamespace(x=1.0, y=2.0, width=10.0, height=20.0)
+	r2 = SimpleNamespace(x=50.0, y=2.0, width=10.0, height=20.0)   # x 漂移
+	rm.browser.get_element_coordinates = AsyncMock(side_effect=[r1, r2] * 10)
+	rm.browser.get_state = AsyncMock(return_value=_state({5: node}))
+	hist = {"_semantic_clue": True, "tag": "button", "ariaLabel": "go"}
+	out_state, idx = await rm._wait_for_stable(
+		_state({5: node}), hist, 5, timeout=0.05, poll=0.01,
+		interval=0.0, tolerance=1.0)
+	assert idx == 5                                  # 降级返回，不抛错
+
+
 # ── 阶段 2：actionability 编排（默认关零行为变更 + upload_file 不误杀）──
 
 
@@ -1255,6 +1395,39 @@ def test_agent_wires_actionability_from_settings():
 	assert agent.rerun_actionability_check is True
 	assert agent.rerun_actionability_timeout == 5.0
 	assert agent.rerun_actionability_poll == 0.5
+
+
+# ── 阶段 4：actionability receives-events + stable 配置 ──────────────────
+
+
+def test_agentsettings_default_actionability_stage4():
+	from tree_walker.config import AgentSettings
+	s = AgentSettings()
+	assert s.rerun_actionability_receives_events is True     # L1+L2 默认开（零开销，总开关管辖）
+	assert s.rerun_actionability_runtime_occlusion is False  # L3 默认关（CDP 开销）
+	assert s.rerun_actionability_stable is False             # 阶段三默认关
+	assert s.rerun_actionability_stable_interval == 0.1
+	assert s.rerun_actionability_stable_tolerance == 1.0
+
+
+def test_agent_wires_actionability_stage4_from_settings():
+	from tree_walker.agent import Agent
+	from tree_walker.browser.session import BrowserSettings
+	from tree_walker.config import AgentSettings, JudgeSettings
+	browser = MagicMock()
+	browser._settings = BrowserSettings()
+	agent = Agent(task="x", llm=MagicMock(), browser=browser,
+		settings=AgentSettings(judge=JudgeSettings(enabled=False),
+			rerun_actionability_receives_events=False,
+			rerun_actionability_runtime_occlusion=True,
+			rerun_actionability_stable=True,
+			rerun_actionability_stable_interval=0.2,
+			rerun_actionability_stable_tolerance=2.0))
+	assert agent.rerun_actionability_receives_events is False
+	assert agent.rerun_actionability_runtime_occlusion is True
+	assert agent.rerun_actionability_stable is True
+	assert agent.rerun_actionability_stable_interval == 0.2
+	assert agent.rerun_actionability_stable_tolerance == 2.0
 
 
 # ── 阶段 3：networkidle 开关 + 重放端 upload 等待 ──────────────────────────

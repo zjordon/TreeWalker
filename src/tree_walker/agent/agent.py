@@ -85,6 +85,12 @@ class Agent(StepPipeline, RerunMixin):
         self.rerun_actionability_check = _settings.rerun_actionability_check
         self.rerun_actionability_timeout = _settings.rerun_actionability_timeout
         self.rerun_actionability_poll = _settings.rerun_actionability_poll
+        # actionability 阶段二/三（阶段 4）：receives-events + stable（由 Agent.__init__ 从 AgentSettings 拷贝）
+        self.rerun_actionability_receives_events = _settings.rerun_actionability_receives_events
+        self.rerun_actionability_runtime_occlusion = _settings.rerun_actionability_runtime_occlusion
+        self.rerun_actionability_stable = _settings.rerun_actionability_stable
+        self.rerun_actionability_stable_interval = _settings.rerun_actionability_stable_interval
+        self.rerun_actionability_stable_tolerance = _settings.rerun_actionability_stable_tolerance
         # 等待机制 阶段 3：networkidle 开关 + 重放端 upload 等待（默认关 / 默认值对齐现状）
         self.rerun_wait_for_networkidle = _settings.rerun_wait_for_networkidle
         self.rerun_upload_wait_video = _settings.rerun_upload_wait_video
