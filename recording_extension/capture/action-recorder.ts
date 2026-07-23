@@ -164,6 +164,7 @@ export function installActionRecorder(opts: InstallOptions): () => void {
       type: 'click',
       xpath: ref.xpath,
       rect: ref.rect,
+      text: ref.text,
       ...refAttrs(target),
     });
   };
@@ -196,6 +197,7 @@ export function installActionRecorder(opts: InstallOptions): () => void {
     emit({
       type: 'select_dropdown',
       xpath: ref.xpath,
+      text: ref.text,
       ...refAttrs(target),
       params: { value },
     });

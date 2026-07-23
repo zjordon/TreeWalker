@@ -70,7 +70,7 @@ async def _handle_signal(request: web.Request) -> web.Response:
 		payload = await request.json()
 	except Exception:
 		return web.json_response({"ok": False, "error": "invalid json"}, status=400)
-	attached = rec.attach_signal(payload)
+	attached = await rec.attach_signal(payload)
 	return web.json_response({"ok": attached})
 
 

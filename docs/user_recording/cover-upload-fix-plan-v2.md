@@ -1,5 +1,12 @@
 # 封面上传选错 file input：根因订正与正解方案（v2，待 review）
 
+> 🛑 **2026-07-23 订正（本文核心结论已被证伪，issue #136）**：本文把"封面上传选错 file input"当作
+> 封面流程失败的根因、并围绕"给 file input 算指纹"（D1 标记 → area_text）展开——**方向错了**。实测证明
+> 封面流程失败的**真正主因是"切换竖封面"的 click 回放点错**（指纹撞车，点到设置横封面），与 file input
+> 重建无关；已在 issue #136 用"扩展文字 + 重放端 TEXT 匹配级"修复（详见
+> `recording-reliability-fixes-retrospective.md`）。§八的 file-input-重建现象本身真实，但不是卡点；
+> area_text 方案从未实施，upload 至今走 accept+xpath 兜底。**下方原文保留作"走过的弯路"存档。**
+
 > ⚠️ **2026-07-16 更新：D1（标记算指纹）已实施但实测失败**——抖音 Semi-UI 上传后**重建 file input**，
 > 扩展打的 `data-tw-recmark` 标记随旧 input 销毁，后端 get_state 时新 input 已无标记。拟转向
 > **area_text 方案**（drag-area 文本是 input 的兄弟元素、不随重建消失，且能区分封面/参考图）。
@@ -228,3 +235,57 @@ D1（标记算指纹）实施后，重录 `douyin_redesign6.json`，upload_file 
 - `event_mapper.py`：recmark → area_text。
 - `recorder.py`：去掉凭标记找 node + `_clear_recmark` + 诊断日志，改为凭 area_text 在 file_inputs_meta 找。
 - 测试：D1 的 recmark 测试改为 area_text。
+
+---
+
+## 九、本文结论被证伪（2026-07-23，issue #136）
+
+> 本节订正本文（含 §八）的核心结论。完整的修复总结见 `recording-reliability-fixes-retrospective.md`。
+
+### 本文的误诊
+
+本文的核心假设：封面流程失败 = **upload_file 选错了 file input**（选到参考图而非封面），根因是录制端
+算不出 file input 的指纹（导航竞态 + input 重建），正解是"给 file input 找一把稳定的钥匙"（D1 标记 →
+area_text）。§八在这个框架下把 D1 失败归因为"Semi-UI 重建 file input 带走标记"，并提出 area_text。
+
+### 实测推翻
+
+重录 `douyin_redesign11/12.json` 重放定位：封面流程失败的**真正主因是"设置竖封面"切换 click 回放点错**
+——本该点设置竖封面，实际点到设置横封面。根因是指纹撞车：两个 step tab 都是 `ax_name=null` 的 `<div>`，
+`element_hash` 含会翻转的 `step-active` 状态类 + 录制时序（点后状态），重放时 EXACT 匹配到当前激活的
+设置横封面（`len(matches)==1` 直接返回，绕过 xpath tie-break）。切错 → 后续竖封面上传落到错的区 →
+整个封面流程失败。**与 file input 重建无关。**
+
+证据：
+
+- 录到的设置竖封面 click 元素是**顶部 step tab**（`<div class="step-dXVbPX step-active-...">`），不是 file input。
+- 失败发生在**上传之前**的切换步，不是 upload_file 步。
+- **agent 录制点的是底部 `<button>`**（有 ax_name="设置竖封面"，指纹唯一）所以 agent 不受影响——反证根因
+  在 click 指纹撞车，不在 file input。（agent 点 button、扩展点 div tab 的这个差异本身就是根因线索，当时被忽略了。）
+
+### 正解（已在 #136 落地）
+
+**用扩展捕获的元素可见文字做主身份**：扩展 `buildElementRef` 早就有 `ref.text`（`textContent`），之前
+click emit 把它丢了；修复后 click/select 带上 text，重放端加 `MatchLevel.TEXT`（优先于 EXACT，按
+`get_all_children_text` 匹配，`node_name` 约束避免误匹配底部按钮）。配合 `normalize_text` 移除全部空白
+（抖音每字独立 span，`textContent` 无分隔符 vs `get_all_children_text` 用 `\n` 连接，不 strip 会失配）。
+
+切换 click 修好后，整个封面流程（切竖封面 → 上传竖封面图 → 完成）打通。**upload_file 本身无需算指纹**
+——至今仍走 accept+xpath 兜底（`_resolve_file_input_by_accept`），由语义线索回放（`semantic-clue-replay.md`）承担。
+
+### 关于 §八的 file-input-重建现象
+
+§八观察到的"Semi-UI 上传后重建 file input、D1 标记丢失"**现象本身真实**（不是假的），但：
+
+- 它**不是封面流程失败的卡点**（卡点在切换 click，发生在上传之前）。
+- area_text 方案**从未实施**（还没转向 area_text，issue #136 已用更通用的 text 方案解决了卡点）。
+- 即便 file input 重建导致 upload 算不出指纹，accept+xpath 兜底 + 语义线索回放已足够，**不需要 area_text**。
+
+### 教训
+
+- **封面流程"失败"要先定位失败在哪一步**（切换 click？上传？确认？），别默认是 upload 选错 input。本次
+  花了大量精力在 file input 指纹（D1/area_text）上，真正的卡点（切换 click）却在上游。
+- **agent 能跑通、扩展跑不通的差异**，先查"agent 点的元素 vs 扩展点的元素"是否不同（agent 点 button、
+  扩展点 div tab），差异本身就是根因线索。
+- 文档结论要标日期与证据状态；本文从"v2 正解方案"到"§八根因订正"多次自称已定位根因，但都建立在
+  "upload 选错 input"的未经验证前提上——前提错了，后面的推理再精巧也没用。

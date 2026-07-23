@@ -47,6 +47,10 @@ _SIGNAL_WINDOW_S = 2.0
 # 抢在元素渲染前/页面过渡态——等几档重新 get_state + 定位救回。两档兼顾「渲染慢」与
 # 「modal/动画收尾」。
 _LOCATE_RETRY_DELAYS = (0.6, 1.5)
+# stop() 等待 in-flight handle_event 释放锁的上限（秒）。正常事件 ≤ get_state + 重试 ≈ 数秒；
+# 设宽裕上限：若 get_state 卡死（页面/CDP 无响应），stop 超时后强制落盘（末步可能不完整，
+# 但至少有产物，避免 stop 永久挂起）。
+_STOP_LOCK_TIMEOUT_S = 15.0
 
 
 def select_http_target(
@@ -102,18 +106,33 @@ class Recorder:
 		# 落盘格式：stop 时 flatten 赋值；server.py 的 /stop 响应读 len(self.history.history)
 		self.history: AgentHistoryList = AgentHistoryList()
 		self._recording = False
+		# 串行化 start/handle_event/stop/attach_signal：aiohttp 并发处理 /event 与 /stop，不加锁则
+		# 末步事件还在 await get_state/重试时 /stop 就跑 flatten，落盘半成品 action（issue #136 关联）。
+		self._lock = asyncio.Lock()
 
 	async def start(self) -> None:
-		"""开始录制：连浏览器，初始化空录制。"""
-		await self.browser.start()
-		await self._disable_file_chooser_intercept()  # 让原生文件选择框正常弹出
-		self._recording = True
-		self.recording = Recording(state=RecordingState())
-		self.history = AgentHistoryList()
+		"""开始录制：连浏览器，初始化空录制（加锁，避免与 in-flight 事件/stop 竞态）。"""
+		async with self._lock:
+			await self.browser.start()
+			await self._disable_file_chooser_intercept()  # 让原生文件选择框正常弹出
+			self._recording = True
+			self.recording = Recording(state=RecordingState())
+			self.history = AgentHistoryList()
 		logger.info("录制开始")
 
 	async def handle_event(self, event: dict[str, Any]) -> Any:
-		"""处理一条扩展事件 → 映射成 ``ActionRecord`` 追加；不可映射/已聚合返回 None。
+		"""处理一条扩展事件 → ``ActionRecord`` 追加（加锁串行；实际逻辑见 ``_handle_event_impl``）。"""
+		# 加锁串行（与 stop/attach_signal）：aiohttp 并发处理 /event 与 /stop，不加锁则末步事件还在
+		# await get_state/重试 sleep 时 /stop 就 flatten 落盘了半成品 action（click {} + null
+		# interacted + 空 url）。这**不是异常**（三重兜底本会存语义线索），是 stop 没等事件跑完就
+		# 落盘——故历次"扩大异常捕获"均无效。根因 = 并发竞态（issue #136 关联）。
+		async with self._lock:
+			if not self._recording:
+				return None
+			return await self._handle_event_impl(event)
+
+	async def _handle_event_impl(self, event: dict[str, Any]) -> Any:
+		"""handle_event 实际逻辑（调用方已持 ``self._lock``，且 ``self._recording`` 为 True）。
 
 		实时做定位 + 指纹投影（modal DOM 活着时），结果填进 ``ActionRecord.params['index']``
 		与 ``interacted_element``。连续同框 ``input_text`` 由 ``translate_event`` 聚合（取最终值，
@@ -124,8 +143,6 @@ class Recorder:
 		``_store_semantic_clue``；②外层 except 捕获 translate_event / 定位块逃逸（含 CancelledError）
 		→ 存语义线索；③末尾保底——任何路径下 interacted 仍空则强制存。语义线索供重放端重新定位。
 		"""
-		if not self._recording:
-			return None
 		action: ActionRecord | None = None
 		state: Any = None
 		retried = False
@@ -211,7 +228,13 @@ class Recorder:
 				else:
 					index, node = located
 					action.params["index"] = index
-					action.interacted_element = [DOMInteractedElement.load_from_enhanced_dom_tree(node).to_dict()]
+					ie = DOMInteractedElement.load_from_enhanced_dom_tree(node).to_dict()
+					# 扩展捕获的点击瞬间文字（ground truth）——重放端 TEXT 级优先按它定位（issue #136）。
+					# text 为主、ax_name 兜底：get_state 在动作后跑，状态依赖元素的名称/类可能已是动作后状态。
+					_evt_text = event.get("text")
+					if _evt_text:
+						ie["text"] = _evt_text
+					action.interacted_element = [ie]
 			else:
 				# 无定位（upload_file 不 get_state 定位 / navigate 等无 target 动作）。
 				# upload_file 置 [None]（有目标但重放端解析）；其余置 []（无 target）。
@@ -276,6 +299,7 @@ class Recorder:
 			"ariaLabel": event.get("ariaLabel"),
 			"role": event.get("role"),
 			"rect": event.get("rect"),
+			"text": event.get("text"),
 		}
 		action.interacted_element = [{"_semantic_clue": True, **base}]
 		action.locate_miss = {
@@ -285,25 +309,29 @@ class Recorder:
 			"retried": retried,
 		}
 
-	def attach_signal(self, payload: dict[str, Any]) -> bool:
+	async def attach_signal(self, payload: dict[str, Any]) -> bool:
 		"""把扩展 SideEffectObserver 的信号（modal_opened/dropdown_opened）附到最近动作。
 
 		仅当录制中、有动作、且信号时间距最近动作 ≤ ``_SIGNAL_WINDOW_S`` 时附加（防陈旧信号
 		误附）。``MODAL_OPENED`` 同时更新 ``state.pending_modal``。返回是否成功附加。
+
+		**async + 加锁**：与 handle_event/stop 串行——避免并发读取/改 ``recording.actions[-1]``
+		时 last 漂移（aiohttp 并发处理 /signal 与 /event）。调用方（server）须 ``await``。
 		"""
-		if not self._recording or not self.recording.actions:
-			return False
-		sig = signal_from_payload(payload)
-		if sig is None:
-			return False
-		last = self.recording.actions[-1]
-		if sig.timestamp > 0 and last.timestamp > 0 and abs(sig.timestamp - last.timestamp) > _SIGNAL_WINDOW_S:
-			return False
-		last.signals.append(sig)
-		if sig.kind == SignalKind.MODAL_OPENED:
-			self.recording.state.pending_modal = sig.detail.get("selector")
-		logger.info("附信号 %s 到步 %d", sig.kind.value, len(self.recording.actions) - 1)
-		return True
+		async with self._lock:
+			if not self._recording or not self.recording.actions:
+				return False
+			sig = signal_from_payload(payload)
+			if sig is None:
+				return False
+			last = self.recording.actions[-1]
+			if sig.timestamp > 0 and last.timestamp > 0 and abs(sig.timestamp - last.timestamp) > _SIGNAL_WINDOW_S:
+				return False
+			last.signals.append(sig)
+			if sig.kind == SignalKind.MODAL_OPENED:
+				self.recording.state.pending_modal = sig.detail.get("selector")
+			logger.info("附信号 %s 到步 %d", sig.kind.value, len(self.recording.actions) - 1)
+			return True
 
 	async def _ensure_target(self, event_url: str | None) -> None:
 		"""确保 BrowserSession 指向用户操作的 http page target（非 popup/扩展页）。
@@ -416,25 +444,40 @@ class Recorder:
 
 		``file_path`` 必须相对（``resolve_rerun_path`` 拒绝绝对路径 / ``..`` 越界）。
 		"""
-		self._recording = False
-		# Stage 3：signal 感知去噪（导航关联 / upload 去噪 / click 折叠 / input·scroll 合并）
-		self.recording.actions = apply_rules(self.recording.actions)
-		# 落盘 reshape：Recording → AgentHistoryList（纯映射，不再二次定位）
-		self.history = flatten(self.recording)
-		self._prepend_initial_navigation()  # 起始页 navigate 作 history[0]
-		if mark_done:
-			now = time.time()
-			next_step = len(self.history.history)  # flatten + 初始 navigate 后的下一个序号（避免跳号）
-			self.history.history.append(AgentHistory(
-				step_number=next_step,
-				model_output={"actions": [{"name": "done", "params": {"text": done_text, "success": success}}]},
-				result=[],
-				state_summary=None,
-				interacted_element=[None],
-				metadata=StepMetadata(step_start_time=now, step_end_time=now, step_number=next_step),
-			))
-		path = resolve_rerun_path(self.rerun_history_dir, file_path)
-		self.history.save_to_file(path, action_registry_version=self.registry_version)
+		self._recording = False  # 先置 False 拒新事件（新事件取不到锁后见此即返 None）
+		# 等 in-flight handle_event 跑完再 flatten/落盘（修末步录不全竞态，issue #136 关联）。
+		# 有上限（_STOP_LOCK_TIMEOUT_S）：get_state 卡死时不让 stop 永久挂起——超时强制落盘。
+		try:
+			await asyncio.wait_for(self._lock.acquire(), timeout=_STOP_LOCK_TIMEOUT_S)
+			_locked = True
+		except asyncio.TimeoutError:
+			_locked = False
+			logger.warning(
+				"stop 等待 in-flight 事件超时（%ss）——疑 get_state 卡住，强制落盘（末步可能不完整）",
+				_STOP_LOCK_TIMEOUT_S,
+			)
+		try:
+			# Stage 3：signal 感知去噪（导航关联 / upload 去噪 / click 折叠 / input·scroll 合并）
+			self.recording.actions = apply_rules(self.recording.actions)
+			# 落盘 reshape：Recording → AgentHistoryList（纯映射，不再二次定位）
+			self.history = flatten(self.recording)
+			self._prepend_initial_navigation()  # 起始页 navigate 作 history[0]
+			if mark_done:
+				now = time.time()
+				next_step = len(self.history.history)  # flatten + 初始 navigate 后的下一个序号（避免跳号）
+				self.history.history.append(AgentHistory(
+					step_number=next_step,
+					model_output={"actions": [{"name": "done", "params": {"text": done_text, "success": success}}]},
+					result=[],
+					state_summary=None,
+					interacted_element=[None],
+					metadata=StepMetadata(step_start_time=now, step_end_time=now, step_number=next_step),
+				))
+			path = resolve_rerun_path(self.rerun_history_dir, file_path)
+			self.history.save_to_file(path, action_registry_version=self.registry_version)
+		finally:
+			if _locked:
+				self._lock.release()
 		await self.browser.stop()
 		logger.info("录制结束，落盘 %s（%d 步）", path, len(self.history.history))
 		return path

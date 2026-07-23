@@ -29,7 +29,7 @@ from tree_walker.agent.views import (
     RerunSummaryAction,
 )
 from tree_walker.prompts.rerun_summary import get_rerun_summary_prompt
-from tree_walker.recorder.locator import locate_by_ref, normalize_xpath
+from tree_walker.recorder.locator import locate_by_ref, normalize_text, normalize_xpath
 
 if TYPE_CHECKING:
     from tree_walker.browser.session import BrowserSession
@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 class MatchLevel(Enum):
     """元素匹配严格级别（命中即停，逐级降级）。"""
 
+    TEXT = 0       # node_name + 可见文字相等（扩展捕获的点击瞬间 ground truth，优先于指纹——issue #136）
     EXACT = 1      # element_hash 完全相等（TreeWalker 确定性 sha256，跨会话稳定）
     STABLE = 2     # stable_hash 相等（过滤动态 CSS 类，重放首选）
     XPATH = 3      # x_path 字符串相等
@@ -816,6 +817,19 @@ class RerunMixin:
                 else None
             )
 
+        # Level 0: TEXT（扩展捕获的点击瞬间文字，ground truth）——优先于指纹/ax_name：
+        # get_state 在动作后跑，状态依赖元素（cover step tab 的 step-active 类、toggle 按钮的翻转
+        # 文字）的指纹/名称可能已是动作后状态，反而匹配到错误元素（issue #136）。仅当扩展提供了
+        # text 才启用（旧录制/agent 自录无 text → 跳过，走原指纹路径，向后兼容）。
+        h_text = normalize_text(hist.get("text"))
+        if h_text:
+            matches = [
+                (idx, e) for idx, e in selector_map.items()
+                if e.node_name.lower() == h_name
+                and normalize_text(e.get_all_children_text()) == h_text
+            ]
+            if matches:
+                return _nearest_idx(hist, matches), MatchLevel.TEXT
         # Level 1: EXACT（TreeWalker 确定性 sha256，跨会话稳定）
         h_exact = hist.get("element_hash")
         if h_exact is not None:
