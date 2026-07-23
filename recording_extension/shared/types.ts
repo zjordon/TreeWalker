@@ -27,6 +27,9 @@ export interface RecorderEvent {
   name?: string;
   ariaLabel?: string;
   role?: string;
+  /** 目标元素可见文字（扩展 textContent，点击瞬间 ground truth）。后端 TEXT 级优先按它定位——
+   *  cover step tab 等指纹/类撞车、仅靠文字区分的元素（issue #136）。 */
+  text?: string;
   type:
     | 'click'
     | 'input_text'

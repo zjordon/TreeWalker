@@ -11,6 +11,7 @@ xpath 格式归一化：Browser-BC ``xpathFor`` 产出 ``/html/body/...``（前�
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -26,6 +27,23 @@ def normalize_xpath(xpath: str | None) -> str:
 	if not xpath:
 		return ""
 	return xpath.strip().lstrip("/")
+
+
+# 可见文字截断上限——对齐扩展端 ``normalizeText`` 的 ``MAX_TEXT_LENGTH``（capture/selector.ts）。
+_TEXT_MAX_LENGTH = 120
+
+
+def normalize_text(value: str | None) -> str:
+	"""可见文字归一化：**移除全部空白** + 截断，对齐扩展 ``textContent`` 语义（issue #136）。
+
+	扩展 ``element.textContent`` 拼接后代文本节点**不加分隔符**（"设置竖封面"）；后端
+	``EnhancedDOMTreeNode.get_all_children_text`` 用 ``\\n`` 连接文本节点。抖音封面 tab 把每个
+	字拆成独立 span（"设\\n置\\n竖\\n封\\n面"），若只折叠空白会变成"设 置 竖 封 面"——与录制的
+	"设置竖封面"对不上。移除全部空白让两侧可比对（UI 文字标签几乎不会仅靠空白区分，可安全 strip）。
+	"""
+	if not value:
+		return ""
+	return re.sub(r"\s+", "", value)[:_TEXT_MAX_LENGTH]
 
 
 def _bounds_center(bounds: Any) -> tuple[float, float] | None:
@@ -105,8 +123,9 @@ def locate_by_ref(
 	ref: Mapping[str, Any],
 	selector_map: Mapping[int, Node],
 ) -> tuple[int, Node] | None:
-	"""多级定位：xpath → ATTRIBUTE → RECT（位置）。用于 click / input_text / select_dropdown。
+	"""多级定位：TEXT → xpath → ATTRIBUTE → RECT（位置）。用于 click / input_text / select_dropdown。
 
+	- Level 0 TEXT：扩展捕获的点击瞬间文字（``textContent``，ground truth）+ tag。
 	- Level 1 XPATH：按 xpath 找（多候选 rect 就近）。
 	- Level 2 ATTRIBUTE：tag + name/id/aria-label（对应 rerun 五级匹配第 5 级）。
 	- Level 3 RECT（位置）：前两级都失配时，按扩展 rect 的中心点在 ``selector_map`` 里找
@@ -119,6 +138,18 @@ def locate_by_ref(
 
 	返回 ``(index, node)`` 或 ``None``。
 	"""
+	# Level 0: TEXT（扩展捕获的点击瞬间文字，ground truth）——优先于 xpath/属性/位置。
+	# cover step tab 这类元素指纹/类撞车、仅靠可见文字（"设置横/竖封面"）区分（issue #136）。
+	# 扩展在点击瞬间握住 textContent（真值）；后端 get_all_children_text 读 live 节点同源文字。
+	h_text = normalize_text(ref.get("text"))
+	if h_text:
+		tag = (ref.get("tag") or "").lower()
+		for idx, node in selector_map.items():
+			if tag and (getattr(node, "node_name", "") or "").lower() != tag:
+				continue
+			node_text = getattr(node, "get_all_children_text", None)
+			if callable(node_text) and normalize_text(node_text()) == h_text:
+				return (idx, node)
 	# Level 1: XPATH
 	r = locate_by_xpath(ref.get("xpath"), selector_map, ref.get("rect"))
 	if r:

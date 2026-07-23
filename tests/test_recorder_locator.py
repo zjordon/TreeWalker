@@ -2,7 +2,7 @@
 
 from types import SimpleNamespace
 
-from tree_walker.recorder.locator import locate_by_ref, locate_by_xpath, normalize_xpath
+from tree_walker.recorder.locator import locate_by_ref, locate_by_xpath, normalize_text, normalize_xpath
 
 
 def _node(xpath: str, bounds=None):
@@ -178,3 +178,52 @@ def test_locate_by_ref_rect_no_rect_returns_none():
 	sm = {1: node}
 	r = locate_by_ref({"xpath": "/html/y", "tag": "div"}, sm)
 	assert r is None
+
+
+# ── normalize_text + locate_by_ref Level 0：TEXT ─────────────────────────
+
+
+def test_normalize_text_strips_all_whitespace():
+	# 移除全部空白（不只折叠）：抖音 tab 每字独立 span → "设\n置\n竖\n封\n面" 须变 "设置竖封面"
+	assert normalize_text("  设置\n竖  封面  ") == "设置竖封面"
+	assert normalize_text("设 置 竖 封 面") == "设置竖封面"
+	assert normalize_text(None) == ""
+	assert normalize_text("") == ""
+
+
+def test_normalize_text_truncates_to_120():
+	assert normalize_text("a" * 200) == "a" * 120
+
+
+def _text_ref_node(xpath, tag="DIV", text="", attrs=None):
+	"""带 get_all_children_text 的 mock 节点（TEXT 级用）。"""
+	return SimpleNamespace(
+		xpath=xpath, node_name=tag, attributes=attrs or {},
+		snapshot_node=None, get_all_children_text=lambda: text,
+	)
+
+
+def test_locate_by_ref_text_matches_correct_tab():
+	# cover step tab：两个同 class 的 DIV，仅靠文字（设置横/竖封面）区分（issue #136）
+	h_tab = _text_ref_node("html/body/div[1]/div[1]", "DIV", "设置横封面", {"class": "step-dXVbPX step-active-AWDV7U"})
+	v_tab = _text_ref_node("html/body/div[1]/div[2]", "DIV", "设置竖封面", {"class": "step-dXVbPX"})
+	sm = {1: h_tab, 2: v_tab}
+	# xpath 故意失配（瞬时漂移），靠 text 命中设置竖封面
+	r = locate_by_ref({"xpath": "/html/missing", "tag": "div", "text": "设置竖封面"}, sm)
+	assert r == (2, v_tab)
+
+
+def test_locate_by_ref_text_tag_must_match():
+	# 文字相同但 tag 不同（div vs button）→ TEXT 不命中；无 xpath/属性/rect 兜底 → None
+	btn = _text_ref_node("html/btn", "BUTTON", "设置竖封面")
+	sm = {1: btn}
+	r = locate_by_ref({"xpath": "/html/x", "tag": "div", "text": "设置竖封面"}, sm)
+	assert r is None
+
+
+def test_locate_by_ref_no_text_falls_back_to_xpath():
+	# 无 text → TEXT 级跳过，走 xpath（向后兼容）
+	node = _ref_node("html/body/btn", "BUTTON", {})
+	sm = {5: node}
+	r = locate_by_ref({"xpath": "/html/body/btn", "tag": "button"}, sm)
+	assert r == (5, node)

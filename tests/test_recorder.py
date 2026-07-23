@@ -6,6 +6,8 @@
 
 from types import SimpleNamespace
 
+import asyncio
+
 import pytest
 
 from tree_walker.agent.views import AgentHistoryList
@@ -267,14 +269,14 @@ async def test_attach_signal_attaches_to_last_action(tmp_path, patch_projection)
 	await rec.handle_event({"type": "click", "xpath": "html/body/btn", "ts": 1000})  # ts→1.0s
 
 	# 信号 ts=1500ms → 1.5s，距动作 0.5s < 2s 窗口 → 附加
-	assert rec.attach_signal({"type": "modal_opened", "selector": ".editor", "ts": 1500}) is True
+	assert await rec.attach_signal({"type": "modal_opened", "selector": ".editor", "ts": 1500}) is True
 	last = rec.recording.actions[-1]
 	assert len(last.signals) == 1
 	assert last.signals[0].kind is SignalKind.MODAL_OPENED
 	assert rec.recording.state.pending_modal == ".editor"
 
 	# 超窗（ts=5000ms → 5.0s，距动作 4.0s > 2s）→ 拒绝
-	assert rec.attach_signal({"type": "modal_opened", "selector": ".late", "ts": 5000}) is False
+	assert await rec.attach_signal({"type": "modal_opened", "selector": ".late", "ts": 5000}) is False
 
 
 @pytest.mark.asyncio
@@ -283,7 +285,47 @@ async def test_attach_signal_unknown_type_rejected(tmp_path, patch_projection):
 	rec = Recorder(browser, rerun_history_dir=str(tmp_path))
 	await rec.start()
 	await rec.handle_event({"type": "click", "xpath": "html/body/btn", "ts": 1000})
-	assert rec.attach_signal({"type": "mystery", "ts": 1100}) is False
+	assert await rec.attach_signal({"type": "mystery", "ts": 1100}) is False
+
+
+@pytest.mark.asyncio
+async def test_stop_waits_for_inflight_event(tmp_path, patch_projection, monkeypatch):
+	"""stop() 加锁等 in-flight handle_event 跑完再 flatten——修末步偶发录不全竞态（issue #136 关联）。
+
+	无锁时：事件卡在 get_state，/stop 并发跑 flatten → 落盘 click {} + null interacted（半成品，
+	正是 douyin_redesign12 step20 的现象）。加锁后：stop 等事件持锁跑完 → 该步完整。
+	"""
+	monkeypatch.setattr(rec_mod, "_LOCATE_RETRY_DELAYS", (0.0, 0.0))
+	entered = asyncio.Event()
+	release = asyncio.Event()
+
+	class _HangingBrowser(FakeBrowser):
+		async def get_state(self, include_screenshot=True):
+			entered.set()
+			await release.wait()  # 模拟 get_state 慢：事件处理中途 /stop 到达
+			return await super().get_state(include_screenshot)
+
+	browser = _HangingBrowser(selector_map={5: SimpleNamespace(xpath="html/body/btn")})
+	rec = Recorder(browser, rerun_history_dir=str(tmp_path))
+	await rec.start()
+
+	# 事件先跑（卡在 get_state 持锁），再调 stop——stop 必须等锁，不能抢先 flatten
+	event_task = asyncio.create_task(
+		rec.handle_event({"type": "click", "xpath": "html/body/btn", "rect": None, "text": "X"})
+	)
+	await entered.wait()         # 事件已进入 get_state（持锁 hang 住）
+	stop_task = asyncio.create_task(rec.stop(file_path="out.json"))
+	await asyncio.sleep(0.05)    # 让 stop 排到等锁队列（验证它没抢先落盘）
+	release.set()                # 放行事件
+	await stop_task
+	await event_task
+
+	# history[0]=起始 navigate（prepend），history[1]=click——须完整：interacted 非 null（未被截断）
+	assert len(rec.history.history) >= 2
+	click_step = rec.history.history[1]
+	assert click_step.model_output["actions"][0]["name"] == "click"
+	assert click_step.interacted_element[0] is not None
+	assert click_step.interacted_element[0].get("text") == "X"
 
 
 @pytest.mark.asyncio
@@ -547,3 +589,40 @@ async def test_stop_done_step_number_continuous(tmp_path, patch_projection):
 	await rec.stop(file_path="out.json", mark_done=True, done_text="完成")
 	nums = [s.step_number for s in rec.history.history]
 	assert nums == list(range(len(nums)))  # 0..N-1 连续，无跳号
+
+
+@pytest.mark.asyncio
+async def test_click_event_stores_extension_text(tmp_path, patch_projection):
+	"""扩展 click 事件带的 text（点击瞬间 ground truth）存进 interacted_element（issue #136）。"""
+	browser = FakeBrowser(selector_map={5: SimpleNamespace(xpath="html/body/btn")})
+	rec = Recorder(browser, rerun_history_dir=str(tmp_path))
+	await rec.start()
+	action = await rec.handle_event({
+		"type": "click", "xpath": "html/body/btn", "rect": None, "text": "设置竖封面",
+	})
+	assert action.interacted_element[0]["text"] == "设置竖封面"
+
+
+@pytest.mark.asyncio
+async def test_click_event_omits_text_when_absent(tmp_path, patch_projection):
+	"""无 text（旧协议/无文字元素）→ 不写入 text 字段，向后兼容。"""
+	browser = FakeBrowser(selector_map={5: SimpleNamespace(xpath="html/body/btn")})
+	rec = Recorder(browser, rerun_history_dir=str(tmp_path))
+	await rec.start()
+	action = await rec.handle_event({"type": "click", "xpath": "html/body/btn", "rect": None})
+	assert "text" not in action.interacted_element[0]
+
+
+@pytest.mark.asyncio
+async def test_locate_failure_stores_text_in_semantic_clue(tmp_path, patch_projection, monkeypatch):
+	"""定位失败存语义线索时也带上 text（重放端 TEXT 级重新定位，issue #136）。"""
+	monkeypatch.setattr(rec_mod, "_LOCATE_RETRY_DELAYS", (0.0, 0.0))
+	browser = FakeBrowser(selector_map={5: SimpleNamespace(xpath="html/body/other")})
+	rec = Recorder(browser, rerun_history_dir=str(tmp_path))
+	await rec.start()
+	action = await rec.handle_event({
+		"type": "click", "xpath": "html/body/missing", "text": "设置竖封面",
+	})
+	clue = action.interacted_element[0]
+	assert clue["_semantic_clue"] is True
+	assert clue["text"] == "设置竖封面"

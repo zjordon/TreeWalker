@@ -133,6 +133,64 @@ def test_match_ax_name(make_node, make_ax_node):
     assert rm._match_element_index(hist, {3: live}) == (3, MatchLevel.AX_NAME)
 
 
+# ── Level 0 TEXT 匹配（issue #136：cover step tab 仅靠可见文字区分）────────
+
+
+def test_match_text_overrides_colliding_exact(make_node):
+    """守住 bug 修复：录制设置竖封面（点后 step-active），element_hash 撞到重放时激活的
+    设置横封面——TEXT 级（优先于 EXACT）按文字命中设置竖封面，避免点错。"""
+    from tree_walker.browser.views import NodeType
+    rm = RerunMixin()
+    h_tab = make_node(
+        tag="div", attributes={"class": "step-dXVbPX step-active-AWDV7U"},
+        children=[make_node(tag="#text", node_type=NodeType.TEXT_NODE, node_value="设置横封面")],
+    )
+    v_tab = make_node(
+        tag="div", attributes={"class": "step-dXVbPX"},
+        children=[make_node(tag="#text", node_type=NodeType.TEXT_NODE, node_value="设置竖封面")],
+    )
+    sm = {1: h_tab, 2: v_tab}
+    # hist：录制设置竖封面，但 element_hash 故意取 h_tab（重放时 step-active 在横封面那边，
+    # EXACT 本会命中 idx=1 设置横封面——错的）
+    hist = {
+        "node_name": "DIV",
+        "text": "设置竖封面",
+        "element_hash": h_tab.element_hash,
+        "x_path": "",
+        "bounds": None,
+    }
+    idx, level = rm._match_element_index(hist, sm)
+    assert idx == 2                       # 命中设置竖封面，而非 h_tab
+    assert level == MatchLevel.TEXT
+
+
+def test_match_text_skipped_when_absent(make_node):
+    """无 text（旧录制/agent 自录）→ 跳过 TEXT，走原指纹路径（向后兼容）。"""
+    rm = RerunMixin()
+    live = make_node(tag="input", attributes={"name": "email"})
+    hist = DOMInteractedElement.load_from_enhanced_dom_tree(live).to_dict()
+    assert "text" not in hist
+    assert rm._match_element_index(hist, {7: live}) == (7, MatchLevel.EXACT)
+
+
+def test_match_text_handles_per_char_spans(make_node):
+    """抖音封面 tab 把每个字拆成独立 span——live ``get_all_children_text`` 带 \\n/空格，
+    须 strip 全部空白后才能与录制的 textContent（无分隔符）匹配（issue #136 真实场景）。"""
+    from tree_walker.browser.views import NodeType
+    rm = RerunMixin()
+    v_tab = make_node(
+        tag="div", attributes={"class": "step-dXVbPX"},
+        children=[make_node(tag="span", children=[
+            make_node(tag="#text", node_type=NodeType.TEXT_NODE, node_value=ch)
+        ]) for ch in "设置竖封面"],
+    )
+    sm = {1: v_tab}
+    hist = {"node_name": "DIV", "text": "设置竖封面", "element_hash": 0, "x_path": "", "bounds": None}
+    idx, level = rm._match_element_index(hist, sm)
+    assert idx == 1
+    assert level == MatchLevel.TEXT
+
+
 def test_match_attribute_fallback(make_node):
     rm = RerunMixin()
     live = make_node(tag="input", attributes={"name": "email", "id": "x"})
