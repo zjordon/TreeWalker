@@ -192,7 +192,14 @@ async def test_upload_file_records_signature_no_fingerprint(tmp_path, patch_proj
 	assert action is not None
 	p = action.params
 	assert "index" not in p                      # 不再录制时定位
-	assert action.interacted_element == [None]   # 无指纹（重放端解析）
+	# issue #139：upload 存语义线索（非 [None]），重放端 _match_file_upload_by_clue 按 area_text 精筛。
+	# 本例事件无 upload_ctx/rect → 线索仅 accept+xpath（area_text 等为空）。
+	ie = action.interacted_element[0]
+	assert ie is not None
+	assert ie["_semantic_clue"] is True
+	assert ie["kind"] == "file_upload"
+	assert ie["accept"] == "video/*"
+	assert ie["xpath"] == "html/body/div[2]/input"
 	assert action.locate_miss is None            # 非定位失败，是设计如此
 	# 签名落盘：accept + xpath（change 瞬间扩展捕获，未被 selector_map 的 image input 带偏）
 	assert p["accept"] == "video/*"
@@ -238,7 +245,39 @@ async def test_upload_file_missing_accept_defaults_empty(tmp_path, patch_project
 	assert action is not None
 	assert action.params["accept"] == ""
 	assert action.params["xpath"] == "html/body/x/input"
-	assert action.interacted_element == [None]
+
+
+@pytest.mark.asyncio
+async def test_upload_file_stores_semantic_clue_with_ctx(tmp_path, patch_projection):
+	"""issue #139：扩展 change 瞬间捕获 upload_ctx（封装组件 drag-area 文案 + 活动 step tab）+ rect
+	→ 录制端存进 _semantic_clue（kind=file_upload），重放端 _match_file_upload_by_clue 据 area_text
+	在多个同 accept file input 里精筛。"""
+	browser = FakeBrowser(selector_map={})
+	rec = Recorder(browser, rerun_history_dir=str(tmp_path))
+	await rec.start()
+	action = await rec.handle_event({
+		"type": "upload_file", "xpath": "html/body/div[12]/div[2]/input",
+		"rect": {"x": 10, "y": 20, "width": 100, "height": 60},
+		"params": {"path": "heng.png", "accept": "image/png,image/jpeg"},
+		"upload_ctx": {
+			"area_text": "点击上传文件或拖拽文件到这里",
+			"nearby_text": "设置横封面",
+			"upload_ancestor_class": "semi-upload upload-BvM5FF",
+		},
+	})
+	assert action is not None
+	ie = action.interacted_element[0]
+	assert ie is not None
+	assert ie["_semantic_clue"] is True
+	assert ie["kind"] == "file_upload"
+	assert ie["area_text"] == "点击上传文件或拖拽文件到这里"
+	assert ie["nearby_text"] == "设置横封面"
+	assert ie["upload_ancestor_class"] == "semi-upload upload-BvM5FF"
+	assert ie["rect"] == {"x": 10, "y": 20, "width": 100, "height": 60}
+	assert ie["accept"] == "image/png,image/jpeg"
+	# accept+xpath 仍落 params（老重放路径 _resolve_file_input_by_accept 的 xpath_hint 兜底）
+	assert action.params["accept"] == "image/png,image/jpeg"
+	assert action.params["xpath"] == "html/body/div[12]/div[2]/input"
 
 
 @pytest.mark.asyncio

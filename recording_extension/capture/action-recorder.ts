@@ -84,6 +84,32 @@ function refAttrs(el: Element): Pick<RecorderEvent, 'tag' | 'id' | 'name' | 'ari
   };
 }
 
+/** 取 upload file input 封装组件的上下文（issue #139 语义线索）。
+ *
+ * drag-area 文案是 input 的**兄弟元素**——Semi-UI change 后重建的是 `<input>` 本身（这正是
+ * `data-tw-recmark` 标记法失败的原因：标记随旧 input 销毁），但 drag-area 文案作为兄弟节点不被
+ * 重建，录制瞬间与重放瞬间都在、且不变。这是多个同 accept 的 file input 间**唯一稳定区分信号**
+ * （实证：抖音"上传封面"区文案="点击上传文件或拖拽文件到这里"，"AI封面"区无文案）。重放端据此
+ * 精筛，替代 `_resolve_file_input_by_accept` 的 `candidates[0]`（DOM 顺序第一个，受 get_state
+ * 时序漂移 → issue #139）。详见 docs/user_recording/upload-semantic-clue-plan.md。 */
+function captureUploadCtx(input: Element): { area_text: string; nearby_text: string; upload_ancestor_class: string } {
+  const norm = (s: string | null): string => (s ?? '').replace(/\s+/g, ' ').trim();
+  // 向上找封装的 semi-upload widget（Semi Design 上传组件根），读其 drag-area 文案。
+  // **必须用精确 class token `.semi-upload`**——不能用 `[class*="semi-upload"]`：file input 自身
+  // 的 class 是 `semi-upload-hidden-input`，含子串 "semi-upload" → closest 会命中 input 自己（无子节点
+  // → dragArea=null → area_text 空，issue #139 实测回归）。`.semi-upload` 只匹配 widget 根（其 class
+  // 含独立 token `semi-upload`），input 不含 → 正确向上找到 widget。
+  const widget = input.closest('.semi-upload');
+  const dragArea = widget?.querySelector('[class*="semi-upload-drag-area"]');
+  // 活动 step tab（封面编辑器"设置横/竖封面"步骤等）——提供方向/区域辅助区分；无则空。
+  const activeStep = document.querySelector('[class*="step-active"]');
+  return {
+    area_text: norm(dragArea?.textContent ?? null),
+    nearby_text: norm(activeStep?.textContent ?? null),
+    upload_ancestor_class: widget?.className ?? '',
+  };
+}
+
 interface PendingInput {
   xpath: string;
   value: string;
@@ -244,8 +270,10 @@ export function installActionRecorder(opts: InstallOptions): () => void {
     emit({
       type: 'upload_file',
       xpath: ref.xpath,
+      rect: ref.rect, // 现带上（多候选时重放端按中心就近兜底；issue #139）
       ...refAttrs(target),
       params: { path: file.name, accept },
+      upload_ctx: captureUploadCtx(raw), // 封装组件上下文语义线索（issue #139）
     });
   };
 

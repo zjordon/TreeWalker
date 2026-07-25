@@ -45,6 +45,18 @@ export interface RecorderEvent {
   xpath?: string;
   /** 目标元素 rect（多候选时后端按中心就近）。 */
   rect?: { x: number; y: number; width: number; height: number };
+  /** upload_file 专用语义线索（issue #139）：封装上传组件的上下文。后端存进 ``_semantic_clue``，
+   *  重放端 ``_match_file_upload_by_clue`` 据此在多个同 accept 的 file input 里精筛（替代
+   *  ``_resolve_file_input_by_accept`` 的 ``candidates[0]`` 兜底）。详见
+   *  docs/user_recording/upload-semantic-clue-plan.md。 */
+  upload_ctx?: {
+    /** 封装 semi-upload widget 的 drag-area 文案（兄弟元素，不随 Semi-UI 重建 input 消失）——主区分信号。 */
+    area_text: string;
+    /** 活动 step tab / 最近 heading 文案（"设置横/竖封面" 等）——方向/区域辅助区分。 */
+    nearby_text: string;
+    /** 封装 widget 的 class（粗筛辅助，含 CSS-module hash，不稳）。 */
+    upload_ancestor_class: string;
+  };
   /** 操作参数（text/value/url/...，不含 index——index 由后端 locator 定位后填）。 */
   params?: Record<string, unknown>;
   tab_id?: string;

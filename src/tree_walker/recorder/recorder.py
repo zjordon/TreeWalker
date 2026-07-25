@@ -237,8 +237,13 @@ class Recorder:
 					action.interacted_element = [ie]
 			else:
 				# 无定位（upload_file 不 get_state 定位 / navigate 等无 target 动作）。
-				# upload_file 置 [None]（有目标但重放端解析）；其余置 []（无 target）。
-				action.interacted_element = [None] if action.action_name == "upload_file" else []
+				# upload_file 存语义线索（issue #139：area_text/nearby_text 让重放端在多个同 accept
+				# 的 file input 里精筛，替 _resolve_file_input_by_accept 的 candidates[0] 兜底）；
+				# 其余置 []（无 target）。
+				if action.action_name == "upload_file":
+					self._store_upload_clue(action, event)
+				else:
+					action.interacted_element = []
 		except BaseException as e:
 			# 任何逃逸（translate_event 阶段 / _ensure_target / 定位块 / CancelledError 等 BaseException）：
 			# 记下异常待重抛，target 动作在此兜底存语义线索；末尾保底再校验一次确保 interacted 非空。
@@ -308,6 +313,32 @@ class Recorder:
 			"selector_map_size": selector_map_size,
 			"retried": retried,
 		}
+
+	def _store_upload_clue(self, action: ActionRecord, event: dict[str, Any]) -> None:
+		"""upload_file 存语义线索（issue #139）：accept+xpath 签名 + 封装组件上下文。
+
+		upload 在录制端算不出指纹（导航竞态 + Semi-UI change 后重建 input），原本只存 accept+xpath、
+		``interacted_element=[None]``（重放走 ``_resolve_file_input_by_accept``）。但那兜底取
+		``candidates[0]``（DOM 顺序第一个）受 get_state 时序漂移 → 开 #123 等待机制后封面上传选错 input
+		（issue #139）。本方法把扩展 change 瞬间捕获的封装组件上下文（drag-area 文案等**兄弟元素**，
+		不随 input 重建消失）存成语义线索，重放端 ``_match_file_upload_by_clue`` 据此精筛。详见
+		``docs/user_recording/upload-semantic-clue-plan.md``。
+
+		与 click/input/select 的 ``_semantic_clue`` 同形（带 ``_semantic_clue`` 标记），多
+		``kind="file_upload"`` 与 upload 专有字段（area_text/nearby_text/upload_ancestor_class）；
+		重放端按 ``kind`` 分发。``accept``/``xpath`` 同时仍存进 ``params``（老重放路径与 xpath_hint 兜底）。
+		"""
+		ctx = event.get("upload_ctx") or {}
+		base = {
+			"xpath": event.get("xpath"),
+			"tag": event.get("tag"),
+			"rect": event.get("rect"),
+			"accept": action.params.get("accept") or "",
+			"area_text": ctx.get("area_text", ""),
+			"nearby_text": ctx.get("nearby_text", ""),
+			"upload_ancestor_class": ctx.get("upload_ancestor_class", ""),
+		}
+		action.interacted_element = [{"_semantic_clue": True, "kind": "file_upload", **base}]
 
 	async def attach_signal(self, payload: dict[str, Any]) -> bool:
 		"""把扩展 SideEffectObserver 的信号（modal_opened/dropdown_opened）附到最近动作。
