@@ -5,6 +5,29 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.11.0] - 2026-07-26
+
+### Added
+
+**重放等待机制（#123，阶段 1-4）**——补全"录制→重放"的时序健壮性，重放可配置地等待页面稳定/目标元素/网络空闲后再进下一步，对齐 Playwright actionability 概念：
+
+- 阶段 1（#128）：录制间隔回放（真实停顿）+ 时序参数可配置 + page-settle
+- 阶段 2（#131）：等目标元素出现 + actionability 阶段一（可交互性检查）
+- 阶段 3（#126/#132）：networkidle 可选开关（默认关）+ 清理 upload 硬编码 wait
+- 阶段 4（#127/#133）：actionability 完善（paint_order 静态遮挡 / pointer-events / elementFromPoint 运行时遮挡 / stable 可选）+ step_interval 语义清理（新增 user_pause_seconds 优先）
+
+**upload file input 通用重定位（#139）**——把初版修复写死的 4 个 Semi-UI/抖音选择器换成站点无关信号（`input.labels` / `aria-labelledby` / `region_text` / `in_dialog`），Layer 2 捕获触发点击 affordance；并修复 content script 看不见 `addEventListener` 的 click 捕获盲区（MAIN-world hook 打 `data-tw-jsclick` 标记，`findInteractiveAncestor` 认标记，对齐后端 `has_js_click_listener`）。
+
+### Fixed
+
+- 跳转类 click 录制异常兜底（#130）：保证跳转类操作落盘带语义线索，重放可重新定位
+- 封面切换 click 文字匹配 + 末步录不全并发竞态（#136/#137）：click/select emit 带 `text`、重放加 TEXT 匹配级（优先于 EXACT，按 textContent + node_name 匹配）；Recorder 加 `asyncio.Lock` 串行化 start/handle_event/stop/attach_signal，修末步偶发录不全（click{}+null+空 url）
+
+### Docs
+
+- 半主动 get_state 设计存档（#134 已关闭/方向放弃）
+- 录制器性能与 get_state 复杂度优化方案
+
 ## [0.10.0] - 2026-07-18
 
 ### Added
