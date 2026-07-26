@@ -151,7 +151,10 @@ elif hist_elem and has_index:
   可靠。httpbin submit 的 xpath 重放时实测完全匹配（live 确认 button 在 selector_map，idx=1477）。
 - **重定位也失败**（三道全 miss，元素真无特征，罕见）：raise + 记日志，不静默 skip。
 - **upload_file 不在本次**：保持 accept 兜底（file input 隐藏无属性，三道防线弱；后续若要覆盖，可给
-  upload_file 也存语义线索 accept+rect+xpath）。
+  upload_file 也存语义线索 accept+rect+xpath）。**→ 已落地为可行方案**：见
+  [`upload-semantic-clue-plan.md`](upload-semantic-clue-plan.md)（issue #139：开 #123 等待机制后封面
+  上传选错 input；方向 A = 录制端多存 `area_text`/`nearby_text` 线索 + 重放端 `_match_file_upload_by_clue`
+  精筛，替代 `_resolve_file_input_by_accept` 的 `candidates[0]` 兜底）。
 
 ---
 

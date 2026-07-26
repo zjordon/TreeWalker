@@ -237,8 +237,13 @@ class Recorder:
 					action.interacted_element = [ie]
 			else:
 				# 无定位（upload_file 不 get_state 定位 / navigate 等无 target 动作）。
-				# upload_file 置 [None]（有目标但重放端解析）；其余置 []（无 target）。
-				action.interacted_element = [None] if action.action_name == "upload_file" else []
+				# upload_file 存语义线索（issue #139：area_text/nearby_text 让重放端在多个同 accept
+				# 的 file input 里精筛，替 _resolve_file_input_by_accept 的 candidates[0] 兜底）；
+				# 其余置 []（无 target）。
+				if action.action_name == "upload_file":
+					self._store_upload_clue(action, event)
+				else:
+					action.interacted_element = []
 		except BaseException as e:
 			# 任何逃逸（translate_event 阶段 / _ensure_target / 定位块 / CancelledError 等 BaseException）：
 			# 记下异常待重抛，target 动作在此兜底存语义线索；末尾保底再校验一次确保 interacted 非空。
@@ -308,6 +313,44 @@ class Recorder:
 			"selector_map_size": selector_map_size,
 			"retried": retried,
 		}
+
+	def _store_upload_clue(self, action: ActionRecord, event: dict[str, Any]) -> None:
+		"""upload_file 存语义线索（issue #139 通用化）：accept+xpath 签名 + **站点无关**身份上下文。
+
+		upload 在录制端算不出指纹（导航竞态 + 框架 change 后重建 input），原本只存 accept+xpath、
+		``interacted_element=[None]``（重放走 ``_resolve_file_input_by_accept``）。但那兜底取
+		``candidates[0]``（DOM 顺序第一个）受 get_state 时序漂移 → 开 #123 等待机制后封面上传选错 input
+		（issue #139）。本方法把扩展 change 瞬间捕获的**通用身份**（原生 label/aria-labelledby/就近文本/
+		ARIA dialog + 可选 trigger_affordance——标准信号，跨站点稳定）存成语义线索，重放端
+		``_match_file_upload_by_clue`` 据此精筛。详见 ``docs/user_recording/upload-general-identity-impl-plan.md``。
+
+		与 click/input/select 的 ``_semantic_clue`` 同形（带 ``_semantic_clue`` 标记），多
+		``kind="file_upload"`` 与 upload 专有字段（label_text/aria_text/region_text/in_dialog + 可选
+		trigger_affordance）；重放端按 ``kind`` 分发。``accept``/``xpath`` 同时仍存进 ``params``（老重放
+		路径与 xpath_hint 兜底）。老 history（带 area_text/in_modal）走重放端 legacy 别名，零回归。
+		"""
+		ctx = event.get("upload_ctx") or {}
+		base = {
+			"xpath": event.get("xpath"),
+			"tag": event.get("tag"),
+			"rect": event.get("rect"),
+			"accept": action.params.get("accept") or "",
+			# 站点无关通用信号（issue #139 通用化）。region_text 泛化旧 area_text、in_dialog 泛化旧 in_modal。
+			"label_text": ctx.get("label_text", ""),
+			"aria_text": ctx.get("aria_text", ""),
+			"region_text": ctx.get("region_text", ""),
+			"in_dialog": bool(ctx.get("in_dialog", False)),
+		}
+		# Layer 2：change 前最近一次可见 click 的 affordance 身份（用户实点元素，比 walk 推断精确）。
+		aff = ctx.get("trigger_affordance")
+		if isinstance(aff, dict) and aff:
+			base["trigger_affordance"] = {
+				"text": aff.get("text", ""),
+				"role": aff.get("role", ""),
+				"tag": aff.get("tag", ""),
+				"rect": aff.get("rect"),
+			}
+		action.interacted_element = [{"_semantic_clue": True, "kind": "file_upload", **base}]
 
 	async def attach_signal(self, payload: dict[str, Any]) -> bool:
 		"""把扩展 SideEffectObserver 的信号（modal_opened/dropdown_opened）附到最近动作。

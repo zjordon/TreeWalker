@@ -1,0 +1,181 @@
+INFO:cdp_use.client:Connecting to ws://localhost:9222/devtools/browser/0cbb5737-e8ba-4ac1-89de-adfc5b487c65 (max frame size: 100MB)
+INFO:tree_walker.browser.session:Browser connected: target=88662FF64918B54F357266EF21298C08
+INFO:tree_walker.agent.rerun:🔗 重导航到 https://creator.douyin.com/creator-micro/content/upload
+INFO:tree_walker.agent.rerun:🔁 开始重放（共 22 步）
+INFO:tree_walker.agent.rerun:🔁 回放 Step 0 (1/22) [default delay=1.0s]:
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=1421, ax_nodes=224, js_listeners=34, file_inputs=1, dpr=1.25
+INFO:tree_walker.agent.rerun:▶️  navigate: url: https://creator.douyin.com/creator-micro/content/upload, new_tab: False
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=841, ax_nodes=54, js_listeners=4, file_inputs=0, dpr=1.25
+INFO:tree_walker.tools.actions:Navigated to https://creator.douyin.com/creator-micro/content/upload
+INFO:tree_walker.agent.rerun:🔁 回放 Step 1 (2/22) [user_pause=3.0s]:
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=1422, ax_nodes=221, js_listeners=34, file_inputs=1, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=278, ax_nodes=8, js_listeners=1, file_inputs=0, dpr=1.25
+INFO:tree_walker.agent.rerun:🔍 定位元素: <I> hash=1674131120149916294 stable_hash=13203346166218386049
+INFO:tree_walker.agent.rerun:元素 index 更新 55364 → 8987（匹配级别 EXACT）
+INFO:tree_walker.agent.rerun:▶️  click: index: 8987
+INFO:tree_walker.tools.actions:Clicked [I] at index 8987
+INFO:tree_walker.agent.rerun:🔁 回放 Step 2 (3/22) [user_pause=7.4s]:
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=1443, ax_nodes=242, js_listeners=38, file_inputs=1, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=278, ax_nodes=8, js_listeners=1, file_inputs=0, dpr=1.25
+INFO:tree_walker.agent.rerun:upload_file 无指纹，按 accept 解析 file input index=9324
+INFO:tree_walker.agent.rerun:▶️  upload_file: path: D:\Videos\test\final\2026-04-29-20-41-59.mp4, accept: video/x-flv,video/mp4,video/x-m4v,video/*,.flv,.avi,.wmv,.w…
+INFO:tree_walker.tools.actions:upload_file: index=9324, tag=INPUT, type=file, backend_node_id=9324, is_file_input=True, resolved_backend_id=9324, available_file_inputs=[9324]
+INFO:tree_walker.browser.session:set_file_input: backend_node_id=9324, file_input_backend_ids=None, file=D:\Videos\test\final\2026-04-29-20-41-59.mp4
+INFO:tree_walker.browser.session:DOM.setFileInputFiles: backendNodeId=9324, file=D:\Videos\test\final\2026-04-29-20-41-59.mp4
+INFO:tree_walker.tools.actions:Uploaded '2026-04-29-20-41-59.mp4' to [INPUT] at index 9324  ℹ️ File was set on the input successfully (DOM.setFileInputFiles returned OK). No new <canvas>/<im
+g> preview detected within the wait window — the page may still be processing, or use a non-standard preview mechanism. Do NOT conclude the upload failed just because the upload area still s
+hows placeholder text like "点击上传文件或拖拽文件到这里" — that text is static markup, not upload state. (This does NOT override explicit failure signals — an error toast / "rejected" / red
+ border / size-limit notice still means failure.) To confirm, proceed one step and re-read the DOM (look for a newly appeared preview) rather than taking a screenshot (visual verification is currently disabled).
+
+INFO:tree_walker.agent.rerun:upload 后等待 5.0s（video）
+INFO:tree_walker.agent.rerun:重放：页面漂移(https://creator.douyin.com/creator-micro/content/upload → https://creator.douyin.com/creator-micro/content/post/video?enter_from=publish_page)，停剩余动作
+INFO:tree_walker.agent.rerun:🔁 回放 Step 3 (4/22) [user_pause=1.8s]:
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=2725, ax_nodes=738, js_listeners=95, file_inputs=2, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=278, ax_nodes=8, js_listeners=1, file_inputs=0, dpr=1.25
+INFO:tree_walker.agent.rerun:🔍 定位元素: <INPUT> hash=8254015704144486660 stable_hash=8254015704144486660
+INFO:tree_walker.agent.rerun:元素 index 更新 59540 → 10575（匹配级别 EXACT）
+INFO:tree_walker.agent.rerun:▶️  click: index: 10575
+INFO:tree_walker.tools.actions:Clicked [INPUT] '填写作品标题，为作品获得更多流量' at index 10575
+INFO:tree_walker.agent.rerun:🔁 回放 Step 4 (5/22) [user_pause=7.5s]:
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=2727, ax_nodes=740, js_listeners=95, file_inputs=2, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=278, ax_nodes=8, js_listeners=1, file_inputs=0, dpr=1.25
+INFO:tree_walker.agent.rerun:🔍 定位元素: <INPUT> hash=8254015704144486660 stable_hash=8254015704144486660
+INFO:tree_walker.agent.rerun:元素 index 更新 59540 → 10575（匹配级别 EXACT）
+INFO:tree_walker.agent.rerun:▶️  input_text: text: ai浏览器第5期-browser-use, clear: True, index: 10575
+INFO:tree_walker.tools.actions:Typed 'ai浏览器第5期-browser-use' into [INPUT] '填写作品标题，为作品获得更多流量' at index 10575
+INFO:tree_walker.agent.rerun:🔁 回放 Step 5 (6/22) [user_pause=0.0s]:
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=2727, ax_nodes=741, js_listeners=96, file_inputs=2, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=278, ax_nodes=8, js_listeners=1, file_inputs=0, dpr=1.25
+INFO:tree_walker.agent.rerun:▶️  send_keys: keys: Tab
+INFO:tree_walker.tools.actions:Sent keys 'Tab'
+INFO:tree_walker.agent.rerun:🔁 回放 Step 6 (7/22) [user_pause=12.9s]:
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=2730, ax_nodes=741, js_listeners=96, file_inputs=2, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=278, ax_nodes=8, js_listeners=1, file_inputs=0, dpr=1.25
+INFO:tree_walker.agent.rerun:🔍 定位元素: <DIV> hash=8972017763774459989 stable_hash=9414416610528224384
+INFO:tree_walker.agent.rerun:元素 index 更新 59138 → 10173（匹配级别 EXACT）
+INFO:tree_walker.agent.rerun:▶️  input_text: text: browser-use体验及技术分析​, clear: True, index: 10173
+INFO:tree_walker.tools.actions:Typed 'browser-use体验及技术分析\u200b' into [DIV] at index 10173  ⚠️ Note: the field's actual value '        \u200bbrowser-use体验及技术分析\u200b\u200b' differs from the intended 'browser-use体验及技术分析\u200b'. The site may have reformatted, truncated, or rejected the input — re-observe before continuing.
+INFO:tree_walker.agent.rerun:🔁 回放 Step 7 (8/22) [user_pause=1.3s]:
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=2738, ax_nodes=745, js_listeners=96, file_inputs=2, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=278, ax_nodes=8, js_listeners=1, file_inputs=0, dpr=1.25
+INFO:tree_walker.agent.rerun:🔍 定位元素: <DIV> hash=1584574962579419888 stable_hash=15419633017861583594
+INFO:tree_walker.agent.rerun:元素 index 更新 60025 → 10653（匹配级别 TEXT）
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=2738, ax_nodes=745, js_listeners=96, file_inputs=2, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=278, ax_nodes=8, js_listeners=1, file_inputs=0, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=2738, ax_nodes=745, js_listeners=96, file_inputs=2, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=278, ax_nodes=8, js_listeners=1, file_inputs=0, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=2738, ax_nodes=745, js_listeners=96, file_inputs=2, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=278, ax_nodes=8, js_listeners=1, file_inputs=0, dpr=1.25
+INFO:tree_walker.agent.rerun:▶️  click: index: 10653
+INFO:tree_walker.tools.actions:Clicked [DIV] at index 10653
+INFO:tree_walker.agent.rerun:🔁 回放 Step 8 (9/22) [user_pause=8.2s]:
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=3699, ax_nodes=1566, js_listeners=298, file_inputs=6, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=278, ax_nodes=8, js_listeners=1, file_inputs=0, dpr=1.25
+INFO:tree_walker.agent.rerun:upload_file 无指纹，按 accept 解析 file input index=10304
+INFO:tree_walker.agent.rerun:▶️  upload_file: path: D:\dev\git\claude\skills-deom\ppt\browser-use\heng.png, accept: image/png,image/jpeg,image/jpg,image/bmp,image/we…
+INFO:tree_walker.tools.actions:upload_file: index=10304, tag=INPUT, type=file, backend_node_id=10304, is_file_input=True, resolved_backend_id=10304, available_file_inputs=[10304, 10919, 11844, 11845, 12072, 12073]
+INFO:tree_walker.browser.session:set_file_input: backend_node_id=10304, file_input_backend_ids=None, file=D:\dev\git\claude\skills-deom\ppt\browser-use\heng.png
+INFO:tree_walker.browser.session:DOM.setFileInputFiles: backendNodeId=10304, file=D:\dev\git\claude\skills-deom\ppt\browser-use\heng.png
+INFO:tree_walker.tools.actions:Uploaded 'heng.png' to [INPUT] 'upload-btn' at index 10304  ⚠️ Page has 6 file inputs; uploaded to the one you specified (index 10304). Likely-live candidates 
+(visible + upload container): [10304, 10919, 11844, 11845, 12072, 12073]. If the site reacted wrongly (a 收藏封面/favorite-cover modal popped, or nothing changed = you hit a hidden decoy input), retry upload_file on the correct visible upload area.  ✅ Upload verified on page: new <img> preview appeared (count 21→22).
+
+INFO:tree_walker.agent.rerun:upload 后等待 3.0s（image）
+INFO:tree_walker.agent.rerun:🔁 回放 Step 9 (10/22) [user_pause=1.6s]: 
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=3699, ax_nodes=1565, js_listeners=297, file_inputs=6, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=278, ax_nodes=8, js_listeners=1, file_inputs=0, dpr=1.25
+INFO:tree_walker.agent.rerun:🔍 定位元素: <BUTTON> hash=1146575265585160695 stable_hash=10975769124903192236
+INFO:tree_walker.agent.rerun:元素 index 更新 61805 → 12090（匹配级别 TEXT）
+INFO:tree_walker.agent.rerun:▶️  click: index: 12090
+INFO:tree_walker.tools.actions:Clicked [BUTTON] at index 12090
+INFO:tree_walker.agent.rerun:🔁 回放 Step 10 (11/22) [user_pause=4.1s]:
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=3710, ax_nodes=1618, js_listeners=307, file_inputs=6, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=278, ax_nodes=8, js_listeners=1, file_inputs=0, dpr=1.25
+INFO:tree_walker.agent.rerun:upload_file 无指纹，按 accept 解析 file input index=12821
+INFO:tree_walker.agent.rerun:▶️  upload_file: path: D:\dev\git\claude\skills-deom\ppt\browser-use\shu.png, accept: image/png,image/jpeg,image/jpg,image/bmp,image/web…
+INFO:tree_walker.tools.actions:upload_file: index=12821, tag=INPUT, type=file, backend_node_id=12821, is_file_input=True, resolved_backend_id=12821, available_file_inputs=[12821, 10919, 12956, 12957, 12072, 12073]
+INFO:tree_walker.browser.session:set_file_input: backend_node_id=12821, file_input_backend_ids=None, file=D:\dev\git\claude\skills-deom\ppt\browser-use\shu.png
+INFO:tree_walker.browser.session:DOM.setFileInputFiles: backendNodeId=12821, file=D:\dev\git\claude\skills-deom\ppt\browser-use\shu.png
+INFO:tree_walker.tools.actions:Uploaded 'shu.png' to [INPUT] 'upload-btn' at index 12821  ⚠️ Page has 6 file inputs; uploaded to the one you specified (index 12821). Likely-live candidates (
+visible + upload container): [12821, 10919, 12956, 12957, 12072, 12073]. If the site reacted wrongly (a 收藏封面/favorite-cover modal popped, or nothing changed = you hit a hidden decoy input), retry upload_file on the correct visible upload area.  ✅ Upload verified on page: new <img> preview appeared (count 21→23).
+
+INFO:tree_walker.agent.rerun:upload 后等待 3.0s（image）
+INFO:tree_walker.agent.rerun:🔁 回放 Step 11 (12/22) [user_pause=1.9s]: 
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=3706, ax_nodes=1605, js_listeners=301, file_inputs=6, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=278, ax_nodes=8, js_listeners=1, file_inputs=0, dpr=1.25
+INFO:tree_walker.agent.rerun:🔍 定位元素: <BUTTON> hash=964000279689765997 stable_hash=7246920738848044772
+INFO:tree_walker.agent.rerun:元素 index 更新 61805 → 12976（匹配级别 TEXT）
+INFO:tree_walker.agent.rerun:▶️  click: index: 12976
+INFO:tree_walker.tools.actions:Clicked [BUTTON] at index 12976
+INFO:tree_walker.agent.rerun:🔁 回放 Step 12 (13/22) [user_pause=4.0s]:
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=2852, ax_nodes=810, js_listeners=97, file_inputs=2, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=278, ax_nodes=8, js_listeners=1, file_inputs=0, dpr=1.25
+INFO:tree_walker.agent.rerun:▶️  scroll: amount: 1, direction: down
+INFO:tree_walker.tools.actions:Scrolled down 1 viewport-heights (86.8% down)
+INFO:tree_walker.agent.rerun:🔁 回放 Step 13 (14/22) [user_pause=0.4s]:
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=2852, ax_nodes=810, js_listeners=97, file_inputs=2, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=278, ax_nodes=8, js_listeners=1, file_inputs=0, dpr=1.25
+INFO:tree_walker.agent.rerun:🔍 定位元素: <DIV> hash=1600400123539434347 stable_hash=13129615169607904102
+INFO:tree_walker.agent.rerun:元素 index 更新 59524 → 10559（匹配级别 TEXT）
+INFO:tree_walker.agent.rerun:▶️  click: index: 10559
+INFO:tree_walker.tools.actions:Clicked [DIV] at index 10559
+INFO:tree_walker.agent.rerun:🔁 回放 Step 14 (15/22) [user_pause=1.4s]:
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=2919, ax_nodes=862, js_listeners=111, file_inputs=2, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=278, ax_nodes=8, js_listeners=1, file_inputs=0, dpr=1.25
+INFO:tree_walker.agent.rerun:🔍 定位元素: <DIV> hash=712558693996805125 stable_hash=6192764521939121170
+INFO:tree_walker.agent.rerun:元素 index 更新 62397 → 13720（匹配级别 TEXT）
+INFO:tree_walker.agent.rerun:▶️  click: index: 13720
+INFO:tree_walker.tools.actions:Clicked [DIV] at index 13720
+INFO:tree_walker.agent.rerun:🔁 回放 Step 15 (16/22) [user_pause=1.0s]:
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=2866, ax_nodes=823, js_listeners=99, file_inputs=2, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=278, ax_nodes=8, js_listeners=1, file_inputs=0, dpr=1.25
+INFO:tree_walker.agent.rerun:🔍 定位元素: <DIV> hash=1489542029154490631 stable_hash=15324600084436654337
+INFO:tree_walker.agent.rerun:元素 index 更新 59202 → 10237（匹配级别 TEXT）
+INFO:tree_walker.agent.rerun:▶️  click: index: 10237
+INFO:tree_walker.tools.actions:Clicked [DIV] at index 10237
+INFO:tree_walker.agent.rerun:🔁 回放 Step 16 (17/22) [user_pause=1.0s]:
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=2948, ax_nodes=903, js_listeners=108, file_inputs=2, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=278, ax_nodes=8, js_listeners=1, file_inputs=0, dpr=1.25
+INFO:tree_walker.agent.rerun:🔍 定位元素: <LABEL> hash=6931043934554469738 stable_hash=4160733873948126797
+INFO:tree_walker.agent.rerun:元素 index 更新 62486 → 13801（匹配级别 TEXT）
+INFO:tree_walker.agent.rerun:▶️  click: index: 13801
+INFO:tree_walker.tools.actions:Clicked [LABEL] at index 13801
+INFO:tree_walker.agent.rerun:🔁 回放 Step 17 (18/22) [user_pause=0.0s]:
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=2952, ax_nodes=907, js_listeners=109, file_inputs=2, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=278, ax_nodes=8, js_listeners=1, file_inputs=0, dpr=1.25
+INFO:tree_walker.agent.rerun:🔍 定位元素: <SPAN> hash=1145245320192042047 stable_hash=14980303375474205753
+INFO:tree_walker.agent.rerun:元素 index 更新 62483 → 13798（匹配级别 EXACT）
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=2952, ax_nodes=907, js_listeners=109, file_inputs=2, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=278, ax_nodes=8, js_listeners=1, file_inputs=0, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=2952, ax_nodes=907, js_listeners=109, file_inputs=2, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=278, ax_nodes=8, js_listeners=1, file_inputs=0, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=2952, ax_nodes=907, js_listeners=109, file_inputs=2, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=278, ax_nodes=8, js_listeners=1, file_inputs=0, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=2952, ax_nodes=907, js_listeners=109, file_inputs=2, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=278, ax_nodes=8, js_listeners=1, file_inputs=0, dpr=1.25
+INFO:tree_walker.agent.rerun:▶️  click: index: 13798
+INFO:tree_walker.browser.session:Element backendNodeId=13798 is occluded at (393,397), using JS click fallback
+INFO:tree_walker.tools.actions:Clicked [SPAN] at index 13798
+INFO:tree_walker.agent.rerun:🔁 回放 Step 18 (19/22) [user_pause=1.5s]:
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=2952, ax_nodes=907, js_listeners=109, file_inputs=2, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=278, ax_nodes=8, js_listeners=1, file_inputs=0, dpr=1.25
+INFO:tree_walker.agent.rerun:🔍 定位元素: <BUTTON> hash=872164324805324782 stable_hash=2974158301110368304
+INFO:tree_walker.agent.rerun:元素 index 更新 62518 → 13833（匹配级别 TEXT）
+INFO:tree_walker.agent.rerun:▶️  click: index: 13833
+INFO:tree_walker.tools.actions:Clicked [BUTTON] at index 13833
+INFO:tree_walker.agent.rerun:🔁 回放 Step 19 (20/22) [user_pause=1.9s]:
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=2866, ax_nodes=823, js_listeners=99, file_inputs=2, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=278, ax_nodes=8, js_listeners=1, file_inputs=0, dpr=1.25
+INFO:tree_walker.agent.rerun:▶️  scroll: amount: 1, direction: down
+INFO:tree_walker.tools.actions:Scrolled down 1 viewport-heights (100.1% down) (already at down, no further content)
+INFO:tree_walker.agent.rerun:🔁 回放 Step 20 (21/22) [user_pause=0.4s]:
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=2866, ax_nodes=823, js_listeners=99, file_inputs=2, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=278, ax_nodes=8, js_listeners=1, file_inputs=0, dpr=1.25
+INFO:tree_walker.agent.rerun:语义线索重定位 idx=10456（action=click）
+INFO:tree_walker.agent.rerun:▶️  click: index: 10456
+INFO:tree_walker.tools.actions:Clicked [BUTTON] at index 10456
+INFO:tree_walker.agent.rerun:重放：页面漂移(https://creator.douyin.com/creator-micro/content/post/video?enter_from=publish_page → https://creator.douyin.com/creator-micro/content/upload?enter_from=publish)，停止剩余动作
+INFO:tree_walker.agent.rerun:🔁 回放 Step 21 (22/22) [default delay=1.0s]:
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=2140, ax_nodes=244, js_listeners=42, file_inputs=1, dpr=1.25
+INFO:tree_walker.browser.dom:DOM state: degradation=full, snapshot_entries=278, ax_nodes=8, js_listeners=1, file_inputs=0, dpr=1.25
+INFO:tree_walker.agent.rerun:▶️  done: text: 录制完成, success: True
+INFO:tree_walker.tools.actions:Task completed: True - 录制完成
