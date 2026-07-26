@@ -315,18 +315,19 @@ class Recorder:
 		}
 
 	def _store_upload_clue(self, action: ActionRecord, event: dict[str, Any]) -> None:
-		"""upload_file 存语义线索（issue #139）：accept+xpath 签名 + 封装组件上下文。
+		"""upload_file 存语义线索（issue #139 通用化）：accept+xpath 签名 + **站点无关**身份上下文。
 
-		upload 在录制端算不出指纹（导航竞态 + Semi-UI change 后重建 input），原本只存 accept+xpath、
+		upload 在录制端算不出指纹（导航竞态 + 框架 change 后重建 input），原本只存 accept+xpath、
 		``interacted_element=[None]``（重放走 ``_resolve_file_input_by_accept``）。但那兜底取
 		``candidates[0]``（DOM 顺序第一个）受 get_state 时序漂移 → 开 #123 等待机制后封面上传选错 input
-		（issue #139）。本方法把扩展 change 瞬间捕获的封装组件上下文（drag-area 文案等**兄弟元素**，
-		不随 input 重建消失）存成语义线索，重放端 ``_match_file_upload_by_clue`` 据此精筛。详见
-		``docs/user_recording/upload-semantic-clue-plan.md``。
+		（issue #139）。本方法把扩展 change 瞬间捕获的**通用身份**（原生 label/aria-labelledby/就近文本/
+		ARIA dialog + 可选 trigger_affordance——标准信号，跨站点稳定）存成语义线索，重放端
+		``_match_file_upload_by_clue`` 据此精筛。详见 ``docs/user_recording/upload-general-identity-impl-plan.md``。
 
 		与 click/input/select 的 ``_semantic_clue`` 同形（带 ``_semantic_clue`` 标记），多
-		``kind="file_upload"`` 与 upload 专有字段（area_text/nearby_text/upload_ancestor_class）；
-		重放端按 ``kind`` 分发。``accept``/``xpath`` 同时仍存进 ``params``（老重放路径与 xpath_hint 兜底）。
+		``kind="file_upload"`` 与 upload 专有字段（label_text/aria_text/region_text/in_dialog + 可选
+		trigger_affordance）；重放端按 ``kind`` 分发。``accept``/``xpath`` 同时仍存进 ``params``（老重放
+		路径与 xpath_hint 兜底）。老 history（带 area_text/in_modal）走重放端 legacy 别名，零回归。
 		"""
 		ctx = event.get("upload_ctx") or {}
 		base = {
@@ -334,10 +335,21 @@ class Recorder:
 			"tag": event.get("tag"),
 			"rect": event.get("rect"),
 			"accept": action.params.get("accept") or "",
-			"area_text": ctx.get("area_text", ""),
-			"nearby_text": ctx.get("nearby_text", ""),
-			"upload_ancestor_class": ctx.get("upload_ancestor_class", ""),
+			# 站点无关通用信号（issue #139 通用化）。region_text 泛化旧 area_text、in_dialog 泛化旧 in_modal。
+			"label_text": ctx.get("label_text", ""),
+			"aria_text": ctx.get("aria_text", ""),
+			"region_text": ctx.get("region_text", ""),
+			"in_dialog": bool(ctx.get("in_dialog", False)),
 		}
+		# Layer 2：change 前最近一次可见 click 的 affordance 身份（用户实点元素，比 walk 推断精确）。
+		aff = ctx.get("trigger_affordance")
+		if isinstance(aff, dict) and aff:
+			base["trigger_affordance"] = {
+				"text": aff.get("text", ""),
+				"role": aff.get("role", ""),
+				"tag": aff.get("tag", ""),
+				"rect": aff.get("rect"),
+			}
 		action.interacted_element = [{"_semantic_clue": True, "kind": "file_upload", **base}]
 
 	async def attach_signal(self, payload: dict[str, Any]) -> bool:

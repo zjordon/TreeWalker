@@ -49,9 +49,15 @@ let installed = false;
 
 /** 从 el 向上找最近的可交互祖先；找不到返回 null（调用方据此跳过非可交互的噪声点击）。
  *
- * 找不到 = el 及祖先都非可交互（非 INTERACTIVE_SELECTOR、非 div cursor:pointer、无 onclick），
- * 典型如点 <p> 段落空白——onClick 应跳过这类噪声，避免录到 selector_map 永不在的非可交互元素
- * （录制/重放都定位失败）。button/label/input/div 触发器都能在向上找时命中返回。 */
+ * 四道启发式（任一命中即返回该祖先）：
+ *   1. INTERACTIVE_SELECTOR（button/a/[role=tab]/input/...）
+ *   2. div + cursor:pointer（Semi select 触发器 / cover-Jg3T4p 等 div 模拟组件）
+ *   3. onclick/onmousedown（属性或 DOM 属性赋值）
+ *   4. data-tw-jsclick 标记（MAIN-world addEventListener hook 打的——补 content script 看不到
+ *      JS 监听器的盲区，对齐后端 has_js_click_listener；详见 docs/user_recording/js-click-capture-fix-plan.md）
+ *
+ * 找不到 = el 及祖先四道全不命中，典型如点 <p> 段落空白——onClick 应跳过这类噪声，避免录到
+ * selector_map 永不在的非可交互元素（录制/重放都定位失败）。 */
 function findInteractiveAncestor(el: Element | null): Element | null {
   let cur: Element | null = el;
   while (cur && cur !== document.body) {
@@ -65,6 +71,9 @@ function findInteractiveAncestor(el: Element | null): Element | null {
       if (cur.tagName === 'DIV' && window.getComputedStyle(cur).cursor === 'pointer') return cur;
       const html = cur as HTMLElement;
       if (html.onclick || cur.getAttribute('onclick') || cur.getAttribute('onmousedown')) return cur;
+      // MAIN-world addEventListener hook 打的标记（补 content script 看不到 JS 监听器的盲区，
+      // 对齐后端 has_js_click_listener；详见 docs/user_recording/js-click-capture-fix-plan.md）
+      if (cur.hasAttribute('data-tw-jsclick')) return cur;
     } catch {
       /* 非元素节点，继续向上 */
     }
@@ -84,30 +93,53 @@ function refAttrs(el: Element): Pick<RecorderEvent, 'tag' | 'id' | 'name' | 'ari
   };
 }
 
-/** 取 upload file input 封装组件的上下文（issue #139 语义线索）。
+/** 取 upload file input 的通用身份线索（站点无关，issue #139 通用化）。
  *
- * drag-area 文案是 input 的**兄弟元素**——Semi-UI change 后重建的是 `<input>` 本身（这正是
- * `data-tw-recmark` 标记法失败的原因：标记随旧 input 销毁），但 drag-area 文案作为兄弟节点不被
- * 重建，录制瞬间与重放瞬间都在、且不变。这是多个同 accept 的 file input 间**唯一稳定区分信号**
- * （实证：抖音"上传封面"区文案="点击上传文件或拖拽文件到这里"，"AI封面"区无文案）。重放端据此
- * 精筛，替代 `_resolve_file_input_by_accept` 的 `candidates[0]`（DOM 顺序第一个，受 get_state
- * 时序漂移 → issue #139）。详见 docs/user_recording/upload-semantic-clue-plan.md。 */
-function captureUploadCtx(input: Element): { area_text: string; nearby_text: string; upload_ancestor_class: string } {
+ * 替代旧 Semi-UI 写死选择器（`.semi-upload`/`drag-area`/`step-active`），改读**标准信号**：原生 label
+ * 关联（input.labels）、aria-labelledby IDREF 解析、就近可见文本祖先、ARIA dialog。这些信号跨框架/站点
+ * 稳定（Ant `ant-upload`、原生 `<label for>`、Element `el-upload` 都覆盖）。重放端 ``_upload_input_contexts``
+ * 用**同一份逻辑**从活 DOM 重算，字段相等即匹配。详见 docs/user_recording/upload-general-identity-impl-plan.md。
+ *
+ * 注：affordance（可点祖先文案）不在录制端算——Layer 2 的 trigger_affordance 直接取 change 前的实点
+ * click 身份（见 onFileChange），比 walk 推断更精确。 */
+function captureUploadCtx(input: Element): {
+  label_text: string;
+  aria_text: string;
+  region_text: string;
+  in_dialog: boolean;
+} {
   const norm = (s: string | null): string => (s ?? '').replace(/\s+/g, ' ').trim();
-  // 向上找封装的 semi-upload widget（Semi Design 上传组件根），读其 drag-area 文案。
-  // **必须用精确 class token `.semi-upload`**——不能用 `[class*="semi-upload"]`：file input 自身
-  // 的 class 是 `semi-upload-hidden-input`，含子串 "semi-upload" → closest 会命中 input 自己（无子节点
-  // → dragArea=null → area_text 空，issue #139 实测回归）。`.semi-upload` 只匹配 widget 根（其 class
-  // 含独立 token `semi-upload`），input 不含 → 正确向上找到 widget。
-  const widget = input.closest('.semi-upload');
-  const dragArea = widget?.querySelector('[class*="semi-upload-drag-area"]');
-  // 活动 step tab（封面编辑器"设置横/竖封面"步骤等）——提供方向/区域辅助区分；无则空。
-  const activeStep = document.querySelector('[class*="step-active"]');
-  return {
-    area_text: norm(dragArea?.textContent ?? null),
-    nearby_text: norm(activeStep?.textContent ?? null),
-    upload_ancestor_class: widget?.className ?? '',
-  };
+  const htmlInput = input as HTMLInputElement;
+  // 1. 原生 label 关联（W3C）：input.labels 同时含 <label for> 指向与包裹 <label>。
+  const labelText = norm(
+    Array.from(htmlInput.labels ?? [])
+      .map((l) => l.textContent ?? '')
+      .join(' '),
+  );
+  // 2. aria-labelledby → 目标元素 textContent（IDREF 解析，不走 accname 算法——浏览器实现差异大）。
+  const ariaText = norm(
+    (input.getAttribute('aria-labelledby') ?? '')
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((id) => document.getElementById(id))
+      .filter((el): el is HTMLElement => !!el)
+      .map((el) => el.textContent ?? '')
+      .join(' '),
+  );
+  // 3. 就近可见文本祖先（≤5 层，首个 textContent 非空且 <200 字）——泛化旧 area_text：
+  //    Semi widget 祖先的 textContent 即含 drag-area 文案"点击上传文件..."。
+  let region = '';
+  let p: Element | null = input.parentElement;
+  let depth = 0;
+  while (p && depth < 5 && !region) {
+    const t = norm(p.textContent ?? '');
+    if (t && t.length < 200) region = t;
+    p = p.parentElement;
+    depth += 1;
+  }
+  // 4. ARIA dialog（泛化旧 in_modal 的 [class*="modal"]——无障碍标准更稳）。
+  const inDialog = !!(input.closest('[role="dialog"]') ?? input.closest('[aria-modal="true"]'));
+  return { label_text: labelText, aria_text: ariaText, region_text: region, in_dialog: inDialog };
 }
 
 interface PendingInput {
@@ -135,6 +167,17 @@ export function installActionRecorder(opts: InstallOptions): () => void {
   // IME（中文等输入法）composing 中——抑制 input/MutationObserver 的 setPending，
   // 避免中间拼音值被录（只录 compositionend 后的最终值）。
   let isComposing = false;
+  // Layer 2：最近一次可见 click 的身份——onFileChange 据此附 trigger_affordance。
+  // 原生文件选择器是 OS 级模态：打开 picker 的 click 与 change 之间无 DOM click 事件，
+  // 且 onClick 已丢弃程序化 input.click()（composedPath[0] 是 input），故"最近一次非 input click"
+  // 可靠地 = 触发上传的可见 affordance（上传按钮/dropzone），无需紧时间窗（onFileChange 加 60s 陈旧兜底）。
+  let lastVisibleClick: {
+    text: string;
+    role: string;
+    tag: string;
+    rect: { x: number; y: number; width: number; height: number };
+    ts: number;
+  } | null = null;
 
   /** 统一发送：填 ts。对齐 Browser-BC emit()。同时通知 SideEffectObserver 开观察窗口。 */
   const emit = (partial: Omit<RecorderEvent, 'ts'>) => {
@@ -186,6 +229,14 @@ export function installActionRecorder(opts: InstallOptions): () => void {
     const target = findInteractiveAncestor(raw);
     if (!target) return;
     const ref = buildElementRef(target);
+    // Layer 2：记下最近一次可见 click 身份，供下一次 onFileChange 作 trigger_affordance。
+    lastVisibleClick = {
+      text: ref.text ?? '',
+      role: ref.role ?? '',
+      tag: ref.tag,
+      rect: ref.rect,
+      ts: performance.now(),
+    };
     emit({
       type: 'click',
       xpath: ref.xpath,
@@ -267,13 +318,24 @@ export function installActionRecorder(opts: InstallOptions): () => void {
     // 定位（选完视频抖音立即 /upload→/post/video 跳转，get_state 会抓到跳转后页面致 file input 错位）。
     const accept = raw.getAttribute('accept') ?? '';
     console.log('[TW Recorder] upload_file name=%s accept=%s', file.name, accept);
+    // Layer 2：附 change 前最近一次可见 click 作 trigger_affordance（≤60s 陈旧兜底；用完即清）。
+    const uploadCtx: NonNullable<RecorderEvent['upload_ctx']> = captureUploadCtx(raw);
+    if (lastVisibleClick && performance.now() - lastVisibleClick.ts <= 60_000) {
+      uploadCtx.trigger_affordance = {
+        text: lastVisibleClick.text,
+        role: lastVisibleClick.role,
+        tag: lastVisibleClick.tag,
+        rect: lastVisibleClick.rect,
+      };
+    }
+    lastVisibleClick = null;
     emit({
       type: 'upload_file',
       xpath: ref.xpath,
       rect: ref.rect, // 现带上（多候选时重放端按中心就近兜底；issue #139）
       ...refAttrs(target),
       params: { path: file.name, accept },
-      upload_ctx: captureUploadCtx(raw), // 封装组件上下文语义线索（issue #139）
+      upload_ctx: uploadCtx, // 站点无关通用身份线索（issue #139 通用化）+ 可选 trigger_affordance（L2）
     });
   };
 

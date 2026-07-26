@@ -953,34 +953,49 @@ class RerunMixin:
                     return hits[0]
         return candidates[0][0]
 
-    async def _upload_widget_contexts(
+    async def _upload_input_contexts(
         self, candidates: list[tuple[int, Any]], kind: str = "",
-    ) -> dict[int, dict[str, str]]:
+    ) -> dict[int, dict[str, Any]]:
         """单次 ``execute_js`` 扫页面上所有 ``input[type=file]``（DOM 文档序），返回每个 input 的
-        ``accept`` + 封装 ``semi-upload`` widget 的 drag-area 文案 + 活动 step tab；在 Python 侧按
-        ``kind`` 过滤后，与 ``candidates``（``_file_input_candidates`` 同款过滤）按 **DOM 序下标** 对齐 →
-        ``{backend_id: ctx}``（issue #139 重放端 area_text 精筛用）。
+        **站点无关**通用身份（issue #139 通用化）：``accept`` + 原生 label 文案 + aria-labelledby 解析
+        + 就近可见文本祖先 + 是否在 ARIA dialog 内 + 可点 affordance 文案/role。Python 侧按 ``kind``
+        过滤后，与 ``candidates``（``_file_input_candidates`` 同款过滤）按 **DOM 序下标** 对齐 →
+        ``{backend_id: ctx}``（``_match_file_upload_by_clue`` 精筛用）。
 
-        关键：JS 必须返回 accept、由 Python 用与 ``_file_input_candidates`` **完全相同**的 kind 过滤——
-        否则页面 6 个 file input（含 1 个 video）≠ 5 个 image 候选，下标对不上 → 计数不等放弃 area_text
-        （issue #139 实测踩过）。过滤后两边都是「同 kind、DOM 文档序」→ 一一对齐。计数仍不等（shadow/
-        iframe 穿透差异等）→ 放弃 area_text（matcher 降级到可见性/rect，不崩）。drag-area 文案是 input
-        的**兄弟元素**，不随 Semi-UI 重建 input 消失——多个同 accept file input 间唯一稳定区分信号。
+        替代旧 ``_upload_widget_contexts`` 写死的 Semi-UI 选择器（``.semi-upload``/drag-area/step-active/
+        ``[class*="modal"]``）——改读标准信号，跨框架/站点通用（Ant/Element/原生都覆盖）。关键不变量保留：
+        JS 必须返回 accept、Python 用与 ``_file_input_candidates`` 完全相同的 kind 过滤再对齐（坑③：否则
+        页面 6 个 input 含 1 video ≠ 5 image 候选，下标对不上 → 计数不等放弃精筛，matcher 降级到可见性/rect，
+        不崩）。详见 ``docs/user_recording/upload-general-identity-impl-plan.md``。
         """
         if not candidates:
             return {}
         code = (
             "(()=>{"
             "const norm=s=>(s||'').replace(/\\s+/g,' ').trim();"
-            "const step=document.querySelector('[class*=\"step-active\"]');"
-            "const stepTxt=norm(step&&step.textContent);"
             "const out=[];"
             "document.querySelectorAll('input[type=file]').forEach(inp=>{"
-            "const w=inp.closest('.semi-upload');"
-            "const d=w&&w.querySelector('[class*=\"semi-upload-drag-area\"]');"
+            # 1. 原生 label（W3C input.labels：含 <label for> 指向与包裹 <label>）
+            "const labelText=norm(Array.from(inp.labels||[]).map(l=>l.textContent||'').join(' '));"
+            # 2. aria-labelledby IDREF → 目标 textContent（不走 accname——浏览器实现差异大）
+            "const ariaText=norm((inp.getAttribute('aria-labelledby')||'').split(/\\s+/).filter(Boolean)"
+            ".map(id=>document.getElementById(id)).filter(Boolean).map(el=>el.textContent||'').join(' '));"
+            # 3. 就近可见文本祖先（≤5 层，首个 textContent 非空且 <200 字）——泛化旧 area_text
+            #    （Semi widget 祖先的 textContent 即含 drag-area 文案）
+            "let region='',p=inp.parentElement,depth=0;"
+            "while(p&&depth<5&&!region){const t=norm(p.textContent||'');if(t&&t.length<200)region=t;p=p.parentElement;depth++;}"
+            # 4. ARIA dialog（泛化旧 in_modal 的 [class*="modal"]——无障碍标准更稳）
+            "const inDialog=!!(inp.closest('[role=dialog]')||inp.closest('[aria-modal=true]'));"
+            # 5. Layer 2：可点 affordance 文案/role（≤6 层，首个 button/[role=button]/a/label/cursor:pointer）
+            "let a=inp.parentElement,affText='',affRole='',d2=0;"
+            "while(a&&d2<6&&!affText){const role=a.getAttribute('role');"
+            "const click=a.tagName==='BUTTON'||role==='button'||a.tagName==='A'||a.tagName==='LABEL'||role==='link'"
+            "||(window.getComputedStyle(a).cursor==='pointer');"
+            "if(click){affText=norm(a.textContent||'');affRole=role||a.tagName.toLowerCase();}"
+            "a=a.parentElement;d2++;}"
             "out.push({accept:(inp.getAttribute('accept')||'').toLowerCase(),"
-            "area_text:norm(d&&d.textContent), nearby_text:stepTxt,"
-            "in_modal:!!inp.closest('[class*=\"modal\"]')});"
+            "label_text:labelText,aria_text:ariaText,region_text:region,"
+            "in_dialog:inDialog,affordance_text:affText,affordance_role:affRole});"
             "});"
             "return out;"
             "})()"
@@ -988,10 +1003,10 @@ class RerunMixin:
         try:
             arr = await self.browser.execute_js(code)
         except Exception as e:
-            logger.warning("upload_widget_contexts execute_js 失败: %s", e)
+            logger.warning("upload_input_contexts execute_js 失败: %s", e)
             return {}
         if not isinstance(arr, list):
-            logger.info("upload_widget_contexts: execute_js 返回 %r（非 list），放弃 area_text", type(arr).__name__)
+            logger.info("upload_input_contexts: execute_js 返回 %r（非 list），放弃上下文精筛", type(arr).__name__)
             return {}
         # 与 _file_input_candidates 同款 accept(kind) 过滤 → DOM 序下标与 candidates 一一对齐
         entries = [
@@ -1000,8 +1015,8 @@ class RerunMixin:
         ]
         if len(entries) != len(candidates):
             logger.warning(
-                "upload_widget_contexts: kind=%r 过滤后 file input 数 %d ≠ 候选数 %d"
-                "（DOM 序对应不可靠，放弃 area_text）",
+                "upload_input_contexts: kind=%r 过滤后 file input 数 %d ≠ 候选数 %d"
+                "（DOM 序对应不可靠，放弃上下文精筛）",
                 kind or "(none)", len(entries), len(candidates),
             )
             return {}
@@ -1010,11 +1025,14 @@ class RerunMixin:
     async def _match_file_upload_by_clue(
         self, clue: dict[str, Any], selector_map: dict[int, Any],
     ) -> int | None:
-        """upload_file 语义线索精筛（issue #139）：accept 粗筛 → area_text 精筛 → 可见性 → rect 就近。
+        """upload_file 语义线索精筛（issue #139 通用化）：accept 粗筛 → trigger_affordance（L2）→
+        文本束 label/aria/region（L1，或 legacy ``area_text`` 别名）→ in_dialog（或 legacy ``in_modal``）
+        → 可见性 → rect 就近。
 
-        替代 ``_resolve_file_input_by_accept`` 的 ``candidates[0]``（DOM 顺序第一个，受 get_state
-        时序漂移 → 封面上传选错 input）。``area_text`` = 候选所在 ``semi-upload`` widget 的 drag-area
-        文案（兄弟元素，跨 input 重建稳定），是多个同 accept file input 间唯一稳定区分信号。
+        站点无关：线索字段（label_text/aria_text/region_text/in_dialog/trigger_affordance）由扩展
+        ``captureUploadCtx`` 与本类 ``_upload_input_contexts`` 用**同一份标准信号逻辑**各自从活 DOM 算出，
+        字段相等即匹配。每级独立收窄、有日志、失败不崩——尾部 visibility + rect 就近即当前抖音横/竖封面
+        的实际解法（通用化只增不减）。老 history（fix/139 的 area_text/in_modal）走 legacy 别名零回归。
         逐级降级、不抛错（让 ``_exec_one`` 照常执行 → ``_rerun_step_with_retries`` 兜底）。
         """
         candidates = self._file_input_candidates(
@@ -1027,34 +1045,66 @@ class RerunMixin:
         if len(candidates) == 1:
             logger.info("upload 线索精筛：唯一候选 idx=%s", cand_ids[0])
             return cand_ids[0]
-        # 1. area_text 精筛（读每个候选封装组件的 drag-area 文案）
-        want_area = (clue.get("area_text") or "").strip()
+
+        want_aff = ((clue.get("trigger_affordance") or {}).get("text") or "").strip()
+        want_label = (clue.get("label_text") or "").strip()
+        want_aria = (clue.get("aria_text") or "").strip()
+        want_region = (clue.get("region_text") or clue.get("area_text") or "").strip()  # legacy 别名
+        want_in_dialog = clue.get("in_dialog")
+        if want_in_dialog is None:
+            want_in_dialog = clue.get("in_modal")  # legacy 别名
+        need_ctx = bool(want_aff or want_label or want_aria or want_region or want_in_dialog is not None)
         _acc = (clue.get("accept") or "").lower()
         _kind = "video" if "video" in _acc else ("image" if "image" in _acc else "")
-        ctx = await self._upload_widget_contexts(candidates, _kind) if want_area else {}
+        ctx = await self._upload_input_contexts(candidates, _kind) if need_ctx else {}
         logger.info(
-            "upload 线索精筛：%d 候选 %s；want area_text=%r nearby=%r；widget 上下文=%s",
-            len(cand_ids), cand_ids, want_area, (clue.get("nearby_text") or "").strip(),
+            "upload 线索精筛：%d 候选 %s；want aff=%r label=%r aria=%r region=%r in_dialog=%r；上下文=%s",
+            len(cand_ids), cand_ids, want_aff, want_label, want_aria, want_region, want_in_dialog,
             {i: ctx.get(i) for i in cand_ids},
         )
-        if want_area:
-            hits = [idx for idx in cand_ids
-                    if (ctx.get(idx, {}).get("area_text", "") == want_area)]
-            logger.info("upload 线索精筛：area_text=%r 命中 %s", want_area, hits)
-            if len(hits) == 1:
-                return hits[0]
-            if hits:
-                # area_text 撞车（多个 widget 同 drag-area 文案，如主上传区与封面区都是
-                # "点击上传文件..."）→ 优先在封面 modal 内的（主上传区在 modal 外）
-                if len(hits) > 1:
-                    in_modal = [idx for idx in hits if ctx.get(idx, {}).get("in_modal")]
-                    if 0 < len(in_modal) < len(hits):
-                        logger.info("upload 线索精筛：area_text 撞车，优先 modal 内 %s", in_modal)
-                        hits = in_modal
-                        if len(hits) == 1:
-                            return hits[0]
-                candidates = [(idx, selector_map[idx]) for idx in hits if idx in selector_map]
-        # 2. 可见性优先（隐藏 input 排后；活动面板的 widget 才可见——横/竖面板同屏时区分）
+
+        def _try_narrow(hits: list[int]) -> bool:
+            """命中非空且真正收窄时把 candidates 收到 hits；返回收窄后是否唯一。
+
+            全命中（``len(hits)==len(cand_ids)``，未起区分作用）或空命中都不动，留给下一级。
+            """
+            nonlocal candidates, cand_ids
+            if not hits or len(hits) >= len(cand_ids):
+                return False
+            candidates = [(idx, selector_map[idx]) for idx in hits if idx in selector_map]
+            cand_ids = [idx for idx, _ in candidates]
+            return len(cand_ids) == 1
+
+        if ctx and want_aff:
+            # Layer 2：用户实点 affordance 文本 == 候选可点祖先文案（最精确——用户点的那个可见元素）
+            hits = [idx for idx in cand_ids if ctx.get(idx, {}).get("affordance_text", "") == want_aff]
+            logger.info("upload 线索精筛：trigger_affordance=%r 命中 %s", want_aff, hits)
+            if _try_narrow(hits):
+                return cand_ids[0]
+
+        if ctx and (want_label or want_aria or want_region):
+            # Layer 1：文本束任一相等（label/aria/region——标准静态身份信号）
+            hits = [
+                idx for idx in cand_ids
+                if (want_label and ctx.get(idx, {}).get("label_text", "") == want_label)
+                or (want_aria and ctx.get(idx, {}).get("aria_text", "") == want_aria)
+                or (want_region and ctx.get(idx, {}).get("region_text", "") == want_region)
+            ]
+            logger.info("upload 线索精筛：文本束(label/aria/region) 命中 %s", hits)
+            if _try_narrow(hits):
+                return cand_ids[0]
+
+        if ctx and want_in_dialog is not None:
+            # ARIA dialog 收窄（泛化旧 in_modal 撞车 tiebreak；现作独立级，无文本命中时也能用）
+            hits = [
+                idx for idx in cand_ids
+                if bool(ctx.get(idx, {}).get("in_dialog")) == bool(want_in_dialog)
+            ]
+            logger.info("upload 线索精筛：in_dialog=%r 命中 %s", want_in_dialog, hits)
+            if _try_narrow(hits):
+                return cand_ids[0]
+
+        # 可见性优先（隐藏 input 排后；活动面板的 widget 才可见——横/竖面板同屏时区分）
         visible = [(idx, n) for idx, n in candidates
                    if getattr(n, "is_visible", None) is not False]
         logger.info(
@@ -1063,9 +1113,10 @@ class RerunMixin:
         )
         if visible:
             candidates = visible
+            cand_ids = [idx for idx, _ in candidates]
         if not candidates:
             return None
-        # 3. rect 就近兜底（复用 _nearest_idx；clue rect 作 hist bounds，无 x_path → 直接 bounds 就近）
+        # rect 就近兜底（复用 _nearest_idx；clue rect 作 hist bounds，无 x_path → 直接 bounds 就近）
         chosen = _nearest_idx({"bounds": clue.get("rect")}, candidates)
         logger.info("upload 线索精筛：rect 就近 → idx=%s", chosen)
         return chosen

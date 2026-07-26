@@ -783,13 +783,13 @@ def test_resolve_file_input_by_accept_single_video_input():
     assert rm._resolve_file_input_by_accept(state, "v.mp4", "", "") == 9
 
 
-# ── _match_file_upload_by_clue：issue #139 upload 语义线索精筛 ──────────
+# ── _match_file_upload_by_clue：issue #139 upload 语义线索精筛（站点无关，通用化）──
 
 
 @pytest.mark.asyncio
-async def test_match_file_upload_by_clue_area_text_disambiguates():
-    """issue #139：多个同 accept 的 file input → area_text（封装组件 drag-area 文案）精筛命中
-    正确的封面 input，替代 _resolve_file_input_by_accept 的 candidates[0]（DOM 顺序第一个）。"""
+async def test_match_file_upload_by_clue_region_text_disambiguates():
+    """issue #139 通用化：多个同 accept 的 file input → region_text（就近可见文本祖先，泛化旧
+    area_text）精筛命中正确的封面 input。替代 candidates[0]（DOM 顺序第一个）。"""
     rm = RerunMixin()
     cover = SimpleNamespace(node_name="INPUT",
                             attributes={"type": "file", "accept": "image/png,image/jpeg"},
@@ -801,100 +801,176 @@ async def test_match_file_upload_by_clue_area_text_disambiguates():
                                attributes={"type": "file", "accept": "image/png,image/jpeg"},
                                xpath="z", is_visible=True, snapshot_node=None)
     sm = {10: cover, 11: ai_cover, 12: main_btn}
-    # 只有封面区 drag-area 有"点击上传文件或拖拽文件到这里"文案（AI封面区无文案、主页面不同）
-    rm._upload_widget_contexts = AsyncMock(return_value={
-        10: {"area_text": "点击上传文件或拖拽文件到这里", "nearby_text": "设置横封面"},
-        11: {"area_text": "", "nearby_text": "设置横封面"},
-        12: {"area_text": "点击上传新的视频封面", "nearby_text": ""},
+    # 只有封面区就近祖先文本是"点击上传文件或拖拽文件到这里"
+    rm._upload_input_contexts = AsyncMock(return_value={
+        10: {"region_text": "点击上传文件或拖拽文件到这里"},
+        11: {"region_text": ""},
+        12: {"region_text": "点击上传新的视频封面"},
     })
     clue = {"accept": "image/png,image/jpeg",
-            "area_text": "点击上传文件或拖拽文件到这里", "rect": None}
+            "region_text": "点击上传文件或拖拽文件到这里", "rect": None}
     assert await rm._match_file_upload_by_clue(clue, sm) == 10
 
 
 @pytest.mark.asyncio
-async def test_match_file_upload_by_clue_area_text_miss_degrades():
-    """area_text 失配（页面改版/文案漂）→ 不抛错，降级到可见性优先 + rect 就近。"""
+async def test_match_file_upload_by_clue_label_text_disambiguates():
+    """通用化：原生 <label for> 的 label_text（W3C 标准信号）精筛——覆盖非抖音站点。"""
+    rm = RerunMixin()
+    cover = SimpleNamespace(node_name="INPUT", attributes={"type": "file", "accept": "image/png"},
+                            xpath="a", is_visible=True, snapshot_node=None)
+    avatar = SimpleNamespace(node_name="INPUT", attributes={"type": "file", "accept": "image/png"},
+                             xpath="b", is_visible=True, snapshot_node=None)
+    sm = {10: cover, 11: avatar}
+    rm._upload_input_contexts = AsyncMock(return_value={
+        10: {"label_text": "封面图", "region_text": ""},
+        11: {"label_text": "头像", "region_text": ""},
+    })
+    clue = {"accept": "image/png", "label_text": "头像", "rect": None}
+    assert await rm._match_file_upload_by_clue(clue, sm) == 11
+
+
+@pytest.mark.asyncio
+async def test_match_file_upload_by_clue_aria_text_disambiguates():
+    """通用化：aria-labelledby 解析出的 aria_text 精筛。"""
     rm = RerunMixin()
     a = SimpleNamespace(node_name="INPUT", attributes={"type": "file", "accept": "image/png"},
                         xpath="a", is_visible=True, snapshot_node=None)
     b = SimpleNamespace(node_name="INPUT", attributes={"type": "file", "accept": "image/png"},
-                        xpath="b", is_visible=False, snapshot_node=None)
+                        xpath="b", is_visible=True, snapshot_node=None)
     sm = {10: a, 11: b}
-    rm._upload_widget_contexts = AsyncMock(return_value={
-        10: {"area_text": "别的文案"}, 11: {"area_text": ""},
+    rm._upload_input_contexts = AsyncMock(return_value={
+        10: {"aria_text": "上传横版封面", "region_text": ""},
+        11: {"aria_text": "上传竖版封面", "region_text": ""},
     })
-    clue = {"accept": "image/png", "area_text": "点击上传文件或拖拽文件到这里", "rect": None}
-    # area_text 都不匹配 → 降级；可见性优先选 a(10)
-    assert await rm._match_file_upload_by_clue(clue, sm) == 10
+    clue = {"accept": "image/png", "aria_text": "上传竖版封面", "rect": None}
+    assert await rm._match_file_upload_by_clue(clue, sm) == 11
 
 
 @pytest.mark.asyncio
-async def test_match_file_upload_by_clue_area_text_collision_prefers_modal():
-    """issue #139：area_text 撞车（封面区与主上传区同文案"点击上传文件..."）→ 优先在封面 modal
-    内的（主上传区在 modal 外，被 in_modal 过滤掉）。"""
+async def test_match_file_upload_by_clue_trigger_affordance_disambiguates():
+    """Layer 2：trigger_affordance.text（用户实点元素文案）== 候选可点祖先 affordance_text 精筛
+    （最精确——优先于文本束；即便 region_text 撞车也能区分）。"""
+    rm = RerunMixin()
+    a = SimpleNamespace(node_name="INPUT", attributes={"type": "file", "accept": "image/png"},
+                        xpath="a", is_visible=True, snapshot_node=None)
+    b = SimpleNamespace(node_name="INPUT", attributes={"type": "file", "accept": "image/png"},
+                        xpath="b", is_visible=True, snapshot_node=None)
+    sm = {10: a, 11: b}
+    rm._upload_input_contexts = AsyncMock(return_value={
+        10: {"affordance_text": "更换封面", "region_text": "点击上传"},
+        11: {"affordance_text": "更换头像", "region_text": "点击上传"},
+    })
+    clue = {"accept": "image/png",
+            "trigger_affordance": {"text": "更换头像"}, "region_text": "点击上传", "rect": None}
+    # 两者 region_text 撞车，但 trigger_affordance 命中 11
+    assert await rm._match_file_upload_by_clue(clue, sm) == 11
+
+
+@pytest.mark.asyncio
+async def test_match_file_upload_by_clue_region_text_collision_prefers_in_dialog():
+    """region_text 撞车（封面区与主上传区同文案"点击上传文件..."）→ in_dialog 收窄（封面在
+    [role=dialog] 内、主上传区在外）——泛化旧 in_modal 撞车 tiebreak。"""
     rm = RerunMixin()
     cover = SimpleNamespace(node_name="INPUT", attributes={"type": "file", "accept": "image/png"},
                             xpath="c", is_visible=True, snapshot_node=None)
     main_btn = SimpleNamespace(node_name="INPUT", attributes={"type": "file", "accept": "image/png"},
                                xpath="m", is_visible=True, snapshot_node=None)
     sm = {10: cover, 11: main_btn}
-    rm._upload_widget_contexts = AsyncMock(return_value={
-        10: {"area_text": "点击上传文件或拖拽文件到这里", "nearby_text": "设置横封面", "in_modal": True},
-        11: {"area_text": "点击上传文件或拖拽文件到这里", "nearby_text": "", "in_modal": False},
+    rm._upload_input_contexts = AsyncMock(return_value={
+        10: {"region_text": "点击上传文件或拖拽文件到这里", "in_dialog": True},
+        11: {"region_text": "点击上传文件或拖拽文件到这里", "in_dialog": False},
     })
-    clue = {"accept": "image/png", "area_text": "点击上传文件或拖拽文件到这里", "rect": None}
+    clue = {"accept": "image/png",
+            "region_text": "点击上传文件或拖拽文件到这里", "in_dialog": True, "rect": None}
+    assert await rm._match_file_upload_by_clue(clue, sm) == 10
+
+
+@pytest.mark.asyncio
+async def test_match_file_upload_by_clue_legacy_area_text_alias():
+    """向后兼容：老 history（fix/139）clue 带 area_text/in_modal、无 region_text/in_dialog，
+    重放端新 ctx 用 region_text/in_dialog——want_region 走 area_text 别名、want_in_dialog 走
+    in_modal 别名，仍命中。"""
+    rm = RerunMixin()
+    cover = SimpleNamespace(node_name="INPUT", attributes={"type": "file", "accept": "image/png"},
+                            xpath="c", is_visible=True, snapshot_node=None)
+    main_btn = SimpleNamespace(node_name="INPUT", attributes={"type": "file", "accept": "image/png"},
+                               xpath="m", is_visible=True, snapshot_node=None)
+    sm = {10: cover, 11: main_btn}
+    rm._upload_input_contexts = AsyncMock(return_value={
+        10: {"region_text": "点击上传文件或拖拽文件到这里", "in_dialog": True},
+        11: {"region_text": "别的", "in_dialog": False},
+    })
+    # 老 clue：只有 area_text（无 region_text）+ in_modal（无 in_dialog）
+    clue = {"accept": "image/png", "area_text": "点击上传文件或拖拽文件到这里",
+            "in_modal": True, "rect": None}
+    assert await rm._match_file_upload_by_clue(clue, sm) == 10
+
+
+@pytest.mark.asyncio
+async def test_match_file_upload_by_clue_text_miss_degrades():
+    """文本束全失配（页面改版/文案漂）→ 不抛错，降级到可见性优先 + rect 就近。"""
+    rm = RerunMixin()
+    a = SimpleNamespace(node_name="INPUT", attributes={"type": "file", "accept": "image/png"},
+                        xpath="a", is_visible=True, snapshot_node=None)
+    b = SimpleNamespace(node_name="INPUT", attributes={"type": "file", "accept": "image/png"},
+                        xpath="b", is_visible=False, snapshot_node=None)
+    sm = {10: a, 11: b}
+    rm._upload_input_contexts = AsyncMock(return_value={
+        10: {"region_text": "别的"}, 11: {"region_text": ""},
+    })
+    clue = {"accept": "image/png", "region_text": "点击上传文件或拖拽文件到这里", "rect": None}
+    # region_text 都不匹配 → 降级；可见性优先选 a(10)
     assert await rm._match_file_upload_by_clue(clue, sm) == 10
 
 
 @pytest.mark.asyncio
 async def test_match_file_upload_by_clue_single_and_empty():
-    """单候选直接返回（不查 widget 上下文）；无候选返回 None。"""
+    """单候选直接返回（不查上下文）；无候选返回 None。"""
     rm = RerunMixin()
     only = SimpleNamespace(node_name="INPUT",
                            attributes={"type": "file", "accept": "image/png"},
                            xpath="x", is_visible=True, snapshot_node=None)
-    rm._upload_widget_contexts = AsyncMock()
+    rm._upload_input_contexts = AsyncMock()
     assert await rm._match_file_upload_by_clue(
-        {"accept": "image/png", "area_text": "x"}, {10: only}) == 10
-    rm._upload_widget_contexts.assert_not_called()
+        {"accept": "image/png", "region_text": "x"}, {10: only}) == 10
+    rm._upload_input_contexts.assert_not_called()
     assert await rm._match_file_upload_by_clue({"accept": "image/png"}, {}) is None
 
 
 @pytest.mark.asyncio
-async def test_upload_widget_contexts_aligns_by_dom_order():
-    """_upload_widget_contexts：单次 execute_js 扫所有 input[type=file]（DOM 序）→ Python 侧按
+async def test_upload_input_contexts_aligns_by_dom_order():
+    """_upload_input_contexts：单次 execute_js 扫所有 input[type=file]（DOM 序）→ Python 侧按
     kind 过滤 → 与候选同序对齐 → {bid: ctx}；空入参/异常/非 list/计数不等 → 降级返 {}（不抛）。"""
     rm = RerunMixin()
     rm.browser = MagicMock()
     rm.browser.execute_js = AsyncMock(return_value=[
-        {"accept": "image/png", "area_text": "点击上传文件或拖拽文件到这里", "nearby_text": "设置横封面"},
-        {"accept": "image/png", "area_text": "", "nearby_text": "设置横封面"},
+        {"accept": "image/png", "region_text": "点击上传文件或拖拽文件到这里", "in_dialog": True},
+        {"accept": "image/png", "region_text": "", "in_dialog": False},
     ])
-    ctx = await rm._upload_widget_contexts([(10, None), (11, None)], kind="image")
-    assert ctx[10]["area_text"] == "点击上传文件或拖拽文件到这里"
-    assert ctx[11]["area_text"] == ""
+    ctx = await rm._upload_input_contexts([(10, None), (11, None)], kind="image")
+    assert ctx[10]["region_text"] == "点击上传文件或拖拽文件到这里"
+    assert ctx[11]["in_dialog"] is False
     # kind 过滤：JS 返回 3 个（1 个 video 被 kind=image 滤掉）→ 过滤后 2 个 == 2 候选
     rm.browser.execute_js = AsyncMock(return_value=[
-        {"accept": "image/png", "area_text": "A"},
-        {"accept": "video/mp4", "area_text": "V"},
-        {"accept": "image/png", "area_text": "B"},
+        {"accept": "image/png", "region_text": "A"},
+        {"accept": "video/mp4", "region_text": "V"},
+        {"accept": "image/png", "region_text": "B"},
     ])
-    ctx = await rm._upload_widget_contexts([(10, None), (11, None)], kind="image")
-    assert ctx[10]["area_text"] == "A" and ctx[11]["area_text"] == "B"
+    ctx = await rm._upload_input_contexts([(10, None), (11, None)], kind="image")
+    assert ctx[10]["region_text"] == "A" and ctx[11]["region_text"] == "B"
     # 空入参 → 不调 execute_js
     rm.browser.execute_js = AsyncMock()
-    assert await rm._upload_widget_contexts([], kind="image") == {}
+    assert await rm._upload_input_contexts([], kind="image") == {}
     rm.browser.execute_js.assert_not_called()
     # execute_js 抛异常 → 返回 {}（降级）
     rm.browser.execute_js = AsyncMock(side_effect=RuntimeError("cdp down"))
-    assert await rm._upload_widget_contexts([(10, None)], kind="image") == {}
+    assert await rm._upload_input_contexts([(10, None)], kind="image") == {}
     # 非 list 返回 → {}
     rm.browser.execute_js = AsyncMock(return_value="not list")
-    assert await rm._upload_widget_contexts([(10, None)], kind="image") == {}
+    assert await rm._upload_input_contexts([(10, None)], kind="image") == {}
     # 计数不等（过滤后 ≠ 候选数）→ {}（DOM 序对应不可靠）
-    rm.browser.execute_js = AsyncMock(return_value=[{"accept": "image/png", "area_text": "x"}])
-    assert await rm._upload_widget_contexts([(10, None), (11, None)], kind="image") == {}
+    rm.browser.execute_js = AsyncMock(return_value=[{"accept": "image/png", "region_text": "x"}])
+    assert await rm._upload_input_contexts([(10, None), (11, None)], kind="image") == {}
 
 
 # ── 语义线索重定位（_semantic_clue → locate_by_ref）─────────────────
