@@ -14,16 +14,8 @@ interface InstallOptions {
 export function installNavigationRecorder(opts: InstallOptions): () => void {
   const { sendEvent } = opts;
 
-  // 注入 MAIN-world hook（<script src>，web_accessible_resources 已声明 injected.js）
-  try {
-    const s = document.createElement('script');
-    s.src = browser.runtime.getURL('injected.js');
-    s.onload = () => s.remove();
-    (document.head || document.documentElement).append(s);
-  } catch {
-    /* 某些页面（about:blank 等）无 head，忽略注入失败 */
-  }
-
+  // MAIN-world injected.ts 的注入已挪到 content.ts main() 开头（无条件、尽早）——
+  // history hook 在录制开始前就装好，这里只负责收 tw:nav/popstate/hashchange。
   let lastUrl = location.href;
   const onNav = () => {
     const url = location.href;

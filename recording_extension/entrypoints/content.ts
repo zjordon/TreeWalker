@@ -11,6 +11,18 @@ export default defineContentScript({
   allFrames: true,
   runAt: 'document_idle',
   main() {
+    // 无条件尽早注入 MAIN-world 脚本（history hook + addEventListener 标记 hook）。
+    // document_idle 注入 → 早于录制开始、早于动态组件（如 B 站封面编辑器）挂载；injected.ts 有守卫幂等。
+    // 详见 docs/user_recording/js-click-capture-fix-plan.md。
+    try {
+      const s = document.createElement('script');
+      s.src = chrome.runtime.getURL('injected.js');
+      s.onload = () => s.remove();
+      (document.head || document.documentElement).append(s);
+    } catch {
+      /* about:blank 等无 head，忽略注入失败 */
+    }
+
     let uninstall: (() => void) | null = null;
 
     const sendEvent = (event: RecorderEvent) => {
