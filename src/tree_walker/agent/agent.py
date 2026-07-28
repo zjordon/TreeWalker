@@ -17,9 +17,11 @@ from tree_walker.agent.rerun import RerunMixin
 from tree_walker.agent.step import StepPipeline
 from tree_walker.agent.views import AgentHistoryList, ActionResult, AgentState
 from tree_walker.browser.session import BrowserSession
+from tree_walker.browser.url_utils import extract_host
 from tree_walker.config import AgentSettings, LLMSettings
 from tree_walker.llm.client import LLMClient
 from tree_walker.prompts.system_prompt import build_system_prompt
+from tree_walker.skills import SkillLoader
 from tree_walker.tools.actions import Tools
 
 from tree_walker.agent.judge import JudgeEvaluator
@@ -107,6 +109,10 @@ class Agent(StepPipeline, RerunMixin):
         self._enable_message_typing = _settings.enable_message_typing
         self._enable_page_stats = _settings.enable_page_stats
         self._enable_sensitive_description = _settings.enable_sensitive_description
+        self._enable_skill_injection = _settings.enable_skill_injection
+        # P1：skill 注入（默认关）。loader 无条件构建（构造零 IO），门控在调用点（step.py _prepare_context）。
+        self.skills_dir = _settings.skills_dir
+        self._skill_loader = SkillLoader(self.skills_dir)
         self._max_history_items = _settings.max_history_items
         self._enable_recent_events = _settings.enable_recent_events
 
@@ -420,6 +426,20 @@ class Agent(StepPipeline, RerunMixin):
             "Available secrets (use as <secret>key</secret> in input_text params): "
             + ", ".join(sorted(available))
         )
+
+    def _build_skill_description(self, page_url: str) -> str | None:
+        """注入当前页 host 的 domain-skill 文本（``[SOP]/[SELECTORS]/...``）。
+
+        ``_build_sensitive_description`` 的「第二兄弟」：URL 驱动 -> 可选字符串 ->
+        state message kwarg。唯一差异：skill 按 host 读文件，且受总开关
+        ``enable_skill_injection`` 控制（默认关）。开关门控在调用点（step.py
+        ``_prepare_context``），本方法入口不加内守卫，严格镜像亲兄弟。
+        """
+        host = extract_host(page_url)
+        if not host:
+            return None
+        text = self._skill_loader.load_for_host(host)
+        return text or None
 
     # ── P1c：agent_history_description（统一历史格式 + 滑动窗口）─────────
 

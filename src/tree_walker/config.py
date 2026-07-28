@@ -84,6 +84,7 @@ class AgentSettings:
     enable_message_typing: bool = True  # P0：消息分类管理（state 替换/context 清理），关则回退原始 append
     enable_page_stats: bool = True  # P1a：state 消息渲染 [Page Stats]（links/交互/iframe/骨架屏），关则不渲染
     enable_sensitive_description: bool = True  # P1d：state 消息渲染 [Available Secrets]（按 URL 过滤告知可用占位符）
+    enable_skill_injection: bool = False  # P1：按 host 读 domain-skills/<host>/ 注入 [Domain Skill]（默认关 = 零行为变更）
     max_history_items: int = 10  # P1c：<agent_history> 滑动窗口大小（compactor 启用时自动降到 5）
     enable_recent_events: bool = False  # P1b：state 消息渲染 [Recent Events]（首期仅 dialog；CDP 回调风险，默认关）
     truncation: TruncationSettings = field(default_factory=TruncationSettings)
@@ -111,6 +112,11 @@ class AgentSettings:
     # 历史重放文件根目录：save_history/load_and_rerun 的相对路径都相对此根解析。
     # 相对路径=相对 CWD(项目根)；可用绝对路径覆盖。默认 "rerun-history"。
     rerun_history_dir: str = "rerun-history"
+    # P1：domain-skills 根目录。enable_skill_injection 开启时按 host 读
+    # <skills_dir>/<host>/{_sop,selectors,quirks}.md 注入 [Domain Skill]。
+    # 相对路径=相对 CWD(项目根)；可用绝对路径覆盖。默认 "domain-skills"。
+    # 与 TreeForge adapters/treewalker_adapter.py 输出对齐。开关关时此字段不被读取。
+    skills_dir: str = "domain-skills"
     # 用户操作录制：upload_file 的约定目录。空→运行时解析为 <rerun_history_dir>/uploads。
     # 扩展只能拿到文件名（浏览器安全限制），录制产物存文件名，重放前用户须把文件放进此目录。
     record_upload_dir: str = ""
@@ -337,6 +343,7 @@ def load_settings() -> Settings:
         enable_message_typing=os.environ.get("AGENT_ENABLE_MESSAGE_TYPING", "true").lower() == "true",
         enable_page_stats=os.environ.get("AGENT_ENABLE_PAGE_STATS", "true").lower() == "true",
         enable_sensitive_description=os.environ.get("AGENT_ENABLE_SENSITIVE_DESCRIPTION", "true").lower() == "true",
+        enable_skill_injection=os.environ.get("AGENT_ENABLE_SKILL_INJECTION", "").lower() == "true",
         max_history_items=int(os.environ.get("AGENT_MAX_HISTORY_ITEMS", "10")),
         enable_recent_events=os.environ.get("AGENT_ENABLE_RECENT_EVENTS", "false").lower() == "true",
         truncation=TruncationSettings(
@@ -371,6 +378,7 @@ def load_settings() -> Settings:
         upload_verify_wait_s=float(os.environ.get("AGENT_UPLOAD_VERIFY_WAIT_S", "1.5")),
         upload_verify_interval_s=float(os.environ.get("AGENT_UPLOAD_VERIFY_INTERVAL_S", "0.25")),
         rerun_history_dir=os.environ.get("AGENT_RERUN_HISTORY_DIR", "rerun-history"),
+        skills_dir=os.environ.get("AGENT_SKILLS_DIR", "domain-skills"),
         record_upload_dir=os.environ.get("AGENT_RECORD_UPLOAD_DIR", ""),
         save_conversation_path=os.environ.get("AGENT_SAVE_CONVERSATION_PATH", ""),
         # 重放时序（阶段 1）

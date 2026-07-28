@@ -126,6 +126,7 @@ def build_state_message(
     download_notice: str | None = None,
     page_stats: dict[str, Any] | None = None,
     sensitive_description: str | None = None,
+    skill_description: str | None = None,
 ) -> str:
     """Build the user message describing the current browser state."""
     parts: list[str] = []
@@ -133,6 +134,14 @@ def build_state_message(
     # Task reminder
     if task:
         parts.append(f"[Task] {task}")
+
+    # P1：domain-skill 注入（按 host 读 domain-skills/<host>/，给 LLM 的领域知识）。
+    # 多行渲染（skill 常是大段文本）；放在 [Task] 后、[Available Secrets] 前，
+    # 让 LLM 在看页面状态前先吸收领域知识。
+    if skill_description:
+        parts.append("[Domain Skill]")
+        parts.append(skill_description)
+        parts.append("")
 
     # P1d：告知 LLM 当前页可用的 <secret> 占位符（只列 key，不含真实值）
     if sensitive_description:
