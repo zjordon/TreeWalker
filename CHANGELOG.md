@@ -5,6 +5,20 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.12.0] - 2026-07-29
+
+### Added
+
+**Domain skill 注入机制（#141/#142，ROADMAP P1）**——按 host 把 domain-skill 注入到 agent 上下文（默认关闭），让 agent 拿到 DOM 看不出的站点决策指导：
+
+- `extract_host`（url_utils.py）+ `SkillLoader`（按 host 读 `_sop`/`selectors`/`quirks`，per-host 缓存 + invalidate）
+- `Agent._build_skill_description` + 调用点三元门控（仿 `enable_sensitive_description`）
+- `enable_skill_injection` 开关（默认 `False`，env `AGENT_ENABLE_SKILL_INJECTION`）+ `skills_dir` 配置
+- `build_state_message` 加 `[Domain Skill]` 渲染段；loader INFO 日志（首次加载打 host/chars/files，便于排查 host 不匹配）
+- skill 格式三文件（`api.md` 弃用——URL 信息走 DOM `[Current URL]` 或并入 quirks）
+
+A/B 验证（手写/蒸馏 × 原始/精简 四版 × N=5）：精简版系统性 100% vs 原始版 80%——验证 skill 内容应「少而精」（只留 DOM 看不出的决策指导）。docs/skill/ 含设计文档、精简方案与 A/B 报告。
+
 ## [0.11.0] - 2026-07-26
 
 ### Added
