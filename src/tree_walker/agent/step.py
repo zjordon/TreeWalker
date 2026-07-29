@@ -96,6 +96,7 @@ class StepPipeline:
     _enable_message_typing: bool
     _enable_page_stats: bool
     _enable_sensitive_description: bool
+    _enable_skill_injection: bool
     _max_history_items: int
     _system_prompt: str
     _tool_schema: dict[str, Any]
@@ -241,6 +242,11 @@ class StepPipeline:
             if self._enable_sensitive_description
             else None
         )
+        skill_desc = (
+            self._build_skill_description(browser_state.url)
+            if self._enable_skill_injection
+            else None
+        )
 
         state_msg = build_state_message(
             browser_state=browser_state,
@@ -256,6 +262,7 @@ class StepPipeline:
             download_notice=download_notice,
             page_stats=page_stats,
             sensitive_description=sensitive_desc,
+            skill_description=skill_desc,
         )
         self._set_state_message(state_msg)  # P0：替换唯一 state 消息（避免完整 DOM 随步数累积）
 
