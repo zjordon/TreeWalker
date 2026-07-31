@@ -7,7 +7,7 @@
 selector_map，唯一可靠位置）。
 """
 
-from tree_walker.browser.serializer import DOMTreeSerializer
+from dom_snapshot.serializer import DOMTreeSerializer
 from tree_walker.browser.views import BrowserStateSummary, SerializedDOMState
 from tree_walker.prompts.system_prompt import build_state_message
 

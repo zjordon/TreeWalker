@@ -8,7 +8,7 @@ from tests.conftest import (
 	_make_dom_rect,
 )
 from tree_walker.browser.views import NodeType
-from tree_walker.browser.dom import ClickableElementDetector
+from dom_snapshot.interactive import ClickableElementDetector
 
 
 # ── Rule 1: Non-ELEMENT_NODE ─────────────────────────────────────────────

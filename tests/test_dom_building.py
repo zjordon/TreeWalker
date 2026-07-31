@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from tree_walker.browser.dom import (
+from dom_snapshot.collector import (
 	_build_ax_lookup,
 	_build_enhanced_ax_node,
 	_build_snapshot_lookup,

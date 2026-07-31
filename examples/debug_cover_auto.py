@@ -12,7 +12,7 @@ import sys
 
 sys.path.insert(0, f"{__file__}/../src")
 
-from tree_walker.browser.dom import build_dom_state
+from dom_snapshot import build_dom_state
 from tree_walker.browser.session import BrowserSession
 from tree_walker.config import load_settings
 from tree_walker.recorder.recorder import select_http_target
