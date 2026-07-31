@@ -4,7 +4,7 @@ from __future__ import annotations
 from unittest.mock import patch
 
 from tree_walker.browser.views import DEFAULT_INCLUDE_ATTRIBUTES, DOMRect, NodeType, SerializedDOMState
-from tree_walker.browser.serializer import DOMTreeSerializer, DISABLED_ELEMENTS, SVG_ELEMENTS
+from dom_snapshot.serializer import DOMTreeSerializer, DISABLED_ELEMENTS, SVG_ELEMENTS
 from tests.conftest import (
 	_make_node,
 	_make_text_node,
@@ -360,7 +360,7 @@ class TestStep5AssignInteractiveIndices:
 
 	def test_interactive_visible_gets_index(self):
 		"""button (interactive tag) + visible -> highlight_index set."""
-		from tree_walker.browser import dom as dom_module
+		import dom_snapshot.interactive as dom_module
 
 		btn_node = _make_node(tag='button', node_id=1, backend_node_id=42)
 		simplified = _make_simplified_node(original_node=btn_node, children=[])
@@ -411,7 +411,7 @@ class TestStep5AssignInteractiveIndices:
 
 	def test_new_node_detection(self):
 		"""backend_node_id not in previous selector_map -> is_new=True."""
-		from tree_walker.browser import dom as dom_module
+		import dom_snapshot.interactive as dom_module
 
 		btn_node = _make_node(tag='button', node_id=1, backend_node_id=99)
 		simplified = _make_simplified_node(original_node=btn_node, children=[])
@@ -432,7 +432,7 @@ class TestStep5AssignInteractiveIndices:
 
 	def test_compound_component_always_new(self):
 		"""is_compound_component -> is_new=True regardless of previous state."""
-		from tree_walker.browser import dom as dom_module
+		import dom_snapshot.interactive as dom_module
 
 		btn_node = _make_node(tag='button', node_id=1, backend_node_id=50)
 		simplified = _make_simplified_node(
@@ -458,7 +458,7 @@ class TestStep5AssignInteractiveIndices:
 
 	def test_excluded_node_not_indexed(self):
 		"""excluded_by_parent=True -> no index assigned."""
-		from tree_walker.browser import dom as dom_module
+		import dom_snapshot.interactive as dom_module
 
 		btn_node = _make_node(tag='button', node_id=1, backend_node_id=30)
 		simplified = _make_simplified_node(
@@ -476,7 +476,7 @@ class TestStep5AssignInteractiveIndices:
 
 	def test_paint_order_occluded_no_index(self):
 		"""ignored_by_paint_order=True + 无 JS click listener -> 不分配索引。"""
-		from tree_walker.browser import dom as dom_module
+		import dom_snapshot.interactive as dom_module
 
 		node = _make_node(tag='div', backend_node_id=10, has_js_click_listener=False)
 		simplified = _make_simplified_node(
@@ -494,7 +494,7 @@ class TestStep5AssignInteractiveIndices:
 
 	def test_paint_order_occluded_js_listener_bypasses(self):
 		"""ignored_by_paint_order=True + 有 JS click listener -> 绕过过滤，仍分配索引。"""
-		from tree_walker.browser import dom as dom_module
+		import dom_snapshot.interactive as dom_module
 
 		node = _make_node(tag='section', backend_node_id=129, has_js_click_listener=True)
 		simplified = _make_simplified_node(

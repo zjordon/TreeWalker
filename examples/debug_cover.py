@@ -12,11 +12,9 @@ import sys
 
 sys.path.insert(0, f"{__file__}/../src")
 
-from tree_walker.browser.dom import (
-	ClickableElementDetector,
-	build_dom_state,
-	_detect_js_click_listeners,
-)
+from dom_snapshot import build_dom_state
+from dom_snapshot.collector import _detect_js_click_listeners
+from dom_snapshot.interactive import ClickableElementDetector
 from tree_walker.browser.session import BrowserSession
 from tree_walker.browser.views import NodeType
 from tree_walker.config import BrowserSettings, load_settings

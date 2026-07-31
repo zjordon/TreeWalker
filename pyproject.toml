@@ -12,6 +12,7 @@ dependencies = [
     "click>=8.0.0",
     "markdownify>=0.13.1",
     "aiohttp>=3.9.0",
+    "dom-snapshot>=0.1.0",  # ROADMAP P1：DOM 快照公共库（本地 editable 见 [tool.uv.sources]）
 ]
 
 [project.optional-dependencies]
@@ -34,3 +35,8 @@ dev = [
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=7.1.0",
 ]
+
+[tool.uv.sources]
+# 本地 editable 开发：dom-snapshot 源码在 ../dom-snapshot（与 TreeWalker 同级）。
+# 远端/CI 可改成 { git = "https://github.com/zjordon/dom-snapshot.git", tag = "v0.1.0" }。
+dom-snapshot = { path = "../dom-snapshot", editable = true }

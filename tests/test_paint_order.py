@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from tree_walker.browser.paint_order import PaintOrderRemover, Rect, RectUnionPure
+from dom_snapshot.paint_order import PaintOrderRemover, Rect, RectUnionPure
 from tests.conftest import (
 	_make_dom_rect,
 	_make_node,

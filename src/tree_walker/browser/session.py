@@ -19,21 +19,23 @@ from typing import Any, Literal
 from cdp_use import CDPClient
 
 from tree_walker.browser.circuit_breaker import CircuitBreaker
-from tree_walker.browser.dom import (
-    _attach_to_iframe_target,
-    _build_frame_target_map,
+from dom_snapshot import (
+    attach_to_iframe_target,
+    build_frame_target_map,
     build_dom_state,
 )
 from tree_walker.browser.highlight import HighlightManager
 from tree_walker.browser.network_idle import NetworkIdleTracker
 from tree_walker.config import BrowserSettings
-from tree_walker.browser.views import (
-    BrowserEvent,
-    BrowserStateSummary,
+from dom_snapshot import (
     DOMCollectionConfig,
     DOMDegradationLevel,
     DOMRect,
     DOMSelectorMap,
+)
+from tree_walker.browser.views import (
+    BrowserEvent,
+    BrowserStateSummary,
     TabInfo,
 )
 
@@ -1590,7 +1592,7 @@ class BrowserSession:
         dom_state = None
         if self._dom_circuit_breaker.is_open:
             logger.warning("DOM circuit breaker is open; returning empty DOM state")
-            from tree_walker.browser.dom import EMPTY_DOM_STATE
+            from dom_snapshot import EMPTY_DOM_STATE
             dom_state = EMPTY_DOM_STATE
         else:
             try:
@@ -1606,7 +1608,7 @@ class BrowserSession:
             except Exception as e:
                 logger.error("build_dom_state raised: %s", e)
                 self._dom_circuit_breaker.record_failure()
-                from tree_walker.browser.dom import EMPTY_DOM_STATE
+                from dom_snapshot import EMPTY_DOM_STATE
                 dom_state = EMPTY_DOM_STATE
         self._cached_selector_map = dom_state.selector_map if dom_state else None
 
@@ -2831,13 +2833,13 @@ class BrowserSession:
                 {"objectId": resolve_ifr["object"]["objectId"]}, session_id=self.current_session_id,
             )
             frame_id = desc_ifr.get("node", {}).get("frameId")
-            frame_target_map, _ = await _build_frame_target_map(self.client)
+            frame_target_map, _ = await build_frame_target_map(self.client)
             target_id = frame_target_map.get(frame_id) if frame_id else None
             if not target_id:
                 raise RuntimeError(
                     f"Evaluate failed: could not resolve iframe target for frame {frame_id!r}",
                 )
-            attached = await _attach_to_iframe_target(self.client, target_id)
+            attached = await attach_to_iframe_target(self.client, target_id)
             if not attached:
                 raise RuntimeError("Evaluate failed: could not attach to iframe target")
             sid = attached

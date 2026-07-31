@@ -2,7 +2,7 @@
 
 import pytest
 
-from tree_walker.browser.serializer import DOMTreeSerializer
+from dom_snapshot.serializer import DOMTreeSerializer
 from tests.conftest import (
 	_make_ax_node,
 	_make_ax_property,

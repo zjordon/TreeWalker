@@ -557,11 +557,11 @@ class TestEvaluateSession:
 		client.send.DOM.describeNode = AsyncMock(return_value={"node": {"frameId": "FRAME_A"}})
 		import tree_walker.browser.session as sess_mod
 		monkeypatch.setattr(
-			sess_mod, "_build_frame_target_map",
+			sess_mod, "build_frame_target_map",
 			AsyncMock(return_value=({"FRAME_A": "TGT_A"}, {})),
 		)
 		attach = AsyncMock(return_value="iframe-sid")
-		monkeypatch.setattr(sess_mod, "_attach_to_iframe_target", attach)
+		monkeypatch.setattr(sess_mod, "attach_to_iframe_target", attach)
 
 		text = await s.evaluate("return document.title", frame=99)
 
@@ -576,8 +576,8 @@ class TestEvaluateSession:
 		client.send.DOM.resolveNode = AsyncMock(return_value={"object": {"objectId": "ifr-oid"}})
 		client.send.DOM.describeNode = AsyncMock(return_value={"node": {"frameId": "FRAME_X"}})
 		import tree_walker.browser.session as sess_mod
-		monkeypatch.setattr(sess_mod, "_build_frame_target_map", AsyncMock(return_value=({}, {})))
-		monkeypatch.setattr(sess_mod, "_attach_to_iframe_target", AsyncMock())
+		monkeypatch.setattr(sess_mod, "build_frame_target_map", AsyncMock(return_value=({}, {})))
+		monkeypatch.setattr(sess_mod, "attach_to_iframe_target", AsyncMock())
 
 		with pytest.raises(RuntimeError, match="could not resolve iframe target"):
 			await s.evaluate("return 1", frame=99)

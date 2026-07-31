@@ -1,7 +1,7 @@
 ﻿"""Tests for the 8-step attribute string building pipeline in _build_attributes_string."""
 
 from tree_walker.browser.views import DEFAULT_INCLUDE_ATTRIBUTES
-from tree_walker.browser.serializer import _build_attributes_string
+from dom_snapshot.serializer import _build_attributes_string
 from tests.conftest import _make_node, _make_ax_node, _make_ax_property
 
 

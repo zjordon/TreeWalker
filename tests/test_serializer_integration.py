@@ -15,7 +15,7 @@ from tests.conftest import (
 	_make_simplified_node,
 )
 from tree_walker.browser.views import NodeType, SerializedDOMState, SimplifiedNode
-from tree_walker.browser.serializer import DOMTreeSerializer
+from dom_snapshot.serializer import DOMTreeSerializer
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────
