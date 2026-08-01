@@ -5,6 +5,31 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.13.0] - 2026-08-01
+
+### Added
+
+**DOM 快照抽取到 dom-snapshot 公共库（#143/#144）**——把 `src/tree_walker/browser/` 里「三源采集 + 五步过滤 → element_tree_text」（~3453 行，5 文件）抽到独立公共库 [dom-snapshot](https://github.com/zjordon/dom-snapshot) v0.1.0，TreeWalker agent 运行时与 TreeForge 采集层共享同一份快照实现，消除格式漂移：
+
+- 删本地 4 文件（`browser/{dom,serializer,paint_order,cdp_timeout}.py`）；`views.py` 精简为聚合/重放类型 + dom-snapshot re-export shim（迁移期兼容）
+- `session.py` / `__init__.py` 改走 dom_snapshot；iframe target 工具用 dom-snapshot public 名（`attach_to_iframe_target` / `build_frame_target_map`）
+- 8 个测 dom-snapshot 内部的测试 repoint 保留（待 dom-snapshot 补齐后迁移）
+
+**探索端 actionability 移植（#145/#147，ROADMAP P2 / P0）**——探索端 `step.py` 点击/输入前等元素 actionable（visible + enabled + receives-events，可选 stable/L3），复用重放端已验证的工具链：
+
+- 新增共享模块 `agent/actionability.py`（探索/重放共用，单一事实源）；rerun.py 改 import（保私有别名，调用点零改动）
+- 探索变体 index-based 重定位（`selector_map[index]`，重放版用录制 `hist_elem`）；默认开（`AGENT_EXPLORATION_ACTIONABILITY_CHECK`）
+- **只"等"不"挡" + 全面降级**（拿不到 node / 超时 / index 漂移都照常执行），默认开不破现有测试
+
+**抖音创作者中心 domain-skill + 发视频示例**——`domain-skills/creator.douyin.com/{_sop,selectors,quirks}.md` + `examples/skill/upload_douyin_with_skill.py`（暂存草稿，横/竖封面）。
+
+**新增 `examples/dump_model_page_view.py`**——只把模型可见 DOM 树 `element_tree_text` 写到文件，无诊断输出。
+
+### Docs
+
+- ROADMAP：skill 注入（v0.12.0）+ dom-snapshot 抽取（P1）标记已交付；下一阶段核心转为 P2
+- 新增 P2「探索可靠性提升方案」（`docs/p3/01-探索可靠性提升方案.md`：P0 actionability 全细节 + P1-P3 分级设计）
+
 ## [0.12.0] - 2026-07-29
 
 ### Added
