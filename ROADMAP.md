@@ -4,8 +4,8 @@
 > 转向「提升 agent 自动探索成功率 + skill 注入」为主线。
 > 详见知识库 `ai/agent/manual-vs-agent-recording.md`。
 >
-> **更新（2026-07-29）**：skill 注入机制已落地（v0.12.0，#141/#142）；下一阶段核心转为把 DOM 快照能力
-> 抽取到公共库 dom-snapshot（`D:\dev\git\z_jordon\dom-snapshot`），让 TreeWalker + TreeForge 共享同一份快照实现。
+> **更新（2026-08-01）**：skill 注入（v0.12.0，#141/#142）+ DOM 快照抽取到 dom-snapshot（PR #144）均已落地；
+> 下一阶段核心转为 P2「agent 自动探索可靠性提升」。
 
 ---
 
@@ -26,7 +26,7 @@
 
 ## 已交付的能力（资产）
 
-这些是已成熟或已落地的实现，下一阶段基本保留不动（重放端 / 录制端零改动；skill 注入仅余 skill 失效处理待办）：
+这些是已成熟或已落地的实现，下一阶段基本保留不动（重放端 / 录制端零改动；skill 注入仅余 skill 失效处理待办；dom-snapshot 接入仅余 e2e 真机验收 + 测试迁移技术债）：
 
 ### 重放端（`src/tree_walker/agent/rerun.py`）—— 零改动
 
@@ -59,39 +59,21 @@ agent 探索时按 host 读 `domain-skills/<host>/` 注入上下文（默认关�
 - [x] A/B 验证：精简版系统性 100% vs 原始版 80% —— skill 内容应「少而精」（只留 DOM 看不出的决策指导）
 - [ ] **待办（skill 失效处理）**：skill 过时检测（selector 失效标记）+ 信息冲突优先级（agent 当前观察 vs skill 建议）
 
+### DOM 快照抽取到 dom-snapshot（PR #144 已交付）
+
+把 `src/tree_walker/browser/` 的「三源采集 + 五步过滤 → element_tree_text」（~3453 行，5 文件）抽到公共库 dom-snapshot（`D:\dev\git\z_jordon\dom-snapshot`，v0.1.0），TreeWalker agent 运行时与 TreeForge 采集层共享同一份快照实现：
+
+- [x] **M2 核心抽取**（dom-snapshot 侧）：5 文件迁移 + 3 耦合点（`dom.py`↔`serializer.py` 循环依赖抽 `interactive.py` 破环 / `views.py` DOM+聚合混合剥离 pydantic / `CDPClient` 硬依赖→`CDPLikeClient` Protocol）
+- [x] **M3 TreeWalker 接入**（#143/#144）：加 `dom-snapshot>=0.1.0` 依赖；`session.py` / `__init__.py` / `views.py` 改走 dom_snapshot；iframe target 工具用 dom-snapshot public 名（`attach_to_iframe_target` / `build_frame_target_map`）；删本地 4 文件，`views.py` 精简为聚合/重放类型 + re-export shim
+- [x] **验证**：2103 测试全过，覆盖率 88%；serializer/dom_building/paint_order 等测试现跑 dom-snapshot 代码全过，`element_tree_text` 行为不变
+- [ ] **bilibili 端到端**：待手动真机验收（需浏览器）
+- [ ] **技术债**：8 个测 dom-snapshot 内部的测试 repoint 保留在 TreeWalker，待 dom-snapshot 补齐 serializer/paint_order 测试后迁移；TreeForge 采集层接入（其 P2.2）待做
+
 ---
 
 ## 下一阶段计划
 
-### P1 —— DOM 快照抽取到 dom-snapshot（下一阶段核心，跨工程）
-
-**目标**：把 TreeWalker `src/tree_walker/browser/` 里「三源采集 + 五步过滤 → element_tree_text」这块（约 3453 行，5 文件）
-抽成独立公共库 dom-snapshot（`D:\dev\git\z_jordon\dom-snapshot`），让 TreeWalker agent 运行时和 TreeForge 采集层共享同一份快照实现，消除格式漂移。
-
-> 这块是 TreeWalker 最重的浏览器侧逻辑，agent 探索 / 录制 / 重放共用。
-> 抽取是**纯重组、不改逻辑**，目标是 byte-for-byte 一致的 element_tree_text。
-> 方案来源：treeforge `docs/p2/README.md` 第 3.1 节（P2.1）；dom-snapshot 自身 ROADMAP 已细化到 M1-M4。
-
-抽取的 5 个文件：
-
-| 源文件（TreeWalker） | 目标（dom-snapshot） |
-|---|---|
-| `browser/views.py`（DOM 部分） | `dom_snapshot/models.py` |
-| `browser/cdp_timeout.py` | `dom_snapshot/cdp_timeout.py` |
-| `browser/paint_order.py` | `dom_snapshot/paint_order.py` |
-| `browser/dom.py` | `dom_snapshot/collector.py` |
-| `browser/serializer.py` | `dom_snapshot/serializer.py` |
-
-- [ ] **M2 核心抽取**（dom-snapshot 侧）：迁 5 文件 + 处理 3 个耦合点
-  - `dom.py` ↔ `serializer.py` 循环依赖（抽 `interactive.py` 破环）
-  - `views.py` DOM 核心 dataclass 与聚合状态模型混合（剥离 pydantic，拆 `models.py`）
-  - `CDPClient` 硬依赖 → `CDPLikeClient` Protocol（鸭子类型解耦 cdp-use）
-- [ ] **M3 TreeWalker 接入**（本仓库侧）
-  - [ ] dom-snapshot 发版 0.1.0；本仓库 `pyproject.toml` 加 `dom-snapshot>=0.1.0`（本地 `uv pip install -e ../dom-snapshot` 开发）
-  - [ ] 改 import：`session.py` 用 `from dom_snapshot import build_dom_state`；`step.py` / `system_prompt.py` / `tools/actions.py` / `recorder/recorder.py` 的 DOM 类型从 `dom_snapshot` 取，聚合状态类型留本地
-  - [ ] 处理 `_attach_to_iframe_target` / `_build_frame_target_map`（提为 public 或 session 端重实现）
-  - [ ] 删本地 5 文件；`browser/views.py` 只留聚合状态模型
-- [ ] **验收**：全量测试通过 + agent 端到端跑 bilibili 投稿，快照与抽取前一致；**回滚**：revert import + 恢复本地 5 文件
+> P1（DOM 快照抽取到 dom-snapshot）已完成，见上方「已交付」；以下是后续 P2-P4。
 
 ### P2 —— agent 自动探索可靠性提升
 
@@ -162,7 +144,7 @@ agent 探索时按 host 读 `domain-skills/<host>/` 注入上下文（默认关�
 |---|---|---|---|
 | 重放端成熟 | 五级匹配 + 等待机制 + 变量替换 | ✅ | 资产，零改动 |
 | 录制端成熟 | signal 模型 + 翻译管线 + 10 类采集 | ✅ | 备选路径资产 |
-| **P1** | **DOM 快照抽取到 dom-snapshot** | ⏳ | **下一阶段核心，跨工程** |
+| **P1** | **DOM 快照抽取到 dom-snapshot** | ✅ | PR #144 已交付（#143）；e2e 待真机 + 测试迁移技术债 |
 | skill 注入 | 注入机制 + 三元门控 + B 站 skill | ✅ | v0.12.0 已交付（#141/#142）；skill 失效处理待办 |
 | P2 | agent 探索可靠性提升 | ⏳ | 知识地图应用 |
 | P3 | 手工录制性能优化 | ⏳ | 备选，按需 |
@@ -182,13 +164,13 @@ TreeWalker：agent 探索（带 skill 加持）→ AgentHistory → 重放
 ```
 
 ```
-dom-snapshot（公共库，下一阶段抽取）
-  ├─ TreeWalker agent 运行时
-  └─ TreeForge 采集层
+dom-snapshot（公共库，TreeWalker 侧已接入 / TreeForge 侧待 P2.2）
+  ├─ TreeWalker agent 运行时 ✅
+  └─ TreeForge 采集层 ⏳
   共享「三源采集 + 五步过滤」DOM 快照实现
 ```
 
 - **skill 链路（已打通）**：TreeForge 蒸馏 skill + TreeWalker 注入（#142）两端已对齐，验收标准一致——「有 skill 的 agent 探索成功率显著高于无 skill」（A/B：精简版 100% vs 原始版 80%）；`domain-skills/` 目录约定已与 TreeForge 的 `adapters/treewalker_adapter.py` 输出路径对齐
-- **快照链路（下一阶段）**：TreeWalker 把 DOM 快照逻辑抽到 dom-snapshot，TreeForge 采集层后续（其 P2.2）接入同一库
+- **快照链路（TreeWalker 侧已打通）**：TreeWalker 已接入 dom-snapshot（PR #144），DOM 快照逻辑共享；TreeForge 采集层待其 P2.2 接入同一库
 
 详见各项目 `ROADMAP.md`。
