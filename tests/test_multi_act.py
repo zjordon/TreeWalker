@@ -97,6 +97,7 @@ def _make_agent(results: list[ActionResult] | None = None) -> Any:
 	agent = MagicMock()
 	agent.state = AgentState()
 	agent.action_timeout = 30
+	agent.exploration_actionability_check = False  # P0 探索 actionability：fake agent 关闭（本文件测执行循环机制，非 actionability）
 	agent.wait_between_actions = 0.0
 	agent.tools = _FakeTools(results)
 	agent.browser = _FakeBrowser()
