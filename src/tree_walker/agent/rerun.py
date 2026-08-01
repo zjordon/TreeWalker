@@ -21,6 +21,12 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from tree_walker.agent.actionability import (
+    ACTIONABILITY_ACTIONS as _ACTIONABILITY_ACTIONS,
+    is_actionable as _is_actionable,
+    is_file_input as _is_file_input,
+    is_rect_stable,
+)
 from tree_walker.agent.views import (
     AgentHistory,
     AgentHistoryList,
@@ -51,60 +57,9 @@ class MatchLevel(Enum):
     CLASS = 6      # node_name + class token 超集（最末兜底：无 name/id/aria-label 的 SPA 按钮）
 
 
-# ── actionability 阶段一（阶段 2）：visible + enabled 检查的纯函数辅助 ──
-# 详见 docs/wait-and-timing/02-阶段2-等目标元素与actionability阶段一.md
-_ACTIONABILITY_ACTIONS: frozenset[str] = frozenset({"click", "input_text", "select_dropdown"})
-
-
-def _is_file_input(node: Any) -> bool:
-    """防御短路：INPUT[type=file] 永远跳过 actionability（仿 serializer.py:264-271）。
-
-    upload_file 的 file input 因 opacity:0/display:none/1×1 → node.is_visible=False（serializer
-    仅对 LLM 简化树强制可见，不改 node.is_visible）。白名单已排除 upload_file，本函数是第二层
-    防御——避免未来白名单逻辑变更或 LLM 误把 file input 当 click 目标时被 visible 检查误杀。
-    """
-    return (
-        (getattr(node, "node_name", "") or "").upper() == "INPUT"
-        and (getattr(node, "attributes", None) or {}).get("type", "").lower() == "file"
-    )
-
-
-def _is_actionable(node: Any, *, check_receives_events: bool = False) -> bool:
-    """visible + enabled（+ receives-events）判定。None 字段保守放过（不引入新失败）。
-
-    - visible：``is_visible`` 为 ``bool|None``。``False``=明确不可见→阻断；``None``=未知→放过。
-    - receives-events（阶段二，``check_receives_events=True`` 时启用）：L2 ``pointer-events:none`` →
-      不接收指针事件→阻断；L1 paint_order 判定被完全覆盖（``ignored_by_paint_order``）→阻断。
-      两者都读快照静态数据，零额外 CDP 开销；``snapshot_node`` 缺失时保守放过。
-    - enabled：AX ``ax_node.properties`` 里 ``name=='disabled'`` 且真值，HTML ``attributes`` 含
-      ``disabled``，或 ``aria-disabled="true"``（阶段4 遗留收编）。
-
-    ``check_receives_events`` 默认 ``False`` → 行为与阶段一一字不差（零回归基线）。
-    运行时遮挡（L3，``elementFromPoint``）是 async，不在此同步函数——见 ``_wait_for_actionability``。
-    """
-    if getattr(node, "is_visible", None) is False:
-        return False
-    # ── 阶段二 receives-events（L2 pointer-events + L1 paint_order 静态遮挡）──
-    if check_receives_events:
-        snap = getattr(node, "snapshot_node", None)
-        if snap is not None:
-            pe = (getattr(snap, "computed_styles", None) or {}).get("pointer-events", "")
-            if str(pe).lower() == "none":
-                return False
-        if getattr(node, "ignored_by_paint_order", False):
-            return False
-    # ── enabled（阶段一 + 阶段4 遗留 aria-disabled）──
-    ax = getattr(node, "ax_node", None)
-    if ax is not None:
-        for prop in (ax.properties or []):
-            if getattr(prop, "name", "") == "disabled" and prop.value:
-                return False
-    attrs = getattr(node, "attributes", None) or {}
-    if "disabled" in attrs:
-        return False
-    if str(attrs.get("aria-disabled", "")).lower() == "true":
-        return False
-    return True
+# actionability 纯函数（白名单 / is_file_input / is_actionable）已抽到共享模块
+# ``tree_walker.agent.actionability``（探索端 + 重放端共用）；顶部 import 处保私有别名供本模块调用。
+# 详见 docs/wait-and-timing/02-阶段2、05-阶段4 与 docs/p3/01-探索可靠性提升方案.md
 
 
 def _substitute_in_dict(data: dict[str, Any], replacements: dict[str, str]) -> int:
@@ -1461,23 +1416,8 @@ class RerunMixin:
     async def _is_rect_stable(
         self, backend_node_id: int, interval: float = 0.1, tolerance: float = 1.0,
     ) -> bool:
-        """两次取 rect 比（~interval 间隔），位置/尺寸变化 ≤ tolerance 视为稳定。
-
-        复用 ``session.get_element_coordinates`` 三级 fallback（getContentQuads → getBoxModel →
-        JS getBoundingClientRect），零新 CDP 封装。拿不到坐标（None）→ 视为不稳定（保守）。
-        """
-        r1 = await self.browser.get_element_coordinates(backend_node_id)
-        if r1 is None:
-            return False
-        await asyncio.sleep(interval)
-        r2 = await self.browser.get_element_coordinates(backend_node_id)
-        if r2 is None:
-            return False
-        return (
-            abs(r1.x - r2.x) <= tolerance and abs(r1.y - r2.y) <= tolerance
-            and abs(r1.width - r2.width) <= tolerance
-            and abs(r1.height - r2.height) <= tolerance
-        )
+        """委托共享 ``actionability.is_rect_stable``（单一事实源，探索/重放共用）。"""
+        return await is_rect_stable(self.browser, backend_node_id, interval, tolerance)
 
     async def _wait_for_stable(
         self,

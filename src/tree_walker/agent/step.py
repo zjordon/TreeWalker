@@ -13,6 +13,11 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
+from tree_walker.agent.actionability import (
+    ACTIONABILITY_ACTIONS,
+    is_file_input,
+    wait_for_actionability,
+)
 from tree_walker.agent.log_formatter import BLUE, RESET, format_action_params, log_response, log_step_completion
 from tree_walker.agent.views import (
     ActionResult,
@@ -867,6 +872,28 @@ class StepPipeline:
                 except Exception:
                     pre_action_url = browser_state.url
             pre_target_id = self.browser.current_target_id
+
+            # P0 探索 actionability（默认开）：白名单动作 click/input_text/select_dropdown
+            # 点击/输入前等元素 actionable（visible+enabled+receives-events，可选 stable/L3）。
+            # 降级原则：拿不到 node / 超时 / index 漂移 → 照常执行，不引入新失败。
+            # 与重放端共用 actionability 模块；探索侧用 live index 重定位（无录制 hist_elem）。
+            if getattr(self, "exploration_actionability_check", False) and action_name in ACTIONABILITY_ACTIONS:
+                idx = action_params.get("index")
+                sm = browser_state.dom_state.selector_map if browser_state.dom_state else None
+                node = sm.get(idx) if (sm and isinstance(idx, int)) else None
+                if node is not None and not is_file_input(node):
+                    browser_state, _ = await wait_for_actionability(
+                        self.browser,
+                        browser_state,
+                        idx,
+                        timeout=self.exploration_actionability_timeout,
+                        poll=self.exploration_actionability_poll,
+                        receives_events=self.exploration_actionability_receives_events,
+                        runtime_occlusion=self.exploration_actionability_runtime_occlusion,
+                        stable=self.exploration_actionability_stable,
+                        stable_interval=self.exploration_actionability_stable_interval,
+                        stable_tolerance=self.exploration_actionability_stable_tolerance,
+                    )
 
             try:
                 result = await asyncio.wait_for(

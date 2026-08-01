@@ -153,6 +153,18 @@ class AgentSettings:
     rerun_actionability_stable_interval: float = 0.1
     # stable rect 变化容差（像素）
     rerun_actionability_stable_tolerance: float = 1.0
+    # ── P0 探索 actionability（默认开）：探索端点击/输入前等元素 actionable ──
+    # 与重放端 rerun_actionability_* 同源（共享 actionability 模块），但探索侧默认开——
+    # 探索可靠性即 P2 目的。降级原则：超时/拿不到 node → 照常执行，不引入新失败。
+    # 详见 docs/p3/01-探索可靠性提升方案.md
+    exploration_actionability_check: bool = True
+    exploration_actionability_timeout: float = 1.5
+    exploration_actionability_poll: float = 0.3
+    exploration_actionability_receives_events: bool = True
+    exploration_actionability_runtime_occlusion: bool = False
+    exploration_actionability_stable: bool = False
+    exploration_actionability_stable_interval: float = 0.1
+    exploration_actionability_stable_tolerance: float = 1.0
     # ── 等待机制 阶段 3：networkidle（默认关）+ 重放端 upload 等待 ──
     # get_state 前等 networkidle（缺口 2）；默认关 = 零行为变更。
     # 开启条件：页面变化由 AJAX 驱动（readyState 常年 complete 的 SPA）。超时降级不抛错。
@@ -396,6 +408,15 @@ def load_settings() -> Settings:
         rerun_actionability_stable=os.environ.get("AGENT_RERUN_ACTIONABILITY_STABLE", "").lower() == "true",
         rerun_actionability_stable_interval=float(os.environ.get("AGENT_RERUN_ACTIONABILITY_STABLE_INTERVAL", "0.1")),
         rerun_actionability_stable_tolerance=float(os.environ.get("AGENT_RERUN_ACTIONABILITY_STABLE_TOLERANCE", "1.0")),
+        # P0 探索 actionability（默认开）：探索端点击/输入前等元素 actionable
+        exploration_actionability_check=os.environ.get("AGENT_EXPLORATION_ACTIONABILITY_CHECK", "true").lower() == "true",
+        exploration_actionability_timeout=float(os.environ.get("AGENT_EXPLORATION_ACTIONABILITY_TIMEOUT", "1.5")),
+        exploration_actionability_poll=float(os.environ.get("AGENT_EXPLORATION_ACTIONABILITY_POLL", "0.3")),
+        exploration_actionability_receives_events=os.environ.get("AGENT_EXPLORATION_ACTIONABILITY_RECEIVES_EVENTS", "true").lower() == "true",
+        exploration_actionability_runtime_occlusion=os.environ.get("AGENT_EXPLORATION_ACTIONABILITY_RUNTIME_OCCLUSION", "").lower() == "true",
+        exploration_actionability_stable=os.environ.get("AGENT_EXPLORATION_ACTIONABILITY_STABLE", "").lower() == "true",
+        exploration_actionability_stable_interval=float(os.environ.get("AGENT_EXPLORATION_ACTIONABILITY_STABLE_INTERVAL", "0.1")),
+        exploration_actionability_stable_tolerance=float(os.environ.get("AGENT_EXPLORATION_ACTIONABILITY_STABLE_TOLERANCE", "1.0")),
         # 等待机制 阶段 3：networkidle 开关 + 重放端 upload 等待（默认值对齐现状 = 零行为变更）
         rerun_wait_for_networkidle=os.environ.get("AGENT_RERUN_WAIT_FOR_NETWORKIDLE", "").lower() == "true",
         rerun_upload_wait_video=float(os.environ.get("AGENT_RERUN_UPLOAD_WAIT_VIDEO", "5.0")),
