@@ -292,6 +292,58 @@ class RerunMixin:
             history = self._substitute_variables_in_history(history, variables)
         return await self.rerun_history(history, **kwargs)
 
+    async def batch_rerun(
+        self,
+        history_file: str | Path,
+        csv_path: str | Path,
+        *,
+        variables: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> list[BatchRowResult]:
+        """CSV 批量重放：每行变量跑一次 ``load_and_rerun``（串行，P4 子任务 2）。
+
+        CSV 列头 = 变量名（detect + manual 的并集，见 ``merge_variable_sources``）。
+        缺列 = 该变量用 history 原值（宽容，不报错）；空单元格（""）跳过不注入。
+        每行叠加全局 ``variables``（行值优先）。逐行串行（共享一个 BrowserSession）；
+        单行异常不中断批量，记入该行 ``error``。
+        """
+        import csv
+
+        from tree_walker.agent.views import BatchRowResult
+
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        if not rows:
+            logger.warning("CSV %s 无数据行", csv_path)
+
+        base = variables or {}
+        results: list[BatchRowResult] = []
+        for i, row in enumerate(rows):
+            merged = {**base, **{k: v for k, v in row.items() if v not in (None, "")}}
+            try:
+                row_results = await self.load_and_rerun(
+                    history_file, variables=merged or None, **kwargs
+                )
+                last = row_results[-1] if row_results else None
+                results.append(
+                    BatchRowResult(
+                        row_index=i,
+                        variables=merged,
+                        success=bool(last and last.is_done and last.success),
+                        n_steps=len(row_results),
+                        extracted_content=last.extracted_content if last else None,
+                        error=last.error if last and last.error else None,
+                    )
+                )
+            except Exception as e:  # 单行失败不中断批量
+                logger.exception("CSV 第 %d 行重放失败", i)
+                results.append(
+                    BatchRowResult(
+                        row_index=i, variables=merged, success=False, error=str(e)
+                    )
+                )
+        return results
+
     # ── 重放主流程 ─────────────────────────────────────────────────────
 
     async def rerun_history(
@@ -1457,10 +1509,19 @@ class RerunMixin:
     def _substitute_variables_in_history(
         self, history: AgentHistoryList, variables: dict[str, str]
     ) -> AgentHistoryList:
-        """变量名→原始值→新值；精确整串替换；只改动作参数，不碰 interacted_element/result。"""
-        from tree_walker.agent.variable_detector import detect_variables_in_history
+        """变量名→原始值→新值；精确整串替换；只改动作参数，不碰 interacted_element/result。
 
-        detected = detect_variables_in_history(history)
+        变量源 = 自动检测（detect_variables_in_history）∪ 人工标注（history.manual_variables），
+        见 variable_detector.merge_variable_sources。
+        """
+        from tree_walker.agent.variable_detector import (
+            detect_variables_in_history,
+            merge_variable_sources,
+        )
+
+        detected = merge_variable_sources(
+            detect_variables_in_history(history), history.manual_variables
+        )
         value_replacements: dict[str, str] = {}
         for var_name, new_value in variables.items():
             if var_name in detected:

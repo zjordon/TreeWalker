@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 
-from tree_walker.agent.views import AgentHistoryList, DetectedVariable
+from tree_walker.agent.views import AgentHistoryList, DetectedVariable, ManualVariableBinding
 
 # 仅这些字段是「用户填入的完整值」，可安全作为变量替换目标。
 _FIELDS: tuple[str, ...] = ("text", "query")
@@ -141,3 +141,22 @@ def _ensure_unique_name(name: str, detected: dict[str, DetectedVariable]) -> str
     while f"{name}_{i}" in detected:
         i += 1
     return f"{name}_{i}"
+
+
+def merge_variable_sources(
+    detected: dict[str, DetectedVariable],
+    manual: list[ManualVariableBinding],
+) -> dict[str, DetectedVariable]:
+    """合并自动检测 + 人工标注的变量源（P4 可视化编辑）。
+
+    ``manual``（编辑器手动标注）覆盖同名 ``detected``——用户显式标注为准。返回
+    ``name → DetectedVariable`` 映射，供 ``_substitute_variables_in_history`` 与编辑器
+    ``/history/detect`` 端点共用。人工标注天然绕过"精确整串匹配漏子串"盲区：直接按
+    ``original_value`` 整串替换，不依赖规则命中。
+    """
+    merged = dict(detected)
+    for binding in manual:
+        merged[binding.name] = DetectedVariable(
+            name=binding.name, original_value=binding.original_value
+        )
+    return merged
