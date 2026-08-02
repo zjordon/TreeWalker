@@ -440,3 +440,26 @@ async def test_is_element_occluded_three_states():
     assert await session._is_element_occluded(1, 10, 20) is False
     client.send.DOM.resolveNode = AsyncMock(side_effect=RuntimeError("boom"))
     assert await session._is_element_occluded(1, 10, 20) is False
+
+
+@pytest.mark.asyncio
+async def test_eval_function_on_node_returns_value():
+    # #151：resolveNode(backendNodeId) + callFunctionOn(this=node, returnByValue) → 返回 JS return 值。
+    # 供 upload_identity.capture_upload_clue 在目标 file input 自身提取身份上下文，避开候选计数对齐。
+    client = _make_mock_cdp_client()
+    client.send.DOM.resolveNode = AsyncMock(return_value={"object": {"objectId": "obj-1"}})
+    session = BrowserSession(ws_url="ws://localhost:9222")
+    session.client = client
+    session.current_session_id = "sid"
+    client.send.Runtime.callFunctionOn = AsyncMock(return_value={"result": {"value": {
+        "region_text": "点击上传", "in_dialog": True,
+        "container_rect": {"x": 10, "y": 10, "width": 5, "height": 5},
+    }}})
+    out = await session.eval_function_on_node(42, "function(){return this;}")
+    assert out["region_text"] == "点击上传"
+    assert out["container_rect"]["x"] == 10
+    # CDP 调用参数：按 backendNodeId 解析、returnByValue=True
+    assert client.send.DOM.resolveNode.call_args.args[0] == {"backendNodeId": 42}
+    fn_kwargs = client.send.Runtime.callFunctionOn.call_args.args[0]
+    assert fn_kwargs["objectId"] == "obj-1"
+    assert fn_kwargs["returnByValue"] is True

@@ -1086,7 +1086,7 @@ class StepPipeline:
                 model_output=model_output,
                 result=results,
                 state_summary=state_summary,
-                interacted_element=self._project_interacted_elements(model_output, browser_state),
+                interacted_element=self._project_interacted_elements(model_output, browser_state, results),
                 metadata=self._build_step_metadata(time.time()),
             ))
 
@@ -1107,12 +1107,17 @@ class StepPipeline:
         self,
         model_output: dict[str, Any],
         browser_state: BrowserStateSummary | None,
+        results: list[ActionResult] | None = None,
     ) -> list[dict[str, Any] | None] | None:
         """把每个动作当年交互的元素投影成 ``DOMInteractedElement.to_dict()``。
 
         与 ``model_output`` 的 actions 列表【等长、按位对应】；无 index 的动作为 None。
         使用【该步开始时】的 ``browser_state``（LLM 看到、index 所指的那份 selector_map），
         这样重放时才能正确还原「当年点的元素」。
+
+        upload_file（#151）：若 ``results[i]`` 带 ``metadata["upload_clue"]``（agent 执行时采集，与
+        手工录制 ``_store_upload_clue`` 同形），用它覆盖原始节点投影 → 历史带 ``_semantic_clue``，重放
+        走 ``_match_file_upload_by_clue`` 稳健路径。``results`` 默认 None = 调用方零行为变化。
         """
         if not browser_state or not browser_state.dom_state:
             return None
@@ -1122,7 +1127,14 @@ class StepPipeline:
 
         actions = model_output.get("actions") or [model_output.get("action", {})]
         projected: list[dict[str, Any] | None] = []
-        for action in actions:
+        for i, action in enumerate(actions):
+            # upload_file：agent 采集的语义线索优先于原始 DOM 节点投影（#151）
+            if results is not None and i < len(results) and isinstance(action, dict) \
+                    and action.get("name") == "upload_file":
+                clue = (results[i].metadata or {}).get("upload_clue")
+                if isinstance(clue, dict) and clue:
+                    projected.append({"_semantic_clue": True, "kind": "file_upload", **clue})
+                    continue
             params = action.get("params", {}) if isinstance(action, dict) else {}
             index = params.get("index")
             if index is None:

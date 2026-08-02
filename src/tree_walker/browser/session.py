@@ -3455,6 +3455,32 @@ class BrowserSession:
         )
         return result.get("result", {}).get("value", {}) or {}
 
+    async def eval_function_on_node(
+        self, backend_node_id: int, function_declaration: str,
+    ) -> Any:
+        """在 backendNodeId 绑定的元素上跑 ``function_declaration``（``this`` = 该元素），返回其
+        ``return`` 值（``returnByValue=True``）。resolveNode + callFunctionOn，无入参——镜像
+        ``_call_setter_on_node`` 但不带 value。CDP/JS 异常上抛（caller 用 try/except 兜底）。
+
+        供 ``upload_identity.capture_upload_clue`` 在【目标 file input 自身】提取身份上下文
+        （region_text/in_dialog/container_rect/affordance），避开 ``_upload_input_contexts`` 的候选
+        计数对齐（坑③：``selector_map`` 的 file input 数 ≠ ``document.querySelectorAll`` 时对齐失败返
+        ``{}``）——抖音二次上传（裁剪弹窗重传）正是触发此坑。"""
+        resolve = await self.client.send.DOM.resolveNode(
+            {"backendNodeId": backend_node_id},
+            session_id=self.current_session_id,
+        )
+        object_id = resolve["object"]["objectId"]
+        result = await self.client.send.Runtime.callFunctionOn(
+            {
+                "objectId": object_id,
+                "functionDeclaration": function_declaration,
+                "returnByValue": True,
+            },
+            session_id=self.current_session_id,
+        )
+        return result.get("result", {}).get("value")
+
     async def set_aria_option(self, backend_node_id: int, value: str) -> dict:
         """在 ARIA menu/listbox（backendNodeId 绑定）中选 option（_fetch_aria_options 的
         写侧对应）。返回与 set_select_option 同形 dict。CDP/JS 异常上抛（caller 包装）。"""

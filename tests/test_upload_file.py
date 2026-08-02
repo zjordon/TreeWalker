@@ -98,6 +98,9 @@ def _make_browser(
 		bs.execute_js = AsyncMock(return_value='{"canvases": 0, "imgPreviews": 0}')
 	else:
 		bs.execute_js = AsyncMock(side_effect=execute_js_side_effect)
+	# #151：upload 线索采集在目标元素自身提取上下文（eval_function_on_node）。默认返 None →
+	# 既有 verify/echo 测试 capture 静默无线索（不消费 execute_js mock 序列）；采集测试覆写此值。
+	bs.eval_function_on_node = AsyncMock(return_value=None)
 	return bs
 
 
@@ -989,3 +992,44 @@ class TestUploadVerification:
 		assert "new <canvas>" in result.extracted_content
 		# before-probe + 2 polls = 3 execute_js calls; early-exit means no 4th.
 		assert browser.execute_js.call_count == 3
+
+
+class TestUploadClueCapture:
+	"""#151：upload_file 在多 file input 页（需消歧）采集语义线索 → ActionResult.metadata['upload_clue']，
+	与手工录制 _store_upload_clue 同形 → agent 录制历史带 _semantic_clue，重放走 _match_file_upload_by_clue。"""
+
+	@pytest.mark.asyncio
+	async def test_captures_clue_with_container_rect_multi_input(self, tmp_upload):
+		entry7 = _make_entry(backend_node_id=7, attributes={"type": "file", "accept": "image/png"})
+		entry8 = _make_entry(backend_node_id=8, attributes={"type": "file", "accept": "image/png"})
+		state = _make_state({5: entry7, 6: entry8}, file_input_backend_ids=[7, 8])
+		# #151：capture 在目标元素自身提取上下文（eval_function_on_node, this=该 input）
+		browser = _make_browser()
+		browser.eval_function_on_node = AsyncMock(return_value={
+			"accept": "image/png", "region_text": "点击上传", "in_dialog": True,
+			"container_rect": {"x": 10, "y": 100, "width": 200, "height": 120},
+		})
+		result = await Tools(upload_verify_enabled=False).execute(
+			"upload_file", {"index": 5, "path": tmp_upload}, browser, browser_state=state,
+		)
+		assert result.error is None
+		assert result.metadata and result.metadata.get("upload_clue")
+		clue = result.metadata["upload_clue"]
+		assert clue["container_rect"]["x"] == 10  # 命中 backend_id=7 的元素 ctx
+		assert clue["accept"] == "image/png"
+		assert clue["in_dialog"] is True
+
+	@pytest.mark.asyncio
+	async def test_capture_failure_does_not_block_upload(self, tmp_upload):
+		entry7 = _make_entry(backend_node_id=7, attributes={"type": "file", "accept": "image/png"})
+		entry8 = _make_entry(backend_node_id=8, attributes={"type": "file", "accept": "image/png"})
+		state = _make_state({5: entry7, 6: entry8}, file_input_backend_ids=[7, 8])
+		# eval_function_on_node 抛异常 → capture 吞掉返 None → 无线索；上传照常成功
+		browser = _make_browser()
+		browser.eval_function_on_node = AsyncMock(side_effect=RuntimeError("cdp down"))
+		result = await Tools(upload_verify_enabled=False).execute(
+			"upload_file", {"index": 5, "path": tmp_upload}, browser, browser_state=state,
+		)
+		assert result.error is None
+		assert not (result.metadata and result.metadata.get("upload_clue"))
+		browser.set_file_input.assert_awaited_once()
