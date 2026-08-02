@@ -170,10 +170,27 @@ def _redact_history_data(
                     params[f] = redact_sensitive_string(params[f], sensitive_data)
 
 
+class ManualVariableBinding(BaseModel):
+    """用户在编辑器手动标注的变量绑定（绕过 detect_variables 规则检测）。
+
+    编辑器把"step i / action j / field 的值"标为变量 ``name``；重放时与
+    ``detect_variables`` 的结果并集合并（见 rerun.merge_variable_sources），
+    天然绕过"精确整串匹配漏子串"盲区——直接按 original_value 替换。
+    """
+
+    name: str
+    step_number: int
+    action_index: int
+    field: str = "text"
+    original_value: str
+
+
 class AgentHistoryList(BaseModel):
     history: list[AgentHistory] = Field(default_factory=list)
     # 存盘时写入，load 侧宽松校验（防 action 注册表漂移导致旧历史读不回）。
     action_registry_version: str | None = None
+    # P4 可视化编辑：编辑器手动标注的变量绑定。老 JSON 无此键 → pydantic 默认 []，自动兼容。
+    manual_variables: list[ManualVariableBinding] = Field(default_factory=list)
 
     def final_result(self) -> str | None:
         for item in reversed(self.history):
@@ -222,6 +239,68 @@ class AgentHistoryList(BaseModel):
                 h["interacted_element"] = None
         return cls.model_validate(data)
 
+    # —— P4 可视化编辑 mutation API ——
+    # 核心不变量：每步 model_output.actions 与 interacted_element【等长、按位对应】
+    # （见 AgentHistory 注释）。下面的方法都维护此不变量。改 params.text 零风险
+    # （text 不参与五级匹配）；但删/合并 click 步可能断后续定位链，调用方须知晓。
+    # 假设 model_output 为新格式 {"actions": [...]}；老格式 {"action": {...}} 不支持编辑。
+
+    def _step_index(self, step_number: int) -> int:
+        for i, h in enumerate(self.history):
+            if h.step_number == step_number:
+                return i
+        raise KeyError(f"step_number {step_number} 不存在")
+
+    def remove_step(self, step_number: int) -> None:
+        """删除指定 step_number 的整步（删整步不影响其他步的等长不变量）。"""
+        idx = self._step_index(step_number)
+        self.history.pop(idx)
+
+    def update_action_params(
+        self, step_number: int, action_index: int, field: str, value: Any
+    ) -> None:
+        """改某步某 action 的 params[field]。text 字段安全（不参与五级匹配）。"""
+        idx = self._step_index(step_number)
+        actions = self.history[idx].model_output.get("actions", [])
+        if not isinstance(actions, list) or action_index < 0 or action_index >= len(actions):
+            raise IndexError(
+                f"action_index {action_index} 越界（step {step_number} 有 "
+                f"{len(actions) if isinstance(actions, list) else 0} 个动作）"
+            )
+        params = actions[action_index].setdefault("params", {})
+        params[field] = value
+
+    def merge_steps(self, step_a: int, step_b: int) -> None:
+        """把 step_b 的 actions + interacted_element 追加到 step_a，删 step_b。
+
+        等长不变量自然维持：a.actions += b.actions，a.interacted_element += b.interacted_element。
+        """
+        ia = self._step_index(step_a)
+        ib = self._step_index(step_b)
+        if ia == ib:
+            raise ValueError("step_a 和 step_b 不能相同")
+        a, b = self.history[ia], self.history[ib]
+        a_actions = a.model_output.setdefault("actions", [])
+        b_actions = b.model_output.get("actions", [])
+        ea = list(a.interacted_element or [None] * len(a_actions))
+        eb = list(b.interacted_element or [None] * len(b_actions))
+        a.interacted_element = ea + eb
+        a_actions.extend(b_actions)
+        self.history.pop(ib)
+
+    def add_manual_variable(self, binding: ManualVariableBinding) -> None:
+        """登记一个手动变量绑定（同名替换，否则追加）。"""
+        self.manual_variables = [
+            v for v in self.manual_variables if v.name != binding.name
+        ]
+        self.manual_variables.append(binding)
+
+    def remove_manual_variable(self, name: str) -> None:
+        """按变量名删除手动绑定。"""
+        self.manual_variables = [
+            v for v in self.manual_variables if v.name != name
+        ]
+
 
 class DetectedVariable(BaseModel):
     """历史中检测到的可替换变量（纯规则检测，不调 LLM）。"""
@@ -243,3 +322,14 @@ class RerunSummaryAction(BaseModel):
         default="complete",
         description="complete(全成功) / partial(部分成功) / failed(未完成)",
     )
+
+
+class BatchRowResult(BaseModel):
+    """CSV 批量重放单行结果（P4 子任务 2）。"""
+
+    row_index: int
+    variables: dict[str, str] = Field(default_factory=dict)  # 该行注入的变量
+    success: bool = False
+    n_steps: int = 0
+    extracted_content: str | None = None
+    error: str | None = None

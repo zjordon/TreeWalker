@@ -210,6 +210,67 @@ await agent.load_and_rerun("myflow.json", variables={"email": "new@x.com"})
 > 完整设计、架构、方案演进与架构反思见 [docs/user_recording/](docs/user_recording/)：
 > [`README.md`](docs/user_recording/README.md) · [`redesign.md`](docs/user_recording/redesign.md) · [`semantic-clue-replay.md`](docs/user_recording/semantic-clue-replay.md) · [`recorder-timing-solutions.md`](docs/user_recording/recorder-timing-solutions.md)
 
+## 历史可视化编辑 + CSV 批量重放
+
+录制或 agent 探索产出的历史（`rerun-history/*.json`）可用浏览器编辑器可视化编辑（删除误录步、改 input 文本、把某个值标注为变量），再喂 CSV 多行数据批量重放——**录制一次，批量执行 N 次**。
+
+### 可视化编辑器
+
+独立 HTTP 后端 + 浏览器 SPA（React+Vite，操作重放端历史，与录制扩展解耦）：拖拽重排步骤、改 input 文本、删步、人工标注变量、试跑（真实起浏览器）。
+
+**首次使用需构建前端**（生成 `history_editor/static/`）：
+```bash
+./scripts/build_editor.sh        # mac / linux（或 bash scripts/build_editor.sh）
+.\scripts\build_editor.ps1       # Windows
+```
+
+启动后端（默认 http://127.0.0.1:8766/）：
+```bash
+uv run python examples/serve_history_editor.py
+```
+
+浏览器打开 `http://127.0.0.1:8766/` → 选历史文件 → 加载：
+
+- **动作列表**（可拖拽重排）：每步的动作类型 / 目标元素 / 参数
+- **编辑**：改 input 的 text、删除误录步
+- **标注变量**：把任意 input 的 text 标为变量（指定变量名），补 `detect_variables` 自动检测识别不了的字段（商品名、订单备注等无规律值）
+- **检测变量**：自动检测（email/phone/name 等有规律字段）∪ 人工标注
+- **试跑**：调 `/history/rerun`（真实起浏览器），每步 ✓/✗
+- **保存**：写回 `rerun-history/*.json`
+
+**前端开发模式**（热重载，免构建）：
+```bash
+uv run python examples/serve_history_editor.py   # 终端1：后端 8766
+cd history_editor_ui; npm run dev                # 终端2：Vite 5173（proxy → 8766）
+# 浏览器开 http://127.0.0.1:5173/
+```
+
+> 完整方案与业界调研见 [docs/p4/](docs/p4/)。
+
+### CSV 批量重放
+
+变量名 = CSV 列头（对齐「检测变量」结果）：
+
+```bash
+# data.csv
+email,name
+alice@example.com,Alice
+bob@example.com,Bob
+
+# 批量重放（需 Chrome 调试端口 + ZHIPU_API_KEY）
+uv run python examples/csv_rerun.py myflow.json data.csv
+```
+
+编程接口：
+
+```python
+results = await agent.batch_rerun("myflow.json", "data.csv")
+for r in results:
+    print(f"行{r.row_index}: {'✓' if r.success else '✗'} {r.extracted_content or r.error}")
+```
+
+缺列变量用历史原值（宽容）；单行失败不中断批量。
+
 ## 配置
 
 所有配置通过环境变量或 `.env` 文件设置，参见 [.env.example](.env.example) 获取完整配置项。

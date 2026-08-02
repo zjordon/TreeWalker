@@ -115,11 +115,10 @@ agent 探索时按 host 读 `domain-skills/<host>/` 注入上下文（默认关�
 
 ### P4 —— 录制-重放体验打磨
 
-**目标**：把已成熟的能力包装成好用的产品功能。
+**目标**：把已成熟的能力包装成好用的产品功能。跟踪：issue #149。
 
-- [ ] **TUI 录制入口整合**
-  - 当前 TUI 的 record-switch 录的是 agent 探索，扩展录制走 popup
-  - 整合两种录制方式的入口
+> **录制能力（含 TUI 录制入口整合、扩展录制、`record` CLI 子命令）整体迁往 TreeForge 工程实现**，不在本仓库 P4 范围。
+
 - [ ] **录制产物可视化编辑**
   - 录制完显示动作列表（每步：动作类型 + 目标元素描述 + 参数）
   - 支持删除误录步、合并/拆分步、改 input 的 text（手动指定变量）
@@ -127,7 +126,6 @@ agent 探索时按 host 读 `domain-skills/<host>/` 注入上下文（默认关�
 - [ ] **CSV 批量执行**
   - 录制一次喂 100 行数据跑 100 次（`for row in csv: load_and_rerun(variables=row)`）
   - [[browser-variable-substitution]] 的批量执行场景
-- [ ] **`tree-walker record` CLI 子命令**（当前录制入口是 examples 脚本）
 
 ---
 
@@ -150,7 +148,7 @@ agent 探索时按 host 读 `domain-skills/<host>/` 注入上下文（默认关�
 | skill 注入 | 注入机制 + 三元门控 + B 站 skill | ✅ | v0.12.0 已交付（#141/#142）；skill 失效处理待办 |
 | P2 | agent 探索可靠性提升 | 🟡 | P0 actionability 已交付（#147）；P1-P3 暂缓（见 docs/p3）；e2e 待真机 |
 | P3 | 手工录制性能优化 | ⏳ | 备选，按需 |
-| P4 | 录制-重放体验打磨 | ⏳ | 产品化 |
+| P4 | 录制-重放体验打磨 | ⏳ | 产品化（#149） |
 
 ---
 
