@@ -27,6 +27,13 @@ from tree_walker.agent.actionability import (
     is_file_input as _is_file_input,
     is_rect_stable,
 )
+from tree_walker.agent.upload_identity import (
+    _UPLOAD_IMAGE_EXTS,
+    _UPLOAD_VIDEO_EXTS,
+    effective_clue_rect,
+    file_input_candidates,
+    upload_input_contexts,
+)
 from tree_walker.agent.views import (
     AgentHistory,
     AgentHistoryList,
@@ -160,8 +167,8 @@ def _nearest_idx(hist: dict[str, Any], candidates: list[tuple[int, Any]]) -> int
     return best_idx
 
 
-_UPLOAD_VIDEO_EXTS = frozenset({"mp4", "mov", "avi", "mkv", "webm", "flv", "wmv", "m4v", "ts", "3gp", "mpeg", "mpg"})
-_UPLOAD_IMAGE_EXTS = frozenset({"png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "svg", "heic"})
+# 上传扩展名集 + file-input 身份逻辑已移至 ``upload_identity``（单一真相源，#151）。
+# 此处经顶部 import 复用 _UPLOAD_VIDEO_EXTS / _UPLOAD_IMAGE_EXTS（``_upload_file_kind`` 用）。
 
 
 def _upload_file_kind(path: str) -> str | None:
@@ -913,21 +920,8 @@ class RerunMixin:
         （mp4→video、png→image）推断。供 ``_resolve_file_input_by_accept``（老 accept 兜底）与
         ``_match_file_upload_by_clue``（issue #139 语义线索精筛）共用，避免重复。
         """
-        if accept_hint:
-            ah = accept_hint.lower()
-            kind = "video" if "video" in ah else ("image" if "image" in ah else None)
-        else:
-            ext = Path(path or "").suffix.lower().lstrip(".")
-            kind = "video" if ext in _UPLOAD_VIDEO_EXTS else ("image" if ext in _UPLOAD_IMAGE_EXTS else None)
-        candidates: list[tuple[int, Any]] = []
-        for idx, node in selector_map.items():
-            attrs = getattr(node, "attributes", None) or {}
-            if (getattr(node, "node_name", "") or "").upper() != "INPUT" \
-                    or attrs.get("type", "").lower() != "file":
-                continue
-            if kind is None or kind in (attrs.get("accept", "") or "").lower():
-                candidates.append((idx, node))
-        return candidates
+        # #151：实现移至 ``upload_identity.file_input_candidates``（采集端与重放端共用同一份）。
+        return file_input_candidates(selector_map, accept_hint=accept_hint, path=path)
 
     def _resolve_file_input_by_accept(
         self, state: Any, path: str, xpath_hint: str = "", accept_hint: str = "",
@@ -965,7 +959,7 @@ class RerunMixin:
     ) -> dict[int, dict[str, Any]]:
         """单次 ``execute_js`` 扫页面上所有 ``input[type=file]``（DOM 文档序），返回每个 input 的
         **站点无关**通用身份（issue #139 通用化）：``accept`` + 原生 label 文案 + aria-labelledby 解析
-        + 就近可见文本祖先 + 是否在 ARIA dialog 内 + 可点 affordance 文案/role。Python 侧按 ``kind``
+        + 就近可见文本祖先 + 是否在 ARIA dialog 内 + 可点 affordance 文案/role/rect + ``container_rect``（#151，隐藏 input 位置信号）。Python 侧按 ``kind``
         过滤后，与 ``candidates``（``_file_input_candidates`` 同款过滤）按 **DOM 序下标** 对齐 →
         ``{backend_id: ctx}``（``_match_file_upload_by_clue`` 精筛用）。
 
@@ -975,59 +969,9 @@ class RerunMixin:
         页面 6 个 input 含 1 video ≠ 5 image 候选，下标对不上 → 计数不等放弃精筛，matcher 降级到可见性/rect，
         不崩）。详见 ``docs/user_recording/upload-general-identity-impl-plan.md``。
         """
-        if not candidates:
-            return {}
-        code = (
-            "(()=>{"
-            "const norm=s=>(s||'').replace(/\\s+/g,' ').trim();"
-            "const out=[];"
-            "document.querySelectorAll('input[type=file]').forEach(inp=>{"
-            # 1. 原生 label（W3C input.labels：含 <label for> 指向与包裹 <label>）
-            "const labelText=norm(Array.from(inp.labels||[]).map(l=>l.textContent||'').join(' '));"
-            # 2. aria-labelledby IDREF → 目标 textContent（不走 accname——浏览器实现差异大）
-            "const ariaText=norm((inp.getAttribute('aria-labelledby')||'').split(/\\s+/).filter(Boolean)"
-            ".map(id=>document.getElementById(id)).filter(Boolean).map(el=>el.textContent||'').join(' '));"
-            # 3. 就近可见文本祖先（≤5 层，首个 textContent 非空且 <200 字）——泛化旧 area_text
-            #    （Semi widget 祖先的 textContent 即含 drag-area 文案）
-            "let region='',p=inp.parentElement,depth=0;"
-            "while(p&&depth<5&&!region){const t=norm(p.textContent||'');if(t&&t.length<200)region=t;p=p.parentElement;depth++;}"
-            # 4. ARIA dialog（泛化旧 in_modal 的 [class*="modal"]——无障碍标准更稳）
-            "const inDialog=!!(inp.closest('[role=dialog]')||inp.closest('[aria-modal=true]'));"
-            # 5. Layer 2：可点 affordance 文案/role（≤6 层，首个 button/[role=button]/a/label/cursor:pointer）
-            "let a=inp.parentElement,affText='',affRole='',d2=0;"
-            "while(a&&d2<6&&!affText){const role=a.getAttribute('role');"
-            "const click=a.tagName==='BUTTON'||role==='button'||a.tagName==='A'||a.tagName==='LABEL'||role==='link'"
-            "||(window.getComputedStyle(a).cursor==='pointer');"
-            "if(click){affText=norm(a.textContent||'');affRole=role||a.tagName.toLowerCase();}"
-            "a=a.parentElement;d2++;}"
-            "out.push({accept:(inp.getAttribute('accept')||'').toLowerCase(),"
-            "label_text:labelText,aria_text:ariaText,region_text:region,"
-            "in_dialog:inDialog,affordance_text:affText,affordance_role:affRole});"
-            "});"
-            "return out;"
-            "})()"
-        )
-        try:
-            arr = await self.browser.execute_js(code)
-        except Exception as e:
-            logger.warning("upload_input_contexts execute_js 失败: %s", e)
-            return {}
-        if not isinstance(arr, list):
-            logger.info("upload_input_contexts: execute_js 返回 %r（非 list），放弃上下文精筛", type(arr).__name__)
-            return {}
-        # 与 _file_input_candidates 同款 accept(kind) 过滤 → DOM 序下标与 candidates 一一对齐
-        entries = [
-            e for e in arr
-            if isinstance(e, dict) and (not kind or kind in (e.get("accept") or ""))
-        ]
-        if len(entries) != len(candidates):
-            logger.warning(
-                "upload_input_contexts: kind=%r 过滤后 file input 数 %d ≠ 候选数 %d"
-                "（DOM 序对应不可靠，放弃上下文精筛）",
-                kind or "(none)", len(entries), len(candidates),
-            )
-            return {}
-        return {idx: entries[i] for i, (idx, _) in enumerate(candidates)}
+        # #151：实现移至 ``upload_identity.upload_input_contexts``——JS 探针扩展了 affordance_rect /
+        # container_rect（隐藏 input 的位置信号），采集端（actions.py）与重放端共用同一份。
+        return await upload_input_contexts(self.browser, candidates, kind=kind)
 
     async def _match_file_upload_by_clue(
         self, clue: dict[str, Any], selector_map: dict[int, Any],
@@ -1060,7 +1004,9 @@ class RerunMixin:
         want_in_dialog = clue.get("in_dialog")
         if want_in_dialog is None:
             want_in_dialog = clue.get("in_modal")  # legacy 别名
-        need_ctx = bool(want_aff or want_label or want_aria or want_region or want_in_dialog is not None)
+        # #151：多候选（单候选已在上面提前返回）必算 ctx——尾部 container_rect 就近依赖它；
+        # 即便线索只有 accept（want_* 全空）也要算，否则隐藏 input 区分不了横/竖。
+        need_ctx = True
         _acc = (clue.get("accept") or "").lower()
         _kind = "video" if "video" in _acc else ("image" if "image" in _acc else "")
         ctx = await self._upload_input_contexts(candidates, _kind) if need_ctx else {}
@@ -1123,9 +1069,26 @@ class RerunMixin:
             cand_ids = [idx for idx, _ in candidates]
         if not candidates:
             return None
-        # rect 就近兜底（复用 _nearest_idx；clue rect 作 hist bounds，无 x_path → 直接 bounds 就近）
-        chosen = _nearest_idx({"bounds": clue.get("rect")}, candidates)
-        logger.info("upload 线索精筛：rect 就近 → idx=%s", chosen)
+        # rect 就近兜底：隐藏 input 自身 rect={0,0,0,0}、候选 snapshot bounds 同样为零时 _nearest_idx
+        # 退回 candidates[0]。改用 effective_clue_rect（优先 container_rect/affordance 真实几何）的中心
+        # 对候选 ctx 的 container_rect 比距离；ctx 无 container_rect 时退回 _nearest_idx（legacy 行为）。
+        want_rect = effective_clue_rect(clue)
+        rc = _bounds_center(want_rect)
+        chosen: int | None = None
+        if rc is not None and ctx:
+            best_d = float("inf")
+            for idx in cand_ids:
+                cc = _bounds_center(ctx.get(idx, {}).get("container_rect"))
+                if cc is None:
+                    continue
+                d = (cc[0] - rc[0]) ** 2 + (cc[1] - rc[1]) ** 2
+                if d < best_d:
+                    best_d, chosen = d, idx
+            if chosen is not None:
+                logger.info("upload 线索精筛：container_rect 就近 → idx=%s", chosen)
+                return chosen
+        chosen = _nearest_idx({"bounds": want_rect}, candidates)
+        logger.info("upload 线索精筛：rect 就近(snapshot) → idx=%s", chosen)
         return chosen
 
     def _update_action_indices(

@@ -938,6 +938,69 @@ async def test_match_file_upload_by_clue_single_and_empty():
 
 
 @pytest.mark.asyncio
+async def test_match_file_upload_by_clue_container_rect_beats_xpath_drift():
+    """#151：隐藏 input 横/竖封面——region_text/in_dialog 全撞车、xpath 漂移失配时，靠 container_rect
+    （最近非零祖先真实几何）中心就近区分。这是 agent 端采集移植后抖音封面的实际解法。"""
+    rm = RerunMixin()
+    heng = SimpleNamespace(node_name="INPUT", attributes={"type": "file", "accept": "image/png"},
+                           xpath="/html/body/div[99]/div[2]/input[1]", is_visible=True, snapshot_node=None)
+    shu = SimpleNamespace(node_name="INPUT", attributes={"type": "file", "accept": "image/png"},
+                          xpath="/html/body/div[99]/div[3]/input[1]", is_visible=True, snapshot_node=None)
+    sm = {10: heng, 11: shu}
+    rm._upload_input_contexts = AsyncMock(return_value={
+        10: {"region_text": "点击上传文件或拖拽文件到这里", "in_dialog": True,
+             "container_rect": {"x": 10, "y": 100, "width": 200, "height": 120}},
+        11: {"region_text": "点击上传文件或拖拽文件到这里", "in_dialog": True,
+             "container_rect": {"x": 500, "y": 100, "width": 120, "height": 200}},
+    })
+    # 线索：input 自身 rect={0,0,0,0}（隐藏）→ effective_clue_rect 取 container_rect；xpath 已漂移
+    clue = {"accept": "image/png",
+            "region_text": "点击上传文件或拖拽文件到这里", "in_dialog": True,
+            "rect": {"x": 0, "y": 0, "width": 0, "height": 0},
+            "container_rect": {"x": 500, "y": 100, "width": 120, "height": 200},
+            "xpath": "/html/body/div[12]/div[3]/input[1]"}
+    assert await rm._match_file_upload_by_clue(clue, sm) == 11
+
+
+@pytest.mark.asyncio
+async def test_match_file_upload_by_clue_accept_only_computes_ctx():
+    """#151：accept-only 线索（无 region/affordance/in_dialog）+ 多候选也强制算 ctx——尾部 container_rect
+    就近依赖它；此前 need_ctx=False 会跳过 ctx，rect 全零退回 candidates[0] 选错。"""
+    rm = RerunMixin()
+    a = SimpleNamespace(node_name="INPUT", attributes={"type": "file", "accept": "image/png"},
+                        xpath="a", is_visible=True, snapshot_node=None)
+    b = SimpleNamespace(node_name="INPUT", attributes={"type": "file", "accept": "image/png"},
+                        xpath="b", is_visible=True, snapshot_node=None)
+    sm = {10: a, 11: b}
+    rm._upload_input_contexts = AsyncMock(return_value={
+        10: {"container_rect": {"x": 10, "y": 0, "width": 10, "height": 10}},
+        11: {"container_rect": {"x": 500, "y": 0, "width": 10, "height": 10}},
+    })
+    clue = {"accept": "image/png", "rect": None,
+            "container_rect": {"x": 500, "y": 0, "width": 10, "height": 10}}
+    assert await rm._match_file_upload_by_clue(clue, sm) == 11
+    rm._upload_input_contexts.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_match_file_upload_by_clue_all_zero_rect_falls_back_to_nearest():
+    """#151：线索 rect/container_rect/affordance 全零/缺失、ctx 也无 container_rect → effective_clue_rect
+    返回零 rect → 中心 None → 跳过 container_rect 就近，退回 legacy _nearest_idx（不崩，DOM 序首个）。"""
+    rm = RerunMixin()
+    a = SimpleNamespace(node_name="INPUT", attributes={"type": "file", "accept": "image/png"},
+                        xpath="a", is_visible=True, snapshot_node=None)
+    b = SimpleNamespace(node_name="INPUT", attributes={"type": "file", "accept": "image/png"},
+                        xpath="b", is_visible=True, snapshot_node=None)
+    sm = {10: a, 11: b}
+    rm._upload_input_contexts = AsyncMock(return_value={
+        10: {"region_text": ""}, 11: {"region_text": ""},  # 无 container_rect
+    })
+    clue = {"accept": "image/png", "rect": {"x": 0, "y": 0, "width": 0, "height": 0}}
+    # 文本失配 → 降级；rect 全零、无 container_rect → _nearest_idx 退回 candidates[0][0]=10
+    assert await rm._match_file_upload_by_clue(clue, sm) == 10
+
+
+@pytest.mark.asyncio
 async def test_upload_input_contexts_aligns_by_dom_order():
     """_upload_input_contexts：单次 execute_js 扫所有 input[type=file]（DOM 序）→ Python 侧按
     kind 过滤 → 与候选同序对齐 → {bid: ctx}；空入参/异常/非 list/计数不等 → 降级返 {}（不抛）。"""

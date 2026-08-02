@@ -14,6 +14,7 @@ import time
 
 from pydantic import BaseModel, ValidationError
 
+from tree_walker.agent.upload_identity import capture_upload_clue
 from tree_walker.agent.views import ActionResult
 from tree_walker.browser.session import BrowserSession, _requires_direct_value_assignment
 from tree_walker.browser.views import BrowserStateSummary, EnhancedDOMTreeNode, SerializedDOMState
@@ -1703,6 +1704,28 @@ class Tools:
             is_file_input, backend_id, file_input_ids,
         )
 
+        # #151：为【实际命中】的 input 采集语义线索（与手工录制 ``_store_upload_clue`` 同形）→ agent 录制
+        # 的历史带 _semantic_clue，重放走 ``_match_file_upload_by_clue`` 稳健路径。在目标元素**自身**提取
+        # 上下文（resolveNode+callFunctionOn，不依赖候选计数对齐——坑③），best-effort：失败回退无线索
+        # （legacy 重放路径），绝不阻塞上传。
+        upload_clue: dict[str, Any] | None = None
+        try:
+            _clue_sm = (
+                self._cached_browser_state.dom_state.selector_map
+                if self._cached_browser_state and self._cached_browser_state.dom_state else {}
+            )
+            upload_clue = await capture_upload_clue(browser, _clue_sm, backend_id)
+            if upload_clue:
+                logger.info(
+                    "upload_file: 采集线索 container_rect=%s region=%r accept=%r",
+                    upload_clue.get("container_rect"),
+                    (upload_clue.get("region_text") or "")[:40],
+                    upload_clue.get("accept", ""),
+                )
+        except Exception as exc:
+            logger.debug("upload clue 采集失败（非阻塞）: %s", exc)
+            upload_clue = None
+
         # P1 三次修订：上传前页面信号快照（canvas/img 计数），上传后比对给 LLM 客观证据。
         # 验证关闭时跳过探针（避免无谓 CDP 往返）——_verify_upload 也会直接返回空串。
         before_signals = (
@@ -1748,7 +1771,10 @@ class Tools:
         memory += await self._verify_upload(browser, before_signals, os.path.basename(file_path))
 
         logger.info(memory)
-        return ActionResult(extracted_content=memory, long_term_memory=memory)
+        _upload_clue_meta = {"upload_clue": upload_clue} if upload_clue else None
+        return ActionResult(
+            extracted_content=memory, long_term_memory=memory, metadata=_upload_clue_meta,
+        )
 
     async def _action_write_file(self, params: dict, browser: BrowserSession) -> ActionResult:
         path = params["path"]
