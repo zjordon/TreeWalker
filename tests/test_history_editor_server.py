@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 import pytest_asyncio
 from types import SimpleNamespace
@@ -173,3 +175,143 @@ async def test_save_rejects_unequal_pairing(client):
     resp = await client.post("/history/save", params={"name": "bad.json"}, json=bad)
     assert resp.status == 400
     assert "不等长" in (await resp.json())["error"]
+
+
+# ── CSV 批量重放（issue #155）─────────────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _isolate_batch_tasks():
+    """每个测试前后清空模块级 _BATCH_TASKS，防单并发状态在测试间泄漏。"""
+    from tree_walker.history_editor import server
+    server._BATCH_TASKS.clear()
+    yield
+    server._BATCH_TASKS.clear()
+
+
+def _csv_formdata(text):
+    """把 CSV 文本包成 multipart FormData（field 名 'file'）。"""
+    from aiohttp import FormData
+    data = FormData()
+    data.add_field("file", text.encode("utf-8"), filename="data.csv",
+                   content_type="text/csv")
+    return data
+
+
+def _save_blank_history(tmp_path, name="a.json"):
+    _save(tmp_path, name, AgentHistoryList(history=[
+        AgentHistory(step_number=1, model_output={"actions": []}, result=[])]))
+
+
+@pytest.mark.asyncio
+async def test_batch_start_uploads_csv(client, tmp_path, monkeypatch):
+    _save_blank_history(tmp_path)
+    fake_agent = SimpleNamespace(
+        batch_rerun=AsyncMock(return_value=[]), stop=lambda: None)
+    monkeypatch.setattr("tree_walker.history_editor.server._build_agent", lambda: fake_agent)
+    resp = await client.post(
+        "/history/batch/start", params={"name": "a.json"},
+        data=_csv_formdata("email\na@b.com\nc@d.com"))
+    assert resp.status == 200
+    j = await resp.json()
+    assert "task_id" in j
+    assert j["total_rows"] == 2
+
+
+@pytest.mark.asyncio
+async def test_batch_start_missing_name(client):
+    resp = await client.post(
+        "/history/batch/start", data=_csv_formdata("email\na@b.com"))
+    assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_batch_start_missing_file(client, tmp_path):
+    _save_blank_history(tmp_path)
+    resp = await client.post("/history/batch/start", params={"name": "a.json"})
+    assert resp.status == 400  # 无 multipart file part
+
+
+@pytest.mark.asyncio
+async def test_batch_start_traversal_rejected(client):
+    resp = await client.post(
+        "/history/batch/start", params={"name": "../evil.json"},
+        data=_csv_formdata("email\na@b.com"))
+    assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_batch_start_empty_csv(client, tmp_path, monkeypatch):
+    _save_blank_history(tmp_path)
+    fake_agent = SimpleNamespace(batch_rerun=AsyncMock(return_value=[]), stop=lambda: None)
+    monkeypatch.setattr("tree_walker.history_editor.server._build_agent", lambda: fake_agent)
+    resp = await client.post(
+        "/history/batch/start", params={"name": "a.json"},
+        data=_csv_formdata("email"))  # 只表头
+    assert resp.status == 400
+    assert "无数据行" in (await resp.json())["error"]
+
+
+@pytest.mark.asyncio
+async def test_batch_concurrent_rejected(client, tmp_path, monkeypatch):
+    _save_blank_history(tmp_path)
+    hold = asyncio.Event()
+
+    async def slow_batch(hf, csv_p, *, on_row=None, **kw):
+        await hold.wait()
+        return []
+
+    fake_agent = SimpleNamespace(batch_rerun=slow_batch, stop=lambda: None)
+    monkeypatch.setattr("tree_walker.history_editor.server._build_agent", lambda: fake_agent)
+    resp1 = await client.post(
+        "/history/batch/start", params={"name": "a.json"},
+        data=_csv_formdata("email\na@b.com"))
+    assert resp1.status == 200
+    resp2 = await client.post(  # 已有运行中 → 409
+        "/history/batch/start", params={"name": "a.json"},
+        data=_csv_formdata("email\nc@d.com"))
+    assert resp2.status == 409
+    hold.set()  # 放行第一个，避免任务泄漏
+
+
+@pytest.mark.asyncio
+async def test_batch_progress_sse(client, tmp_path, monkeypatch):
+    from tree_walker.agent.views import BatchRowResult
+    _save_blank_history(tmp_path)
+
+    async def fake_batch(hf, csv_p, *, on_row=None, **kw):
+        r0 = BatchRowResult(row_index=0, success=True, n_steps=3)
+        r1 = BatchRowResult(row_index=1, success=False, error="boom")
+        if on_row:
+            await on_row(r0)
+            await on_row(r1)
+        return [r0, r1]
+
+    fake_agent = SimpleNamespace(batch_rerun=fake_batch, stop=lambda: None)
+    monkeypatch.setattr("tree_walker.history_editor.server._build_agent", lambda: fake_agent)
+    resp = await client.post(
+        "/history/batch/start", params={"name": "a.json"},
+        data=_csv_formdata("email\na@b.com\nc@d.com"))
+    task_id = (await resp.json())["task_id"]
+
+    resp = await client.get("/history/batch/progress", params={"task_id": task_id})
+    assert resp.headers["Content-Type"] == "text/event-stream"
+    events = []
+    async for raw in resp.content:
+        line = raw.decode().strip()
+        if line.startswith("event: "):
+            events.append(line[7:])
+    assert events.count("row") == 2
+    assert "done" in events
+
+
+@pytest.mark.asyncio
+async def test_batch_progress_unknown_task(client):
+    resp = await client.get("/history/batch/progress", params={"task_id": "nope"})
+    assert resp.status == 404
+
+
+@pytest.mark.asyncio
+async def test_batch_cancel_unknown_task(client):
+    resp = await client.post("/history/batch/cancel", params={"task_id": "nope"})
+    assert resp.status == 404

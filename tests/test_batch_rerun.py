@@ -25,9 +25,9 @@ def _write_csv(path, fieldnames, rows):
             w.writerow(r)
 
 
-def _agent_with_load(load):
-    """batch_rerun 只用 self.load_and_rerun，SimpleNamespace 即可（不绑定 self）。"""
-    return SimpleNamespace(load_and_rerun=load)
+def _agent_with_load(load, *, stopped=False):
+    """batch_rerun 用 self.load_and_rerun + self.state.stopped；SimpleNamespace 即可（不绑定 self）。"""
+    return SimpleNamespace(load_and_rerun=load, state=SimpleNamespace(stopped=stopped))
 
 
 @pytest.mark.asyncio
@@ -120,3 +120,60 @@ async def test_batch_rerun_row_exception_continues(tmp_path):
     assert results[0].success is False
     assert "boom" in results[0].error
     assert results[1].success is True
+
+
+@pytest.mark.asyncio
+async def test_batch_rerun_on_row_callback(tmp_path):
+    """on_row 回调每行完成后触发，收到 BatchRowResult（issue #155 行级进度）。"""
+    csv_path = tmp_path / "data.csv"
+    _write_csv(csv_path, ["email"], [{"email": "a@b.com"}, {"email": "c@d.com"}])
+    fake = AsyncMock(return_value=[ActionResult(is_done=True, success=True)])
+    agent = _agent_with_load(fake)
+    received = []
+
+    async def on_row(result):
+        received.append(result)
+
+    await RerunMixin.batch_rerun(agent, "demo.json", csv_path, on_row=on_row)
+    assert len(received) == 2
+    assert all(r.success for r in received)
+    assert [r.row_index for r in received] == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_batch_rerun_stops_on_cancel(tmp_path):
+    """state.stopped=True 时行循环中断，后续行不执行（issue #155 协作式取消）。"""
+    csv_path = tmp_path / "data.csv"
+    _write_csv(csv_path, ["email"], [{"email": f"r{i}@x.com"} for i in range(5)])
+
+    call_count = 0
+
+    async def fake_load(hf, variables=None, **kw):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            agent.state.stopped = True  # 第二行后触发取消
+        return [ActionResult(is_done=True, success=True)]
+
+    agent = _agent_with_load(fake_load)
+    results = await RerunMixin.batch_rerun(agent, "demo.json", csv_path)
+    assert len(results) == 2  # 第二行后行后检查 stopped → break，后续 3 行不跑
+
+
+@pytest.mark.asyncio
+async def test_batch_rerun_passes_on_step_to_load(tmp_path):
+    """on_step 透传给 load_and_rerun（issue #155 步级进度）。"""
+    csv_path = tmp_path / "data.csv"
+    _write_csv(csv_path, ["email"], [{"email": "a@b.com"}])
+    captured = {}
+
+    async def fake_load(hf, variables=None, *, on_step=None, **kw):
+        captured["on_step"] = on_step
+        return [ActionResult(is_done=True, success=True)]
+
+    async def on_step(step_index, total, step_results):
+        pass
+
+    agent = _agent_with_load(fake_load)
+    await RerunMixin.batch_rerun(agent, "demo.json", csv_path, on_step=on_step)
+    assert captured["on_step"] is on_step
