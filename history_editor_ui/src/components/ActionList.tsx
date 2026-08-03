@@ -28,12 +28,13 @@ function elemDesc(el: InteractedElement | null | undefined): string {
 interface RowProps {
 	step: AgentHistory;
 	stepIdx: number;
-	selected: boolean;
+	// 该步当前选中的 action 下标；null 表示此步未选中任何 action。
+	selectedActionIdx: number | null;
 	failed: boolean;
 	onSelect: (stepIdx: number, actionIdx: number) => void;
 }
 
-function SortableStepRow({ step, stepIdx, selected, failed, onSelect }: RowProps) {
+function SortableStepRow({ step, stepIdx, selectedActionIdx, failed, onSelect }: RowProps) {
 	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
 		id: `step-${step.step_number}`,
 	});
@@ -48,15 +49,38 @@ function SortableStepRow({ step, stepIdx, selected, failed, onSelect }: RowProps
 		<tr
 			ref={setNodeRef}
 			style={style}
-			className={`row ${selected ? "selected" : ""} ${failed ? "failed" : ""}`}
-			onClick={() => onSelect(stepIdx, 0)}
+			className={`row ${selectedActionIdx !== null ? "selected" : ""} ${failed ? "failed" : ""}`}
 		>
 			<td className="grip" {...attributes} {...listeners}>
 				⠿
 			</td>
 			<td>{step.step_number}</td>
-			<td>{actions.map((a: AgentAction) => a.name).join(", ") || "-"}</td>
-			<td>{actions.map((_, i) => elemDesc(interacted[i])).join(" | ")}</td>
+			<td className="action-cell">
+				{actions.length === 0 ? (
+					"-"
+				) : (
+					actions.map((a: AgentAction, i: number) => (
+						<span
+							key={i}
+							className={`action-chip${selectedActionIdx === i ? " selected" : ""}`}
+							onClick={() => onSelect(stepIdx, i)}
+						>
+							{i + 1}. {a.name}
+						</span>
+					))
+				)}
+			</td>
+			<td>
+				{actions.length === 0 ? (
+					elemDesc(interacted[0])
+				) : (
+					actions.map((_: AgentAction, i: number) => (
+						<span key={i} className="action-desc">
+							{elemDesc(interacted[i])}
+						</span>
+					))
+				)}
+			</td>
 		</tr>
 	);
 }
@@ -134,7 +158,11 @@ export default function ActionList({ state, dispatch }: ListProps) {
 								key={step.step_number}
 								step={step}
 								stepIdx={stepIdx}
-								selected={state.selected?.stepIdx === stepIdx}
+								selectedActionIdx={
+									state.selected && state.selected.stepIdx === stepIdx
+										? state.selected.actionIdx
+										: null
+								}
 								failed={failedIdx.has(stepIdx)}
 								onSelect={(si, ai) =>
 									dispatch({ type: "SELECT", selected: { stepIdx: si, actionIdx: ai } })
