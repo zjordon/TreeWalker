@@ -50,6 +50,35 @@ export interface DetectedVariable {
 	format?: string | null;
 }
 
+// CSV 批量重放单行进度（镜像后端 BatchRowResult，issue #155）
+export interface BatchRowProgress {
+	row_index: number;
+	variables: Record<string, string>;
+	success: boolean;
+	n_steps: number;
+	extracted_content: string | null;
+	error: string | null;
+}
+
+export type BatchPhase = "idle" | "starting" | "running" | "done" | "cancelled" | "error";
+
+export interface BatchStepProgress {
+	step_index: number;
+	total: number;
+	success: boolean;
+	extracted_content: string | null;
+	error: string | null;
+}
+
+export interface BatchState {
+	phase: BatchPhase;
+	taskId: string | null;
+	totalRows: number;
+	rows: BatchRowProgress[];
+	currentStep: BatchStepProgress | null;
+	error: string | null;
+}
+
 // 编辑器单一 state（useReducer）
 export interface EditorState {
 	history: AgentHistoryList | null;
@@ -58,5 +87,6 @@ export interface EditorState {
 	selected: { stepIdx: number; actionIdx: number } | null;
 	variables: Record<string, DetectedVariable>;
 	runResult: ActionResult[] | null;
+	batch: BatchState;
 	status: string;
 }

@@ -19,7 +19,7 @@ import time
 import uuid
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from tree_walker.agent.actionability import (
     ACTIONABILITY_ACTIONS as _ACTIONABILITY_ACTIONS,
@@ -281,6 +281,8 @@ class RerunMixin:
         self,
         history_file: str | Path,
         variables: dict[str, str] | None = None,
+        *,
+        on_step: Callable[[int, int, list[ActionResult]], Awaitable[None]] | None = None,
         **kwargs: Any,
     ) -> list[ActionResult]:
         """读历史文件 → 可选变量替换 → 重放。
@@ -297,7 +299,7 @@ class RerunMixin:
             )
         if variables:
             history = self._substitute_variables_in_history(history, variables)
-        return await self.rerun_history(history, **kwargs)
+        return await self.rerun_history(history, on_step=on_step, **kwargs)
 
     async def batch_rerun(
         self,
@@ -305,6 +307,8 @@ class RerunMixin:
         csv_path: str | Path,
         *,
         variables: dict[str, str] | None = None,
+        on_row: Callable[[BatchRowResult], Awaitable[None]] | None = None,
+        on_step: Callable[[int, int, list[ActionResult]], Awaitable[None]] | None = None,
         **kwargs: Any,
     ) -> list[BatchRowResult]:
         """CSV 批量重放：每行变量跑一次 ``load_and_rerun``（串行，P4 子任务 2）。
@@ -313,6 +317,10 @@ class RerunMixin:
         缺列 = 该变量用 history 原值（宽容，不报错）；空单元格（""）跳过不注入。
         每行叠加全局 ``variables``（行值优先）。逐行串行（共享一个 BrowserSession）；
         单行异常不中断批量，记入该行 ``error``。
+
+        ``on_row``：每行完成（无论成功/失败）后异步回调，Web SSE 行级进度推送用；
+        CLI 不传则行为不变。行循环顶部与每行结束后检查 ``self.state.stopped``，
+        协作式取消（``Agent.stop()``）在行边界生效（issue #155）。
         """
         import csv
 
@@ -326,29 +334,32 @@ class RerunMixin:
         base = variables or {}
         results: list[BatchRowResult] = []
         for i, row in enumerate(rows):
+            if self.state.stopped:  # 协作式取消：行前检查（issue #155）
+                break
             merged = {**base, **{k: v for k, v in row.items() if v not in (None, "")}}
             try:
                 row_results = await self.load_and_rerun(
-                    history_file, variables=merged or None, **kwargs
+                    history_file, variables=merged or None, on_step=on_step, **kwargs
                 )
                 last = row_results[-1] if row_results else None
-                results.append(
-                    BatchRowResult(
-                        row_index=i,
-                        variables=merged,
-                        success=bool(last and last.is_done and last.success),
-                        n_steps=len(row_results),
-                        extracted_content=last.extracted_content if last else None,
-                        error=last.error if last and last.error else None,
-                    )
+                result = BatchRowResult(
+                    row_index=i,
+                    variables=merged,
+                    success=bool(last and last.is_done and last.success),
+                    n_steps=len(row_results),
+                    extracted_content=last.extracted_content if last else None,
+                    error=last.error if last and last.error else None,
                 )
-            except Exception as e:  # 单行失败不中断批量
+            except Exception as e:  # 单行失败不中断批量（不捕获 CancelledError）
                 logger.exception("CSV 第 %d 行重放失败", i)
-                results.append(
-                    BatchRowResult(
-                        row_index=i, variables=merged, success=False, error=str(e)
-                    )
+                result = BatchRowResult(
+                    row_index=i, variables=merged, success=False, error=str(e)
                 )
+            results.append(result)
+            if on_row is not None:  # 行级进度回调（issue #155，Web SSE 推送用）
+                await on_row(result)
+            if self.state.stopped:  # 协作式取消：行后检查（覆盖取消在行执行中到达）
+                break
         return results
 
     # ── 重放主流程 ─────────────────────────────────────────────────────
@@ -370,6 +381,7 @@ class RerunMixin:
         wait_for_networkidle: bool | None = None,
         summary_llm: LLMClient | None = None,
         ai_step_llm: LLMClient | None = None,
+        on_step: Callable[[int, int, list[ActionResult]], Awaitable[None]] | None = None,
     ) -> list[ActionResult]:
         """重放历史。返回 ``list[ActionResult]``，最后一项是 AI 摘要（``is_done=True``）。
 
@@ -443,6 +455,8 @@ class RerunMixin:
                     rerun_actionability_stable, wait_for_networkidle,
                 )
                 results.extend(step_results)
+                if on_step is not None:  # 步级进度回调（issue #155，每步推送）
+                    await on_step(i, total, step_results)
                 previous_succeeded = bool(step_results) and not any(
                     r.error for r in step_results
                 )
@@ -452,8 +466,17 @@ class RerunMixin:
                 # done 只终止「该步内的动作链」（_execute_history_step 的 guard），
                 # 不应截断后续步骤。对齐 browser-use rerun_history。
         finally:
-            summary = await self._generate_rerun_summary(self.task, results, summary_llm)
-            results.append(summary)
+            if not self.state.stopped:  # 正常路径：生成 AI 摘要
+                summary = await self._generate_rerun_summary(self.task, results, summary_llm)
+                results.append(summary)
+            else:  # 取消快速路径：跳过 summary（否则卡 ~120s LLM），直接关浏览器（issue #155）
+                results.append(
+                    ActionResult(
+                        is_done=True,
+                        success=False,
+                        extracted_content="Rerun cancelled by user.",
+                    )
+                )
             await self.browser.stop()
 
         return results

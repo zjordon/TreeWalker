@@ -1,4 +1,4 @@
-import { useReducer, useCallback } from "react";
+import { useReducer, useCallback, useEffect } from "react";
 import { initialState, reducer } from "./reducer";
 export type { EditorAction } from "./reducer";
 import * as api from "./api";
@@ -7,6 +7,7 @@ import ActionList from "./components/ActionList";
 import ActionEditor from "./components/ActionEditor";
 import VariablePanel from "./components/VariablePanel";
 import RunPanel from "./components/RunPanel";
+import BatchRunPanel from "./components/BatchRunPanel";
 
 export default function App() {
 	const [state, dispatch] = useReducer(reducer, initialState);
@@ -57,6 +58,51 @@ export default function App() {
 		}
 	}, [state.loadedName]);
 
+	const onStartBatch = useCallback(async (file: File) => {
+		if (!state.loadedName) return;
+		dispatch({ type: "BATCH_START" });
+		try {
+			const { task_id, total_rows } = await api.startBatch(state.loadedName, file);
+			dispatch({ type: "BATCH_STARTED", taskId: task_id, totalRows: total_rows });
+		} catch (e) {
+			dispatch({ type: "BATCH_ERROR", error: `启动失败: ${e}` });
+		}
+	}, [state.loadedName]);
+
+	const onCancelBatch = useCallback(async () => {
+		if (!state.batch.taskId) return;
+		try {
+			await api.cancelBatch(state.batch.taskId);
+			dispatch({ type: "BATCH_CANCEL" });
+		} catch (e) {
+			dispatch({ type: "STATUS", status: `中止失败: ${e}` });
+		}
+	}, [state.batch.taskId]);
+
+	const onResetBatch = useCallback(() => {
+		dispatch({ type: "BATCH_RESET" });
+	}, []);
+
+	// SSE 订阅批量进度（依赖只 taskId，避免每行 row 触发重建连接）
+	useEffect(() => {
+		const taskId = state.batch.taskId;
+		if (!taskId || state.batch.phase !== "running") return;
+		const es = api.subscribeBatchProgress(
+			taskId,
+			(row) => dispatch({ type: "BATCH_ROW", row }),
+			(step) => dispatch({ type: "BATCH_STEP", step }),
+			(done) =>
+				dispatch({
+					type: "BATCH_DONE",
+					total: done.total,
+					succeeded: done.succeeded,
+					failed: done.failed,
+					...(done.error ? { error: done.error } : {}),
+				}),
+		);
+		return () => es.close();
+	}, [state.batch.taskId]);
+
 	return (
 		<div className="app">
 			<h1>TreeWalker 历史编辑器</h1>
@@ -75,6 +121,12 @@ export default function App() {
 				</div>
 			</div>
 			<RunPanel state={state} />
+			<BatchRunPanel
+				state={state}
+				onStart={onStartBatch}
+				onCancel={onCancelBatch}
+				onReset={onResetBatch}
+			/>
 		</div>
 	);
 }

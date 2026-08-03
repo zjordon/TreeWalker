@@ -19,8 +19,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import csv
+import json
 import logging
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from aiohttp import web
 
@@ -36,16 +42,38 @@ logger = logging.getLogger(__name__)
 _HISTORY_DIR_KEY = web.AppKey("history_dir", str)
 
 
+@dataclass
+class BatchTaskHandle:
+	"""运行中的 CSV 批量重放任务句柄（issue #155）。单进程 web.run_app，模块级 dict 存。"""
+
+	agent: Any                       # Agent 实例（cancel 调 agent.stop()）
+	queue: asyncio.Queue             # 进度事件（worker put / SSE handler get）
+	total_rows: int
+	csv_path: Path                   # 上传的 CSV 临时文件（任务结束删除）
+	task: asyncio.Task | None = None           # create_task 后回填
+	final_event: dict | None = None            # 任务结束存最终事件（SSE 重连补发）
+
+
+# task_id → handle。单进程单线程 asyncio，无需锁。单并发防同 Chrome 多 BrowserSession 抢 target。
+_BATCH_TASKS: dict[str, BatchTaskHandle] = {}
+_MAX_CONCURRENT_BATCH = 1
+
+
 async def make_app(history_dir: str = "rerun-history") -> web.Application:
 	"""构造编辑器 aiohttp Application。``history_dir`` 由调用方传入（便于测试）。"""
-	app = web.Application()
+	app = web.Application(client_max_size=10 * 1024 * 1024)  # 默认 1MiB 不够 CSV 上传（issue #155）
 	app[_HISTORY_DIR_KEY] = history_dir
 	app.router.add_get("/history/list", _handle_list)
 	app.router.add_get("/history/load", _handle_load)
 	app.router.add_post("/history/save", _handle_save)
 	app.router.add_get("/history/detect", _handle_detect)
 	app.router.add_post("/history/rerun", _handle_rerun)
+	# CSV 批量重放（issue #155）：必须在 catch-all 之前注册，否则被 SPA fallback 吞
+	app.router.add_post("/history/batch/start", _handle_batch_start)
+	app.router.add_get("/history/batch/progress", _handle_batch_progress)
+	app.router.add_post("/history/batch/cancel", _handle_batch_cancel)
 	app.router.add_get("/health", _handle_health)
+	app.on_shutdown.append(_on_batch_shutdown)  # 进程退出时停所有批量任务、关浏览器
 	# 前端 SPA（构建产物在 _STATIC_DIR）：/assets/* 静态资源 + GET / 入口 + catch-all 回退
 	if (_STATIC_DIR / "assets").is_dir():
 		app.router.add_static("/assets", str(_STATIC_DIR / "assets"))
@@ -162,6 +190,189 @@ async def _handle_rerun(request: web.Request) -> web.Response:
 		return web.json_response({"results": [r.model_dump(mode="json") for r in results]})
 	except Exception as e:
 		return web.json_response({"error": str(e)}, status=400)
+
+
+def _sse_event(event_type: str, data: dict) -> bytes:
+	"""格式化一条 SSE 消息（`event: <type>\\ndata: <json>\\n\\n`）。"""
+	payload = json.dumps(data, ensure_ascii=False)
+	return f"event: {event_type}\ndata: {payload}\n\n".encode("utf-8")
+
+
+async def _handle_batch_start(request: web.Request) -> web.Response:
+	"""启动 CSV 批量重放：multipart 上传 CSV → 落盘 → 起 task → 返 {task_id, total_rows}。
+
+	单并发（`_MAX_CONCURRENT_BATCH`）：同 Chrome 多 BrowserSession 抢 CDP target。
+	"""
+	name = request.query.get("name")
+	if not name:
+		return web.json_response({"error": "missing name"}, status=400)
+	try:
+		resolve_rerun_path(_dir(request), name)  # 越界校验
+	except ValueError as e:
+		return web.json_response({"error": str(e)}, status=400)
+
+	# 清已结束 handle（防 dict 无限增长）+ 单并发检查
+	for old_id, h in list(_BATCH_TASKS.items()):
+		if h.final_event is not None:
+			_BATCH_TASKS.pop(old_id, None)
+	active = [h for h in _BATCH_TASKS.values() if h.final_event is None]
+	if len(active) >= _MAX_CONCURRENT_BATCH:
+		return web.json_response(
+			{"error": "已有批量任务在运行，请先等待完成或中止"}, status=409)
+
+	# 读 multipart 的 file part
+	try:
+		reader = await request.multipart()
+		csv_part = None
+		while True:
+			part = await reader.next()
+			if part is None:
+				break
+			if part.name == "file":
+				csv_part = part
+				break
+	except Exception:
+		return web.json_response({"error": "invalid multipart"}, status=400)
+	if csv_part is None:
+		return web.json_response({"error": "missing CSV file part 'file'"}, status=400)
+
+	# 落盘到 rerun_history_dir 下唯一名（复用 resolve_rerun_path 校验）
+	csv_name = f"batch_{uuid.uuid4().hex[:8]}.csv"
+	try:
+		csv_path = resolve_rerun_path(_dir(request), csv_name)
+		with open(csv_path, "wb") as f:
+			while True:
+				chunk = await csv_part.read_chunk()
+				if not chunk:
+					break
+				f.write(chunk)
+	except Exception as e:
+		return web.json_response({"error": f"CSV 写入失败: {e}"}, status=500)
+
+	# 计数 + 空校验
+	try:
+		with open(csv_path, newline="", encoding="utf-8") as f:
+			total_rows = sum(1 for _ in csv.DictReader(f))
+	except Exception as e:
+		csv_path.unlink(missing_ok=True)
+		return web.json_response({"error": f"CSV 解析失败: {e}"}, status=400)
+	if total_rows == 0:
+		csv_path.unlink(missing_ok=True)
+		return web.json_response({"error": "CSV 无数据行（只有表头或空）"}, status=400)
+
+	# 建 agent + handle + 起 task（先存 dict 再 create_task，消除 cancel 竞态）
+	try:
+		agent = _build_agent()
+	except Exception as e:
+		csv_path.unlink(missing_ok=True)
+		return web.json_response({"error": str(e)}, status=400)
+
+	task_id = uuid.uuid4().hex[:8]
+	queue: asyncio.Queue = asyncio.Queue()
+	handle = BatchTaskHandle(
+		agent=agent, queue=queue, total_rows=total_rows, csv_path=csv_path)
+	_BATCH_TASKS[task_id] = handle
+
+	async def run_batch() -> None:
+		async def on_row(result):
+			await queue.put({"type": "row", **result.model_dump(mode="json")})
+
+		async def on_step(step_index, total, step_results):
+			last = step_results[-1] if step_results else None
+			await queue.put({
+				"type": "step", "step_index": step_index, "total": total,
+				"success": not any(r.error for r in step_results),
+				"extracted_content": last.extracted_content if last else None,
+				"error": next((r.error for r in step_results if r.error), None),
+			})
+		try:
+			results = await agent.batch_rerun(name, csv_path, on_row=on_row, on_step=on_step)
+			succeeded = sum(1 for r in results if r.success)
+			final = {"type": "done", "total": len(results),
+			         "succeeded": succeeded, "failed": len(results) - succeeded}
+		except Exception as e:  # batch 整体崩溃（行级异常已在 batch_rerun 内兜住）
+			logger.exception("批量任务 %s 崩溃", task_id)
+			final = {"type": "done", "total": 0, "succeeded": 0,
+			         "failed": 0, "error": str(e)}
+		finally:
+			handle.final_event = final
+			await queue.put(final)
+			csv_path.unlink(missing_ok=True)
+			# 不立即 pop：保留 handle 供 SSE 重连补发 final_event；由下次 start 清理或 on_shutdown 回收。
+
+	handle.task = asyncio.create_task(run_batch())
+	return web.json_response({"task_id": task_id, "total_rows": total_rows})
+
+
+async def _handle_batch_progress(request: web.Request) -> web.StreamResponse:
+	"""SSE 行级进度流。EventSource 只支持 GET → 此端点必须 GET（issue #155）。"""
+	task_id = request.query.get("task_id")
+	if not task_id:
+		return web.json_response({"error": "missing task_id"}, status=400)
+	handle = _BATCH_TASKS.get(task_id)
+	if handle is None:
+		return web.json_response({"error": "unknown task_id"}, status=404)
+
+	resp = web.StreamResponse(status=200, headers={
+		"Content-Type": "text/event-stream",
+		"Cache-Control": "no-cache",
+		"Connection": "keep-alive",
+		"X-Accel-Buffering": "no",  # 防代理缓冲（prod 同源无 nginx，加上无害）
+	})
+	await resp.prepare(request)
+	try:
+		# 任务在客户端连入前就完成且队列已空 → 补发最终事件
+		if handle.final_event is not None and handle.queue.empty():
+			await resp.write(_sse_event("done", handle.final_event))
+			return resp
+		while True:
+			try:
+				event = await asyncio.wait_for(handle.queue.get(), timeout=15.0)
+			except asyncio.TimeoutError:
+				await resp.write(b": keepalive\n\n")  # SSE 注释，客户端忽略；防空闲断连
+				continue
+			await resp.write(_sse_event(event["type"], event))
+			if event["type"] == "done":
+				break
+	except (ConnectionResetError, asyncio.CancelledError):
+		pass  # 客户端断开：任务继续（SSE 与任务解耦），handler 退出
+	finally:
+		try:
+			await resp.write_eof()
+		except Exception:
+			pass
+	return resp
+
+
+async def _handle_batch_cancel(request: web.Request) -> web.Response:
+	"""协作式中止：agent.stop() 设 state.stopped=True，重放循环在行/步边界退出（issue #155）。"""
+	task_id = request.query.get("task_id")
+	if not task_id:
+		return web.json_response({"error": "missing task_id"}, status=400)
+	handle = _BATCH_TASKS.get(task_id)
+	if handle is None:
+		return web.json_response({"error": "unknown task_id"}, status=404)
+	handle.agent.stop()  # 协作式（非 task.cancel，避免丢 finally 的 browser.stop）
+	return web.json_response({"ok": True})
+
+
+async def _on_batch_shutdown(app: web.Application) -> None:
+	"""进程退出（SIGINT/SIGTERM）：停所有批量任务、关浏览器、超时强 cancel。"""
+	for h in list(_BATCH_TASKS.values()):
+		h.agent.stop()
+	tasks = [h.task for h in _BATCH_TASKS.values() if h.task and not h.task.done()]
+	if tasks:
+		try:
+			await asyncio.wait_for(
+				asyncio.gather(*tasks, return_exceptions=True), timeout=10.0)
+		except asyncio.TimeoutError:
+			for h in _BATCH_TASKS.values():
+				if h.task and not h.task.done():
+					h.task.cancel()
+			await asyncio.gather(
+				*[h.task for h in _BATCH_TASKS.values() if h.task],
+				return_exceptions=True)
+	_BATCH_TASKS.clear()
 
 
 async def _handle_health(request: web.Request) -> web.Response:

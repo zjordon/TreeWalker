@@ -3,6 +3,8 @@ import type {
 	AgentHistoryList,
 	DetectedVariable,
 	ActionResult,
+	BatchRowProgress,
+	BatchStepProgress,
 } from "./types";
 
 export const initialState: EditorState = {
@@ -12,6 +14,7 @@ export const initialState: EditorState = {
 	selected: null,
 	variables: {},
 	runResult: null,
+	batch: { phase: "idle", taskId: null, totalRows: 0, rows: [], currentStep: null, error: null },
 	status: "",
 };
 
@@ -33,6 +36,20 @@ export type EditorAction =
 	| { type: "SET_DIRTY"; dirty: boolean }
 	| { type: "DETECT_DONE"; variables: Record<string, DetectedVariable> }
 	| { type: "RUN_DONE"; results: ActionResult[] | null }
+	| { type: "BATCH_START" }
+	| { type: "BATCH_STARTED"; taskId: string; totalRows: number }
+	| { type: "BATCH_ROW"; row: BatchRowProgress }
+	| { type: "BATCH_STEP"; step: BatchStepProgress }
+	| {
+			type: "BATCH_DONE";
+			total: number;
+			succeeded: number;
+			failed: number;
+			error?: string;
+	  }
+	| { type: "BATCH_CANCEL" }
+	| { type: "BATCH_ERROR"; error: string }
+	| { type: "BATCH_RESET" }
 	| { type: "STATUS"; status: string };
 
 export function reducer(state: EditorState, action: EditorAction): EditorState {
@@ -45,7 +62,8 @@ export function reducer(state: EditorState, action: EditorAction): EditorState {
 				dirty: false,
 				selected: null,
 				runResult: null,
-				status: `已加载 ${action.name}（${action.history.history.length} 步）`,
+				batch: { phase: "idle", taskId: null, totalRows: 0, rows: [], currentStep: null, error: null },
+			status: `已加载 ${action.name}（${action.history.history.length} 步）`,
 			};
 		case "SELECT":
 			return { ...state, selected: action.selected };
@@ -113,7 +131,36 @@ export function reducer(state: EditorState, action: EditorAction): EditorState {
 				runResult: action.results,
 				status: action.results ? "试跑完成" : "",
 			};
-		case "STATUS":
+		case "BATCH_START":
+		return { ...state, batch: { ...state.batch, phase: "starting", rows: [], error: null } };
+	case "BATCH_STARTED":
+		return {
+			...state,
+			batch: { ...state.batch, phase: "running", taskId: action.taskId, totalRows: action.totalRows },
+		};
+	case "BATCH_STEP":
+		return { ...state, batch: { ...state.batch, currentStep: action.step } };
+	case "BATCH_ROW":
+		return { ...state, batch: { ...state.batch, rows: [...state.batch.rows, action.row] } };
+	case "BATCH_DONE":
+		return {
+			...state,
+			batch: {
+				...state.batch,
+				phase: action.error ? "error" : "done",
+				error: action.error ?? null,
+			},
+		};
+	case "BATCH_CANCEL":
+		return { ...state, batch: { ...state.batch, phase: "cancelled" } };
+	case "BATCH_ERROR":
+		return { ...state, batch: { ...state.batch, phase: "error", error: action.error } };
+	case "BATCH_RESET":
+		return {
+			...state,
+			batch: { phase: "idle", taskId: null, totalRows: 0, rows: [], currentStep: null, error: null },
+		};
+	case "STATUS":
 			return { ...state, status: action.status };
 		default:
 			return state;
