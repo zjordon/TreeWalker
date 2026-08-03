@@ -28,11 +28,26 @@ button.error { color: #c00; border-color: #c00; }
 table { width: 100%; border-collapse: collapse; background: #fff; }
 th, td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; vertical-align: top; }
 th { background: #eee; position: sticky; top: 0; }
-tr.row { cursor: pointer; }
+tr.row { cursor: default; }
 tr.row.selected { background: #e3f2fd; }
 tr.row.failed { background: #fdecea; }
 .grip { cursor: grab; user-select: none; color: #999; width: 16px; text-align: center; }
 .grip:active { cursor: grabbing; }
+
+.action-cell { line-height: 1.9; }
+.action-chip {
+	display: inline-block;
+	margin: 1px 2px;
+	padding: 1px 6px;
+	border: 1px solid #ccc;
+	border-radius: 9px;
+	background: #fff;
+	cursor: pointer;
+	white-space: nowrap;
+}
+.action-chip:hover { background: #e3f2fd; border-color: #90caf9; }
+.action-chip.selected { background: #1976d2; color: #fff; border-color: #1976d2; }
+.action-desc { display: block; color: #555; }
 
 .panel { background: #fff; border: 1px solid #ddd; padding: 10px; }
 .panel h2 { font-size: 14px; margin: 0 0 8px; }
