@@ -5,6 +5,29 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.14.0] - 2026-08-04
+
+### Added
+
+**可视化历史编辑器（#149/#150，ROADMAP P4）**——浏览器端 `history_editor_ui` 可视化编辑录制产物，把"录制完只能看 JSON"升级为可交互编辑：动作列表（每步动作类型+目标元素+参数）、拖拽排序、删步、改 input_text；变量检测（`variable_detector` 自动）+ 人工标注混合，导出变量名 CSV 模板。
+
+**CSV 批量重放 UI——SSE 步级实时进度 + 协作式中止（#155/#156，ROADMAP P4）**——把后端已有的 `Agent.batch_rerun` 暴露到 Web，CSV 每行一组变量批量跑，带实时进度与中止：
+
+- 后端 `history_editor/server.py`：`/history/batch/{start,progress,cancel}` 三端点；multipart CSV 上传（`resolve_rerun_path` 越界校验）+ `BatchTaskHandle` 模块级 dict（单并发）+ `on_shutdown` 清理
+- SSE **步级**（每步 `step` 事件：步号/成功/extracted_content）+ 行级实时推送；前端 `EventSource` 订阅，`BatchRunPanel` 显示当前步 `X/Y`
+- 中止：协作式 `agent.stop()`；`rerun_history` finally 守卫取消时跳过 AI 摘要（否则卡 ~120s LLM），浏览器秒关
+- `batch_rerun` 加 `on_row`/`on_step` 回调 + 行级 `state.stopped`（向后兼容，CLI `examples/csv_rerun.py` 零回归）
+
+**agent 上传封面语义线索采集移植（#151/#152）**——agent 录制路径也采集 `_semantic_clue`（此前仅手工录制有），重放端复用 `_match_file_upload_by_clue`；新建共享模块 `agent/upload_identity.py`；修复二次上传。
+
+### Fixed
+
+- **多 action 步骤变量标注（#153/#154）**：`history_editor_ui` 一步含多 action 时合并成单行、点击只选中第 0 个 → 无法为各 action 单独标注变量；改为动作列每个 action 可单独选中。
+
+### Docs
+
+- ROADMAP：P4（录制-重放体验打磨）标记 ✅ 完成；新增 P5（变量识别扩展到选择类动作）/ P6（TUI→浏览器端）。
+
 ## [0.13.0] - 2026-08-01
 
 ### Added
