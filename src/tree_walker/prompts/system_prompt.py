@@ -91,6 +91,26 @@ successfully. Do NOT retry on a different index just because of it.
 """
 
 
+# Appended to the prompt ONLY when a dropdown action is available for the current
+# page (URL filters may drop actions — don't advertise guidance the agent can't
+# act on). Radix/shadcn dropdowns render as role=combobox, and the bare name
+# "dropdown" doesn't cue the model to these tools — make it explicit. See
+# build_system_prompt.
+DROPDOWN_RULES = """\
+
+## Dropdown Rules
+
+1. For any dropdown — native `<select>`, `role=combobox`, `role=listbox`, or a \
+custom dropdown — use `dropdown_options` to read its options and `select_dropdown` \
+to pick a value. These tools operate on the dropdown directly.
+2. Do NOT first `click` the dropdown trigger (the combobox button / `<select>`). \
+These tools expand and read/select options themselves; clicking first wastes a step \
+and may leave an open menu behind.
+3. For a Radix/shadcn custom dropdown, the trigger is a `role=combobox` button — \
+pass that button's index to `select_dropdown`.
+"""
+
+
 def build_system_prompt(
     action_descriptions: str,
     task: str = "",
@@ -106,6 +126,8 @@ def build_system_prompt(
     # filters may drop it — don't advertise an action the agent can't call).
     if "upload_file" in action_descriptions:
         prompt += FILE_UPLOAD_RULES
+    if "dropdown_options" in action_descriptions or "select_dropdown" in action_descriptions:
+        prompt += DROPDOWN_RULES
     if enable_decision_attribution:
         from tree_walker.observability.decision_prompt import get_decision_attribution_prompt
         prompt += get_decision_attribution_prompt()

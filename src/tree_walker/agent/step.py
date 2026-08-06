@@ -184,6 +184,8 @@ class StepPipeline:
         # 1. Get browser state
         # 断路止血：每步截图暂不取（LLM 视觉通道尚未打通，见 docs/tools-optimize/screenshot.md 阶段二）
         browser_state = await self.browser.get_state(include_screenshot=False)
+        # 临时调试：env AGENT_DEBUG_DUMP_DIR 设定时，每步 dump element_tree_text（issue #157）
+        await self._maybe_dump_step_dom(browser_state)
 
         # 2. Log step context
         self._log_step_context(browser_state)
@@ -285,6 +287,73 @@ class StepPipeline:
         self._force_done_after_failure()
 
         return browser_state, state_msg
+
+    async def _maybe_dump_step_dom(self, browser_state: BrowserStateSummary) -> None:
+        """临时调试：env AGENT_DEBUG_DUMP_DIR 设定时，每步把 element_tree_text + JS 直查实际 DOM 落盘。
+
+        排查 dom_snapshot 是否漏抓已存在的表单子树（issue #157）：
+        - JS probe 查实际 DOM 的表单控件数 + name input/form 的 display/rect（页面真实可见性）；
+        - element_tree_text 是 dom_snapshot 生成给模型的视图。
+        对照两者即可判断「表单真 hidden」还是「dom_snapshot 漏抓」。
+        排查完取消设置即关；不设时本方法 no-op，对探索零影响。
+        """
+        import os
+        dump_dir = os.environ.get("AGENT_DEBUG_DUMP_DIR")
+        if not dump_dir:
+            return
+        dom = browser_state.dom_state
+        tree = getattr(dom, "element_tree_text", "") if dom else ""
+        js_probe = await self._dump_js_probe()  # 实际 DOM 可见性（对照 dom_snapshot）
+        try:
+            os.makedirs(dump_dir, exist_ok=True)
+            from datetime import datetime, timezone
+            ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+            step = self.state.n_steps
+            path = os.path.join(dump_dir, f"step_{step:02d}.txt")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(f"=== step {step} | url={browser_state.url} | {ts} ===\n\n")
+                f.write("--- JS probe (actual DOM) ---\n")
+                f.write(js_probe)
+                f.write("\n\n--- element_tree_text (dom_snapshot) ---\n")
+                f.write(tree)
+        except OSError as e:
+            logger.warning("step dom dump failed: %s", e)
+
+    async def _dump_js_probe(self) -> str:
+        """直查实际 DOM 的表单结构 + 所有控件布局信息（issue #157：定位 dom_snapshot 是否漏抓）。
+
+        返回 JSON 摘要（formCount / nameInputCount / 每个 input·select·textarea 的 rect +
+        offsetWidth + computed width + offsetParent）+ form 与 body 的 outerHTML 片段。
+        对照 dom_snapshot 的 element_tree_text 即可判断「表单有布局却被剪」还是「真无布局」：
+        offsetParent=null / offsetWidth=0 → 真无布局；offsetWidth≠0 但 rect=0 → 采集问题。
+        """
+        js = r"""(function(){
+  var form = document.querySelector('form');
+  var controls = Array.from(document.querySelectorAll('input,select,textarea')).map(function(el){
+    var r = el.getBoundingClientRect(); var cs = getComputedStyle(el);
+    return {tag:el.tagName, name:el.name, type:el.type, id:el.id,
+      rect:[Math.round(r.x),Math.round(r.y),Math.round(r.width),Math.round(r.height)],
+      offsetW:el.offsetWidth, offsetH:el.offsetHeight, offsetParent:!!el.offsetParent,
+      csW:cs.width, csH:cs.height};
+  });
+  var summary = JSON.stringify({
+    formCount: document.querySelectorAll('form').length,
+    nameInputCount: document.querySelectorAll('input[name="name"]').length,
+    controls: controls
+  });
+  var formHTML = form ? form.outerHTML.slice(0,3000) : "<no form>";
+  var bodyHTML = document.body.outerHTML.slice(0,2000);
+  return summary + "\n\n--- form outerHTML (first 3000 chars) ---\n" + formHTML
+    + "\n\n--- body outerHTML (first 2000 chars) ---\n" + bodyHTML;
+})()"""
+        try:
+            result = await self.browser.client.send.Runtime.evaluate(
+                {"expression": js, "returnByValue": True},
+                session_id=self.browser.current_session_id,
+            )
+            return result.get("result", {}).get("value", "<no value>")
+        except Exception as e:  # noqa: BLE001
+            return f"<js probe failed: {e!r}>"
 
     # ── Context injection helpers ─────────────────────────────────────
 

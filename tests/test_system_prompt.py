@@ -126,3 +126,32 @@ class TestFileInputsSection:
             self._state([FileInputInfo(backend_node_id=10)])
         )
         assert "[File Inputs]" not in build_state_message(self._state([]))
+
+
+class TestDropdownRules:
+    """DROPDOWN_RULES：dropdown action 可用时追加引导，优先 dropdown_options /
+    select_dropdown 而非 click（纠正 Radix combobox 默认 click）。"""
+
+    def test_appended_when_dropdown_available(self):
+        prompt = build_system_prompt(
+            action_descriptions="- **dropdown_options**(index): ...\n"
+            "- **select_dropdown**(index): ...",
+            task="t",
+        )
+        assert "## Dropdown Rules" in prompt
+        assert "role=combobox" in prompt
+        assert "Do NOT first" in prompt  # 禁止先 click
+
+    def test_omitted_when_no_dropdown_action(self):
+        """action_descriptions 不含 dropdown_options/select_dropdown → 不追加。"""
+        prompt = build_system_prompt(
+            action_descriptions="- **click**(index): Click an element",
+            task="t",
+        )
+        assert "## Dropdown Rules" not in prompt
+
+    def test_dropdown_description_mentions_combobox(self):
+        """工具描述补了 combobox/listbox，让模型能把 role=combobox 关联到这些工具。"""
+        from tree_walker.tools.models import ACTION_DEFINITIONS
+        desc = ACTION_DEFINITIONS["dropdown_options"][1] + ACTION_DEFINITIONS["select_dropdown"][1]
+        assert "role=combobox" in desc
