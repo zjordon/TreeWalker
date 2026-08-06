@@ -595,12 +595,15 @@ ACTION_DEFINITIONS: dict[str, tuple[type[BaseModel], str, bool]] = {
     ),
     "dropdown_options": (
         DropdownOptionsParams,
-        "Get all options from a select dropdown element",
+        "Get all options from a dropdown element: native <select>, role=combobox, "
+        "role=listbox, or custom dropdown",
         False,
     ),
     "select_dropdown": (
         SelectDropdownParams,
-        "Select an option in a dropdown element",
+        "Select an option in a dropdown element (native <select>, role=combobox, "
+        "role=listbox, or custom dropdown). Pass the dropdown's index — do not "
+        "click it first",
         False,
     ),
     "upload_file": (UploadFileParams, "Upload a file to a file input element. Do NOT click the input or an upload button first — upload_file sets the file directly without opening the OS file picker", False),
