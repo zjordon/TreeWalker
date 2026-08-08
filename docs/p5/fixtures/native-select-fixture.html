@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+	<meta charset="UTF-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+	<title>P5 原生 select 测试夹具 · native-select-fixture</title>
+	<style>
+		:root { color-scheme: light; }
+		body { font: 15px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; max-width: 880px; margin: 0 auto; padding: 24px 16px 64px; color: #1f2328; }
+		h1 { font-size: 20px; margin-bottom: 4px; }
+		.sub { color: #57606a; margin: 0 0 8px; }
+		.intro { background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 6px; padding: 12px 14px; margin: 16px 0 24px; font-size: 14px; }
+		.intro code { background: #eaeef2; padding: 1px 5px; border-radius: 4px; }
+		form { display: flex; flex-direction: column; gap: 18px; }
+		fieldset { border: 1px solid #d0d7de; border-radius: 8px; padding: 14px 16px 8px; margin: 0; }
+		legend { font-weight: 600; padding: 0 6px; }
+		legend .tag { font-size: 12px; font-weight: 500; padding: 1px 7px; border-radius: 10px; margin-left: 6px; vertical-align: middle; }
+		.tag.auto { background: #dafbe1; color: #1a7f37; }
+		.tag.manual { background: #fff8c5; color: #9a6700; }
+		.tag.neg { background: #ffebe9; color: #cf222e; }
+		label { display: block; margin: 8px 0 2px; font-size: 13px; color: #57606a; }
+		select, input[type="text"], input[type="email"] { font: inherit; padding: 6px 8px; border: 1px solid #d0d7de; border-radius: 6px; background: #fff; min-width: 240px; }
+		.row { display: flex; gap: 16px; flex-wrap: wrap; }
+		.row > div { flex: 1 1 220px; }
+		button { font: inherit; padding: 8px 18px; border: 1px solid #1f6feb; background: #1f6feb; color: #fff; border-radius: 6px; cursor: pointer; align-self: flex-start; }
+		.hint { font-size: 12px; color: #8c959f; margin-top: 2px; }
+		.note { background: #fff8c5; border: 1px solid #eac54f; border-radius: 6px; padding: 12px 14px; margin-top: 18px; font-size: 14px; }
+	</style>
+</head>
+<body>
+
+<h1>P5 原生 <code>&lt;select&gt;</code> 测试夹具</h1>
+<p class="sub">每个 fieldset = 一个 case，对应 <code>docs/p5/01-select-as-variable-plan.md</code> 的一条验证点。HTML 注释里写了预期录制 / 检测 / 重放行为。</p>
+
+<div class="intro">
+	<strong>怎么用：</strong>用 TreeWalker 录制这个页面，依次操作每个下拉框（选非默认项），停止后检查落盘 <code>history.json</code>。<br />
+	标签含义：<span class="tag auto">应自动检测</span> = select 带 <code>_detect_from_attributes</code> 认的英文关键词；
+	<span class="tag manual">需手动标注</span> = 无关键词，走 P4 手动标注（<code>strFields</code> 含 value/label）；
+	<span class="tag neg">不应检测（反例）</span> = 验证保守检测不误报。<br />
+	关键词清单见 <code>src/tree_walker/agent/variable_detector.py:62-112</code>：<code>email/phone/name/date/address/city/state/province/country/zip/...</code>（仅英文，中文 aria-label 不命中）。
+</div>
+
+<form id="the-form" onsubmit="return false;">
+
+	<!-- ═══════════════════════════════════════════════════════════════════
+	     Case 1 / 国家 country —— 核心正例（HERO CASE）
+	     验证点：
+	       · 录制同时记 value + label（设计决策 1）
+	       · 变量名从 id 推导（设计决策 2）→ name="country"
+	       · original_value = label = "中国"（设计决策 2）
+	       · label 作重放键：CSV 替换 label，重放按 label 选（设计决策 3、E2E 1/3/4）
+	       · 保守检测命中 keyword "country"（设计决策 4）
+	     DOM：<select id="country" name="country">，value≠label（cn→中国），含 value="" 占位项
+	     预期录制：params = { value: "cn", label: "中国" }
+	     预期检测：自动 → DetectedVariable(name="country", original_value="中国", format=None)
+	     预期 CSV 批量重放：模板含 country 列；填 "美国" → params.label 被精确替换为 "美国"，
+	                        params.value ("cn") 不被误伤；重放按 label 匹配选「美国」
+	     预期单跑回归：load_and_rerun 原历史 → 按 label "中国" 选回，不回归
+	     边界：占位项 value="" 录制/重放不应报错
+	═══════════════════════════════════════════════════════════════════ -->
+	<fieldset>
+		<legend>Case 1 · 国家 <span class="tag auto">应自动检测 → country</span></legend>
+		<label for="country">国家 / Country（value≠label，含空占位项）</label>
+		<select id="country" name="country" data-smoke="country">
+			<option value="" selected>请选择国家</option>
+			<option value="cn">中国</option>
+			<option value="us">美国</option>
+			<option value="jp">日本</option>
+			<option value="uk">英国</option>
+			<option value="de">德国</option>
+		</select>
+		<p class="hint">选中「中国」→ 录得 value="cn" + label="中国"；检测出变量 country="中国"。这是覆盖整条 value/label/检测/CSV/回归链路的主用例。</p>
+	</fieldset>
+
+	<!-- ═══════════════════════════════════════════════════════════════════
+	     Case 2 / 省份 province —— name 关键词派生（无 id）
+	     验证点：
+	       · 变量名从 name 推导（设计决策 2）
+	       · ⚠️ 注意归一：_detect_from_attributes 把 "province" 归一成变量名 "state"
+	         （variable_detector.py:100 state/province → "state"），不是 "province"
+	     DOM：<select name="province">（无 id），value≠label（gd→广东省）
+	     预期录制：params = { value: "gd", label: "广东省" }
+	     预期检测：自动 → name="state"（不是 province！），original_value="广东省"
+	═══════════════════════════════════════════════════════════════════ -->
+	<fieldset>
+		<legend>Case 2 · 省份 <span class="tag auto">应自动检测 → state（注意归一）</span></legend>
+		<label>省份 / Province（仅 name，无 id）
+		<select name="province" data-smoke="province">
+			<option value="gd">广东省</option>
+			<option value="zj" selected>浙江省</option>
+			<option value="js">江苏省</option>
+			<option value="sd">山东省</option>
+		</select></label>
+		<p class="hint">选中「广东省」→ 检测出变量 <strong>state</strong>="广东省"（province 被 _detect_from_attributes 归一为 state）。</p>
+	</fieldset>
+
+	<!-- ═══════════════════════════════════════════════════════════════════
+	     Case 3 / 城市 city —— 中文 aria-label，反例（保守检测不命中）
+	     验证点：
+	       · 保守检测：aria-label 是中文「城市」，不含英文关键词 → 不自动检测（设计决策 4）
+	       · 验证「不误报」（单元测试：select 无可识别 name → 不自动检测）
+	       · 仍可走 P4 手动标注：strFields 含 value/label，标注默认落到 label（设计决策、UI 改动 6）
+	     DOM：<select aria-label="城市">（无 id/name），value≠label（bj→北京）
+	     预期录制：params = { value: "bj", label: "北京" }
+	     预期检测：不自动检测（combined="城市"，无英文关键词）→ 仅手动标注可用
+	     说明：真实中文站 aria-label 多为中文，本就难自动检测——这是保守策略的真实代价。
+	═══════════════════════════════════════════════════════════════════ -->
+	<fieldset>
+		<legend>Case 3 · 城市 <span class="tag neg">不应检测（反例）/ 可手动标注</span></legend>
+		<label>城市（aria-label="城市"，无 id/name）
+		<select aria-label="城市" data-smoke="city">
+			<option value="bj">北京</option>
+			<option value="sh">上海</option>
+			<option value="gz">广州</option>
+			<option value="sz" selected>深圳</option>
+		</select></label>
+		<p class="hint">选中「北京」→ 录得 value/label，但 <strong>不自动检测</strong>（中文 aria-label 无英文关键词）；编辑器手动标注默认落到 label。</p>
+	</fieldset>
+
+	<!-- ═══════════════════════════════════════════════════════════════════
+	     Case 4 / 每页条数 per_page —— value==label，测 value 兜底
+	     验证点：
+	       · value==label：录制 label 与 value 相同（label="25", value="25"）
+	       · 重放「label if present else value」兜底（设计决策 3）——此处 label==value，选哪个都对
+	       · 保守检测：id="per_page" 无关键词 → 不自动检测（同 Case 3 走手动）
+	     DOM：<select id="per_page">，<option value="25">25</option>（value 属性 == 文本）
+	     预期录制：params = { value: "25", label: "25" }
+	     预期检测：不自动检测（"per_page" 无关键词）
+	═══════════════════════════════════════════════════════════════════ -->
+	<fieldset>
+		<legend>Case 4 · 每页条数 <span class="tag manual">需手动标注 / value==label 兜底</span></legend>
+		<label for="per_page">每页条数 / Per page（value==label）</label>
+		<select id="per_page" data-smoke="per_page">
+			<option value="25" selected>25</option>
+			<option value="50">50</option>
+			<option value="100">100</option>
+		</select>
+		<p class="hint">选中「50」→ value="50"、label="50"；测 value 兜底路径（label==value 时二者等价）。</p>
+	</fieldset>
+
+	<!-- ═══════════════════════════════════════════════════════════════════
+	     Case 5 / 颜色 color —— <option> 无 value 属性的 DOM 边界
+	     验证点：
+	       · <option>红</option> 无 value 属性 → select.value 隐式取文本="红"，
+	         label = options.text = "红" → 录得 value="红"、label="红"
+	       · 验证录制器 onSelect 对「无 value 属性」的 option 不报错、不丢值
+	       · 保守检测：id="color" 无关键词 → 不自动检测
+	     DOM：<select id="color">，<option>红</option>（无 value 属性）
+	     预期录制：params = { value: "红", label: "红" }（value 来自隐式文本）
+	     预期检测：不自动检测
+	═══════════════════════════════════════════════════════════════════ -->
+	<fieldset>
+		<legend>Case 5 · 颜色 <span class="tag manual">option 无 value 属性的边界</span></legend>
+		<label for="color">颜色 / Color（option 无 value 属性）</label>
+		<select id="color" data-smoke="color">
+			<option>红</option>
+			<option>蓝</option>
+			<option selected>绿</option>
+			<option>黄</option>
+		</select>
+		<p class="hint">option 没有 value 属性时，select.value 隐式取文本；验证录制器不丢值、label 与 value 都拿到「绿」。</p>
+	</fieldset>
+
+	<!-- ═══════════════════════════════════════════════════════════════════
+	     Case 6 / 账单州 + 收货州 —— 变量名去重（_ensure_unique_name）
+	     验证点：
+	       · 两个 select 的 id 都含 "state" → _detect_from_attributes 都归一成 name="state"
+	       · 触发 _ensure_unique_name：第二个变成 "state_2"（variable_detector.py:136-143，从 _2 起）
+	       · 验证「select 与 select 变量混合 → 命名去重正常」（单元测试 3）
+	     DOM：<select id="billing_state">、<select id="shipping_state">，均 value≠label
+	     预期录制：各带 value+label
+	     预期检测：第一个 → state="加利福尼亚"；第二个 → state_2="纽约"（去重）
+	     注意：combined="billing_state" 不含 address 关键词，直接命中 state 分支。
+	═══════════════════════════════════════════════════════════════════ -->
+	<fieldset>
+		<legend>Case 6 · 账单州 / 收货州 <span class="tag auto">变量名去重 → state + state_2</span></legend>
+		<div class="row">
+			<div>
+				<label for="billing_state">账单州 / Billing state</label>
+				<select id="billing_state" data-smoke="billing_state">
+					<option value="ca">加利福尼亚</option>
+					<option value="ny" selected>纽约</option>
+					<option value="tx">德克萨斯</option>
+				</select>
+			</div>
+			<div>
+				<label for="shipping_state">收货州 / Shipping state</label>
+				<select id="shipping_state" data-smoke="shipping_state">
+					<option value="ca">加利福尼亚</option>
+					<option value="ny">纽约</option>
+					<option value="tx" selected>德克萨斯</option>
+				</select>
+			</div>
+		</div>
+		<p class="hint">两个 id 都含 "state" → 都归一为变量名 <strong>state</strong>；_ensure_unique_name 把第二个改成 <strong>state_2</strong>。</p>
+	</fieldset>
+
+	<!-- ═══════════════════════════════════════════════════════════════════
+	     Case 7 / 文本输入 —— select 与 text 变量混合，验证互不干扰（单元测试 3）
+	     验证点：
+	       · 同页既有 select 变量（上）又有 text 变量（email/name/address）→ 互不干扰
+	       · 这些 input 走既有 _FIELDS=("text","query") 路径，分别检测为 email/full_name/address
+	     预期检测：email、full_name、address 三个 text 变量与上面的 select 变量共存、命名各自唯一
+	═══════════════════════════════════════════════════════════════════ -->
+	<fieldset>
+		<legend>Case 7 · 文本输入 <span class="tag auto">与 select 变量混合，互不干扰</span></legend>
+		<label for="email">邮箱 / Email</label>
+		<input type="email" id="email" name="email" placeholder="test@example.com" />
+		<label for="full_name">姓名 / Full name</label>
+		<input type="text" id="full_name" name="full_name" placeholder="张三" />
+		<label for="address">详细地址 / Address</label>
+		<input type="text" id="address" name="address" placeholder="朝阳区..." />
+		<p class="hint">既有文本变量（email/full_name/address）又有 select 变量，验证两套检测互不干扰、命名各自唯一。</p>
+	</fieldset>
+
+	<button type="submit">提交（仅演示，不跳转）</button>
+</form>
+
+<!-- ═══════════════════════════════════════════════════════════════════
+     附：无法用 DOM 表达的两个验证点（仅记录，非交互 case）
+     ─────────────────────────────────────────────────────────────────
+     A. 旧历史兼容（E2E 5 / 设计决策 3 的 value 兜底）：
+        加载「只有 value、无 label」的旧 select history → 重放仍按 value 选。
+        这是历史文件层面的问题，本夹具无法制造；需手工编辑一份去掉 label 的 history.json 测试。
+     B. label 为空（option 无文本 / 录制时 selectedIndex 为占位项）：
+        录制端 change #1 用 `label ? { label } : {}` 省略空 label key；
+        event_mapper change #2 同样 `if label: params["label"]=label`。
+        ⇒ 空 label 时 params 只有 value，检测分支（plan step 5 取 label 非空才产出）应跳过、不误报。
+        Case 1 的占位项 value="" 配合可观察：选回占位项时 label="请选择国家"（非空），故仍走 label 路径。
+═══════════════════════════════════════════════════════════════════ -->
+<div class="note">
+	<strong>附：两个无法用本页 DOM 测的点</strong>
+	<ul style="margin:6px 0 0; padding-left:20px;">
+		<li><b>旧历史兼容（value 兜底）</b>：加载只有 value、无 label 的旧 select history，重放仍按 value 选。需手工编辑一份去掉 <code>label</code> 的 <code>history.json</code> 测，DOM 造不出来。</li>
+		<li><b>空 label 省略</b>：录制端空 label 时省略 <code>label</code> key（<code>label ? {label} : {}</code>），检测分支应跳过不误报。</li>
+	</ul>
+</div>
+
+<script>
+	// 仅阻止真实提交跳转，方便反复录制/重放；点提交按钮本身仍会被录制为一次动作。
+	document.getElementById("the-form").addEventListener("submit", function (e) {
+		e.preventDefault();
+		var b = this.querySelector("button[type=submit]");
+		var orig = b.textContent;
+		b.textContent = "已提交（仅演示）";
+		setTimeout(function () { b.textContent = orig; }, 1500);
+	});
+</script>
+
+</body>
+</html>
