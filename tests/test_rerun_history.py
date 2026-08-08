@@ -16,12 +16,13 @@ import pytest
 
 from tree_walker.agent.rerun import MatchLevel, RerunMixin, _substitute_in_dict
 from tree_walker.agent.step import StepPipeline
-from tree_walker.agent.variable_detector import detect_variables_in_history
+from tree_walker.agent.variable_detector import detect_variables_in_history, merge_variable_sources
 from tree_walker.agent.views import (
     AgentHistory,
     AgentHistoryList,
     ActionResult,
     DetectedVariable,
+    ManualVariableBinding,
     StepMetadata,
     redact_sensitive_string,
 )
@@ -445,6 +446,46 @@ def test_substitute_unknown_variable_skipped():
     new = rm._substitute_variables_in_history(history, {"nonexistent": "x"})
     assert new.history[0].model_output["action"]["params"]["text"] == "john@x.com"
 
+
+def test_detect_does_not_autodetect_select_dropdown():
+    """select_dropdown.value 不在 _FIELDS(text/query) → 不自动检测（P5 agent 路径走手工标注）。
+    守住「select 不进自动检测」决策：若误把 value 加进 _FIELDS，此断言失败即提醒。"""
+    history = AgentHistoryList(history=[
+        AgentHistory(
+            step_number=0,
+            model_output={"action": {"name": "select_dropdown", "params": {"index": 4, "value": "Technical Support"}}},
+            result=[],
+            interacted_element=[{"node_name": "SELECT", "attributes": {"id": "department"}}],
+        )
+    ])
+    assert detect_variables_in_history(history) == {}
+
+
+def test_manual_select_dropdown_variable_substitutes():
+    """P5 agent 路径核心：手工标注 select_dropdown.value → 并入合并变量集 → 精确整串替换 params.value。
+    agent 的 value 本就是可见文本（如 'Technical Support'，非 value 属性码），无需 label；
+    重放时 set_select_option 按 text 匹配（live 验证见 examples/p5_select_e2e_live.py）。"""
+    rm = RerunMixin()
+    history = AgentHistoryList(history=[
+        AgentHistory(
+            step_number=0,
+            model_output={"action": {"name": "select_dropdown", "params": {"index": 4, "value": "Technical Support"}}},
+            result=[],
+            interacted_element=[{"node_name": "SELECT", "attributes": {"id": "department"}}],
+        )
+    ])
+    history.manual_variables = [ManualVariableBinding(
+        name="department", step_number=0, action_index=0, field="value",
+        original_value="Technical Support")]
+    # 手工变量并入合并集（CSV 列头 = detect ∪ manual）；select 不被自动检测 → department 仅来自 manual
+    merged = merge_variable_sources(detect_variables_in_history(history), history.manual_variables)
+    assert "department" in merged
+    assert merged["department"].original_value == "Technical Support"
+    # 替换：Technical Support → Sales，精确命中 params.value；index 不动；原始 history 未污染
+    new = rm._substitute_variables_in_history(history, {"department": "Sales"})
+    assert new.history[0].model_output["action"]["params"]["value"] == "Sales"
+    assert new.history[0].model_output["action"]["params"]["index"] == 4
+    assert history.history[0].model_output["action"]["params"]["value"] == "Technical Support"
 
 # ── 步间延迟 / 跳过重试辅助 ─────────────────────────────────────────────
 
