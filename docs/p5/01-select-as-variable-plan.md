@@ -62,6 +62,7 @@ TreeWalker 的 `select_dropdown`（24 动作词表）本就契合业界主流（
 - [`fixtures/native-select-fixture.html`](./fixtures/native-select-fixture.html) —— 原生 select demo 页（各 case 注释；可用作 agent 探索或人工测试目标）。
 - [`03-serve-fixture-locally.md`](./03-serve-fixture-locally.md) —— 用内置 `http.server` 本地托管 fixture 的步骤（含给 agent example 复用常驻 URL、nginx 可选）。
 - [`04-select-record-replay-mechanism.md`](./04-select-record-replay-mechanism.md) —— 录制（`select_dropdown` 工具 + `set_select_option` 的 text/value 匹配）与重放（CSV 变量替换 + 指纹重定位）的原理图解与代码索引。
+- [`05-p5-takeaways-and-custom-dropdown-bridge.md`](./05-p5-takeaways-and-custom-dropdown-bridge.md) —— P5 关键知识总结 + 向「自定义下拉录制重放」下一阶段的桥接判断点。
 
 ## 历史
 
