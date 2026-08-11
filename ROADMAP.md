@@ -73,7 +73,7 @@ agent 探索时按 host 读 `domain-skills/<host>/` 注入上下文（默认关�
 
 ## 下一阶段计划
 
-> P1、P4 已完成；下一阶段主要方向 = **P5（变量识别扩展到选择类动作）** + **P6（TUI→浏览器端）**；P2（进行中）、P3（备选）为既有项。
+> P1、P4、P5 已完成；下一阶段主要方向 = **P6（TUI→浏览器端）** 与 **P7（WebArena 基准评测）**；P2（进行中）、P3（备选）为既有项。
 
 ### P2 —— agent 自动探索可靠性提升（🟡 进行中：P0 已交付，P1-P3 暂缓）
 
@@ -127,17 +127,22 @@ agent 探索时按 host 读 `domain-skills/<host>/` 注入上下文（默认关�
   - 录制一次喂 100 行数据跑 100 次（`for row in csv: load_and_rerun(variables=row)`）
   - [[browser-variable-substitution]] 的批量执行场景
 
-### P5 —— 变量识别扩展到选择类动作
+### P5 —— 变量识别扩展到选择类动作（✅ 已完成）
 
 **目标**：让下拉框、单选/复选等「选择即值」的动作也能被识别为变量、按行参数化替换。
 
-> 当前 `variable_detector`（`src/tree_walker/agent/variable_detector.py:15` 的 `_FIELDS = ("text", "query")`）只识别 `input_text` 的 text、`search`/`extract` 的 query——即「用户键入的完整值」。下拉框选项、单选/复选勾选等选择类动作的「值」（选了哪个选项）无法抽成变量，CSV 批量重放时这类选择不能按行替换。
+> 原生 `<select>` 在 PR #157/#159 已通过 agent 路径解决（零 src 改动，靠 `select_dropdown` + 手工标注 + 变量替换）。P5 续（issue #160 / PR #161）补了自定义下拉（非原生 / 非 ARIA）的 agent 录制重放支持——`select_dropdown`/`dropdown_options` 闭态判型 miss 时兜底「open→discover→read/write」（真实 CDP click 选中），覆盖 B站（无 role `<li>`/`<div title>`）+ 抖音 Semi UI（portal `[role=option]` + 虚拟化）。另修了手工变量按 `(step/action/field)` 位置替换（避免同 `original_value` 撞 key）。方案 + 真机偏差见 [`docs/p5/06`](docs/p5/06-custom-dropdown-support-plan.md)。
 
-- [ ] **选择类动作变量识别**
+- [x] **选择类动作变量识别**
   - 扩展 detect 到选择类动作，把「选中选项的值/标签」作为可替换变量
   - [[browser-variable-substitution]] 变量场景从「键入值」扩展到「选择值」
-- [ ] **录制端采集选择语义**
-  - 录制选择类动作时记录选项的稳定标识（值/标签，非易变 index），供重放定位 + 变量替换
+- [x] **自定义下拉支持（issue #160 / PR #161）**
+  - `select_dropdown`/`dropdown_options` 闭态 miss → open→discover→read/write 兜底
+  - 真实 CDP click option 选中（Semi UI 等 React 受控下拉只认 trusted click）
+  - 精确→包含匹配（解「合集名 共N个作品」精确 miss）+ 虚拟化 scroll-until-found
+  - B站/抖音 domain skill → `select_dropdown`；全量 2224 测过、真机 B站+抖音验证
+- [x] **手工变量位置替换（PR #161）**
+  - 按 `(step_number, action_index, field)` 位置精确替换，避免同 `original_value` 撞 key
 
 ### P6 —— 交互前端从 TUI 迁往浏览器端
 
@@ -150,6 +155,39 @@ agent 探索时按 host 读 `domain-skills/<host>/` 注入上下文（默认关�
 - [ ] **浏览器端承接 TUI 能力**
   - 扩展 history_editor_ui 或新建 web 入口，承接 TUI 的运行/配置等交互
   - 复杂交付（多任务编排、批量、实时进度）统一走 web
+
+### P7 —— WebArena 基准评测与短板改进（🟡 进行中：harness 已通 + 首站点基线已出）
+
+**目标**：用 WebArena 标准 812 任务基准量化 TreeWalker 端到端浏览器操作能力，定位短板反哺改进。
+
+> 评测工作空间是**独立项目** `D:\dev\git\z_jordon\evals\webarena`（不在本仓库，editable install 依赖 `tree_walker`）。
+> 架构决策（**方案 A**）：TreeWalker 用原生 CDP 跑任务，WebArena 原版 evaluator **零改动复用**，
+> 用 `CDPPageAdapter` 鸭子类型把 CDP 适配成 Playwright Page（`url`/`goto`/`content`/`evaluate` 四接口）+ worker 线程同步/异步桥接。
+> 评测原理见工作空间 `docs/benchmark-principles.md`，首次跑通复盘见 `docs/setup-retrospective-2026-08-07.md`。
+>
+> **当前进度**：smoke harness 已建（`smoke_test.py`/`runner.py`/`cdp_evaluator.py`/`task_selector.py`/`analyze_results.py`），
+> smoke 链路已验证通过（Task 0 端到端成功，2026-08-07）；shopping_admin 站点已跑出基线 **SR = 50%（28/56）**。
+
+- [x] **smoke 链路打通**（10 任务子集，验证「链路通」而非跑分）
+  - `CDPPageAdapter` + 同步/异步桥接（worker 线程跑 evaluator，`run_coroutine_threadsafe` + `wrap_future` 防死锁）
+  - cookie 注入修复（CDP + localhost + domain 假成功坑，改用 `url` 参数）—— 首次 SR=0 的元凶
+  - 4 个 setup bug 修复（pyproject 路径 / hatchling target / openai 2.x `openai.error` shim / cookie）+ 10 个 cdp_evaluator 单测全过
+- [ ] **全量 812 任务跑分**
+  - 去掉 task_selector 的 smoke 过滤，让 smoke_test 读全量任务列表（含断点续跑 resume）
+  - 覆盖全部 5 站点（shopping_admin 已通；补 shopping / gitlab / reddit / map / wikipedia 镜像与 cookie）
+  - 预计 ~1 周 + $300–500 LLM 费用；按站点 / eval_type 分组出 SR（`analyze_results.py` 已就绪）
+- [ ] **模型交叉实验**（分离「架构差」与「模型差」）
+  - 至少三组：TreeWalker+GLM / TreeWalker+Claude / browser-use+Claude
+  - 只有同模型对比（TreeWalker vs browser-use，都接 Claude）才能把差距归因到 agent 架构本身
+- [ ] **WebArena-Hard 258 子集**
+  - 从 [ServiceNow/webarena-verified](https://github.com/ServiceNow/webarena-verified) 取 hard task_id 列表跑分，提升区分度
+- [ ] **短板定位与反哺改进**（本阶段的真正产出）
+  - 拉「TreeWalker 失败但 browser-use 成功」的任务逐条看 history，归因到具体能力缺口
+  - 命中 P2（探索可靠性）/ 重放端 / DOM 快照 / 动作能力等改进点，回流成本 ROADMAP 条目
+- [ ] **判分对齐清理**（已知技术债）
+  - trajectory 转换是简化的（program_html 依赖中间步骤页面快照，目前只 string_match/url_match 准）
+  - exact_match 45 任务的答案提取对齐（`runner.extract_concise_answer`：长汇报 → 精简答案）
+  - beartype 全局 monkey-patch（smoke 可接受，长期跑分建议精细化）
 
 ---
 
@@ -173,8 +211,9 @@ agent 探索时按 host 读 `domain-skills/<host>/` 注入上下文（默认关�
 | P2 | agent 探索可靠性提升 | 🟡 | P0 actionability 已交付（#147）；P1-P3 暂缓（见 docs/p3）；e2e 待真机 |
 | P3 | 手工录制性能优化 | ⏳ | 备选，按需 |
 | P4 | 录制-重放体验打磨 | ✅ | #149/#150 可视化编辑 + #153 多 action 变量 + #155 CSV 批量 Web UI（步级实时+中止） |
-| P5 | 变量识别扩展到选择类动作 | ⏳ | 下拉框/单选等「选择即值」动作可参数化（当前仅 text/query） |
+| P5 | 变量识别扩展到选择类动作 | ✅ | 原生 select #157/#159 + 自定义下拉 #160/PR#161（B站/抖音真机验证）|
 | P6 | TUI → 浏览器端 | ⏳ | 复杂交互迁 web，统一交互入口 |
+| P7 | WebArena 基准评测与短板改进 | 🟡 | smoke 通 + shopping_admin 基线 SR=50%；全量 812 + 模型交叉 + 短板反哺待做 |
 
 ---
 
