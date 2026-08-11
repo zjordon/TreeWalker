@@ -5,6 +5,21 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.15.0] - 2026-08-11
+
+### Added
+
+- **自定义下拉框 agent 录制重放支持（#160/#161，ROADMAP P5）**——`select_dropdown`/`dropdown_options` 闭态判型 miss 时兜底「open→discover→read/write」；真实 CDP click 选中 option（Semi UI 等 React 受控下拉只认 trusted click）；精确→包含匹配（解「合集名 共N个作品」精确 miss）+ 虚拟化 scroll-until-found。覆盖 B站（无 role `<li>`/`<div title>`）+ 抖音（Semi UI portal `[role=option]`）。手工变量按 `(step/action/field)` 位置替换，避免同 `original_value` 撞 key。
+
+### Fixed
+
+- **下拉框动作引导（#157/#158）**：调整 prompt，引导模型对下拉框优先用 `dropdown_options`/`select_dropdown` 而非 `click`，减少误点击。
+
+### Docs
+
+- **原生 select 变量化方案（#159）**：agent 路径方案 + 录制/重放原理 + 验证文档（`docs/p5/`）。
+- ROADMAP：P5（变量识别扩展到选择类动作）标记 ✅ 完成；新增 P7（WebArena 基准评测与短板改进）。
+
 ## [0.14.0] - 2026-08-04
 
 ### Added
