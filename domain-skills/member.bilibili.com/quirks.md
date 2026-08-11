@@ -1,11 +1,13 @@
 # Quirks — bilibili.com
 
-1. **多文件输入框陷阱 (Element Identity Ambiguity)**：投稿页面同时存在 3-4 个 `input type=file name=buploader`（或无 name），分别用于视频、字幕、附件等。**绝对不能仅靠 `name` 或顺序定位**，必须交叉检查 `accept` 属性：视频选 `.mp4`，封面选 `image/png`。
+1. **多文件输入陷阱 (Element Identity Ambiguity)**
+   在 `upload-video` 阶段，DOM 底部始终潜伏着多个 `name=buploader` 的全局隐藏 `<input type=file>` （如 `accept=.txt` 用于字幕，`accept=.zip` 用于附件，以及冗余的 `accept=.mp4` 视频输入）。**上传主视频时，务必通过 `accept` 属性中没有 `name=buploader` 或位于主上传区域内的那个 `<input type=file>` 来区分**，否则可能将视频错误上传到字幕通道。
 
-2. **封面 Input 的条件性渲染 (Hidden Dependency / Sequencing)**：在 **publish** 阶段，`accept=image/png` 的封面上传 Input 并不存在于 DOM 中。必须先点击 `span` (可见文本"封面设置") 触发 SPA 切换到 **upload-conver** 阶段，该 Input 才会被动态渲染到 DOM 中，随后才能进行文件注入。
+2. **标签提交方式 (Action Method Requirement)**
+   添加标签时，在 `placeholder=按回车键Enter创建标签` 的输入框中输入文本后，必须使用 `send_keys(keys="Enter")` 动作来提交标签使其生效，不能依赖失焦或点击空白处。
 
-3. **标签添加需要键盘事件 (Action-method requirements)**：在 `input placeholder=按回车键Enter创建标签` 中输入文本后，普通的点击或失去焦点不会创建标签。**必须模拟 `Enter` 键的 keydown 事件**才能将文本转化为标签 chip。
+3. **封面上传模态框触发 (Hidden Dependency)**
+   封面上传 `<input type=file accept=image/png, image/jpeg>` 在默认阶段不在主 DOM 树中（被掩藏）。必须先点击可见文本为"添加封面"的按钮触发模态框后，该 file input 才会渲染并可被索引到。
 
-4. **全程 SPA 无 URL 变化 (SPA Stage Transition)**：从进入 `.../upload/video/frame` 到视频上传完毕、填写信息、进入封面裁剪、返回信息页，整个流程 URL 完全不变。必须依赖 DOM 内容（如是否出现"上传完成"、是否存在特定弹窗）来判断当前处于哪个阶段，不能用 URL 区分。
-
-5. **Hidden File Input 注入方式 (Action-method requirements)**：所有上传 Input（视频和封面）虽然可能被标记为 `visible=True`，但它们是通过 wrapper div 模拟样式的，直接 click 会触发无法控制的操作系统级弹窗。**必须使用直接文件路径注入 (upload_file by index/path) 的方式**处理这些 input。
+4. **无文件对话框交互 (Action Method Requirement)**
+   页面上所有的上传区域（视频、封面）点击后都会触发 OS 原生文件选择对话框。必须严格使用 `upload_file(index, path)` 进行直接文件注入，不要尝试 `click` 上传按钮。

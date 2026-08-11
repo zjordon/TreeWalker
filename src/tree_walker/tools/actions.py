@@ -32,6 +32,7 @@ _EMPTY_OPTIONS_DIAGNOSTIC = {
 	"custom": "Custom dropdown found but no .item/.option/[data-value] children (may need expanding).",
 	"combobox": "Combobox listbox found but empty (options may load on demand).",
 	"click-select": "Select element has no <option> children (may populate lazily — try dropdown_options again after the page settles).",
+	"custom-open": "Custom dropdown opened but no options found (may load on demand — retry after settle, or scroll).",
 }
 
 
@@ -1483,18 +1484,31 @@ class Tools:
                 return self._format_options_result(raw_options, entry, index, "combobox")
             # 其余：session 层 dispatcher（aria / custom / 子树）
             dispatched = await browser.fetch_dropdown_options(backend_id)
-            if dispatched["source"] is None:
-                # 真阴性：非任何已知下拉类型，回退到 P0 风格的友好 error 提示手动展开
+            if dispatched["source"] is not None:
+                # 闭态判型命中（aria/custom/子树）：原路径零回归
+                return self._format_options_result(
+                    dispatched["options"], entry, index, dispatched["source"],
+                )
+            # FALLBACK（issue #160）：闭态判型 miss → 开态 discover+read
+            # （真实 click 展开，B 站/Douyin 自定义下拉：无 role 或 list 在 portal、无 aria-controls）
+            try:
+                raw_options = await browser.expand_and_fetch_custom_options(backend_id)
+            except Exception as ex:
                 return ActionResult(
                     error=(
                         f"Index {index} is a [{tag}] element, not a recognized dropdown "
                         f"(native <select>, ARIA listbox/menu, custom dropdown, or combobox). "
-                        f"Use click to expand and read options manually."
+                        f"Open-then-discover also failed: {ex}"
                     ),
                 )
-            return self._format_options_result(
-                dispatched["options"], entry, index, dispatched["source"],
-            )
+            if not raw_options:
+                return ActionResult(
+                    error=(
+                        f"Index {index} opened but exposed no options — it may not be a "
+                        f"dropdown, or options load on a trigger other than a click."
+                    ),
+                )
+            return self._format_options_result(raw_options, entry, index, "custom-open")
         except Exception as e:
             return ActionResult(error=f"Failed to read dropdown options: {e}")
 
@@ -1541,14 +1555,9 @@ class Tools:
                 # aria / custom / 子树：session 写 dispatcher（复用读侧分类，读写零漂移）
                 result = await browser.set_dropdown_option(backend_id, value)
                 if result.get("source") is None:
-                    # 真阴性：非任何已知下拉类型（与 dropdown_options 真阴性一致）
-                    return ActionResult(
-                        error=(
-                            f"Index {index} is a [{tag}] element, not a recognized dropdown "
-                            f"(native <select>, ARIA listbox/menu, custom dropdown, or combobox). "
-                            f"Use dropdown_options to list available options first."
-                        ),
-                    )
+                    # FALLBACK（issue #160）：闭态判型 miss → 开态 discover+select
+                    # （真实 click 展开 + 按 role/text 匹配 + 虚拟化 scroll-until-found）
+                    result = await browser.set_custom_dropdown_option(backend_id, value)
         except Exception as e:
             return ActionResult(error=f"Failed to select option: {e}")
 

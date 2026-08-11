@@ -63,7 +63,7 @@ def _make_state(selector_map: dict[int, EnhancedDOMTreeNode]) -> BrowserStateSum
 	)
 
 
-def _make_browser(*, options=None, raises=None, dispatch=None) -> MagicMock:
+def _make_browser(*, options=None, raises=None, dispatch=None, expand_custom=None) -> MagicMock:
 	"""Stub BrowserSession for action-layer tests (does NOT touch CDP).
 
 	native <select> path calls fetch_select_options (options/raises); the
@@ -82,6 +82,7 @@ def _make_browser(*, options=None, raises=None, dispatch=None) -> MagicMock:
 		return_value=dispatch if dispatch is not None else {"options": [], "source": None}
 	)
 	bs.expand_and_fetch_combobox_options = AsyncMock(return_value=[])
+	bs.expand_and_fetch_custom_options = AsyncMock(return_value=expand_custom or [])
 	bs.get_state = AsyncMock(return_value=_make_state({}))
 	return bs
 
@@ -120,9 +121,15 @@ class TestDropdownOptionsAction:
 
 	@pytest.mark.asyncio
 	async def test_non_select_element_returns_error_without_fetch(self):
+		# 非 SELECT：委托 session dispatcher；source=None（真阴性）→ issue #160 兜底
+		# expand_and_fetch_custom_options。真非下拉时开态发现不到 listbox 抛 RuntimeError，
+		# 兜底 except 回显 "not a recognized dropdown ... Open-then-discover also failed"。
 		entry = _make_entry(tag="DIV", backend_node_id=7)
 		state = _make_state({3: entry})
 		browser = _make_browser()
+		browser.expand_and_fetch_custom_options = AsyncMock(
+			side_effect=RuntimeError("custom dropdown listbox not found after opening"),
+		)
 
 		result = await Tools().execute(
 			"dropdown_options", {"index": 3}, browser, browser_state=state,
@@ -131,9 +138,11 @@ class TestDropdownOptionsAction:
 		assert result.error is not None
 		assert "[DIV]" in result.error
 		assert "not a recognized dropdown" in result.error
-		# 非 select 委托 session dispatcher（真阴性），不碰 native fetch
+		assert "listbox not found" in result.error
+		# 先 dispatcher（真阴性），再兜底 custom flow；不碰 native fetch
 		browser.fetch_select_options.assert_not_awaited()
 		browser.fetch_dropdown_options.assert_awaited_once_with(7)
+		browser.expand_and_fetch_custom_options.assert_awaited_once_with(7)
 
 	@pytest.mark.asyncio
 	async def test_missing_index_returns_error_without_fetch(self):

@@ -5,7 +5,7 @@
     1. uv sync
     2. Chrome 以远程调试端口启动（建议用录制时的 profile，已登录目标站点）：
 
-       chrome --remote-debugging-port=9222 --user-data-dir=<profile>
+       chrome --remote-debugging-port=9223 --user-data-dir=<profile>
 
     3. 录制产物（``recorded.json`` 等）已落 ``rerun-history/``
 
@@ -26,7 +26,7 @@ import logging
 import sys
 
 from tree_walker import Agent, BrowserSession, LLMClient
-from tree_walker.config import load_settings
+from tree_walker.config import _fetch_ws_url, load_settings
 
 
 async def main() -> None:
@@ -40,13 +40,14 @@ async def main() -> None:
 	args = parser.parse_args()
 
 	settings = load_settings()
-	if not settings.browser.ws_url:
-		print("✗ Chrome 未以 --remote-debugging-port=9222 启动")
+	ws_url = _fetch_ws_url("127.0.0.1", 9223)
+	if not ws_url:
+		print("✗ Chrome 未以 --remote-debugging-port=9223 启动")
 		sys.exit(1)
 
 	# 重放本身不调决策 LLM；LLMClient 仅用于结尾 AI 摘要（失败有 fallback，不阻塞）
 	llm = LLMClient(settings.llm)
-	browser = BrowserSession(settings.browser)
+	browser = BrowserSession(ws_url=ws_url)
 	logging.basicConfig(level=logging.INFO)
 
 	agent = Agent(task="", llm=llm, browser=browser, settings=settings.agent)

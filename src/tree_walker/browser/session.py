@@ -1113,6 +1113,173 @@ function(maxDepth) {
 }
 """
 
+# ── 自定义下拉（非原生 / 非 ARIA-classified）open→discover→read/write ────────
+# issue #160：B 站（无 role 的 <li>/<article>/<div title>）、抖音 Semi UI（role=option 但
+# list teleport 到 .semi-portal、无 aria-controls）这类下拉，闭态判型器全 miss。这组 JS
+# 是「开后发现 list → 按 role/text 读或选」flow 的零件，镜像 combobox flow 的形状。
+
+# 真正能展开的点击目标：从触发器父节点向上爬，取 4 层内「最外层」select-ish 祖先（regex
+# select|dropdown|combobox|picker 或 role=combobox 或 data-component），否则返回 this。
+# 取最外层是为了 B 站创作声明命中 .bcc-select（真正展开者）而非 .bcc-select-input-wrap
+# （点 inner input 不展开）。returnByValue=False 由 caller 设，节点以 RemoteObject 存活。
+_EFFECTIVE_CLICK_TARGET_JS = """
+function() {
+    let node = this.parentElement;
+    let best = null;
+    for (let i = 0; i < 4 && node; i++, node = node.parentElement) {
+        const cls = (typeof node.className === 'string') ? node.className : '';
+        const role = node.getAttribute ? node.getAttribute('role') : null;
+        if (/(select|dropdown|combobox|picker)/i.test(cls) || role === 'combobox'
+            || (node.dataset && node.dataset.component)) {
+            best = node;
+        }
+    }
+    return best || this;
+}
+"""
+
+# 发现 list 节点（跑在触发器上）。三档优先级，option-like 选择器统一为
+# [role=option],[role=menuitem],li,[data-value],.item,.option,[title]：
+#   1. aria-controls/owns → getElementById（真 combobox 保险）
+#   2. 祖先作用域子树搜：trigger.parentElement → 最近 select-ish wrapper → wrapper.parentElement，
+#      各作用域找 [role=listbox/menu] 或「≥2 个 option-like 子节点」的容器
+#      （覆盖 in-subtree 如 B 站分区、组件根兄弟分支如 B 站创作声明 .bcc-select）
+#   3. 全局可见 option-list 就近：document 里可见的 list，按到触发器 rect 的边距距离取最近
+#      （覆盖 portal-to-body 如抖音 .semi-portal；isOptionList 过滤已隐藏的残留 portal）
+# 返回 list 节点（RemoteObject 存活）或 null（无 objectId）。returnByValue=False 由 caller 设。
+_CUSTOM_LISTBOX_DISCOVER_JS = """
+function() {
+    const trigger = this;
+    const OPTION_SEL = '[role="option"],[role="menuitem"],li,[data-value],.item,.option,[title]';
+    const ROLE_CONT = '[role="listbox"],[role="menu"],[role="menubar"],[role="tree"],[role="grid"]';
+    const GEN_CONT = ROLE_CONT + ',ul,[class*="list"],[class*="option"],[class*="menu"],[class*="portal"],[class*="popover"],[class*="dropdown"]';
+
+    function visible(el) {
+        const cs = getComputedStyle(el);
+        if (cs.display === 'none' || cs.visibility === 'hidden' || Number(cs.opacity) === 0) return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 || r.height > 0;
+    }
+    function isOptionList(el) {
+        if (!el || !visible(el)) return false;
+        return el.querySelectorAll(OPTION_SEL).length >= 2;
+    }
+    function searchScope(root) {
+        if (!root) return null;
+        const roleFirst = Array.from(root.querySelectorAll(ROLE_CONT)).filter(isOptionList);
+        if (roleFirst.length) return roleFirst[0];
+        if (root !== trigger && isOptionList(root)) return root;
+        const generic = Array.from(root.querySelectorAll(GEN_CONT)).filter(isOptionList);
+        return generic.length ? generic[0] : null;
+    }
+
+    const cid = trigger.getAttribute('aria-controls') || trigger.getAttribute('aria-owns');
+    if (cid) { const lb = document.getElementById(cid); if (lb && isOptionList(lb)) return lb; }
+
+    const scopes = [];
+    if (trigger.parentElement) scopes.push(trigger.parentElement);
+    const wrapper = trigger.parentElement
+        ? trigger.parentElement.closest('[class*="select"],[class*="dropdown"],[class*="combobox"],[class*="picker"],[data-component]')
+        : null;
+    if (wrapper && scopes.indexOf(wrapper) === -1) scopes.push(wrapper);
+    if (wrapper && wrapper.parentElement && scopes.indexOf(wrapper.parentElement) === -1)
+        scopes.push(wrapper.parentElement);
+    for (const sc of scopes) { const f = searchScope(sc); if (f) return f; }
+
+    const trect = trigger.getBoundingClientRect();
+    function edgeDist(r) {
+        const dx = Math.max(trect.left - r.right, r.left - trect.right, 0);
+        const dy = Math.max(trect.top - r.bottom, r.top - trect.bottom, 0);
+        return Math.hypot(dx, dy);
+    }
+    function pickFrom(sel) {
+        let best = null, bestD = Infinity;
+        const cands = document.querySelectorAll(sel);
+        for (let i = 0; i < cands.length; i++) {
+            const c = cands[i];
+            if (!isOptionList(c)) continue;
+            const d = edgeDist(c.getBoundingClientRect());
+            if (d < bestD) { bestD = d; best = c; }
+        }
+        return best;
+    }
+    return pickFrom(ROLE_CONT) || pickFrom(GEN_CONT);
+}
+"""
+
+# 自定义下拉开态读脚本（跑在发现的 list 节点上）。有 [role=option]/[role=menuitem] 用之
+# （抖音），否则用通用选择器（B 站 <div title>/<article>/<li>）。返回 [{text,value,selected}]，
+# 200 上限 + 截断行，与 _ARIA_OPTIONS_JS 同形（直接喂 _format_options_result）。
+_CUSTOM_OPEN_OPTIONS_JS = """
+function() {
+    const root = this;
+    const GEN_SEL = '[role="option"],[role="menuitem"],li,[data-value],.item,.option,[title]';
+    function readOne(n) {
+        const text = (n.textContent || '').replace(/\\s+/g, ' ').trim();
+        const value = n.getAttribute('data-value') || n.getAttribute('value')
+                      || n.getAttribute('title') || text;
+        const selected = n.getAttribute('aria-selected') === 'true'
+                         || n.classList.contains('selected')
+                         || n.classList.contains('active')
+                         || n.classList.contains('checked');
+        return { text: text, value: value, selected: selected };
+    }
+    const roleOpts = root.querySelectorAll('[role="option"],[role="menuitem"]');
+    const pool = roleOpts.length ? roleOpts : root.querySelectorAll(GEN_SEL);
+    const all = Array.from(pool);
+    const total = all.length;
+    const capped = all.slice(0, 200);
+    const mapped = capped.map(readOne);
+    if (total > 200) {
+        mapped.push({ text: '... (showing 200 of ' + total + ', use scroll/search_page for more)', value: '', selected: false });
+    }
+    return mapped;
+}
+"""
+
+# 自定义下拉：在发现的 list 节点上找匹配 option（精确→包含），返回 option 节点
+# （returnByValue=False → RemoteObject，caller 解析 backendNodeId 后用 click_element 真实点击）。
+# 真实 CDP click 比 JS 合成 click 可靠——Semi UI 等框架的 React 选中/收起 handler 只认真实点击事件。
+_CUSTOM_FIND_OPTION_JS = """
+function(targetText) {
+    const root = this;
+    const GEN_SEL = '[role="option"],[role="menuitem"],li,[data-value],.item,.option,[title]';
+    function textOf(n) { return (n.textContent || '').replace(/\\s+/g, ' ').trim(); }
+    function valueOf(n) {
+        return n.getAttribute('data-value') || n.getAttribute('value') || n.getAttribute('title') || '';
+    }
+    const roleOpts = root.querySelectorAll('[role="option"],[role="menuitem"]');
+    const all = roleOpts.length ? roleOpts : root.querySelectorAll(GEN_SEL);
+    const tl = (targetText || '').toLowerCase();
+    for (const n of all) {
+        if (textOf(n).toLowerCase() === tl || valueOf(n).toLowerCase() === tl) return n;
+    }
+    if (tl.length >= 2) {
+        for (const n of all) {
+            if (textOf(n).toLowerCase().indexOf(tl) !== -1) return n;
+        }
+    }
+    return null;
+}
+"""
+
+# 虚拟化滚动（跑在发现的 list 节点上）：scrollTop += clientHeight，返回是否真的滚了。
+# 用于关联热点等虚拟列表的 scroll-until-found。
+_SCROLL_LISTBOX_JS = """
+function() {
+    const el = this;
+    if (el.scrollHeight <= el.clientHeight + 2) return false;
+    const before = el.scrollTop;
+    el.scrollTop = before + el.clientHeight;
+    if (el.scrollTop === before) return false;
+    el.dispatchEvent(new Event('scroll', { bubbles: true }));
+    return true;
+}
+"""
+
+# 虚拟化 scroll-until-found 的最大翻页数（10 页 × ~0.12s ≈ 1.2s 预算）
+_CUSTOM_SCROLL_CAP = 10
+
 
 class BrowserSession:
     """Manages browser connection and provides high-level page operations."""
@@ -3595,6 +3762,38 @@ class BrowserSession:
         except Exception as e:
             logger.debug("combobox collapse failed: %s", e)
 
+    async def _collapse_custom_dropdown(self, trigger_backend_id: int) -> None:
+        """收起自定义下拉。先 Escape（多数框架有效）；若仍开着（抖音 Semi UI 不认 Escape、
+        也不认合成 body-click），真实 click 触发器 toggle 收起——Semi 这种 React 受控下拉只在
+        trusted outside / 再点触发器时收起。load-bearing：dropdown_options/select_dropdown 跑完
+        若留下拉开着，agent 下一步会看到选项就去 click（老习惯），绕开 select_dropdown。best-effort。"""
+        try:
+            await self.send_keys("Escape")
+        except Exception as e:
+            logger.debug("custom dropdown Escape failed: %s", e)
+        if await self._custom_dropdown_still_open():
+            try:
+                await self.click_element(trigger_backend_id)   # 再点触发器 → toggle 收起
+            except Exception as e:
+                logger.debug("custom dropdown toggle-close failed: %s", e)
+
+    async def _custom_dropdown_still_open(self) -> bool:
+        """是否还有展开的自定义下拉：Semi 的 .semi-popover-wrapper-show，或任何可见的
+        [role=listbox]（非零 rect）。best-effort（异常返 False）。"""
+        try:
+            r = await self.client.send.Runtime.evaluate(
+                {"expression": "!!document.querySelector('.semi-popover-wrapper-show') "
+                               "|| Array.from(document.querySelectorAll('[role=\"listbox\"]'))"
+                               ".some(function(lb){ var r=lb.getBoundingClientRect(); "
+                               "return r.width>0 && r.height>0; })",
+                 "returnByValue": True},
+                session_id=self.current_session_id,
+            )
+            return bool((r.get("result", {}) or {}).get("value"))
+        except Exception as e:
+            logger.debug("custom dropdown still-open check failed: %s", e)
+            return False
+
     async def expand_and_fetch_combobox_options(self, backend_node_id: int) -> list[dict]:
         """Expand a combobox (real click), read its aria-controls listbox, then
         ALWAYS collapse (finally). Python flow — a combobox needs a real click +
@@ -3683,6 +3882,163 @@ class BrowserSession:
             return result.get("result", {}).get("value", {}) or {}
         finally:
             await self._collapse_combobox(combo_object_id)
+
+    async def _effective_click_bid(
+        self, trigger_object_id: str, fallback_bid: int,
+    ) -> int:
+        """解析真正能展开的点击目标 backendNodeId：触发器 4 层内最外层 select-ish 祖先
+        （_EFFECTIVE_CLICK_TARGET_JS，如 .bcc-select / .semi-select），否则原触发器。
+        best-effort：任一步失败回退 fallback_bid。用于自定义下拉 open 步——坐标 click 须落在
+        持有展开 handler 的组件 chrome 上（创作声明：点 input 不展开，点 .bcc-select 才展开）。"""
+        try:
+            r = await self.client.send.Runtime.callFunctionOn(
+                {
+                    "objectId": trigger_object_id,
+                    "functionDeclaration": _EFFECTIVE_CLICK_TARGET_JS,
+                    "returnByValue": False,
+                },
+                session_id=self.current_session_id,
+            )
+            oid = (r.get("result", {}) or {}).get("objectId")
+            if not oid:
+                return fallback_bid
+            desc = await self.client.send.DOM.describeNode(
+                {"objectId": oid}, session_id=self.current_session_id,
+            )
+            bid = (desc.get("node", {}) or {}).get("backendNodeId")
+            return int(bid) if bid else fallback_bid
+        except Exception as e:
+            logger.debug("effective click target resolve failed: %s", e)
+            return fallback_bid
+
+    async def _open_and_discover_listbox(
+        self, backend_node_id: int,
+    ) -> tuple[str | None, str | None]:
+        """展开自定义下拉并发现其 option list。返回 (listbox_object_id, trigger_object_id)；
+        listbox 未发现则 (None, trigger_object_id)。collapse 由 caller 在 finally 负责。
+
+        两次 click 尝试（容错）：先点 effective target（组件根，解决创作声明 input 不展开），
+        若没发现 list 再点原触发器（兜底只能点自身的触发器）。同一目标只点一次。"""
+        resolve = await self.client.send.DOM.resolveNode(
+            {"backendNodeId": backend_node_id}, session_id=self.current_session_id,
+        )
+        trigger_object_id = resolve["object"]["objectId"]
+        click_bid = await self._effective_click_bid(trigger_object_id, backend_node_id)
+        attempts = [click_bid] if click_bid == backend_node_id else [click_bid, backend_node_id]
+        listbox_object_id = None
+        for bid in attempts:
+            await self.click_element(bid)
+            await asyncio.sleep(0.5)
+            lb = await self.client.send.Runtime.callFunctionOn(
+                {
+                    "objectId": trigger_object_id,
+                    "functionDeclaration": _CUSTOM_LISTBOX_DISCOVER_JS,
+                    "returnByValue": False,
+                },
+                session_id=self.current_session_id,
+            )
+            listbox_object_id = (lb.get("result", {}) or {}).get("objectId")
+            if listbox_object_id:
+                break
+        return listbox_object_id, trigger_object_id
+
+    async def expand_and_fetch_custom_options(self, backend_node_id: int) -> list[dict]:
+        """开自定义下拉、读其 options，finally 收起（镜像 expand_and_fetch_combobox_options）。
+        flow：_open_and_discover_listbox → _read_custom_options。listbox 未发现抛 RuntimeError；
+        CDP/JS 异常上抛；收起于 finally（残留展开的遮罩会挡后续 click）。"""
+        trigger_object_id = None
+        try:
+            listbox_object_id, trigger_object_id = await self._open_and_discover_listbox(backend_node_id)
+            if not listbox_object_id:
+                raise RuntimeError("custom dropdown listbox not found after opening")
+            return await self._read_custom_options(listbox_object_id)
+        finally:
+            await self._collapse_custom_dropdown(backend_node_id)
+
+    async def set_custom_dropdown_option(self, backend_node_id: int, value: str) -> dict:
+        """开 + 发现 list + 找匹配 option + **真实 CDP click** option + readback，finally 收起
+        （镜像 set_combobox_option，但选中用 click_element 而非 JS 合成 click——Semi UI 等 React
+        框架的选中/收起 handler 只认真实点击）。含虚拟化 scroll-until-found：option 不在当前视口时
+        滚 list 再找（≤_CUSTOM_SCROLL_CAP）。返回与 set_select_option 同形 setter dict。CDP/JS
+        异常上抛；收起于 finally。"""
+        trigger_object_id = None
+        try:
+            listbox_object_id, trigger_object_id = await self._open_and_discover_listbox(backend_node_id)
+            if not listbox_object_id:
+                return {"success": False, "error": "custom dropdown listbox not found after opening",
+                        "availableOptions": []}
+            option_object_id = await self._find_option_object_id(listbox_object_id, value)
+            if not option_object_id:
+                return {"success": False,
+                        "error": f"Option with text or value '{value}' not found in custom dropdown",
+                        "availableOptions": await self._read_custom_options(listbox_object_id)}
+            option_bid = await self._backend_id_of_object(option_object_id)
+            if option_bid is None:
+                return {"success": False, "error": "custom dropdown option could not be resolved",
+                        "availableOptions": await self._read_custom_options(listbox_object_id)}
+            await self.click_element(option_bid)          # 真实 click：最可靠的选中交互
+            await asyncio.sleep(0.3)
+            # 真实 click 命中匹配 option 即视为选中（Semi/B 站均如此）。不作硬性 readback：
+            # option 是否脱离/打 selected 标记因框架而异，硬查会误报「not retained」
+            # （如 B 站分区：值已变但 option div 仍连着、无 selected class）。
+            return {"success": True, "message": f"Selected option: {value}", "value": value}
+        finally:
+            await self._collapse_custom_dropdown(backend_node_id)
+
+    async def _read_custom_options(self, listbox_object_id: str) -> list[dict]:
+        """在发现的 list 节点上读 options（_CUSTOM_OPEN_OPTIONS_JS）。返回 [{text,value,selected}]。"""
+        result = await self.client.send.Runtime.callFunctionOn(
+            {"objectId": listbox_object_id, "functionDeclaration": _CUSTOM_OPEN_OPTIONS_JS,
+             "returnByValue": True},
+            session_id=self.current_session_id,
+        )
+        return result.get("result", {}).get("value") or []
+
+    async def _find_option_object_id(self, listbox_object_id: str, value: str) -> str | None:
+        """在发现的 list 上找匹配 option（_CUSTOM_FIND_OPTION_JS，精确→包含）。含虚拟化
+        scroll-until-found：没命中就滚一页再找（≤_CUSTOM_SCROLL_CAP）。返回 option objectId 或 None。"""
+        for _ in range(_CUSTOM_SCROLL_CAP + 1):
+            r = await self.client.send.Runtime.callFunctionOn(
+                {"objectId": listbox_object_id, "functionDeclaration": _CUSTOM_FIND_OPTION_JS,
+                 "arguments": [{"value": value}], "returnByValue": False},
+                session_id=self.current_session_id,
+            )
+            oid = (r.get("result", {}) or {}).get("objectId")
+            if oid:
+                return oid
+            if not await self._scroll_listbox(listbox_object_id):
+                return None
+            await asyncio.sleep(0.12)
+        return None
+
+    async def _backend_id_of_object(self, object_id: str) -> int | None:
+        """remote objectId → backendNodeId（DOM.describeNode）。best-effort：失败返 None。"""
+        try:
+            desc = await self.client.send.DOM.describeNode(
+                {"objectId": object_id}, session_id=self.current_session_id,
+            )
+            bid = (desc.get("node", {}) or {}).get("backendNodeId")
+            return int(bid) if bid else None
+        except Exception as e:
+            logger.debug("backend_id_of_object failed: %s", e)
+            return None
+
+    async def _scroll_listbox(self, listbox_object_id: str) -> bool:
+        """滚发现的 listbox 下一页（_SCROLL_LISTBOX_JS）。返回是否真滚了（仍可滚且没到底），
+        否则（不可滚/到底/异常）False。best-effort（异常仅 debug 日志）。"""
+        try:
+            r = await self.client.send.Runtime.callFunctionOn(
+                {
+                    "objectId": listbox_object_id,
+                    "functionDeclaration": _SCROLL_LISTBOX_JS,
+                    "returnByValue": True,
+                },
+                session_id=self.current_session_id,
+            )
+            return bool((r.get("result", {}) or {}).get("value"))
+        except Exception as e:
+            logger.debug("listbox scroll failed: %s", e)
+            return False
 
     async def search_children_for_dropdowns(self, backend_node_id: int, max_depth: int = 4) -> dict:
         """BFS the subtree (max_depth levels) for a dropdown-shaped descendant

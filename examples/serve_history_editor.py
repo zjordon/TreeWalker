@@ -4,10 +4,11 @@
 前端 SPA（阶段③）接入后，浏览器开 http://127.0.0.1:8766/ 编辑；当前可用 curl 测试端点。
 
 Usage:
-    uv run python examples/serve_history_editor.py [--host 127.0.0.1] [--port 8766] [--history-dir rerun-history]
+    uv run python examples/serve_history_editor.py [--host 127.0.0.1] [--port 8766] [--cdp-port 9223] [--history-dir rerun-history]
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -21,12 +22,20 @@ def main() -> None:
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8766)
     p.add_argument(
+        "--cdp-port",
+        type=int,
+        default=9223,
+        help="Chrome 远程调试端口：试跑/开始批量重放连这个端口（默认 9223）",
+    )
+    p.add_argument(
         "--history-dir",
         default=None,
         help="历史 JSON 根目录（默认 settings.agent.rerun_history_dir）",
     )
     args = p.parse_args()
-    print(f"编辑器后端: http://{args.host}:{args.port}/history/list")
+    # 试跑/开始批量经 _build_agent → load_settings() 读 CDP_PORT 连 Chrome；显式置默认 9223
+    os.environ["CDP_PORT"] = str(args.cdp_port)
+    print(f"编辑器后端: http://{args.host}:{args.port}/history/list  (Chrome CDP 端口={args.cdp_port})")
     print("(前端 SPA 待阶段③接入；当前可用 curl 测试端点，如 curl 'http://.../history/list')")
     run_server(host=args.host, port=args.port, history_dir=args.history_dir)
 
