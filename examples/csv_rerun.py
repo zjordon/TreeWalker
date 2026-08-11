@@ -6,7 +6,7 @@ CSV 缺列 = 该变量用历史原值（宽容）。
 
 Prerequisites:
 1. uv sync
-2. chrome --remote-debugging-port=9222
+2. chrome --remote-debugging-port=9223
 3. 设置 ZHIPU_API_KEY
 4. 已有一份录制历史（如 examples/features/rerun_history.py 产出的 agent_history.json）
 
@@ -27,7 +27,7 @@ from tree_walker.agent.variable_detector import (
     merge_variable_sources,
 )
 from tree_walker.agent.views import AgentHistoryList
-from tree_walker.config import load_settings
+from tree_walker.config import load_settings,_fetch_ws_url
 
 
 async def main(history_file: str, csv_path: str) -> None:
@@ -35,13 +35,14 @@ async def main(history_file: str, csv_path: str) -> None:
     if not settings.llm.api_key:
         print("Error: Set ZHIPU_API_KEY environment variable")
         sys.exit(1)
-    if not settings.browser.ws_url:
-        print("Error: Chrome 未以 --remote-debugging-port=9222 启动")
+    ws_url = _fetch_ws_url("127.0.0.1", 9223)
+    if not ws_url:
+        print("Error: Chrome 未以 --remote-debugging-port=9223 启动")
         sys.exit(1)
 
     logging.basicConfig(level=logging.INFO)
     llm = LLMClient(settings.llm)
-    browser = BrowserSession(settings.browser)
+    browser = BrowserSession(ws_url=ws_url)
     agent = Agent(task="", llm=llm, browser=browser, settings=settings.agent)
 
     # 提示期望的 CSV 列头（detect ∪ manual）

@@ -19,7 +19,7 @@ Prerequisites:
 1. ``uv sync``
 2. Chrome 以远程调试端口启动（建议用录制专用 profile，提前登录 B 站）::
 
-       chrome --remote-debugging-port=9222
+       chrome --remote-debugging-port=9223
 
 3. 设置 ``ZHIPU_API_KEY`` 环境变量
 4. （可选但推荐）手写 ``domain-skills/www.bilibili.com/{selectors.md, quirks.md}``
@@ -37,7 +37,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from tree_walker import Agent, BrowserSession, LLMClient
-from tree_walker.config import AgentSettings, load_settings
+from tree_walker.config import AgentSettings, _fetch_ws_url, load_settings
 
 
 async def main():
@@ -46,12 +46,13 @@ async def main():
     if not settings.llm.api_key:
         print("Error: Set ZHIPU_API_KEY environment variable")
         sys.exit(1)
-    if not settings.browser.ws_url:
-        print("Error: Chrome 未以 --remote-debugging-port=9222 启动")
+    ws_url = _fetch_ws_url("127.0.0.1", 9223)
+    if not ws_url:
+        print("Error: Chrome 未以 --remote-debugging-port=9223 启动")
         sys.exit(1)
 
     llm = LLMClient(settings.llm)
-    browser = BrowserSession(settings.browser)
+    browser = BrowserSession(ws_url=ws_url)
 
     # ── 任务素材（按需改成你自己的路径）──
     video_path = r"D:\Videos\test\final\2026-04-29-20-41-59.mp4"

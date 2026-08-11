@@ -58,7 +58,7 @@ def _make_state(selector_map: dict[int, EnhancedDOMTreeNode]) -> BrowserStateSum
 	)
 
 
-def _make_browser(*, returns=None, raises=None, select=None, combo=None, dropdown=None) -> MagicMock:
+def _make_browser(*, returns=None, raises=None, select=None, combo=None, dropdown=None, custom=None) -> MagicMock:
 	"""Stub BrowserSession for action-layer tests (does NOT touch CDP).
 
 	P0 native path calls set_select_option (``returns``/``raises``, or ``select`` for
@@ -75,6 +75,7 @@ def _make_browser(*, returns=None, raises=None, select=None, combo=None, dropdow
 		)
 	bs.set_combobox_option = AsyncMock(return_value=combo or {})
 	bs.set_dropdown_option = AsyncMock(return_value=dropdown or {})
+	bs.set_custom_dropdown_option = AsyncMock(return_value=custom or {})
 	bs.get_state = AsyncMock(return_value=_make_state({}))
 	return bs
 
@@ -110,22 +111,26 @@ class TestSelectDropdownAction:
 
 	@pytest.mark.asyncio
 	async def test_non_select_element_routes_through_dispatcher(self):
-		# P1：非 SELECT 不再 hard-reject，走写 dispatcher；真阴性（source=None）返友好 error。
+		# P1：非 SELECT 不再 hard-reject，走写 dispatcher；真阴性（source=None）→ issue #160
+		# 兜底 set_custom_dropdown_option（开态 discover+select），其 listbox-not-found bare
+		# error 回显为 action error。验证非 native 路由 + 兜底串联。
 		entry = _make_entry(tag="DIV", backend_node_id=7)
 		state = _make_state({3: entry})
-		browser = _make_browser(dropdown={
-			"success": False, "source": None, "error": "not a recognized dropdown",
-		})
+		browser = _make_browser(
+			dropdown={"success": False, "source": None, "error": "not a recognized dropdown"},
+			custom={"success": False, "error": "custom dropdown listbox not found after opening",
+			        "availableOptions": []},
+		)
 
 		result = await Tools().execute(
 			"select_dropdown", {"index": 3, "value": "x"}, browser, browser_state=state,
 		)
 
 		assert result.error is not None
-		assert "[DIV]" in result.error
-		assert "not a recognized dropdown" in result.error
-		# 走写 dispatcher（非 native select），不碰 native 写链
+		assert "listbox not found" in result.error
+		# 先写 dispatcher（source=None），再兜底 custom flow；不碰 native 写链
 		browser.set_dropdown_option.assert_awaited_once_with(7, "x")
+		browser.set_custom_dropdown_option.assert_awaited_once_with(7, "x")
 		browser.set_select_option.assert_not_awaited()
 		browser.set_combobox_option.assert_not_awaited()
 

@@ -87,6 +87,35 @@ def _substitute_in_dict(data: dict[str, Any], replacements: dict[str, str]) -> i
     return count
 
 
+def _apply_manual_variable_at_location(
+    history_items: list, step_number: int, action_index: int, field: str, new_value: str,
+) -> bool:
+    """把手工变量按 (step_number, action_index, field) 精确写入对应 action 的 params，返回是否命中。
+
+    用于区分「同 original_value、不同位置」的多个手工变量——value-based 替换（_substitute_in_dict）
+    按 original_value 建 dict 会撞 key（后写覆盖先写），位置绑定直接定位则不会。典型场景：录制时
+    标题与简介填了同一文本，title-1(标题) 与 title-2(简介) 的 original_value 相同。"""
+    for item in history_items:
+        if getattr(item, "step_number", None) != step_number:
+            continue
+        model_output = item.model_output or {}
+        actions = model_output.get("actions")
+        if not actions:
+            single = model_output.get("action")
+            actions = [single] if single else []
+        if not (0 <= action_index < len(actions)):
+            return False
+        action = actions[action_index]
+        if not isinstance(action, dict):
+            return False
+        params = action.get("params")
+        if isinstance(params, dict) and field in params:
+            params[field] = new_value
+            return True
+        return False
+    return False
+
+
 def _truncate(text: str, limit: int = 80) -> str:
     """截断长文本用于日志展示（剥首尾空白、折叠换行）。"""
     text = (text or "").strip().replace("\n", " ")
@@ -1495,10 +1524,13 @@ class RerunMixin:
     def _substitute_variables_in_history(
         self, history: AgentHistoryList, variables: dict[str, str]
     ) -> AgentHistoryList:
-        """变量名→原始值→新值；精确整串替换；只改动作参数，不碰 interacted_element/result。
+        """变量名→新值；只改动作参数，不碰 interacted_element/result。两路替换：
 
-        变量源 = 自动检测（detect_variables_in_history）∪ 人工标注（history.manual_variables），
-        见 variable_detector.merge_variable_sources。
+        - 手工变量（history.manual_variables，带 step/action/field 位置）：按位置精确写入
+          （_apply_manual_variable_at_location）——能区分「同 original_value、不同位置」的变量
+          （如录制时标题与简介同文本，title-1 与 title-2 的 original_value 相同；按值替换会撞 key）。
+        - 自动检测变量（无位置）：按 original_value 精确整串替换（_substitute_in_dict）。
+        变量源 = 自动检测（detect_variables_in_history）∪ 人工标注，见 merge_variable_sources。
         """
         from tree_walker.agent.variable_detector import (
             detect_variables_in_history,
@@ -1508,24 +1540,41 @@ class RerunMixin:
         detected = merge_variable_sources(
             detect_variables_in_history(history), history.manual_variables
         )
+        manual_by_name = {mv.name: mv for mv in (history.manual_variables or [])}
+
+        modified = copy.deepcopy(history)
+        n_applied = 0
         value_replacements: dict[str, str] = {}
         for var_name, new_value in variables.items():
-            if var_name in detected:
+            mv = manual_by_name.get(var_name)
+            if mv is not None:
+                # 手工变量：按 (step, action, field) 精确写入，不靠 original_value（避免同值撞 key）
+                if _apply_manual_variable_at_location(
+                    modified.history, mv.step_number, mv.action_index, mv.field, new_value,
+                ):
+                    n_applied += 1
+                else:
+                    logger.warning(
+                        "变量 %r 的位置 (step=%s action=%s field=%s) 未命中，跳过",
+                        var_name, mv.step_number, mv.action_index, mv.field,
+                    )
+            elif var_name in detected:
+                # 自动检测变量：按 original_value 精确整串替换
                 value_replacements[detected[var_name].original_value] = new_value
             else:
                 logger.warning("变量 %r 在历史中未检测到，跳过", var_name)
-        if not value_replacements:
-            return history
 
-        logger.info("🔁 已替换 %d 个变量值", len(value_replacements))
-        modified = copy.deepcopy(history)
-        for item in modified.history:
-            actions = item.model_output.get("actions") or [item.model_output.get("action", {})]
-            for action in actions:
-                if isinstance(action, dict):
-                    params = action.get("params")
-                    if isinstance(params, dict):
-                        _substitute_in_dict(params, value_replacements)
+        if value_replacements:
+            for item in modified.history:
+                actions = item.model_output.get("actions") or [item.model_output.get("action", {})]
+                for action in actions:
+                    if isinstance(action, dict):
+                        params = action.get("params")
+                        if isinstance(params, dict):
+                            _substitute_in_dict(params, value_replacements)
+            n_applied += len(value_replacements)
+        if n_applied:
+            logger.info("🔁 已替换 %d 个变量值", n_applied)
         return modified
 
     # ── AI 摘要（无截图）──────────────────────────────────────────────

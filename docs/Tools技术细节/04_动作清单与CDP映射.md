@@ -13,7 +13,7 @@
 | 1 | [click](#41-click) | 否 | `index \| element_id, ...` | DOM + Input + Overlay | 点击元素（index 或 element_id=backend id），含 SELECT 分支 |
 | 2 | [close_tab](#42-close_tab) | 否 | `tab_id: str=""` | Target | 关闭 Tab，必要时切换其他 |
 | 3 | [done](#43-done) | 否 | `text, success, files_to_display`（变体 B：`data`） | (无 CDP) | 任务终止信号 |
-| 4 | [dropdown_options](#44-dropdown_options) | 否 | `index: int` | Runtime (JS) | 读取 select 所有 option |
+| 4 | [dropdown_options](#44-dropdown_options) | 否 | `index: int` | Runtime (JS) + Input（combobox/自定义展开收起）| 读取下拉所有 option（native/ARIA/custom/combobox + 自定义兜底）|
 | 5 | [evaluate](#45-evaluate) | 是 | `code: str` | Runtime | 执行任意 JS，返回结果 |
 | 6 | [extract](#46-extract) | 否 | `query, extract_links?, extract_images?, start_from_char?, already_collected?` | CDP (DOM.getDocument) + LLM | 页面转 markdown → LLM 抽取/结构化（分页 + 去重 + 大结果落盘） |
 | 7 | [find_elements](#47-find_elements) | 否 | `selector, attributes?, max_results?, offset?, include_text?, first_only?, include_geometry?, return_node_ids?` | Runtime (JS) / DOM.performSearch | CSS 选择器查询元素（穿透 shadow/iframe；tag/text/attrs/children_count + 可选几何/visible + 总数；`return_node_ids` 回 backendNodeId） |
@@ -28,7 +28,7 @@
 | 16 | [scroll](#416-scroll) | 否 | `amount, direction` | Page + Input | 鼠标滚轮翻页 |
 | 17 | [search](#417-search) | 是 | `query: str` | Page | 跳转 Google 搜索结果 |
 | 18 | [search_page](#418-search_page) | 否 | `query: str` | Runtime (JS) | 在页面正文搜索文本 |
-| 19 | [select_dropdown](#419-select_dropdown) | 否 | `index, value` | Runtime (JS) | 设置 select 的 value |
+| 19 | [select_dropdown](#419-select_dropdown) | 否 | `index, value` | Runtime (JS) + Input（真实 click option 选中）| 选中下拉 option（native/combobox/自定义 + 兜底，value=可见文本）|
 | 20 | [send_keys](#420-send_keys) | 否 | `keys: str` | Input | 发送组合键 |
 | 21 | [switch_tab](#421-switch_tab) | 是 | `tab_id: str` | Target | 切换到指定 Tab |
 | 22 | [upload_file](#422-upload_file) | 否 | `index, path` | DOM | 设置文件输入 |
@@ -250,7 +250,8 @@
   action 层做廉价预分类，按下拉类型分发到不同 session 方法，所有类型共用 `_format_options_result` 的 json 编码 + 序号 + `select_dropdown` 用法提示 + 短/长回显（`source` 折进 `long_term_memory` 作诊断通道）：
   - **native `<select>`**：复用 `fetch_select_options(backend_node_id)`（`DOM.resolveNode` + `Runtime.callFunctionOn`），精确绑定到 index 指定的那个 select（修掉原 `querySelectorAll('select option')` 全页扫描 bug）；`source=native`，long_term_memory 无 `via` 后缀（P0 字节一致）。
   - **combobox**（`_is_autocomplete_field` + `aria-controls`/`aria-owns`）：调 `expand_and_fetch_combobox_options` —— 真实 `click_element` 展开 → `sleep 0.5s` 等懒加载 → `getElementById(aria-controls)` 读 listbox → `finally` 强制 `send_keys("Escape")`+`blur()` 收起；`source=combobox`（**实验性**）。
-  - **其余**：委托 session 轻量 dispatcher `fetch_dropdown_options`，顺序试 `_fetch_aria_options`（`[role=option]`/`[role=menuitem"]`）→ `_fetch_custom_class_options`（`.dropdown`/`.ui` 下 `.item/.option/[data-value]`）→ `search_children_for_dropdowns`（BFS 子树 depth 4）；首个命中返回（`source=aria`/`custom`/`child-depth-N`），全未命中返回友好 error。
+  - **其余**：委托 session 轻量 dispatcher `fetch_dropdown_options`，顺序试 `_fetch_aria_options`（`[role=option]`/`[role=menuitem"]`）→ `_fetch_custom_class_options`（`.dropdown`/`.ui` 下 `.item/.option/[data-value]`）→ `search_children_for_dropdowns`（BFS 子树 depth 4）；首个命中返回（`source=aria`/`custom`/`child-depth-N`）。
+  - **自定义下拉兜底（issue #160）**：闭态判型全 miss（`source=None`）时，再调 `expand_and_fetch_custom_options` —— **真实 click 展开**（爬到组件根，解 B站创作声明点 input 不展开）→ 三档 JS 发现 list 节点（aria-controls / 祖先作用域子树 / 全局可见 listbox 就近，覆盖抖音 Semi UI portal）→ `_CUSTOM_OPEN_OPTIONS_JS` 按 role/text 读 option → `finally` `_collapse_custom_dropdown` 收起（Escape + 仍开着则再点触发器 toggle）；`source=custom-open`。覆盖 B站（无 role `<li>`/`<div title>`）、抖音（`role=option` 但 list teleport 到 `.semi-portal`）等非原生非 ARIA 下拉。详见 [`docs/p5/06`](../p5/06-custom-dropdown-support-plan.md)。
 
   ```python
   async def _action_dropdown_options(self, params, browser):
@@ -270,9 +271,18 @@
               raw = await browser.expand_and_fetch_combobox_options(backend_id)
               return self._format_options_result(raw, entry, index, "combobox")
           dispatched = await browser.fetch_dropdown_options(backend_id)            # aria/custom/子树
-          if dispatched["source"] is None:
-              return ActionResult(error=f"Index {index} is a [{tag}], not a recognized dropdown ...")
-          return self._format_options_result(dispatched["options"], entry, index, dispatched["source"])
+          if dispatched["source"] is not None:
+              return self._format_options_result(dispatched["options"], entry, index, dispatched["source"])
+          # FALLBACK（issue #160）：闭态判型 miss → 开态 discover+read（自定义下拉）
+          try:
+              raw = await browser.expand_and_fetch_custom_options(backend_id)
+          except Exception as ex:
+              return ActionResult(error=f"Index {index} is a [{tag}], not a recognized dropdown "
+                                        f"(native <select>, ARIA listbox/menu, custom dropdown, or combobox). "
+                                        f"Open-then-discover also failed: {ex}")
+          if not raw:
+              return ActionResult(error=f"Index {index} opened but exposed no options ...")
+          return self._format_options_result(raw, entry, index, "custom-open")
       except Exception as e:
           return ActionResult(error=f"Failed to read dropdown options: {e}")
   ```
@@ -286,11 +296,12 @@
   | custom class | `_fetch_custom_class_options` | `.dropdown/.ui` 下 `.item,.option,[data-value]` | 200 |
   | combobox | `expand_and_fetch_combobox_options` | `getElementById(aria-controls)` 下 `[role=option],li` + 展开/收起 | 200 |
   | 子树搜索 | `search_children_for_dropdowns` | BFS depth 4，classify + readAria/readCustom | 200 |
+  | 自定义（兜底 issue #160）| `expand_and_fetch_custom_options` | 真实 click 展开 + 三档发现 listbox（aria-controls/祖先子树/全局就近）+ `_CUSTOM_OPEN_OPTIONS_JS`（role/text 读 option）+ `_collapse_custom_dropdown` 收起 | 200 |
 
-  combobox 另调用 `click_element`（展开，经 `Input.dispatchMouseEvent`/JS 回退）与 `send_keys("Escape")`（`Input.dispatchKeyEvent`，finally 强制收起）。
+  combobox 另调用 `click_element`（展开，经 `Input.dispatchMouseEvent`/JS 回退）与 `send_keys("Escape")`（`Input.dispatchKeyEvent`，finally 强制收起）；自定义兜底另调用 `click_element`（展开 + 收不起时再点触发器 toggle）、`DOM.describeNode`（option backendNodeId）、`_find_option_object_id`（精确→包含匹配 + 虚拟化 scroll-until-found）。
 
 - **注意事项**：
-  - 支持 native `<select>` / ARIA menu·listbox / custom class（Semantic UI 等）/ combobox（`aria-controls` 独立 listbox）/ 子树搜索（depth 4）；非任何已知类型返回友好 error，提示用 click 手动展开（设计规格见 `docs/tools-optimize/dropdown_options_follow_up.md`）。
+  - 支持 native `<select>` / ARIA menu·listbox / custom class（Semantic UI 等）/ combobox（`aria-controls` 独立 listbox）/ 子树搜索（depth 4）/ **自定义兜底**（issue #160：闭态判型 miss 后开态 discover+read，覆盖 B站无 role `<li>`/`<div title>`、抖音 Semi UI portal `[role=option]`）。闭态 + 兜底都 miss 才返友好 error（`source=custom-open` 进 `via [CUSTOM-OPEN]` 诊断）。设计规格见 [`docs/p5/06`](../p5/06-custom-dropdown-support-plan.md)。
   - combobox 为**实验性**：browser-use 自身跳过了全部 combobox/ARIA 测试；本实现用固定 `sleep 0.5s` + `finally` 强制收起 + 200 选项上限，框架差异（React Portal / Material）靠手测验收。
   - 输出每行 `序号: text=<json>, value=<json> (selected)`，json 编码保证含引号/特殊字符的文本可被 LLM 精确复制到 `select_dropdown(index=N, value=...)`；`long_term_memory` 为 `Got N options from [TAG] {label} at index N [via <SOURCE>]`。
   - 成功回显 short/long 分离：`extracted_content` 为紧凑列表（靠 `ActionResult.__str__` 的 500 字符截断自然兜底，工具只读幂等可重调），`long_term_memory` 为简短摘要（带选项数 + 类型 source）。
@@ -1170,50 +1181,59 @@
 
 - **主要逻辑**（[actions.py:912](../../src/tree_walker/tools/actions.py)）：
 
-  action 层瘦壳：先 tag 校验（非 `<select>` 早退报错），再委托 session 层 `set_select_option(backend_node_id, value)`（`DOM.resolveNode` + `Runtime.callFunctionOn`），精确绑定到 index 指定的那个 `<select>`，修掉此前 `document.querySelectorAll('select')[0]` 全页写第一个 select、与 index 无关的范围 bug。成功回显 message；选项未命中或框架拦截时软回显可用选项供 LLM 自纠（对齐 dropdown_options 的 try/except 软降级 + short/long 分离规范）。
+  action 层多类型分发（镜像 dropdown_options）：native `<select>` → `set_select_option`（P0 路径，零改动）；combobox（`_is_autocomplete_field` + `aria-controls`/`aria-owns`）→ `set_combobox_option`（Python flow：展开→定位 listbox→写→收起）；其余 → `set_dropdown_option`（复用读侧分类，读写零漂移）。**自定义下拉兜底（issue #160）**：`set_dropdown_option` 返回 `source=None`（闭态判型 miss）时 → `set_custom_dropdown_option`（真实 click 展开 → 三档发现 list → `_CUSTOM_FIND_OPTION_JS` 精确→包含匹配找 option → **真实 `click_element(option_bid)` 选中** → `finally` `_collapse_custom_dropdown` 收起）。成功 / miss(软回显 availableOptions) / bare-error 三段回显与 native 一致（D2 统一 dict 形状，零 per-type 分支）。
 
   ```python
-  async def _action_select_dropdown(self, params: dict, browser: BrowserSession) -> ActionResult:
-      index = params["index"]
+  async def _action_select_dropdown(self, params, browser):
+      index = params["index"]; value = params["value"]
       entry, error = await self._get_element_by_index(index, browser)
-      if error:
-          return error
-      # tag 校验：非 <select> 早退报错
+      if error: return error
       tag = (getattr(entry, "tag_name", "") or "").upper()
-      if tag != "SELECT":
-          return ActionResult(error=f"Index {index} is a [{tag}] element, not a <select>. ...")
       backend_id = getattr(entry, "backend_node_id", None)
-      value = params["value"]
+      is_combo, _ = self._is_autocomplete_field(entry)
+      attrs = getattr(entry, "attributes", {}) or {}
       try:
-          result = await browser.set_select_option(backend_id, value)
+          if tag == "SELECT":
+              result = await browser.set_select_option(backend_id, value)            # native（P0）
+          elif is_combo and (attrs.get("aria-controls") or attrs.get("aria-owns")):
+              result = await browser.set_combobox_option(backend_id, value)          # combobox
+          else:
+              result = await browser.set_dropdown_option(backend_id, value)         # aria/custom/子树
+              if result.get("source") is None:
+                  # FALLBACK（issue #160）：闭态判型 miss → 开态 discover+select（真实 click option）
+                  result = await browser.set_custom_dropdown_option(backend_id, value)
       except Exception as e:
           return ActionResult(error=f"Failed to select option: {e}")
+      # 三段回显：success / miss(软回显 availableOptions 供 LLM 自纠) / bare-error
       desc = self._describe_dropdown(entry, index)
       if result.get("success"):
-          message = result.get("message", f"Selected option: {value}")
-          return ActionResult(extracted_content=message, long_term_memory=f"Selected {json.dumps(value)} in {desc}")
-      # 选项未命中 / 框架拦截（点击回退也失败）→ 软回显可用选项供 LLM 自纠
+          return ActionResult(extracted_content=result.get("message", f"Selected option: {value}"),
+                              long_term_memory=f"Selected {json.dumps(value)} in {desc}")
       available = result.get("availableOptions") or []
       if available:
-          lines = [f"{i}: text={json.dumps(o.get('text', ''))}, value={json.dumps(o.get('value', ''))}" for i, o in enumerate(available)]
-          extracted = "\n".join(lines) + "\n" + f"Use the value in select_dropdown(index={index}, value=...)"
-          return ActionResult(extracted_content=extracted, long_term_memory=f"Couldn't select {json.dumps(value)} in {desc} (not an available option)")
+          ...  # 列出可用选项 + select_dropdown(index=N, value=...) 用法提示
       return ActionResult(error=result.get("error", f"Failed to select option: {value}"))
   ```
 
-  > session 层 `set_select_option`（[session.py:1731](../../src/tree_walker/browser/session.py)）移植 browser-use `on_SelectDropdownOptionEvent`（`default_action_watchdog.py:3241-3695`）的 native `<select>` 完整选择链：focus → 三方式设值（`element.value`/`option.selected`/`selectedIndex`）→ dispatch `input`+`change`+`blur` → 读回 `element.value` 验证框架回退 → 回退时点击回退（`mousedown`/`click-on-option`/`mouseup`/`change`）。匹配策略：`option.text` 或 `option.value`，大小写不敏感精确匹配（参数名仍是 `value`，但传 text 也能命中）。
+  > session 层三 setter：
+  > - `set_select_option`（[session.py](../../src/tree_walker/browser/session.py)）移植 browser-use native `<select>` 完整选择链：focus → 三方式设值（`element.value`/`option.selected`/`selectedIndex`）→ dispatch `input`+`change`+`blur` → 读回 `element.value` 验证框架回退 → 回退时点击回退。匹配：`option.text` 或 `option.value`，大小写不敏感精确。
+  > - `set_combobox_option`：真实 click 展开 → `getElementById(aria-controls)` 定位 listbox → `_SET_COMBOBOX_OPTION_JS` 写 → finally 收起。
+  > - `set_custom_dropdown_option`（issue #160）：`_open_and_discover_listbox` 展开 + 三档发现 list → `_find_option_object_id`（精确→包含匹配 + 虚拟化 scroll-until-found）找 option → **真实 `click_element(option_bid)` 选中**（Semi UI 等 React 受控下拉只认 trusted click，JS 合成 `.click()` 只打 aria-selected 不 commit）→ 默认成功（真实 click 命中即视为选中，不做「脱离/打 selected」硬 readback——B站分区值已变但 option 仍连着会误报「not retained」）。详见 [`docs/p5/06`](../p5/06-custom-dropdown-support-plan.md)。
 
 - **CDP 调用清单**：
 
   | CDP 命令 | 主要参数 | 行号 |
   |---|---|---|
-  | `DOM.resolveNode` | `{backendNodeId}` | session.py:1731（`set_select_option`） |
-  | `Runtime.callFunctionOn` | `{objectId, functionDeclaration: _SELECT_OPTION_JS, arguments:[{value}], returnByValue:True}` | 同上 |
+  | `DOM.resolveNode` | `{backendNodeId}` | session.py（`set_select_option`） |
+  | `Runtime.callFunctionOn` | `{objectId, functionDeclaration: _SELECT_OPTION_JS, arguments:[{value}], returnByValue:True}` | 同上（native） |
   | `Runtime.callFunctionOn`（回退） | `{objectId, functionDeclaration: _SELECT_OPTION_CLICK_FALLBACK_JS, arguments:[{value:optionIndex}], returnByValue:True}`（仅 `selectionReverted` 时） | 同上 |
+  | `Runtime.callFunctionOn`（combobox） | `getElementById(aria-controls)` 定位 listbox + `_SET_COMBOBOX_OPTION_JS` 写 | `set_combobox_option` |
+  | `click_element` + `DOM.describeNode` + `Runtime.callFunctionOn`（自定义兜底） | 真实 click 触发器展开 → `_CUSTOM_LISTBOX_DISCOVER_JS`/`_CUSTOM_FIND_OPTION_JS` 发现 list+option → `click_element(option_bid)` 选中 | `set_custom_dropdown_option`（issue #160） |
 
 - **注意事项**：
-  - 仅支持 native `<select>`；非 select 下拉（ARIA menu/listbox、custom class、combobox）走 tag 校验 error，提示用 click 手动展开（P1 蓝图见 [`docs/tools-optimize/select_dropdown.md`](../tools-optimize/select_dropdown.md)）。
-  - 框架兼容：`input`+`change`+`blur` 三事件 + 三方式设值 + 读回验证 + 点击回退，覆盖 Vue/React/Svelte 等拦截程序化赋值的场景。
+  - **多类型支持**：native `<select>`（P0）/ combobox（`aria-controls`）/ ARIA listbox·menu / custom class（`.dropdown`/`.ui`）/ **自定义下拉兜底**（issue #160：B站无 role `<li>`/`<div title>`、抖音 Semi UI portal `[role=option]`）。非任何已知类型（含兜底开态发现不到 list）才报 friendly error。
+  - 自定义兜底选中用**真实 `click_element`**（非 JS 合成 `.click()`）——Semi UI 等 React 受控下拉只认 trusted click。匹配策略：精确（text/data-value/value/title）→ 包含兜底（≥2 字，解「合集名 共N个作品」精确 miss）。虚拟化列表（抖音关联热点 ~10 页）走 scroll-until-found（`_scroll_listbox`，cap 10）。
+  - 框架兼容（native）：`input`+`change`+`blur` 三事件 + 三方式设值 + 读回验证 + 点击回退，覆盖 Vue/React/Svelte 等拦截程序化赋值的场景。
   - 选项未命中不抛错，软回显可用选项（json 编码）+ `select_dropdown(index=N, value=...)` 用法提示。
 
 ---

@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>自定义下拉 fixture（issue #160）</title>
+<style>
+	body { font: 14px/1.6 -apple-system, "Microsoft YaHei", sans-serif; padding: 24px; background: #fff; }
+	.field { margin-bottom: 28px; max-width: 420px; }
+	.field > h3, .field > label { display: block; font-weight: 600; margin-bottom: 6px; }
+	/* 注意：刻意不用 role= / .dropdown / .ui / .item / [data-value] —— 复刻 B 站那种
+	   「判型器全部 miss」的裸结构。class 也用中性名（trigger/cur/list/opt），不含框架标记。 */
+	.czsm-wrap { position: relative; border: 1px solid #d0d0d0; border-radius: 4px; padding: 8px 10px; }
+	#czsm-trigger { border: none; outline: none; width: 100%; cursor: pointer; }
+	.czsm-list { list-style: none; margin: 6px 0 0; padding: 0; border: 1px solid #e0e0e0; border-radius: 4px; }
+	.czsm-list li { padding: 6px 10px; cursor: pointer; }
+	.czsm-list li:hover { background: #f0f7ff; }
+	.fq-trigger { border: 1px solid #d0d0d0; border-radius: 4px; padding: 8px 10px; cursor: pointer; display: flex; justify-content: space-between; }
+	.fq-cur { margin: 0; }
+	.fq-list { margin-top: 6px; border: 1px solid #e0e0e0; border-radius: 4px; max-height: 160px; overflow: auto; }
+	.fq-list .opt { padding: 6px 10px; cursor: pointer; }
+	.fq-list .opt:hover { background: #f0f7ff; }
+</style>
+</head>
+<body>
+<h1>自定义下拉 fixture</h1>
+<p>复刻 B 站投稿页两种「判型器 miss」的裸结构（无 role / 无框架 class / option 点击才进 DOM）：</p>
+
+<!-- 形态 A：创作声明 —— input 触发 + 与 input 同父的裸 <li> option（懒渲染） -->
+<div class="field">
+	<label>创作声明</label>
+	<div class="czsm-wrap">
+		<input type="text" id="czsm-trigger" placeholder="请选择符合您视频内容的创作声明" readonly>
+		<i class="chevron">▾</i>
+		<!-- 点击 input 时 JS 在此 .czsm-wrap 内追加 <ul class="czsm-list"><li>…；选/收起时移除 -->
+	</div>
+</div>
+
+<!-- 形态 B：分区 —— div 触发 + 触发器的「兄弟」<div title> option 列表（懒渲染） -->
+<div class="field">
+	<h3>分区</h3>
+	<div id="fq-trigger" class="fq-trigger">
+		<p class="fq-cur">影视</p>
+		<i class="chevron">▾</i>
+		<!-- 点击 #fq-trigger 时 JS 在本 .field 内（触发器的兄弟位）追加 <div class="fq-list"> -->
+	</div>
+</div>
+
+<!-- 形态 C：portal —— div 触发 + option 列表 teleport 到 document.body（复刻抖音 Semi UI：
+     无 DOM 亲缘、option 有 role=option） -->
+<div class="field">
+	<h3>主题（portal）</h3>
+	<div id="portal-trigger" class="portal-trigger" style="cursor:pointer;border:1px solid #d0d0d0;border-radius:4px;padding:8px 10px;display:flex;justify-content:space-between;">
+		<p class="portal-cur" style="margin:0;">通用</p>
+		<i class="chevron">▾</i>
+		<!-- 点击时 JS 在 document.body 末尾追加 [role=listbox]（不在触发器子树） -->
+	</div>
+</div>
+
+<script>
+(function () {
+	"use strict";
+	// 形态 A：创作声明
+	var CZSM = ["内容无需标注", "含AI生成内容", "含虚构演绎内容", "内容含营销信息", "个人观点，仅供参考", "内容为转载"];
+	var czsmInput = document.getElementById("czsm-trigger");
+	function closeCzsm() {
+		var ul = czsmInput.parentElement.querySelector(".czsm-list");
+		if (ul) ul.remove();
+	}
+	function openCzsm() {
+		if (czsmInput.parentElement.querySelector(".czsm-list")) return;
+		var ul = document.createElement("ul");
+		ul.className = "czsm-list";
+		CZSM.forEach(function (t) {
+			var li = document.createElement("li");
+			li.textContent = t;                       // 裸 <li>，无 role / 无 data-value
+			li.addEventListener("click", function () {
+				czsmInput.value = t;
+				closeCzsm();
+			});
+			ul.appendChild(li);
+		});
+		czsmInput.parentElement.appendChild(ul);      // option 与 input 同父
+	}
+	czsmInput.addEventListener("click", openCzsm);
+
+	// 形态 B：分区
+	var FQ = ["影视", "娱乐", "音乐", "舞蹈", "动画", "绘画", "鬼畜", "游戏", "资讯", "知识", "人工智能", "科技数码"];
+	var fqTrigger = document.getElementById("fq-trigger");
+	function closeFq() {
+		var field = fqTrigger.parentElement;
+		var list = field.querySelector(".fq-list");
+		if (list) list.remove();
+	}
+	function openFq() {
+		var field = fqTrigger.parentElement;
+		if (field.querySelector(".fq-list")) return;
+		var list = document.createElement("div");
+		list.className = "fq-list";
+		FQ.forEach(function (t) {
+			var opt = document.createElement("div");
+			opt.className = "opt";
+			opt.setAttribute("title", t);             // <div title=X>，无 role
+			opt.textContent = t;
+			opt.addEventListener("click", function () {
+				fqTrigger.querySelector(".fq-cur").textContent = t;
+				closeFq();
+			});
+			list.appendChild(opt);
+		});
+		field.appendChild(list);                      // option 列表是触发器的「兄弟」
+	}
+	fqTrigger.addEventListener("click", openFq);
+
+	// 形态 C：portal（option teleport 到 body，复刻抖音 Semi UI .semi-portal）
+	var PORTAL = ["通用", "科技", "娱乐", "体育", "财经", "生活"];
+	var portalTrigger = document.getElementById("portal-trigger");
+	function closePortal() {
+		var list = document.getElementById("portal-list");
+		if (list) list.remove();
+	}
+	function openPortal() {
+		if (document.getElementById("portal-list")) return;
+		var list = document.createElement("div");
+		list.id = "portal-list";
+		list.className = "portal-list";
+		list.setAttribute("role", "listbox");
+		list.style.cssText = "position:absolute;left:40px;top:360px;background:#fff;border:1px solid #e0e0e0;border-radius:4px;padding:4px 0;z-index:9999;";
+		PORTAL.forEach(function (t) {
+			var opt = document.createElement("div");
+			opt.className = "p-opt";
+			opt.setAttribute("role", "option");
+			opt.setAttribute("title", t);
+			opt.textContent = t;
+			opt.style.cssText = "padding:6px 16px;cursor:pointer;";
+			opt.addEventListener("click", function () {
+				portalTrigger.querySelector(".portal-cur").textContent = t;
+				closePortal();
+			});
+			list.appendChild(opt);
+		});
+		document.body.appendChild(list);            // teleport 到 body（与触发器无 DOM 亲缘）
+	}
+	portalTrigger.addEventListener("click", openPortal);
+
+	// 点外面收起（保持页面整洁，方便连续测多个下拉）
+	document.addEventListener("click", function (e) {
+		if (!czsmInput.parentElement.contains(e.target)) closeCzsm();
+		if (!fqTrigger.parentElement.contains(e.target)) closeFq();
+		var pl = document.getElementById("portal-list");
+		if (!portalTrigger.contains(e.target) && !(pl && pl.contains(e.target))) closePortal();
+	});
+})();
+</script>
+</body>
+</html>

@@ -487,6 +487,54 @@ def test_manual_select_dropdown_variable_substitutes():
     assert new.history[0].model_output["action"]["params"]["index"] == 4
     assert history.history[0].model_output["action"]["params"]["value"] == "Technical Support"
 
+
+def test_manual_variables_same_original_different_location():
+    """两个手工变量 original_value 相同但位置不同（录制时标题与简介同文本），按 (step/action/field)
+    位置替换，各自得各自的值——不撞 key（value-based 会把两处都换成同一个）。"""
+    rm = RerunMixin()
+    history = AgentHistoryList(history=[
+        AgentHistory(step_number=7,
+                     model_output={"actions": [{"name": "input_text",
+                                                "params": {"index": 1, "text": "X"}}]},
+                     result=[]),
+        AgentHistory(step_number=9,
+                     model_output={"actions": [
+                         {"name": "select_dropdown", "params": {"index": 2, "value": "Y"}},
+                         {"name": "input_text", "params": {"index": 3, "text": "浏览器Agent"}},
+                         {"name": "send_keys", "params": {"keys": "Enter"}},
+                         {"name": "input_text", "params": {"index": 4, "text": "X"}},
+                     ]},
+                     result=[]),
+    ])
+    history.manual_variables = [
+        ManualVariableBinding(name="title-1", step_number=7, action_index=0, field="text", original_value="X"),
+        ManualVariableBinding(name="title-2", step_number=9, action_index=3, field="text", original_value="X"),
+    ]
+    new = rm._substitute_variables_in_history(history, {"title-1": "标题A", "title-2": "简介B"})
+    # title-1 → step7/action0/text；title-2 → step9/action3/text，各自独立
+    assert new.history[0].model_output["actions"][0]["params"]["text"] == "标题A"
+    assert new.history[1].model_output["actions"][3]["params"]["text"] == "简介B"
+    # 其他 action 不动
+    assert new.history[1].model_output["actions"][1]["params"]["text"] == "浏览器Agent"
+    # 原始 history 未污染
+    assert history.history[0].model_output["actions"][0]["params"]["text"] == "X"
+
+
+def test_manual_variable_location_miss_skips_no_fallback():
+    """位置未命中（step/action/field 对不上）→ 警告跳过，不回退到 value-based（避免重撞 key）。"""
+    rm = RerunMixin()
+    history = AgentHistoryList(history=[
+        AgentHistory(step_number=7,
+                     model_output={"actions": [{"name": "input_text",
+                                                "params": {"index": 1, "text": "X"}}]},
+                     result=[])])
+    history.manual_variables = [ManualVariableBinding(
+        name="v", step_number=99, action_index=0, field="text", original_value="X")]
+    new = rm._substitute_variables_in_history(history, {"v": "Y"})
+    # step 99 不存在 → 未命中 → 不替换（不回退值替换）
+    assert new.history[0].model_output["actions"][0]["params"]["text"] == "X"
+
+
 # ── 步间延迟 / 跳过重试辅助 ─────────────────────────────────────────────
 
 
