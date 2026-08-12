@@ -1,6 +1,6 @@
 # P6 界面框架提案（UI Framework Proposal）
 
-> 状态：**决策已定**（2026-08-11）。IA 与首期范围已锁，待实施方案。
+> 状态：**已实施**（M1-M5 + M6 前半，2026-08-12 真机 e2e 通过）。本文为 IA 框架定调；实施见 [`02`](02-implementation-plan.md)、复盘见 [`04`](04-implementation-retrospective.md)、后续 backlog 见 [`05`](05-followup-plan.md)。注：TUI 去留（issue #162 决策 Q2，原「下掉」）已修订为**并存保留**（见 §0 / `04` §一·1）。
 > 关联：ROADMAP P6 / issue #162。
 > 目的：在写代码前先把「整个 web 前端的功能布局」讨论清楚，使后续功能扩展有处可放。
 
@@ -8,7 +8,7 @@
 
 ## 0. 背景
 
-P6 已决策（2026-08-11，见 issue #162）：把 TUI（`tui/`）的能力迁到浏览器端 web，迁移完**下掉 TUI**。范围 = live agent 控制台 + 统一现有 `history_editor` 入口，**不含手工录制**（Chrome 扩展，迁 TreeForge）。
+P6 已决策（2026-08-11，见 issue #162）：把 TUI（`tui/`）的能力迁到浏览器端 web，统一交互入口。**TUI 并存保留**（`tw-tui` + `tw-web` 共存，web 为主）——原计划「迁移完下掉 TUI」，2026-08-12 修订为并存（见 `04` §一·1）。范围 = live agent 控制台 + 统一现有 `history_editor` 入口，**不含手工录制**（Chrome 扩展，迁 TreeForge）。
 
 本提案调研 OpenClaw / hermes-agent / browser-use webui / Skyvern 等成熟 agent 交付界面，结合 TreeWalker 的定位与实际能力，给出 web 前端的**信息架构与界面框架**，供讨论定调。
 
