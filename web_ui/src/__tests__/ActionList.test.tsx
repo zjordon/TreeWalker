@@ -3,7 +3,7 @@ import type { Dispatch } from "react";
 import { render, fireEvent } from "@testing-library/react";
 import ActionList from "../components/ActionList";
 import { initialState } from "../reducer";
-import type { EditorAction } from "../App";
+import type { EditorAction } from "../reducer";
 import type { AgentHistoryList, EditorState } from "../types";
 
 // 含 3 个 action 的单步——复现 #153：step 3（input_text → click → input_text）。

@@ -1,21 +1,40 @@
-import { useReducer, useCallback, useEffect } from "react";
+import { useReducer, useCallback, useEffect, useState } from "react";
 import { initialState, reducer } from "./reducer";
-export type { EditorAction } from "./reducer";
 import * as api from "./api";
-import Toolbar from "./components/Toolbar";
 import ActionList from "./components/ActionList";
 import ActionEditor from "./components/ActionEditor";
 import VariablePanel from "./components/VariablePanel";
 import RunPanel from "./components/RunPanel";
 import BatchRunPanel from "./components/BatchRunPanel";
+import DetailView from "./components/DetailView";
 
-export default function App() {
+// P6 流程库工作区：左 sidebar 列流程（点击加载）+ 编辑/重放/详情 tab（M4）。
+// reducer / handlers / 子组件全部复用原编辑器（零回归），仅把渲染重排成 sidebar + tab。
+// 运行（live 探索）在 AppShell 的「探索」模式（RunView）；技能/设置后置。
+type Tab = "edit" | "replay" | "detail";
+
+export default function FlowWorkspace() {
 	const [state, dispatch] = useReducer(reducer, initialState);
+	const [files, setFiles] = useState<string[]>([]);
+	const [tab, setTab] = useState<Tab>("edit");
+
+	const refresh = useCallback(async () => {
+		try {
+			setFiles(await api.listFiles());
+		} catch {
+			setFiles([]);
+		}
+	}, []);
+	// 流程列表：挂载 + 加载/保存后刷新（保存新生成的 history 后立即可见）
+	useEffect(() => {
+		refresh();
+	}, [refresh, state.loadedName, state.dirty]);
 
 	const onLoad = useCallback(async (name: string) => {
 		try {
 			const h = await api.loadHistory(name);
 			dispatch({ type: "LOAD", history: h, name });
+			setTab("edit");
 		} catch (e) {
 			dispatch({ type: "STATUS", status: `加载失败: ${e}` });
 		}
@@ -23,7 +42,6 @@ export default function App() {
 
 	const onDetect = useCallback(async () => {
 		if (!state.loadedName) return;
-		// detect 读盘上文件；本地有未保存改动时先提示
 		if (state.dirty) {
 			dispatch({ type: "STATUS", status: "提示：先保存再检测（detect 读盘上文件）" });
 		}
@@ -103,30 +121,81 @@ export default function App() {
 		return () => es.close();
 	}, [state.batch.taskId]);
 
+	const running = state.batch.phase === "running" || state.batch.phase === "starting";
+
 	return (
-		<div className="app">
-			<h1>TreeWalker 历史编辑器</h1>
-			<Toolbar
-				state={state}
-				onLoad={onLoad}
-				onDetect={onDetect}
-				onSave={onSave}
-				onRun={onRun}
-			/>
-			<div className="layout">
-				<ActionList state={state} dispatch={dispatch} />
-				<div className="right">
-					<ActionEditor state={state} dispatch={dispatch} />
-					<VariablePanel state={state} dispatch={dispatch} />
-				</div>
-			</div>
-			<RunPanel state={state} />
-			<BatchRunPanel
-				state={state}
-				onStart={onStartBatch}
-				onCancel={onCancelBatch}
-				onReset={onResetBatch}
-			/>
+		<div className="flow-workspace">
+			<aside className="flow-sidebar">
+				<h2>流程库</h2>
+				<ul className="var-list flow-list">
+					{files.length === 0 && <li className="muted">（空）</li>}
+					{files.map((f) => (
+						<li key={f} className={f === state.loadedName ? "selected-flow" : ""}>
+							<button className="flow-item" onClick={() => onLoad(f)} disabled={running}>
+								{f}
+							</button>
+						</li>
+					))}
+				</ul>
+			</aside>
+
+			<section className="flow-main">
+				<nav className="flow-tabs">
+					<button className={tab === "edit" ? "active" : ""} onClick={() => setTab("edit")}>
+						编辑
+					</button>
+					<button className={tab === "replay" ? "active" : ""} onClick={() => setTab("replay")}>
+						重放
+					</button>
+					<button className={tab === "detail" ? "active" : ""} onClick={() => setTab("detail")}>
+						详情
+					</button>
+					<span className="status">{state.status}</span>
+				</nav>
+
+				{tab === "edit" && (
+					<div className="edit-tab">
+						<div className="bar">
+							<button onClick={onDetect} disabled={!state.loadedName}>
+								检测变量
+							</button>
+							<button onClick={onSave} disabled={!state.history}>
+								保存{state.dirty ? " *" : ""}
+							</button>
+						</div>
+						{state.history ? (
+							<div className="layout">
+								<ActionList state={state} dispatch={dispatch} />
+								<div className="right">
+									<ActionEditor state={state} dispatch={dispatch} />
+									<VariablePanel state={state} dispatch={dispatch} />
+								</div>
+							</div>
+						) : (
+							<div className="panel muted">从左侧选择一个流程开始编辑</div>
+						)}
+					</div>
+				)}
+
+				{tab === "replay" && (
+					<div className="replay-tab">
+						<div className="bar">
+							<button onClick={onRun} disabled={!state.loadedName}>
+								试跑
+							</button>
+						</div>
+						<RunPanel state={state} />
+						<BatchRunPanel
+							state={state}
+							onStart={onStartBatch}
+							onCancel={onCancelBatch}
+							onReset={onResetBatch}
+						/>
+					</div>
+				)}
+
+				{tab === "detail" && <DetailView state={state} />}
+			</section>
 		</div>
 	);
 }

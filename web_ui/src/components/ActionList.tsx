@@ -16,7 +16,7 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import type { EditorState, AgentHistory, InteractedElement, AgentAction } from "../types";
-import type { EditorAction } from "../App";
+import type { EditorAction } from "../reducer";
 
 function elemDesc(el: InteractedElement | null | undefined): string {
 	if (!el) return "无";

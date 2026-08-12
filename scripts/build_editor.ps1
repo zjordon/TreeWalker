@@ -2,7 +2,7 @@
 # 从仓库根运行（PowerShell 5.1 兼容：路径用相对字符串，避开 Join-Path 多参数）。
 # 产物（static/）gitignore，不进 git。clone 后跑一次本脚本生成。
 $ErrorActionPreference = "Stop"
-$ui = "history_editor_ui"
+$ui = "web_ui"
 $static = "src\tree_walker\history_editor\static"
 
 Write-Output "npm install..."

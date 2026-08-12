@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import type { Dispatch } from "react";
 import type { EditorState } from "../types";
-import type { EditorAction } from "../App";
+import type { EditorAction } from "../reducer";
 
 interface Props {
 	state: EditorState;

@@ -90,3 +90,25 @@ export interface EditorState {
 	batch: BatchState;
 	status: string;
 }
+
+// P6 live agent 任务（后端 /task/* 端点，M1/M2）
+export interface TaskEvent {
+	type: string; // step_start | model_call | model_result | tool_call | tool_result | step_end | anomaly | session_end | log | screenshot | done
+	step?: number;
+	[key: string]: unknown;
+}
+
+export type LivePhase = "idle" | "running" | "paused" | "done" | "error";
+
+export interface LiveState {
+	phase: LivePhase;
+	taskId: string | null;
+	task: string;
+	filePaths: string;
+	record: boolean;
+	events: TaskEvent[];      // EventBus 事件 → 步骤时间线
+	logs: TaskEvent[];         // type:"log"
+	screenshot: string | null; // 最新帧 data URL
+	status: string;
+	result: { success?: boolean; error?: string; saved?: string } | null;
+}

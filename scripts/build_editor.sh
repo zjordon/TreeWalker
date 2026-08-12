@@ -4,7 +4,7 @@
 # Windows 用 scripts/build_editor.ps1。
 set -euo pipefail
 
-ui="history_editor_ui"
+ui="web_ui"
 static="src/tree_walker/history_editor/static"
 
 echo "npm install..."
