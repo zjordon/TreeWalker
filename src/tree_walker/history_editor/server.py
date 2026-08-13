@@ -11,6 +11,9 @@
 - ``POST /history/save?name=``       保存历史 JSON（body: history dict）
 - ``GET /history/detect?name=``      返回 detect ∪ manual 变量
 - ``POST /history/rerun?name=``      试跑（body: {variables}），调 Agent.load_and_rerun
+- ``GET /skills/list``               列出 domain-skills 下的 host 目录（技能面）
+- ``GET /skills/get?host=``          读该 host 的 _sop/selectors/quirks 三文件
+- ``POST /skills/put?host=&file=``   写回某文件（body: {content}），并失效 live loader 缓存
 - ``GET /health``                    健康检查
 
 路径校验复用 ``rerun.resolve_rerun_path``（拒绝绝对路径 / ``..`` 越界）。``/history/rerun``
@@ -41,6 +44,7 @@ from tree_walker.agent.views import AgentHistoryList
 logger = logging.getLogger(__name__)
 
 _HISTORY_DIR_KEY = web.AppKey("history_dir", str)
+_SKILLS_DIR_KEY = web.AppKey("skills_dir", str)
 
 
 @dataclass
@@ -77,10 +81,17 @@ class LiveTaskHandle:
 _LIVE_TASKS: dict[str, LiveTaskHandle] = {}
 
 
-async def make_app(history_dir: str = "rerun-history") -> web.Application:
-	"""构造编辑器 aiohttp Application。``history_dir`` 由调用方传入（便于测试）。"""
+async def make_app(history_dir: str = "rerun-history", skills_dir: str | None = None) -> web.Application:
+	"""构造编辑器 aiohttp Application。``history_dir``/``skills_dir`` 由调用方传入（便于测试）。"""
 	app = web.Application(client_max_size=10 * 1024 * 1024)  # 默认 1MiB 不够 CSV 上传（issue #155）
 	app[_HISTORY_DIR_KEY] = history_dir
+	if skills_dir is None:  # 默认取 settings.agent.skills_dir（"domain-skills"）
+		try:
+			from tree_walker.config import load_settings
+			skills_dir = load_settings().agent.skills_dir
+		except Exception:
+			skills_dir = "domain-skills"
+	app[_SKILLS_DIR_KEY] = skills_dir
 	app.router.add_get("/history/list", _handle_list)
 	app.router.add_get("/history/load", _handle_load)
 	app.router.add_post("/history/save", _handle_save)
@@ -96,6 +107,10 @@ async def make_app(history_dir: str = "rerun-history") -> web.Application:
 	app.router.add_post("/task/pause", _handle_task_pause)
 	app.router.add_post("/task/resume", _handle_task_resume)
 	app.router.add_post("/task/stop", _handle_task_stop)
+	# Skills 技能面（P6 后续 B）：必须在 catch-all 之前注册
+	app.router.add_get("/skills/list", _handle_skills_list)
+	app.router.add_get("/skills/get", _handle_skills_get)
+	app.router.add_post("/skills/put", _handle_skills_put)
 	app.router.add_get("/health", _handle_health)
 	app.on_shutdown.append(_on_batch_shutdown)  # 进程退出时停所有批量任务、关浏览器
 	# 前端 SPA（构建产物在 _STATIC_DIR）：/assets/* 静态资源 + GET / 入口 + catch-all 回退
@@ -179,6 +194,76 @@ async def _handle_detect(request: web.Request) -> web.Response:
 	})
 
 
+# ── Skills 技能面（P6 后续 B）───────────────────────────────────────────────
+
+# 技能三文件白名单（与 skills/loader.py:_SKILL_FILES 一致）
+_SKILL_FILE_WHITELIST = ("_sop.md", "selectors.md", "quirks.md")
+
+
+def _skills_dir(request: web.Request) -> str:
+	return request.app[_SKILLS_DIR_KEY]
+
+
+def _validate_skill_host(host: str | None) -> str:
+	"""host 必须是单段（非空、无路径分隔、非 ./..），防越界创建/读取。"""
+	if not host:
+		raise ValueError("missing host")
+	if host in (".", "..") or "/" in host or "\\" in host or Path(host).parts != (host,):
+		raise ValueError(f"非法 host: {host!r}")
+	return host
+
+
+async def _handle_skills_list(request: web.Request) -> web.Response:
+	"""列出 skills_dir 下所有 host 目录（Immediate subdirs）。"""
+	root = Path(_skills_dir(request))
+	hosts = sorted(p.name for p in root.iterdir() if p.is_dir()) if root.is_dir() else []
+	return web.json_response({"hosts": hosts})
+
+
+async def _handle_skills_get(request: web.Request) -> web.Response:
+	"""读该 host 的三文件（缺失/空 → 空串）。路径经 resolve_rerun_path 校验。"""
+	host = request.query.get("host")
+	try:
+		host = _validate_skill_host(host)
+		root = _skills_dir(request)
+		files: dict[str, str] = {}
+		for fname in _SKILL_FILE_WHITELIST:
+			path = resolve_rerun_path(root, f"{host}/{fname}")
+			files[fname] = path.read_text(encoding="utf-8") if path.is_file() else ""
+	except (ValueError, OSError) as e:
+		return web.json_response({"error": str(e)}, status=400)
+	return web.json_response({"host": host, "files": files})
+
+
+async def _handle_skills_put(request: web.Request) -> web.Response:
+	"""写回某文件（body: {content}）。file 白名单 + 路径校验；写盘后失效 live loader 缓存。"""
+	host = request.query.get("host")
+	fname = request.query.get("file")
+	try:
+		body = await request.json()
+	except Exception:
+		return web.json_response({"error": "invalid json"}, status=400)
+	content = body.get("content") if isinstance(body, dict) else None
+	try:
+		host = _validate_skill_host(host)
+		if fname not in _SKILL_FILE_WHITELIST:
+			raise ValueError(f"非法 file（白名单 {_SKILL_FILE_WHITELIST}）: {fname!r}")
+		if not isinstance(content, str):
+			raise ValueError("missing content")
+		root = _skills_dir(request)
+		path = resolve_rerun_path(root, f"{host}/{fname}")
+		path.parent.mkdir(parents=True, exist_ok=True)  # 新 host → 建目录
+		path.write_text(content, encoding="utf-8")
+	except (ValueError, OSError) as e:
+		return web.json_response({"error": str(e)}, status=400)
+	# 热更新：写盘后失效正在跑的 live agent 的 skill 缓存（单槽，至多一个；getattr 防 mock 无该属性）
+	for h in _LIVE_TASKS.values():
+		loader = getattr(h.agent, "_skill_loader", None)
+		if loader is not None:
+			loader.invalidate(host)
+	return web.json_response({"ok": True})
+
+
 def _build_agent(task: str = ""):
 	"""构造 Agent（真实起浏览器，需 Chrome 远程调试端口）。
 
@@ -194,6 +279,7 @@ def _build_agent(task: str = ""):
 	if not settings.browser.ws_url:
 		raise RuntimeError("Chrome 未以 --remote-debugging-port 启动（settings.browser.ws_url 为空）")
 	settings.agent.enable_observability = True  # live task 靠 EventBus → SSE
+	settings.agent.enable_skill_injection = True  # P6 后续 I1：live 控制台默认带 skill（loader 对无 skill host 返回 ""，无副作用）
 	llm = LLMClient(settings.llm)
 	browser = BrowserSession(settings.browser)
 	return Agent(task=task, llm=llm, browser=browser, settings=settings.agent)

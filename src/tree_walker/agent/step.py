@@ -28,6 +28,7 @@ from tree_walker.agent.views import (
     redact_sensitive_string,
 )
 from tree_walker.browser.views import BrowserStateSummary, DOMInteractedElement
+from tree_walker.browser.url_utils import extract_host
 from tree_walker.prompts.system_prompt import build_state_message, build_system_prompt
 
 if TYPE_CHECKING:
@@ -116,6 +117,22 @@ class StepPipeline:
     _obs_session_id: str
     _truncation: TruncationSettings
     _save_conversation_path: str
+
+    async def _cached_viewport(self) -> tuple[int, int] | None:
+        """视口 (clientWidth, clientHeight)，懒加载缓存（视口罕变，整 session 复用）。
+
+        供 ToolCallEvent 元素几何归一化用。browser 无该方法 / CDP 失败 → None（bbox 降级 None）。
+        """
+        vp = getattr(self, "_viewport_cache", _VIEWPORT_UNSET)
+        if vp is not _VIEWPORT_UNSET:
+            return vp  # type: ignore[return-value]
+        getter = getattr(self.browser, "_get_viewport_size", None)
+        try:
+            vp = await getter() if getter is not None else None
+        except Exception:
+            vp = None
+        self._viewport_cache = vp  # type: ignore[assignment]
+        return vp
 
     # ── Orchestrator ──────────────────────────────────────────────────
 
@@ -254,6 +271,18 @@ class StepPipeline:
             if self._enable_skill_injection
             else None
         )
+
+        # P6 后续 I1：把「本步活动 skill」事件化（web 前端 RunView chip 用）。
+        # 仅 host/命中/字数，不传全文；emit 同步、与 agent 同线程，安全。
+        if self._obs_bus:
+            from tree_walker.observability.events import SkillActiveEvent
+            _skill_host = extract_host(browser_state.url)
+            self._obs_bus.emit(SkillActiveEvent(
+                step=self.state.n_steps, session_id=self._obs_session_id,
+                host=_skill_host,
+                skill_loaded=bool(skill_desc),
+                char_count=len(skill_desc or ""),
+            ))
 
         state_msg = build_state_message(
             browser_state=browser_state,
@@ -571,11 +600,14 @@ class StepPipeline:
         if self._obs_bus:
             from tree_walker.observability.events import ModelResultEvent
             action = response.get("action", {})
+            _usage = response.get("usage") or {}  # P6 后续 I2：LLMClient 透传的 token usage
             self._obs_bus.emit(ModelResultEvent(
                 step=self.state.n_steps, session_id=self._obs_session_id,
                 model_call_id=model_call_id,
                 action_name=action.get("name", "done"),
                 next_goal=response.get("next_goal", ""),
+                input_tokens=_usage.get("input_tokens"),
+                output_tokens=_usage.get("output_tokens"),
             ))
 
         # Record assistant message for conversation history
@@ -921,12 +953,17 @@ class StepPipeline:
             if self._obs_bus:
                 from tree_walker.observability.events import ToolCallEvent
                 tool_call_id = uuid.uuid4().hex[:8]
+                # P6 后续 I3：目标元素几何（归一化百分比，供 BrowserView 高亮框）
+                _vp = await self._cached_viewport()
+                _eidx, _ebbox, _expath = _action_element_geometry(
+                    action_params, browser_state.dom_state, _vp)
                 self._obs_bus.emit(ToolCallEvent(
                     step=self.state.n_steps, session_id=self._obs_session_id,
                     model_call_id=getattr(self, "_current_model_call_id", ""),
                     tool_call_id=tool_call_id, action_name=action_name,
                     params=action_params,
                     action_index=i, total_actions=total,
+                    element_index=_eidx, element_bbox=_ebbox, element_xpath=_expath,
                 ))
 
             # Sample pre-action state for runtime drift detection (guard #5).
@@ -1300,6 +1337,62 @@ class StepPipeline:
 
 
 # ── Helpers ────────────────────────────────────────────────────────────
+
+
+# _cached_viewport 的未初始化哨兵（区分「未取」与「取到 None」）
+_VIEWPORT_UNSET = object()
+
+
+def _normalize_bbox(bounds: dict[str, Any] | None, viewport: tuple[int, int] | None) -> dict[str, float] | None:
+	"""DOMRect.to_dict() + viewport(w,h) → 归一化 {left,top,width,height} ∈ [0,1]，或 None。
+
+	无 bounds / 无 viewport / 零除 → None（前端降级为不画框）。
+	"""
+	if not bounds or not viewport:
+		return None
+	w, h = viewport
+	if w <= 0 or h <= 0:
+		return None
+	x = float(bounds.get("x", 0) or 0)
+	y = float(bounds.get("y", 0) or 0)
+	bw = float(bounds.get("width", 0) or 0)
+	bh = float(bounds.get("height", 0) or 0)
+	return {
+		"left": max(0.0, min(1.0, x / w)),
+		"top": max(0.0, min(1.0, y / h)),
+		"width": max(0.0, min(1.0, bw / w)),
+		"height": max(0.0, min(1.0, bh / h)),
+	}
+
+
+def _action_element_geometry(
+	action_params: dict[str, Any],
+	dom_state: Any,
+	viewport: tuple[int, int] | None,
+) -> tuple[int | None, dict[str, float] | None, str | None]:
+	"""ToolCallEvent 元素高亮的几何提取（P6 后续 I3）。
+
+	返回 ``(element_index, element_bbox, element_xpath)``。无 index / 拿不到 node /
+	DOM 投影失败 → 对应字段 None；全程降级不抛。bbox 已归一化（相对视口）。
+	"""
+	idx = action_params.get("index")
+	if not isinstance(idx, int):
+		return None, None, None
+	sm = getattr(dom_state, "selector_map", None) if dom_state is not None else None
+	node = sm.get(idx) if sm else None
+	if node is None:
+		return idx, None, None
+	try:
+		diel = DOMInteractedElement.load_from_enhanced_dom_tree(node)
+	except Exception:
+		return idx, None, None
+	bbox: dict[str, float] | None = None
+	if diel.bounds is not None:
+		try:
+			bbox = _normalize_bbox(diel.bounds.to_dict(), viewport)
+		except Exception:
+			bbox = None
+	return idx, bbox, (diel.x_path or None)
 
 
 def _redact_params_for_log(

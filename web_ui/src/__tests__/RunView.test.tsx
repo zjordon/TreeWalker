@@ -80,4 +80,24 @@ describe("RunView (P6 M3)", () => {
 		await waitFor(() => expect(apiMocks.controlTask).toHaveBeenCalledWith("t1", "pause"));
 		await waitFor(() => expect(findButton(container, "▶ 恢复")).toBeTruthy());
 	});
+
+	it("skill_active 事件 → 显示活动技能 chip（I1）", async () => {
+		let captured: ((e: TaskEvent) => void) | null = null;
+		apiMocks.startTask.mockResolvedValue({ task_id: "t1" });
+		apiMocks.subscribeTaskEvents.mockImplementation(
+			(_id: string, onEvent: (e: TaskEvent) => void) => {
+				captured = onEvent;
+				return { close: vi.fn() } as unknown as EventSource;
+			},
+		);
+		const { container } = render(<RunView />);
+		setTask(container, "x");
+		fireEvent.click(findButton(container, "▶ 发送"));
+		await waitFor(() => expect(captured).not.toBeNull());
+		act(() => {
+			captured!({ type: "skill_active", step: 1, host: "member.bilibili.com", skill_loaded: true, char_count: 120 });
+		});
+		await waitFor(() => expect(container.textContent).toContain("member.bilibili.com"));
+		expect(container.textContent).toContain("120字");
+	});
 });

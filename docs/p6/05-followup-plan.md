@@ -107,3 +107,5 @@
 ## 5. 建议切入点
 
 若继续推进 P6 后续，建议顺序：**B 技能面 → I（Run 增强，尤其 I1/I2/I3）→ A 直播视口**（T1，高价值或用户明确想要，无阻塞），再视需要进 T2。T3 待解阻塞或主线出结论。
+
+> 「B + I1/I2/I3」的详细实施方案见 [`06-skills-and-run-enhancements-plan.md`](06-skills-and-run-enhancements-plan.md)。注意：06 调研后**勘误了本文对 I1/I2/I3 现状的若干描述**（见 06 §1）——I2 非「累加即可」（需先从 `LLMClient` 透传 usage）、I3 DOM 接线已现成（工作量更小）、I1 需新事件 + 强制开 skill。

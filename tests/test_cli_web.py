@@ -22,4 +22,4 @@ def test_web_defaults_advertised():
 	r = CliRunner().invoke(web, ["--help"])
 	assert r.exit_code == 0
 	assert "8766" in r.output  # 默认 port
-	assert "9222" in r.output  # 默认 cdp-port
+	assert "9223" in r.output  # 默认 cdp-port（web/重放路径约定端口；tw-tui 用 9222）

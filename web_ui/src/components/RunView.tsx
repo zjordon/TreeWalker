@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useReducer } from "react";
 import { initialLiveState, liveReducer } from "../liveReducer";
 import * as api from "../api";
+import { useAppNav } from "../appNav";
 import BrowserView from "./BrowserView";
 
 // P6 live agent 控制台（Run 视图）：任务输入 + 实时浏览器视图（截图流）+ 步骤时间线
 // + 日志流 + 运行控制（暂停/恢复/停止）+ 录制开关。订阅 /task/events SSE（M1/M2 后端）。
 export default function RunView() {
 	const [state, dispatch] = useReducer(liveReducer, initialLiveState);
+	const nav = useAppNav();
 	const running = state.phase === "running" || state.phase === "paused";
 	const finished = state.phase === "done" || state.phase === "error";
 
@@ -94,14 +96,32 @@ export default function RunView() {
 						</button>
 					)}
 					{finished && <button onClick={() => dispatch({ type: "RESET" })}>新任务</button>}
+					{state.activeSkill && (
+						<span className="skill-chip">
+							{state.activeSkill.skillLoaded ? (
+								<button
+									className="chip-btn"
+									onClick={() => nav?.openSkills(state.activeSkill?.host)}
+									title="点击查看/编辑该 host 的技能"
+								>
+									🔧 {state.activeSkill.host}（{state.activeSkill.charCount}字）
+								</button>
+							) : (
+								<span className="muted">🔧 无技能{state.activeSkill.host ? `（${state.activeSkill.host}）` : ""}</span>
+							)}
+						</span>
+					)}
 					<span className="status">{state.status}</span>
 				</div>
 			</div>
 
 			<div className="run-body">
-				<BrowserView mode="screenshots" screenshot={state.screenshot} />
+				<BrowserView mode="screenshots" screenshot={state.screenshot} highlights={state.highlights} />
 				<div className="panel timeline">
 					<h2>步骤时间线</h2>
+					<div className="run-stats muted">
+						⏱ {(state.elapsedMs / 1000).toFixed(1)}s · 🪙 ↑{state.tokens.in} ↓{state.tokens.out}
+					</div>
 					{state.events.length === 0 && <div className="muted">尚无步骤</div>}
 					<ul className="var-list">
 						{state.events.map((e, i) => (

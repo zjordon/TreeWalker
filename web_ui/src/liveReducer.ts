@@ -1,5 +1,5 @@
 // P6 live agent 任务的单一 state（useReducer）。事件来源：后端 /task/events SSE。
-import type { LiveState, TaskEvent } from "./types";
+import type { LiveState, TaskEvent, Highlight } from "./types";
 
 export const initialLiveState: LiveState = {
 	phase: "idle",
@@ -10,6 +10,10 @@ export const initialLiveState: LiveState = {
 	events: [],
 	logs: [],
 	screenshot: null,
+	activeSkill: null,
+	highlights: [],
+	tokens: { in: 0, out: 0 },
+	elapsedMs: 0,
 	status: "",
 	result: null,
 };
@@ -35,6 +39,10 @@ export function liveReducer(state: LiveState, action: LiveAction): LiveState {
 				events: [],
 				logs: [],
 				screenshot: null,
+				activeSkill: null,
+				highlights: [],
+				tokens: { in: 0, out: 0 },
+				elapsedMs: 0,
 				result: null,
 				status: "运行中…",
 			};
@@ -61,6 +69,54 @@ export function liveReducer(state: LiveState, action: LiveAction): LiveState {
 			if (e.type === "screenshot") {
 				const data = e.data as string | undefined;
 				return { ...state, screenshot: data ?? state.screenshot };
+			}
+			if (e.type === "skill_active") {
+				return {
+					...state,
+					activeSkill: {
+						host: (e.host as string | null) ?? null,
+						skillLoaded: Boolean(e.skill_loaded),
+						charCount: Number(e.char_count ?? 0),
+					},
+				};
+			}
+			if (e.type === "model_result") {
+				// I2：累计 token（input_tokens/output_tokens，镜像后端 MetricsAggregator）
+				return {
+					...state,
+					tokens: {
+						in: state.tokens.in + Number(e.input_tokens ?? 0),
+						out: state.tokens.out + Number(e.output_tokens ?? 0),
+					},
+					events: [...state.events, e],
+				};
+			}
+			if (e.type === "step_end") {
+				// I2：累计耗时（StepEndEvent.duration_seconds，秒→毫秒）
+				return {
+					...state,
+					elapsedMs: state.elapsedMs + Number(e.duration_seconds ?? 0) * 1000,
+					events: [...state.events, e],
+				};
+			}
+			if (e.type === "step_start") {
+				// I3：新步开始 → 清空上一步的高亮（保留至下一步 start，与该步截图同框）
+				return { ...state, highlights: [], events: [...state.events, e] };
+			}
+			if (e.type === "tool_call") {
+				// I3：收集本步 tool_call 的目标元素几何（归一化 bbox，无则跳过）
+				const bbox = e.element_bbox as Highlight["bbox"] | undefined;
+				if (bbox) {
+					return {
+						...state,
+						highlights: [
+							...state.highlights,
+							{ index: Number(e.action_index ?? 0), bbox },
+						],
+						events: [...state.events, e],
+					};
+				}
+				return { ...state, events: [...state.events, e] };
 			}
 			return { ...state, events: [...state.events, e] };
 		}

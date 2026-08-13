@@ -9,6 +9,7 @@ from tree_walker.observability.events import (
     ModelCallEvent,
     ModelResultEvent,
     SessionEndEvent,
+    SkillActiveEvent,
     StepEndEvent,
     StepStartEvent,
     ToolCallEvent,
@@ -55,6 +56,31 @@ def test_tool_call_event():
     assert event.tool_call_id == "t1"
 
 
+def test_tool_call_event_element_geometry_defaults_none():
+    # P6 后续 I3：元素几何字段默认 None（无 index / 无节点时）
+    event = ToolCallEvent(
+        step=1, session_id="abc", model_call_id="m1",
+        tool_call_id="t1", action_name="send_keys", params={"keys": "Enter"},
+    )
+    assert event.element_index is None
+    assert event.element_bbox is None
+    assert event.element_xpath is None
+
+
+def test_tool_call_event_element_geometry_populated():
+    event = ToolCallEvent(
+        step=1, session_id="abc", model_call_id="m1",
+        tool_call_id="t1", action_name="click", params={"index": 3},
+        element_index=3,
+        element_bbox={"left": 0.1, "top": 0.2, "width": 0.3, "height": 0.4},
+        element_xpath="/html/body/div",
+    )
+    data = json.loads(event.model_dump_json())
+    assert data["element_index"] == 3
+    assert data["element_bbox"]["left"] == 0.1
+    assert data["element_xpath"] == "/html/body/div"
+
+
 def test_tool_result_event():
     event = ToolResultEvent(
         step=1, session_id="abc", tool_call_id="t1",
@@ -89,3 +115,25 @@ def test_session_end_event():
     )
     assert event.event_type == "session_end"
     assert event.evaluation is None
+
+
+def test_skill_active_event():
+    # P6 后续 I1：活动 skill 事件（host/命中/字数）
+    event = SkillActiveEvent(
+        step=1, session_id="abc",
+        host="member.bilibili.com", skill_loaded=True, char_count=120,
+    )
+    assert event.event_type == "skill_active"
+    data = json.loads(event.model_dump_json())
+    assert data["event_type"] == "skill_active"
+    assert data["host"] == "member.bilibili.com"
+    assert data["skill_loaded"] is True
+    assert data["char_count"] == 120
+
+
+def test_skill_active_event_defaults():
+    # 无 host / 未命中 → 默认值（None / False / 0）
+    event = SkillActiveEvent(step=0, session_id="abc")
+    assert event.host is None
+    assert event.skill_loaded is False
+    assert event.char_count == 0

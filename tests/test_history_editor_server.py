@@ -727,3 +727,193 @@ async def test_screenshot_downsampled_via_resize(client, monkeypatch):
     async for _ in resp.content:
         pass
     assert seen.get("target") == (1280, 800)
+
+
+@pytest.mark.asyncio
+async def test_task_events_include_skill_active(client, monkeypatch):
+    # P6 后续 I1：SkillActiveEvent 经 "*" 订阅 → SSE 流（前端 chip 数据源）
+    from tree_walker.observability import EventBus
+    from tree_walker.observability.events import SkillActiveEvent
+
+    bus = EventBus()
+
+    async def run_with_skill(keep_alive=False):
+        bus.emit(SkillActiveEvent(step=1, session_id="t", host="member.bilibili.com",
+                                  skill_loaded=True, char_count=120))
+        return AgentHistoryList()
+
+    monkeypatch.setattr(
+        "tree_walker.history_editor.server._build_agent",
+        lambda *, task="": _live_agent(run=run_with_skill, bus=bus))
+    resp = await client.post("/task/start", json={"task": "上传视频"})
+    task_id = (await resp.json())["task_id"]
+
+    resp = await client.get("/task/events", params={"task_id": task_id})
+    data_lines = await _sse_data_lines(resp)
+    skill_line = next((l for l in data_lines if '"skill_active"' in l), None)
+    assert skill_line is not None
+    assert '"host": "member.bilibili.com"' in skill_line
+    assert '"skill_loaded": true' in skill_line
+
+
+# ── Skills 技能面（P6 后续 B）───────────────────────────────────────────────
+
+
+@pytest_asyncio.fixture
+async def skills_client(tmp_path):
+    """client + 独立临时 skills_dir（避免读到仓库真 domain-skills）。yield (cli, skills_root)。"""
+    skills_root = tmp_path / "skills"
+    skills_root.mkdir()
+    app = await make_app(str(tmp_path / "hist"), str(skills_root))
+    cli = TestClient(TestServer(app))
+    await cli.start_server()
+    yield cli, skills_root
+    await cli.close()
+
+
+@pytest.mark.asyncio
+async def test_skills_list_empty(skills_client):
+    cli, _ = skills_client
+    resp = await cli.get("/skills/list")
+    assert resp.status == 200
+    assert (await resp.json())["hosts"] == []
+
+
+@pytest.mark.asyncio
+async def test_skills_list_hosts(skills_client):
+    cli, root = skills_client
+    (root / "member.bilibili.com").mkdir()
+    (root / "creator.douyin.com").mkdir()
+    (root / "not-a-dir.txt").write_text("x", encoding="utf-8")
+    resp = await cli.get("/skills/list")
+    assert resp.status == 200
+    assert (await resp.json())["hosts"] == ["creator.douyin.com", "member.bilibili.com"]
+
+
+@pytest.mark.asyncio
+async def test_skills_get_reads_three_files(skills_client):
+    cli, root = skills_client
+    host = root / "member.bilibili.com"
+    host.mkdir()
+    (host / "_sop.md").write_text("# sop", encoding="utf-8")
+    (host / "selectors.md").write_text("| 元素 | 怎么找 |", encoding="utf-8")
+    (host / "quirks.md").write_text("1. quirk", encoding="utf-8")
+    resp = await cli.get("/skills/get", params={"host": "member.bilibili.com"})
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["host"] == "member.bilibili.com"
+    files = data["files"]
+    assert files["_sop.md"] == "# sop"
+    assert files["selectors.md"] == "| 元素 | 怎么找 |"
+    assert files["quirks.md"] == "1. quirk"
+
+
+@pytest.mark.asyncio
+async def test_skills_get_missing_host_returns_empty(skills_client):
+    # host 目录不存在 → 200 + 三文件皆空（与 loader「缺失即空」一致，供编辑器新建）
+    cli, _ = skills_client
+    resp = await cli.get("/skills/get", params={"host": "nope.example.com"})
+    assert resp.status == 200
+    files = (await resp.json())["files"]
+    assert files == {"_sop.md": "", "selectors.md": "", "quirks.md": ""}
+
+
+@pytest.mark.asyncio
+async def test_skills_get_traversal_rejected(skills_client):
+    cli, _ = skills_client
+    resp = await cli.get("/skills/get", params={"host": ".."})
+    assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_skills_get_rejects_nested_host(skills_client):
+    # host 含路径分隔 → 400（host 必须单段）
+    cli, _ = skills_client
+    resp = await cli.get("/skills/get", params={"host": "a/b"})
+    assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_skills_put_writes_file(skills_client):
+    cli, root = skills_client
+    (root / "member.bilibili.com").mkdir()
+    resp = await cli.post(
+        "/skills/put", params={"host": "member.bilibili.com", "file": "_sop.md"},
+        json={"content": "# new sop"})
+    assert resp.status == 200
+    assert (await resp.json())["ok"] is True
+    assert (root / "member.bilibili.com" / "_sop.md").read_text(encoding="utf-8") == "# new sop"
+
+
+@pytest.mark.asyncio
+async def test_skills_put_creates_new_host_dir(skills_client):
+    cli, root = skills_client
+    resp = await cli.post(
+        "/skills/put", params={"host": "new.example.com", "file": "selectors.md"},
+        json={"content": "x"})
+    assert resp.status == 200
+    assert (root / "new.example.com" / "selectors.md").read_text(encoding="utf-8") == "x"
+
+
+@pytest.mark.asyncio
+async def test_skills_put_traversal_rejected(skills_client):
+    cli, _ = skills_client
+    resp = await cli.post(
+        "/skills/put", params={"host": "..", "file": "_sop.md"}, json={"content": "x"})
+    assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_skills_put_bad_file_rejected(skills_client):
+    cli, _ = skills_client
+    resp = await cli.post(
+        "/skills/put", params={"host": "h.example.com", "file": "evil.md"},
+        json={"content": "x"})
+    assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_skills_put_missing_content(skills_client):
+    cli, _ = skills_client
+    resp = await cli.post(
+        "/skills/put", params={"host": "h.example.com", "file": "_sop.md"}, json={})
+    assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_skills_put_invalidates_live_loader(skills_client):
+    # /skills/put 写盘后，正在跑的 live agent 的 _skill_loader.invalidate(host) 应被调用
+    cli, _ = skills_client
+    from tree_walker.history_editor import server
+
+    class _FakeLoader:
+        def __init__(self):
+            self.invalidated = []
+
+        def invalidate(self, host=None):
+            self.invalidated.append(host)
+
+    loader = _FakeLoader()
+    # 植入一个 live handle（autouse fixture 已清空；agent 带 _skill_loader + stop/task 供 on_shutdown）
+    server._LIVE_TASKS["t-running"] = SimpleNamespace(
+        agent=SimpleNamespace(_skill_loader=loader, stop=lambda: None), task=None)
+    resp = await cli.post(
+        "/skills/put", params={"host": "member.bilibili.com", "file": "quirks.md"},
+        json={"content": "1. new"})
+    assert resp.status == 200
+    assert loader.invalidated == ["member.bilibili.com"]
+
+
+@pytest.mark.asyncio
+async def test_skills_put_skips_loader_when_absent(skills_client):
+    # live agent 无 _skill_loader 属性（如 mock）→ getattr 防 AttributeError，不崩
+    cli, _ = skills_client
+    from tree_walker.history_editor import server
+
+    server._LIVE_TASKS["t-bare"] = SimpleNamespace(
+        agent=SimpleNamespace(stop=lambda: None), task=None)  # 无 _skill_loader
+    resp = await cli.post(
+        "/skills/put", params={"host": "h.example.com", "file": "_sop.md"},
+        json={"content": "x"})
+    assert resp.status == 200
+

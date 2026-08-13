@@ -196,6 +196,18 @@ class LLMClient:
                 return await self.get_action(system_prompt, messages, tool_schema)
             raise
 
+        # P6 后续 I2：捕获 SDK 返回的 token usage（透传给 step → ModelResultEvent）。
+        # Anthropic Message 自带 .usage（input_tokens/output_tokens）；getattr 防异常 provider。
+        _usage = getattr(response, "usage", None)
+        _usage_dict = (
+            {
+                "input_tokens": getattr(_usage, "input_tokens", None),
+                "output_tokens": getattr(_usage, "output_tokens", None),
+            }
+            if _usage is not None
+            else None
+        )
+
         # Debug: log raw response content types
         block_types = []
         for block in response.content:
@@ -236,6 +248,7 @@ class LLMClient:
                 "next_goal": "Ending task due to empty response",
                 "action": {"name": "done", "params": {"text": "No response from LLM", "success": False}},
                 "actions": [{"name": "done", "params": {"text": "No response from LLM", "success": False}}],
+                "usage": _usage_dict,
             }
             if url_map:
                 result = self._restore_urls_in_output(result, url_map)
@@ -286,6 +299,7 @@ class LLMClient:
             "next_goal": tool_input.get("next_goal", ""),
             "action": actions_list[0] if actions_list else {},
             "actions": actions_list,
+            "usage": _usage_dict,
         }
 
         # URL restoration

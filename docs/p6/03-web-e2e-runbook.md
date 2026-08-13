@@ -20,13 +20,13 @@
 
 ```powershell
 & "$env:ProgramFiles\Google\Chrome\Application\chrome.exe" `
-    --remote-debugging-port=9222 `
+    --remote-debugging-port=9223 `
     --user-data-dir="$env:TEMP\tw-chrome" `
     --no-first-run --no-default-browser-check
 ```
 
 > Chrome 路径不在 `Program Files` 就换实际路径（如 `Program Files (x86)` 或 `%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe`）。
-> 这个 Chrome 窗口是 **agent 操作的浏览器**，开着不用管。`tw-web` 默认 `--cdp-port=9222` 连它（`config.py` 经 `CDP_PORT` → `_fetch_ws_url`）。
+> 这个 Chrome 窗口是 **agent 操作的浏览器**，开着不用管。`tw-web` 默认 `--cdp-port=9223` 连它（web/重放路径约定端口；`config.py` 经 `CDP_PORT` → `_fetch_ws_url`）。
 
 ---
 
@@ -42,7 +42,7 @@ uv run tw-web
 看到这行就成了：
 
 ```
-TreeWalker web: http://127.0.0.1:8766/  (Chrome CDP 端口=9222)
+TreeWalker web: http://127.0.0.1:8766/  (Chrome CDP 端口=9223)
 ======== Running on http://127.0.0.1:8766 ========
 ```
 
@@ -111,7 +111,7 @@ npm run dev
 
 | 现象 | 原因 / 处理 |
 |---|---|
-| 发送即报 `Chrome 未以 --remote-debugging-port 启动` | 步骤 1 的 Chrome 没起、端口不是 9222、或被别的 Chrome 抢了 user-data-dir → 确认是**新窗口**且 `--user-data-dir` 是独立目录 |
+| 发送即报 `Chrome 未以 --remote-debugging-port 启动` | 步骤 1 的 Chrome 没起、端口不是 9223、或被别的 Chrome 抢了 user-data-dir → 确认是**新窗口**且 `--user-data-dir` 是独立目录 |
 | 步骤/日志出，但**无截图** | 多半 `take_screenshot` 失败 → 看**步骤 2 后端终端**的日志（`screenshot capture failed`）；Pillow 缺失只影响降采样，不影响有帧 |
 | 完全无事件 / 一直转 | 步骤 2 后端没起、或 5173 没代理上 → F12 Network 看 `/task/events` 是否 200 eventstream；后端终端有无报错 |
 | `npm run dev` 起不来 | 端口 5173 被占 → `npm run dev -- --port 5174`，浏览器相应换端口 |

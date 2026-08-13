@@ -93,12 +93,25 @@ export interface EditorState {
 
 // P6 live agent 任务（后端 /task/* 端点，M1/M2）
 export interface TaskEvent {
-	type: string; // step_start | model_call | model_result | tool_call | tool_result | step_end | anomaly | session_end | log | screenshot | done
+	type: string; // step_start | model_call | model_result | tool_call | tool_result | step_end | anomaly | session_end | skill_active | log | screenshot | done
 	step?: number;
 	[key: string]: unknown;
 }
 
 export type LivePhase = "idle" | "running" | "paused" | "done" | "error";
+
+// P6 后续 I1：活动 skill（每步 SkillActiveEvent）
+export interface SkillActive {
+	host: string | null;
+	skillLoaded: boolean;
+	charCount: number;
+}
+
+// P6 后续 I3：元素高亮（当前步各 tool_call 的目标元素几何，归一化百分比）
+export interface Highlight {
+	index: number; // action_index（角标）
+	bbox: { left: number; top: number; width: number; height: number }; // ∈ [0,1]
+}
 
 export interface LiveState {
 	phase: LivePhase;
@@ -109,6 +122,10 @@ export interface LiveState {
 	events: TaskEvent[];      // EventBus 事件 → 步骤时间线
 	logs: TaskEvent[];         // type:"log"
 	screenshot: string | null; // 最新帧 data URL
+	activeSkill: SkillActive | null; // I1：当前 host 的活动 skill
+	highlights: Highlight[]; // I3：当前步 tool_call 元素高亮（step_start 清空）
+	tokens: { in: number; out: number }; // I2：累计 input/output tokens（ModelResultEvent）
+	elapsedMs: number; // I2：累计运行耗时（StepEndEvent.duration_seconds 累加）
 	status: string;
 	result: { success?: boolean; error?: string; saved?: string } | null;
 }

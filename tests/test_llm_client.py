@@ -391,3 +391,46 @@ class TestGetActionIntegration:
                 asyncio.run(
                     client.get_action("sys", [], {"name": "tool"}),
                 )
+
+
+# ── Usage passthrough tests（P6 后续 I2）──────────────────────────────
+
+
+class TestUsagePassthrough:
+    """get_action 把 SDK 返回的 token usage 透传到结果 dict（供 step → ModelResultEvent）。"""
+
+    @staticmethod
+    def _response(tool_input: dict[str, Any], *, usage) -> MagicMock:
+        block = MagicMock()
+        block.type = "tool_use"
+        block.name = "agent_response"
+        block.input = tool_input
+        resp = MagicMock()
+        resp.content = [block]
+        resp.usage = usage
+        return resp
+
+    def test_usage_in_result(self):
+        client = LLMClient(LLMSettings(api_key="test-key"))
+        usage = MagicMock()
+        usage.input_tokens = 123
+        usage.output_tokens = 45
+        resp = self._response(
+            {"evaluation_previous_goal": "", "memory": "", "next_goal": "g",
+             "action": {"name": "done", "params": {"text": "x", "success": True}}},
+            usage=usage,
+        )
+        with patch.object(client.client.messages, "create", return_value=resp):
+            result = asyncio.run(client.get_action("sys", [], {"name": "tool"}))
+        assert result["usage"] == {"input_tokens": 123, "output_tokens": 45}
+
+    def test_usage_none_when_missing(self):
+        # provider 无 usage 字段 → result["usage"] 为 None，不崩
+        client = LLMClient(LLMSettings(api_key="test-key"))
+        resp = self._response(
+            {"action": {"name": "done", "params": {"text": "x", "success": True}}},
+            usage=None,
+        )
+        with patch.object(client.client.messages, "create", return_value=resp):
+            result = asyncio.run(client.get_action("sys", [], {"name": "tool"}))
+        assert result["usage"] is None

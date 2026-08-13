@@ -105,7 +105,7 @@ export async function startTask(
 
 const TASK_EVENT_TYPES = [
 	"step_start", "model_call", "model_result", "tool_call", "tool_result",
-	"step_end", "anomaly", "session_end", "log", "screenshot", "done",
+	"step_end", "anomaly", "session_end", "skill_active", "log", "screenshot", "done",
 ];
 
 export function subscribeTaskEvents(
@@ -130,4 +130,35 @@ export async function controlTask(
 ): Promise<void> {
 	const r = await fetch(`${TASK}/${action}?task_id=${encodeURIComponent(taskId)}`, { method: "POST" });
 	if (!r.ok) throw new Error((await r.json()).error || `${action} failed`);
+}
+
+// ── Skills 技能面（P6 后续 B）───────────────────────────────────────────────
+
+const SKILLS = "/skills";
+
+// 技能三文件（与后端 _SKILL_FILE_WHITELIST 一致）
+export const SKILL_FILES = ["_sop.md", "selectors.md", "quirks.md"] as const;
+export type SkillFile = (typeof SKILL_FILES)[number];
+
+export async function listSkills(): Promise<string[]> {
+	const r = await fetch(`${SKILLS}/list`);
+	return (await r.json()).hosts;
+}
+
+export async function getSkill(host: string): Promise<Record<SkillFile, string>> {
+	const r = await fetch(`${SKILLS}/get?host=${encodeURIComponent(host)}`);
+	if (!r.ok) throw new Error((await r.json()).error || "get skill failed");
+	return (await r.json()).files;
+}
+
+export async function putSkill(host: string, file: SkillFile, content: string): Promise<void> {
+	const r = await fetch(
+		`${SKILLS}/put?host=${encodeURIComponent(host)}&file=${encodeURIComponent(file)}`,
+		{
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ content }),
+		},
+	);
+	if (!r.ok) throw new Error((await r.json()).error || "put skill failed");
 }

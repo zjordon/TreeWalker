@@ -48,7 +48,7 @@ ZHIPU_API_KEY=your_api_key_here
 
 **3. 启动界面**
 
-TreeWalker 提供两个入口（都是 live agent 控制台，连同一个 Chrome 9222）：
+TreeWalker 提供两个入口（都是 live agent 控制台）：`tw-web` 默认连 Chrome **9223**（web/重放路径约定端口，与 `serve_history_editor`/`csv_rerun` 一致），`tw-tui` 连 Chrome **9222**（config 默认）。按惯例分用两个端口，即可各开一个 Chrome 实例互不干扰。
 
 **Web 前端**（`tw-web`，推荐——可视化实时步骤/截图/日志，流程库编辑/批量重放）：
 
@@ -235,7 +235,7 @@ cd web_ui && npm install && npm run build && cd ..
 # 或 ./scripts/build_editor.sh（mac/linux）/ .\scripts\build_editor.ps1（Windows）
 ```
 
-启动（默认 http://127.0.0.1:8766/，连 Chrome 9222）：
+启动（默认 http://127.0.0.1:8766/，连 Chrome 9223）：
 ```bash
 tw-web
 ```
