@@ -112,3 +112,5 @@
 > 「B + I1/I2/I3」的详细实施方案见 [`06-skills-and-run-enhancements-plan.md`](06-skills-and-run-enhancements-plan.md)。注意：06 调研后**勘误了本文对 I1/I2/I3 现状的若干描述**（见 06 §1）——I2 非「累加即可」（需先从 `LLMClient` 透传 usage）、I3 DOM 接线已现成（工作量更小）、I1 需新事件 + 强制开 skill。
 
 > 「A 直播视口」的详细实施方案见 [`08-livestream-viewport-plan.md`](08-livestream-viewport-plan.md)。08 核实 cdp_use screencast API 全现成，方案落点：browser 侧 `start_screencast/stop_screencast` + 独立 `/task/screencast` SSE（最新帧槽）+ 前端 `BrowserView` 双 mode 共渲染；M1（screencast 原语）先做以 de-risk CDP/线程模型。
+
+> 「T2（C 设置面 / G 右 Context / H 进行中 zone + 后置的 I4/I5/I6）」的详细实施方案见 [`11-t2-settings-context-livezone-plan.md`](11-t2-settings-context-livezone-plan.md)。11 调研后修正了若干判断：C 后端比本文暗示的简单（`load_settings` 每任务现读 env → 内存 override 即生效，`.env` 写回降为可选增强）；H 的真正难点是 **live 状态提升**（RunView 内 reducer 切模式即卸载丢状态，需上移 AppShell + context）；G 收窄为阶段一只接 RunView 右栏（编辑/详情局部右栏迁移是纯重构收益低）。**T2 M1–M8 已实施**（2026-08-15，单测全绿），真机 e2e runbook 见 [`12-t2-e2e-runbook.md`](12-t2-e2e-runbook.md)。

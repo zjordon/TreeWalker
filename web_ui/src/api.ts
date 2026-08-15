@@ -1,17 +1,30 @@
 // 后端 /history/* 端点封装。fetch 用相对路径——dev 经 Vite proxy、prod 同源直连。
-import type { AgentHistoryList, DetectedVariable, ActionResult, BatchRowProgress, BatchStepProgress, TaskEvent } from "./types";
+import type { AgentHistoryList, DetectedVariable, ActionResult, BatchRowProgress, BatchStepProgress, TaskEvent, LiveTaskItem } from "./types";
 
 const BASE = "/history";
 
+// JSON 守卫：响应 content-type 非 JSON（典型 = SPA fallback 的 index.html——路径未被
+// Vite 代理 / 后端版本过旧没有该路由）→ 报可诊断的错误，而不是把
+// "Unexpected token '<', "<!DOCTYPE"..." 这种原始 SyntaxError 冒给用户。
+async function readJson(r: Response): Promise<any> {
+	const ct = r.headers.get("content-type") ?? "";
+	if (!ct.includes("application/json")) {
+		throw new Error(
+			`后端返回了非 JSON 响应（content-type: ${ct || "未知"}）——` +
+			"该路径未被代理（检查 vite.config 的 proxy 白名单）或后端版本过旧（重启 tw-web）");
+	}
+	return await r.json();
+}
+
 export async function listFiles(): Promise<string[]> {
 	const r = await fetch(`${BASE}/list`);
-	return (await r.json()).files;
+	return (await readJson(r)).files;
 }
 
 export async function loadHistory(name: string): Promise<AgentHistoryList> {
 	const r = await fetch(`${BASE}/load?name=${encodeURIComponent(name)}`);
-	if (!r.ok) throw new Error((await r.json()).error || "load failed");
-	return (await r.json()).history;
+	if (!r.ok) throw new Error((await readJson(r)).error || "load failed");
+	return (await readJson(r)).history;
 }
 
 export async function saveHistory(name: string, history: AgentHistoryList): Promise<void> {
@@ -20,13 +33,13 @@ export async function saveHistory(name: string, history: AgentHistoryList): Prom
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify(history),
 	});
-	if (!r.ok) throw new Error((await r.json()).error || "save failed");
+	if (!r.ok) throw new Error((await readJson(r)).error || "save failed");
 }
 
 export async function detectVariables(name: string): Promise<Record<string, DetectedVariable>> {
 	const r = await fetch(`${BASE}/detect?name=${encodeURIComponent(name)}`);
-	if (!r.ok) throw new Error((await r.json()).error || "detect failed");
-	return (await r.json()).variables;
+	if (!r.ok) throw new Error((await readJson(r)).error || "detect failed");
+	return (await readJson(r)).variables;
 }
 
 export async function rerun(name: string, variables: Record<string, string>): Promise<ActionResult[]> {
@@ -35,8 +48,8 @@ export async function rerun(name: string, variables: Record<string, string>): Pr
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({ variables }),
 	});
-	if (!r.ok) throw new Error((await r.json()).error || "rerun failed");
-	return (await r.json()).results;
+	if (!r.ok) throw new Error((await readJson(r)).error || "rerun failed");
+	return (await readJson(r)).results;
 }
 
 export async function startBatch(
@@ -49,15 +62,15 @@ export async function startBatch(
 		method: "POST",
 		body: fd,
 	});
-	if (!r.ok) throw new Error((await r.json()).error || "batch start failed");
-	return await r.json();
+	if (!r.ok) throw new Error((await readJson(r)).error || "batch start failed");
+	return await readJson(r);
 }
 
 export async function cancelBatch(taskId: string): Promise<void> {
 	const r = await fetch(`${BASE}/batch/cancel?task_id=${encodeURIComponent(taskId)}`, {
 		method: "POST",
 	});
-	if (!r.ok) throw new Error((await r.json()).error || "cancel failed");
+	if (!r.ok) throw new Error((await readJson(r)).error || "cancel failed");
 }
 
 export interface BatchDoneData {
@@ -94,14 +107,21 @@ export async function startTask(
 	filePaths?: string[],
 	record?: boolean,
 	viewportMode?: "screenshots" | "livestream",
+	model?: string,
 ): Promise<{ task_id: string }> {
 	const r = await fetch(`${TASK}/start`, {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ task, file_paths: filePaths, record, viewport_mode: viewportMode }),
+		body: JSON.stringify({
+			task,
+			file_paths: filePaths,
+			record,
+			viewport_mode: viewportMode,
+			model: model || undefined, // T2 I5：空 = 跟随设置默认，不发该字段
+		}),
 	});
-	if (!r.ok) throw new Error((await r.json()).error || "start failed");
-	return await r.json();
+	if (!r.ok) throw new Error((await readJson(r)).error || "start failed");
+	return await readJson(r);
 }
 
 const TASK_EVENT_TYPES = [
@@ -141,7 +161,30 @@ export async function controlTask(
 	action: "pause" | "resume" | "stop",
 ): Promise<void> {
 	const r = await fetch(`${TASK}/${action}?task_id=${encodeURIComponent(taskId)}`, { method: "POST" });
-	if (!r.ok) throw new Error((await r.json()).error || `${action} failed`);
+	if (!r.ok) throw new Error((await readJson(r)).error || `${action} failed`);
+}
+
+// T2 H（M2）：侧栏「进行中」zone——活跃/最近 live task（只读，30s 轮询）
+export async function listTasks(): Promise<LiveTaskItem[]> {
+	const r = await fetch(`${TASK}/list`);
+	if (!r.ok) throw new Error((await readJson(r)).error || "list tasks failed");
+	return (await readJson(r)).tasks;
+}
+
+// T2 I6（M5）：任务历史——与 TUI 共享 ~/.treewalker/history.json，两端互通
+export async function getTaskHistory(): Promise<string[]> {
+	const r = await fetch(`${TASK}/history`);
+	if (!r.ok) throw new Error((await readJson(r)).error || "get history failed");
+	return (await readJson(r)).tasks;
+}
+
+export async function pushTaskHistory(task: string): Promise<void> {
+	const r = await fetch(`${TASK}/history`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ task }),
+	});
+	if (!r.ok) throw new Error((await readJson(r)).error || "push history failed");
 }
 
 // ── Skills 技能面（P6 后续 B）───────────────────────────────────────────────
@@ -154,13 +197,13 @@ export type SkillFile = (typeof SKILL_FILES)[number];
 
 export async function listSkills(): Promise<string[]> {
 	const r = await fetch(`${SKILLS}/list`);
-	return (await r.json()).hosts;
+	return (await readJson(r)).hosts;
 }
 
 export async function getSkill(host: string): Promise<Record<SkillFile, string>> {
 	const r = await fetch(`${SKILLS}/get?host=${encodeURIComponent(host)}`);
-	if (!r.ok) throw new Error((await r.json()).error || "get skill failed");
-	return (await r.json()).files;
+	if (!r.ok) throw new Error((await readJson(r)).error || "get skill failed");
+	return (await readJson(r)).files;
 }
 
 export async function putSkill(host: string, file: SkillFile, content: string): Promise<void> {
@@ -172,5 +215,35 @@ export async function putSkill(host: string, file: SkillFile, content: string): 
 			body: JSON.stringify({ content }),
 		},
 	);
-	if (!r.ok) throw new Error((await r.json()).error || "put skill failed");
+	if (!r.ok) throw new Error((await readJson(r)).error || "put skill failed");
+}
+
+// ── Settings 设置面（T2 C）──────────────────────────────────────────────────
+
+// 镜像后端 SettingField 注册表条目（GET /settings/get 返回）
+export interface SettingFieldDTO {
+	key: string;
+	env: string;
+	section: string;
+	type: "str" | "int" | "float" | "bool" | "enum";
+	choices: string[];
+	default: string;
+	sensitive: boolean; // 敏感字段（placeholder 提示，不动不提交）
+	value: string; // 敏感字段为掩码串（****+尾4）
+	masked: boolean;
+}
+
+export async function getSettings(): Promise<{ fields: SettingFieldDTO[]; applies: string }> {
+	const r = await fetch("/settings/get");
+	if (!r.ok) throw new Error((await readJson(r)).error || "get settings failed");
+	return await readJson(r);
+}
+
+export async function setSettings(values: Record<string, string>): Promise<void> {
+	const r = await fetch("/settings/set", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify(values),
+	});
+	if (!r.ok) throw new Error((await readJson(r)).error || "set settings failed");
 }

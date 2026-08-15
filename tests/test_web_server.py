@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 
 import pytest
 import pytest_asyncio
@@ -331,6 +333,111 @@ async def test_batch_cancel_unknown_task(client):
     assert resp.status == 404
 
 
+# ── Settings 设置面（T2 C M3）───────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_settings_get_defaults_and_masking(client, monkeypatch):
+    # 清掉本机可能存在的同名 env，验证注册表默认值 + API key 脱敏
+    for env in ("LLM_MODEL", "ZHIPU_API_KEY", "AGENT_MAX_STEPS", "LLM_OUTPUT_MODE",
+                "AGENT_ENABLE_SKILL_INJECTION"):
+        monkeypatch.delenv(env, raising=False)
+    resp = await client.get("/settings/get")
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["applies"] == "new_tasks"
+    fields = {f["env"]: f for f in data["fields"]}
+    assert fields["LLM_MODEL"]["value"] == "glm-5.1"
+    assert fields["LLM_MODEL"]["section"] == "llm"
+    assert fields["AGENT_MAX_STEPS"]["value"] == "100"
+    assert fields["AGENT_MAX_STEPS"]["type"] == "int"
+    assert fields["LLM_OUTPUT_MODE"]["choices"] == ["standard", "flash", "thinking"]
+    # skill 注入默认 false = env 层默认（config.py），web live 由 _build_agent 强制开
+    assert fields["AGENT_ENABLE_SKILL_INJECTION"]["value"] == "false"
+    # 敏感：未设 → 空值不掩码；设了 → **** + 尾 4 位；sensitive 标志供前端区分「敏感未设置」
+    assert fields["ZHIPU_API_KEY"]["masked"] is False
+    assert fields["ZHIPU_API_KEY"]["sensitive"] is True
+    assert fields["LLM_MODEL"]["sensitive"] is False
+    monkeypatch.setenv("ZHIPU_API_KEY", "sk-abcd1234efgh")
+    resp = await client.get("/settings/get")
+    fields = {f["env"]: f for f in (await resp.json())["fields"]}
+    assert fields["ZHIPU_API_KEY"]["value"] == "****efgh"
+    assert fields["ZHIPU_API_KEY"]["masked"] is True
+
+
+@pytest.mark.asyncio
+async def test_settings_set_whitelist_and_validation(client, monkeypatch):
+    # 注册表外 env（含进程级 CDP_PORT）→ 400，防任意 env 注入
+    resp = await client.post("/settings/set", json={"CDP_PORT": "9224"})
+    assert resp.status == 400
+    # 非法 int / bool / enum → 400
+    assert (await client.post("/settings/set", json={"AGENT_MAX_STEPS": "abc"})).status == 400
+    assert (await client.post("/settings/set", json={"AGENT_MAX_STEPS": "1.5"})).status == 400
+    assert (await client.post("/settings/set", json={"AGENT_ENABLE_PLANNING": "yes"})).status == 400
+    assert (await client.post("/settings/set", json={"LLM_OUTPUT_MODE": "turbo"})).status == 400
+    # 非法 JSON / 非对象 body → 400
+    assert (await client.post("/settings/set", data="not json")).status == 400
+    assert (await client.post("/settings/set", json=[1, 2])).status == 400
+    # 合法 set → 进程内存 override（os.environ）
+    monkeypatch.delenv("AGENT_MAX_STEPS", raising=False)
+    monkeypatch.delenv("AGENT_ENABLE_PLANNING", raising=False)
+    resp = await client.post("/settings/set", json={
+        "AGENT_MAX_STEPS": "7", "AGENT_ENABLE_PLANNING": "false", "AGENT_RERUN_DELAY_BETWEEN_ACTIONS": "2"})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    assert body["applies"] == "new_tasks"
+    assert body["applied"] == ["AGENT_ENABLE_PLANNING", "AGENT_MAX_STEPS",
+                               "AGENT_RERUN_DELAY_BETWEEN_ACTIONS"]
+    assert os.environ["AGENT_MAX_STEPS"] == "7"
+    assert os.environ["AGENT_ENABLE_PLANNING"] == "false"
+    assert os.environ["AGENT_RERUN_DELAY_BETWEEN_ACTIONS"] == "2"
+    # bool 值规范化：JSON true → "true"
+    resp = await client.post("/settings/set", json={"AGENT_ENABLE_PLANNING": True})
+    assert resp.status == 200
+    assert os.environ["AGENT_ENABLE_PLANNING"] == "true"
+
+
+@pytest.mark.asyncio
+async def test_settings_set_sensitive_skip_and_atomicity(client, monkeypatch):
+    # 敏感字段：空值 / **** 掩码串回传 → 跳过不写（防掩码覆盖真值）
+    monkeypatch.setenv("ZHIPU_API_KEY", "sk-real-key-9999")
+    resp = await client.post("/settings/set", json={"ZHIPU_API_KEY": "****9999"})
+    assert resp.status == 200
+    assert os.environ["ZHIPU_API_KEY"] == "sk-real-key-9999"  # 未被掩码串覆盖
+    resp = await client.post("/settings/set", json={"ZHIPU_API_KEY": ""})
+    assert resp.status == 200
+    assert os.environ["ZHIPU_API_KEY"] == "sk-real-key-9999"
+    # 真实敏感值正常写入
+    resp = await client.post("/settings/set", json={"ZHIPU_API_KEY": "sk-new-key-1111"})
+    assert resp.status == 200
+    assert os.environ["ZHIPU_API_KEY"] == "sk-new-key-1111"
+    # 原子性：一项合法 + 一项非法（enum 越界）→ 整体 400，合法项也不落盘
+    monkeypatch.delenv("AGENT_MAX_FAILURES", raising=False)
+    resp = await client.post("/settings/set", json={"AGENT_MAX_FAILURES": "9", "LLM_OUTPUT_MODE": "turbo"})
+    assert resp.status == 400
+    assert "AGENT_MAX_FAILURES" not in os.environ
+
+
+@pytest.mark.asyncio
+async def test_settings_set_affects_new_agent(client, monkeypatch):
+    """set 后新任务的 settings 生效——load_settings 每任务现读 env（plan §8.1 生效范围）。"""
+    built = {}
+
+    def fake_build_agent(*, task="", model=None):
+        from tree_walker.config import load_settings
+        built["settings"] = load_settings()
+        return _live_agent()
+
+    monkeypatch.setattr("tree_walker.web.server._build_agent", fake_build_agent)
+    monkeypatch.delenv("AGENT_MAX_STEPS", raising=False)
+    resp = await client.post("/settings/set", json={"AGENT_MAX_STEPS": "3"})
+    assert resp.status == 200
+    resp = await client.post("/task/start", json={"task": "x"})
+    assert resp.status == 200
+    assert built["settings"].agent.max_steps == 3
+
+
 # ── Live agent 探索任务（P6 M1）─────────────────────────────────────────────
 
 
@@ -353,7 +460,7 @@ def _live_agent(*, run=None, bus=None, history=None, browser=None):
 @pytest.mark.asyncio
 async def test_task_start_returns_task_id(client, monkeypatch):
     monkeypatch.setattr(
-        "tree_walker.web.server._build_agent", lambda *, task="": _live_agent())
+        "tree_walker.web.server._build_agent", lambda *, task="", model=None: _live_agent())
     resp = await client.post("/task/start", json={"task": "帮我搜索猫"})
     assert resp.status == 200
     assert "task_id" in (await resp.json())
@@ -366,6 +473,50 @@ async def test_task_start_missing_task(client):
 
 
 @pytest.mark.asyncio
+async def test_task_start_model_passed_to_build_agent(client, monkeypatch):
+    """T2 I5（M6）：/task/start 带 model → 透传 _build_agent；缺省 None（跟随设置默认）。"""
+    captured = {}
+
+    def fake_build(*, task="", model=None):
+        captured["model"] = model
+        return _live_agent()
+
+    monkeypatch.setattr("tree_walker.web.server._build_agent", fake_build)
+    resp = await client.post("/task/start", json={"task": "x", "model": "glm-test"})
+    assert resp.status == 200
+    assert captured["model"] == "glm-test"
+    resp = await client.post("/task/start", json={"task": "y"})  # 缺省 → None
+    assert resp.status == 200
+    assert captured["model"] is None
+
+
+def test_build_agent_model_overrides_llm_settings(monkeypatch):
+    """T2 I5（M6）：model override 只作用于本次构造的 settings.llm.model；缺省不动。
+
+    monkeypatch Agent/BrowserSession/LLMClient + load_settings（免真 Chrome/LLM）。
+    """
+    from tree_walker.config import Settings
+    from tree_walker.web.server import _build_agent
+
+    settings = Settings()
+    settings.browser.ws_url = "ws://fake"  # 过 ws_url 非空检查
+    monkeypatch.setattr("tree_walker.config.load_settings", lambda: settings)
+    monkeypatch.setattr("tree_walker.Agent", lambda **kw: SimpleNamespace(**kw))
+    monkeypatch.setattr("tree_walker.BrowserSession", lambda s: object())
+    monkeypatch.setattr("tree_walker.LLMClient", lambda s: object())
+
+    agent = _build_agent(task="x", model="glm-custom")
+    assert settings.llm.model == "glm-custom"  # 本次 override 生效
+    assert agent.task == "x"
+
+    settings2 = Settings()
+    settings2.browser.ws_url = "ws://fake"
+    monkeypatch.setattr("tree_walker.config.load_settings", lambda: settings2)
+    _build_agent(task="y")  # 缺省：不改 model
+    assert settings2.llm.model == "glm-5.1"
+
+
+@pytest.mark.asyncio
 async def test_task_start_invalid_json(client):
     resp = await client.post("/task/start", data="not json")
     assert resp.status == 400
@@ -373,7 +524,7 @@ async def test_task_start_invalid_json(client):
 
 @pytest.mark.asyncio
 async def test_task_start_build_agent_error(client, monkeypatch):
-    def boom(*, task=""):
+    def boom(*, task="", model=None):
         raise RuntimeError("Chrome 未启动")
     monkeypatch.setattr("tree_walker.web.server._build_agent", boom)
     resp = await client.post("/task/start", json={"task": "x"})
@@ -391,7 +542,7 @@ async def test_task_start_concurrent_with_live_rejected(client, monkeypatch):
 
     monkeypatch.setattr(
         "tree_walker.web.server._build_agent",
-        lambda *, task="": _live_agent(run=slow_run))
+        lambda *, task="", model=None: _live_agent(run=slow_run))
     r1 = await client.post("/task/start", json={"task": "a"})
     assert r1.status == 200
     r2 = await client.post("/task/start", json={"task": "b"})  # 已有 live → 409
@@ -410,7 +561,7 @@ async def test_batch_rejected_when_live_active(client, tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         "tree_walker.web.server._build_agent",
-        lambda *, task="": _live_agent(run=slow_run))
+        lambda *, task="", model=None: _live_agent(run=slow_run))
     _save_blank_history(tmp_path)
     r_live = await client.post("/task/start", json={"task": "a"})
     assert r_live.status == 200
@@ -436,7 +587,7 @@ async def test_task_events_sse(client, monkeypatch):
 
     monkeypatch.setattr(
         "tree_walker.web.server._build_agent",
-        lambda *, task="": _live_agent(run=emitting_run, bus=bus))
+        lambda *, task="", model=None: _live_agent(run=emitting_run, bus=bus))
     resp = await client.post("/task/start", json={"task": "x"})
     task_id = (await resp.json())["task_id"]
 
@@ -472,7 +623,7 @@ async def test_task_control_pause_resume_stop(client, monkeypatch):
     agent.resume = lambda: calls.append("resume")
     agent.stop = lambda: calls.append("stop")
     monkeypatch.setattr(
-        "tree_walker.web.server._build_agent", lambda *, task="": agent)
+        "tree_walker.web.server._build_agent", lambda *, task="", model=None: agent)
     r = await client.post("/task/start", json={"task": "x"})
     task_id = (await r.json())["task_id"]
 
@@ -505,7 +656,7 @@ async def test_task_record_saves_history(client, monkeypatch):
     agent.run = quick_run
     agent.save_history = fake_save
     monkeypatch.setattr(
-        "tree_walker.web.server._build_agent", lambda *, task="": agent)
+        "tree_walker.web.server._build_agent", lambda *, task="", model=None: agent)
     r = await client.post("/task/start", json={"task": "x", "record": True})
     task_id = (await r.json())["task_id"]
 
@@ -534,7 +685,7 @@ async def test_task_events_run_error(client, monkeypatch):
 
     monkeypatch.setattr(
         "tree_walker.web.server._build_agent",
-        lambda *, task="": _live_agent(run=boom_run))
+        lambda *, task="", model=None: _live_agent(run=boom_run))
     resp = await client.post("/task/start", json={"task": "x"})
     task_id = (await resp.json())["task_id"]
 
@@ -553,7 +704,7 @@ async def test_task_events_replay_after_done(client, monkeypatch):
 
     monkeypatch.setattr(
         "tree_walker.web.server._build_agent",
-        lambda *, task="": _live_agent(run=quick))
+        lambda *, task="", model=None: _live_agent(run=quick))
     resp = await client.post("/task/start", json={"task": "x"})
     task_id = (await resp.json())["task_id"]
 
@@ -585,14 +736,188 @@ async def test_task_record_save_failure(client, monkeypatch):
     agent = _live_agent(run=quick, history=hist)
     agent.save_history = bad_save
     monkeypatch.setattr(
-        "tree_walker.web.server._build_agent", lambda *, task="": agent)
+        "tree_walker.web.server._build_agent", lambda *, task="", model=None: agent)
     r = await client.post("/task/start", json={"task": "x", "record": True})
     task_id = (await r.json())["task_id"]
 
     resp = await client.get("/task/events", params={"task_id": task_id})
     data_lines = await _sse_data_lines(resp)
-    assert '"success": true' in data_lines[-1]
+    # #164：success 取 agent 真实终态——该用例的假 agent 无 done 结果 → False（未完成）
+    assert '"success": false' in data_lines[-1]
     assert '"saved"' not in data_lines[-1]
+
+
+# ── 任务历史（T2 I6 M5，与 TUI 共享）────────────────────────────────────────
+
+
+def test_task_history_file_matches_tui():
+    """与 TUI 同一路径（tui/app.py HISTORY_FILE）——两端任务历史互通的前提。"""
+    from pathlib import Path
+
+    from tree_walker.tui.app import HISTORY_FILE
+    from tree_walker.web import server
+
+    assert server._TASK_HISTORY_FILE == HISTORY_FILE == Path.home() / ".treewalker" / "history.json"
+
+
+@pytest.mark.asyncio
+async def test_task_history_roundtrip_and_dedupe(client, monkeypatch, tmp_path):
+    from tree_walker.web import server
+
+    hist_file = tmp_path / "history.json"
+    monkeypatch.setattr(server, "_TASK_HISTORY_FILE", hist_file)
+
+    # 缺失文件 → []（TUI _load_history 同款容错）
+    resp = await client.get("/task/history")
+    assert resp.status == 200
+    assert (await resp.json())["tasks"] == []
+
+    # append → 落盘 + 读回（格式与 TUI 一致：list[str] JSON）
+    resp = await client.post("/task/history", json={"task": "搜索猫"})
+    assert resp.status == 200
+    assert (await resp.json())["count"] == 1
+    resp = await client.get("/task/history")
+    assert (await resp.json())["tasks"] == ["搜索猫"]
+    assert json.loads(hist_file.read_text(encoding="utf-8")) == ["搜索猫"]
+
+    # 连续去重（TUI 同款：task == hist[-1] 不重复记）
+    await client.post("/task/history", json={"task": "搜索猫"})
+    resp = await client.get("/task/history")
+    assert (await resp.json())["tasks"] == ["搜索猫"]
+
+    # 交替任务不丢
+    await client.post("/task/history", json={"task": "上传视频"})
+    resp = await client.get("/task/history")
+    assert (await resp.json())["tasks"] == ["搜索猫", "上传视频"]
+
+
+@pytest.mark.asyncio
+async def test_task_history_corrupt_cap_and_validation(client, monkeypatch, tmp_path):
+    from tree_walker.web import server
+
+    hist_file = tmp_path / "history.json"
+    monkeypatch.setattr(server, "_TASK_HISTORY_FILE", hist_file)
+
+    # 损坏 JSON → []，且下次 append 重写为合法文件
+    hist_file.write_text("{broken", encoding="utf-8")
+    assert (await (await client.get("/task/history")).json())["tasks"] == []
+    await client.post("/task/history", json={"task": "x"})
+    assert json.loads(hist_file.read_text(encoding="utf-8")) == ["x"]
+
+    # 非字符串成员 → [] 容错
+    hist_file.write_text('["a", 1]', encoding="utf-8")
+    assert (await (await client.get("/task/history")).json())["tasks"] == []
+
+    # 100 截断：预写 100 条 → append 1 → 仍 100 且最老被挤掉（TUI 同款 [-100:]）
+    hist_file.write_text(json.dumps([f"t{i}" for i in range(100)]), encoding="utf-8")
+    await client.post("/task/history", json={"task": "new"})
+    data = json.loads(hist_file.read_text(encoding="utf-8"))
+    assert len(data) == 100
+    assert data[0] == "t1" and data[-1] == "new"
+
+    # 非法 body：缺 task / 非对象 / 非 JSON → 400
+    assert (await client.post("/task/history", json={})).status == 400
+    assert (await client.post("/task/history", json={"task": "  "})).status == 400
+    assert (await client.post("/task/history", json=[1])).status == 400
+    assert (await client.post("/task/history", data="not json")).status == 400
+
+
+@pytest.mark.asyncio
+async def test_task_list_running_then_done(client, monkeypatch):
+	"""T2 H（M2）：/task/list 透出 task 文本、phase（running→done）、success、saved。"""
+	hold = asyncio.Event()
+	# #164 后 success 取 agent 真实终态（末步 done 结果）——成功用例须带 done(success=True)
+	hist = AgentHistoryList(history=[AgentHistory(
+		step_number=1, model_output={"actions": []},
+		result=[ActionResult(is_done=True, success=True)])])
+
+	async def slow_run(keep_alive=False):
+		await hold.wait()
+		return AgentHistoryList()
+
+	monkeypatch.setattr(
+		"tree_walker.web.server._build_agent",
+		lambda *, task="", model=None: _live_agent(run=slow_run, history=hist))
+	resp = await client.post("/task/start", json={"task": "帮我搜索猫"})
+	task_id = (await resp.json())["task_id"]
+
+	resp = await client.get("/task/list")
+	assert resp.status == 200
+	tasks = (await resp.json())["tasks"]
+	assert len(tasks) == 1
+	assert tasks[0]["task_id"] == task_id
+	assert tasks[0]["task"] == "帮我搜索猫"
+	assert tasks[0]["phase"] == "running"
+	assert tasks[0]["success"] is None
+
+	hold.set()  # 放行 → 任务完成
+	await asyncio.sleep(0.05)  # 等 run_live finally 写 final_event
+
+	resp = await client.get("/task/list")
+	tasks = (await resp.json())["tasks"]
+	assert tasks[0]["phase"] == "done"
+	assert tasks[0]["success"] is True
+
+
+@pytest.mark.asyncio
+async def test_task_final_success_reflects_done_result(client, monkeypatch):
+	"""issue #164：done(success=False)（max_steps 封顶的诚实上报）→ /task/list 不再误报成功。"""
+	hist = AgentHistoryList(history=[AgentHistory(
+		step_number=1, model_output={"actions": []},
+		result=[ActionResult(is_done=True, success=False, extracted_content="任务部分完成")])])
+	monkeypatch.setattr(
+		"tree_walker.web.server._build_agent",
+		lambda *, task="", model=None: _live_agent(history=hist))
+	resp = await client.post("/task/start", json={"task": "x"})
+	assert resp.status == 200
+	await asyncio.sleep(0.05)  # 等 run_live finally 写 final_event
+
+	resp = await client.get("/task/list")
+	tasks = (await resp.json())["tasks"]
+	assert tasks[0]["phase"] == "done"
+	assert tasks[0]["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_task_final_success_false_when_no_done(client, monkeypatch):
+	"""issue #164 语义补充：无 done 结果（如用户中止）→ success False（未完成）。"""
+	monkeypatch.setattr(
+		"tree_walker.web.server._build_agent",
+		lambda *, task="", model=None: _live_agent())  # 空 history，无 done
+	resp = await client.post("/task/start", json={"task": "x"})
+	assert resp.status == 200
+	await asyncio.sleep(0.05)
+	resp = await client.get("/task/list")
+	tasks = (await resp.json())["tasks"]
+	assert tasks[0]["phase"] == "done"
+	assert tasks[0]["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_task_list_records_saved_and_paused(client, monkeypatch):
+	"""T2 H（M2）：录制落库文件名透出；paused 从 agent.state.paused 推导（mock 无 state → running）。"""
+	monkeypatch.setattr(
+		"tree_walker.web.server._build_agent", lambda *, task="", model=None: _live_agent())
+	resp = await client.post("/task/start", json={"task": "x", "record": True})
+	task_id = (await resp.json())["task_id"]
+	await asyncio.sleep(0.05)  # 等 run 完成（run 是即返的 mock）
+
+	# done + saved：直接改 final_event 模拟录制落库（不依赖真 save_history 路径）
+	from tree_walker.web import server
+	server._LIVE_TASKS[task_id].final_event = {"type": "done", "success": True, "saved": "202608151030.json"}
+	resp = await client.get("/task/list")
+	tasks = (await resp.json())["tasks"]
+	assert tasks[0]["saved"] == "202608151030.json"
+
+	# paused：植入带 state.paused 的 handle（仿 skills 测试的 SimpleNamespace 植入模式）
+	server._LIVE_TASKS.clear()
+	server._LIVE_TASKS["t-paused"] = server.LiveTaskHandle(
+		agent=SimpleNamespace(state=SimpleNamespace(paused=True), stop=lambda: None),
+		queue=asyncio.Queue(), task_text="暂停中的任务")
+	resp = await client.get("/task/list")
+	tasks = (await resp.json())["tasks"]
+	assert tasks[0]["phase"] == "paused"
+	assert tasks[0]["task"] == "暂停中的任务"
 
 
 @pytest.mark.asyncio
@@ -603,7 +928,7 @@ async def test_task_start_clears_finished_handle(client, monkeypatch):
 
     monkeypatch.setattr(
         "tree_walker.web.server._build_agent",
-        lambda *, task="": _live_agent(run=quick))
+        lambda *, task="", model=None: _live_agent(run=quick))
     from tree_walker.web import server
 
     r1 = await client.post("/task/start", json={"task": "a"})
@@ -650,7 +975,7 @@ async def test_task_events_include_logs(client, monkeypatch):
 
     monkeypatch.setattr(
         "tree_walker.web.server._build_agent",
-        lambda *, task="": _live_agent(run=logging_run))
+        lambda *, task="", model=None: _live_agent(run=logging_run))
     resp = await client.post("/task/start", json={"task": "x"})
     task_id = (await resp.json())["task_id"]
 
@@ -680,7 +1005,7 @@ async def test_task_events_include_screenshot(client, monkeypatch):
 
     monkeypatch.setattr(
         "tree_walker.web.server._build_agent",
-        lambda *, task="": _live_agent(run=stepping_run, bus=bus, browser=browser))
+        lambda *, task="", model=None: _live_agent(run=stepping_run, bus=bus, browser=browser))
     resp = await client.post("/task/start", json={"task": "x"})
     task_id = (await resp.json())["task_id"]
 
@@ -719,7 +1044,7 @@ async def test_screenshot_downsampled_via_resize(client, monkeypatch):
 
     monkeypatch.setattr(
         "tree_walker.web.server._build_agent",
-        lambda *, task="": _live_agent(run=stepping_run, bus=bus, browser=browser))
+        lambda *, task="", model=None: _live_agent(run=stepping_run, bus=bus, browser=browser))
     resp = await client.post("/task/start", json={"task": "x"})
     task_id = (await resp.json())["task_id"]
 
@@ -752,7 +1077,7 @@ async def test_task_start_livestream_configures_screencast(client, monkeypatch):
 
     monkeypatch.setattr(
         "tree_walker.web.server._build_agent",
-        lambda *, task="": _live_agent(run=stepping_run, bus=bus, browser=browser))
+        lambda *, task="", model=None: _live_agent(run=stepping_run, bus=bus, browser=browser))
     resp = await client.post("/task/start", json={"task": "x", "viewport_mode": "livestream"})
     assert resp.status == 200
     task_id = (await resp.json())["task_id"]
@@ -790,7 +1115,7 @@ async def test_task_start_screenshots_mode_no_screencast(client, monkeypatch):
 
     monkeypatch.setattr(
         "tree_walker.web.server._build_agent",
-        lambda *, task="": _live_agent(run=stepping_run, bus=bus, browser=browser))
+        lambda *, task="", model=None: _live_agent(run=stepping_run, bus=bus, browser=browser))
     resp = await client.post("/task/start", json={"task": "x"})  # 不带 viewport_mode
     task_id = (await resp.json())["task_id"]
 
@@ -818,7 +1143,7 @@ async def test_task_screencast_streams_latest_frame(client, monkeypatch):
     browser = SimpleNamespace(configure_screencast=lambda *a, **k: None)
     monkeypatch.setattr(
         "tree_walker.web.server._build_agent",
-        lambda *, task="": _live_agent(run=streaming_run, browser=browser))
+        lambda *, task="", model=None: _live_agent(run=streaming_run, browser=browser))
     resp = await client.post("/task/start", json={"task": "x", "viewport_mode": "livestream"})
     task_id = (await resp.json())["task_id"]
 
@@ -837,7 +1162,7 @@ async def test_task_screencast_404_for_screenshots_task(client, monkeypatch):
     """screenshots 任务 frame_slot 为 None → /task/screencast 404。"""
     monkeypatch.setattr(
         "tree_walker.web.server._build_agent",
-        lambda *, task="": _live_agent())
+        lambda *, task="", model=None: _live_agent())
     resp = await client.post("/task/start", json={"task": "x"})  # screenshots
     task_id = (await resp.json())["task_id"]
     resp = await client.get("/task/events", params={"task_id": task_id})  # 喝完让 run 收尾
@@ -869,7 +1194,7 @@ async def test_task_events_include_skill_active(client, monkeypatch):
 
     monkeypatch.setattr(
         "tree_walker.web.server._build_agent",
-        lambda *, task="": _live_agent(run=run_with_skill, bus=bus))
+        lambda *, task="", model=None: _live_agent(run=run_with_skill, bus=bus))
     resp = await client.post("/task/start", json={"task": "上传视频"})
     task_id = (await resp.json())["task_id"]
 

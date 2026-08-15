@@ -17,6 +17,19 @@ describe("liveReducer (P6 M3)", () => {
 		expect(s.screenshot).toBeNull();
 	});
 
+	it("ADOPT 接管任务：重置展示字段 + taskId 换新（T2 H M2）", () => {
+		let s = liveReducer(initialLiveState, { type: "STARTING", taskId: "t-old" });
+		s = liveReducer(s, { type: "EVENT", event: { type: "log", level: "INFO", msg: "x", logger: "t" } });
+		s = liveReducer(s, { type: "EVENT", event: { type: "screenshot", step: 1, data: "data:x" } });
+		s = liveReducer(s, { type: "ADOPT", taskId: "t-new" });
+		expect(s.taskId).toBe("t-new");
+		expect(s.phase).toBe("running");
+		expect(s.events).toEqual([]);       // 已消费事件不可恢复 → 重置
+		expect(s.logs).toEqual([]);
+		expect(s.screenshot).toBeNull();
+		expect(s.status).toContain("不可恢复");
+	});
+
 	it("EVENT 分发：log→logs、screenshot→screenshot、EventBus→events", () => {
 		let s = liveReducer(initialLiveState, { type: "STARTING", taskId: "t1" });
 		s = liveReducer(s, { type: "EVENT", event: { type: "log", level: "INFO", msg: "x", logger: "t" } });
@@ -25,6 +38,34 @@ describe("liveReducer (P6 M3)", () => {
 		expect(s.logs).toHaveLength(1);
 		expect(s.screenshot).toBe("data:x");
 		expect(s.events).toHaveLength(1);
+	});
+
+	it("SELECT_EVENT 选中/取消；STARTING 重置（T2 G M7）", () => {
+		let s = liveReducer(initialLiveState, { type: "STARTING", taskId: "t1" });
+		s = liveReducer(s, { type: "EVENT", event: { type: "tool_call", action_name: "click" } });
+		s = liveReducer(s, { type: "EVENT", event: { type: "step_end", step: 1 } });
+		s = liveReducer(s, { type: "SELECT_EVENT", index: 0 });
+		expect(s.selectedEvent).toBe(0);
+		s = liveReducer(s, { type: "SELECT_EVENT", index: null }); // ✕ 取消
+		expect(s.selectedEvent).toBeNull();
+		s = liveReducer(s, { type: "SELECT_EVENT", index: 1 });
+		s = liveReducer(s, { type: "STARTING", taskId: "t2" }); // 新任务 → 清选中
+		expect(s.selectedEvent).toBeNull();
+	});
+
+	it("EVENT skill_active → 更新 chip 且入时间线（issue #165：ContextPanel 分支复活）", () => {
+		let s = liveReducer(initialLiveState, { type: "STARTING", taskId: "t1" });
+		s = liveReducer(s, {
+			type: "EVENT",
+			event: { type: "skill_active", host: "member.bilibili.com", skill_loaded: true, char_count: 800 },
+		});
+		expect(s.activeSkill).toEqual({
+			host: "member.bilibili.com",
+			skillLoaded: true,
+			charCount: 800,
+		});
+		expect(s.events).toHaveLength(1); // 进时间线 → 可点开右栏 ContextPanel
+		expect(s.events[0].type).toBe("skill_active");
 	});
 
 	it("EVENT screencast → 更新 screenshot（直播视口 A，复用字段）", () => {

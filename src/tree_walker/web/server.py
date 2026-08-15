@@ -27,6 +27,7 @@ import base64
 import csv
 import json
 import logging
+import os
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -73,6 +74,7 @@ class LiveTaskHandle:
 	queue: asyncio.Queue             # 事件流（EventBus handler put / SSE handler get）
 	task: asyncio.Task | None = None           # create_task 后回填
 	final_event: dict | None = None            # 任务结束存最终事件（SSE 重连补发）
+	task_text: str = ""                          # 任务文本（/task/list 给侧栏「进行中」zone 展示，T2 H）
 	record: bool = False                        # 录制开关 → 结束调 agent.save_history
 	log_handler: Any = None                     # P6 M2：日志事件化 handler（结束摘除）
 	capture_tasks: set = field(default_factory=set)  # P6 M2：挂起的截图采集任务
@@ -111,10 +113,17 @@ async def make_app(history_dir: str = "rerun-history", skills_dir: str | None = 
 	app.router.add_post("/task/pause", _handle_task_pause)
 	app.router.add_post("/task/resume", _handle_task_resume)
 	app.router.add_post("/task/stop", _handle_task_stop)
+	app.router.add_get("/task/list", _handle_task_list)  # 侧栏「进行中」zone（T2 H）
+	# 任务历史（T2 I6）：与 TUI 共享 ~/.treewalker/history.json，两端互通
+	app.router.add_get("/task/history", _handle_task_history_get)
+	app.router.add_post("/task/history", _handle_task_history_post)
 	# Skills 技能面（P6 后续 B）：必须在 catch-all 之前注册
 	app.router.add_get("/skills/list", _handle_skills_list)
 	app.router.add_get("/skills/get", _handle_skills_get)
 	app.router.add_post("/skills/put", _handle_skills_put)
+	# Settings 设置面（T2 C）：必须在 catch-all 之前注册
+	app.router.add_get("/settings/get", _handle_settings_get)
+	app.router.add_post("/settings/set", _handle_settings_set)
 	app.router.add_get("/health", _handle_health)
 	app.on_shutdown.append(_on_batch_shutdown)  # 进程退出时停所有批量任务、关浏览器
 	# 前端 SPA（构建产物在 _STATIC_DIR）：/assets/* 静态资源 + GET / 入口 + catch-all 回退
@@ -268,13 +277,145 @@ async def _handle_skills_put(request: web.Request) -> web.Response:
 	return web.json_response({"ok": True})
 
 
-def _build_agent(task: str = ""):
+# ── Settings 设置面（T2 C）──────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class SettingField:
+	"""设置面可编辑项（注册表条目）。
+
+	``env`` 即写 ``os.environ`` 的键——``load_settings`` 每任务现读 env，故 SET 后对
+	下一个任务即时生效（进程内存 override，**不写 ``.env``**，plan §8.1）。注册表是
+	SET 的白名单（防任意 env 注入）；``CDP_PORT`` 等进程级 env（CLI 层固定）不进表。
+	默认值须与 ``config.load_settings`` 的 fallback 一致。
+	"""
+
+	key: str                     # 展示名（前端 id）
+	env: str                     # 环境变量名（白名单键）
+	type: str                    # str | int | float | bool | enum
+	default: str                 # 默认值（字符串形式）
+	section: str                 # llm | agent | browser | advanced
+	choices: tuple[str, ...] = ()  # enum 候选
+	sensitive: bool = False        # GET 时脱敏
+
+
+# 不追求全量（load_settings 有 80+ env）——按「用户会想调的」精选；加项 = 加一行。
+_SETTINGS_FIELDS: tuple[SettingField, ...] = (
+	# LLM
+	SettingField("模型", "LLM_MODEL", "str", "glm-5.1", "llm"),
+	SettingField("Base URL", "LLM_BASE_URL", "str", "https://open.bigmodel.cn/api/anthropic", "llm"),
+	SettingField("Max Tokens", "LLM_MAX_TOKENS", "int", "4096", "llm"),
+	SettingField("输出模式", "LLM_OUTPUT_MODE", "enum", "standard", "llm",
+	             choices=("standard", "flash", "thinking")),
+	SettingField("API Key", "ZHIPU_API_KEY", "str", "", "llm", sensitive=True),
+	SettingField("Fallback 模型", "FALLBACK_LLM_MODEL", "str", "", "llm"),
+	# Agent
+	SettingField("最大步数", "AGENT_MAX_STEPS", "int", "100", "agent"),
+	SettingField("最大失败数", "AGENT_MAX_FAILURES", "int", "5", "agent"),
+	SettingField("LLM 超时(秒)", "AGENT_LLM_TIMEOUT", "int", "120", "agent"),
+	SettingField("Action 超时(秒)", "AGENT_ACTION_TIMEOUT", "int", "30", "agent"),
+	SettingField("计划模式", "AGENT_ENABLE_PLANNING", "bool", "true", "agent"),
+	# 注：默认 false = env 层默认（config.py）；web live 任务由 _build_agent 强制开
+	SettingField("Skill 注入", "AGENT_ENABLE_SKILL_INJECTION", "bool", "false", "agent"),
+	# Browser（cdp_port 由 tw-web CLI 决定，不在此暴露）
+	SettingField("高亮反馈", "BROWSER_HIGHLIGHT_INTERACTION", "bool", "true", "browser"),
+	# 高级
+	SettingField("重放步间延迟(秒)", "AGENT_RERUN_DELAY_BETWEEN_ACTIONS", "float", "1.0", "advanced"),
+	SettingField("步间隔封顶(秒)", "AGENT_RERUN_MAX_STEP_INTERVAL", "float", "5.0", "advanced"),
+	SettingField("重放等元素", "AGENT_RERUN_WAIT_FOR_ELEMENTS", "bool", "false", "advanced"),
+)
+
+
+def _validate_setting_value(field: SettingField, raw: str) -> str:
+	"""按 type 校验并规范化值；非法 raise ValueError（handler → 400）。bool 统一小写。"""
+	if field.type == "bool":
+		if raw.lower() not in ("true", "false"):
+			raise ValueError(f"{field.env} 须为 true/false: {raw!r}")
+		return raw.lower()
+	if field.type == "enum":
+		if raw not in field.choices:
+			raise ValueError(f"{field.env} 须为 {list(field.choices)} 之一: {raw!r}")
+		return raw
+	if field.type == "int":
+		int(raw)  # 仅校验可解析（防 "abc"/"1.5"）
+	elif field.type == "float":
+		float(raw)
+	return raw
+
+
+def _mask_secret(value: str) -> str:
+	"""敏感值脱敏：非空 → ``****`` + 尾 4 位（空值原样返回，前端显示 placeholder）。"""
+	return ("****" + value[-4:]) if value else value
+
+
+async def _handle_settings_get(request: web.Request) -> web.Response:
+	"""设置面数据源：注册表字段 + 当前有效值（env 现读，无则默认）。
+
+	敏感字段（API key）非空时掩码 + ``masked:true``；``applies`` 明示生效范围——只影响
+	之后构造的 agent（`_build_agent` 每任务调 load_settings），运行中任务不受影响。
+	"""
+	fields = []
+	for f in _SETTINGS_FIELDS:
+		value = os.environ.get(f.env, f.default)
+		masked = bool(f.sensitive and value)
+		fields.append({
+			"key": f.key,
+			"env": f.env,
+			"section": f.section,
+			"type": f.type,
+			"choices": list(f.choices),
+			"default": f.default,
+			"sensitive": f.sensitive,  # 前端区分「敏感未设置」（masked=False + value=""）与普通空字段
+			"value": _mask_secret(value) if masked else value,
+			"masked": masked,
+		})
+	return web.json_response({"fields": fields, "applies": "new_tasks"})
+
+
+async def _handle_settings_set(request: web.Request) -> web.Response:
+	"""应用配置：body ``{env: value}`` 逐项校验（注册表白名单 + type）→ ``os.environ`` 内存 override。
+
+	敏感字段：空值或 ``****`` 开头（GET 的掩码串原样回传）→ 跳过不写，防掩码覆盖真值。
+	部分合法 + 部分非法 → 整体 400（原子性：先全量校验再统一写入）。
+	"""
+	try:
+		body = await request.json()
+	except Exception:
+		return web.json_response({"error": "invalid json"}, status=400)
+	if not isinstance(body, dict):
+		return web.json_response({"error": "body 须为 {env: value} 对象"}, status=400)
+
+	registry = {f.env: f for f in _SETTINGS_FIELDS}
+	updates: dict[str, str] = {}
+	try:
+		for env, value in body.items():
+			field = registry.get(env)
+			if field is None:
+				raise ValueError(f"未知配置项（不在注册表）: {env}")
+			if isinstance(value, bool):  # JSON true/false → 字符串
+				value = "true" if value else "false"
+			elif not isinstance(value, str):
+				value = str(value)
+			if field.sensitive and (not value.strip() or value.startswith("****")):
+				continue  # 未改动/掩码回传 → 跳过
+			updates[env] = _validate_setting_value(field, value)
+	except (ValueError, TypeError) as e:
+		return web.json_response({"error": str(e)}, status=400)
+
+	for env, value in updates.items():
+		os.environ[env] = value
+	return web.json_response({"ok": True, "applied": sorted(updates), "applies": "new_tasks"})
+
+
+def _build_agent(task: str = "", model: str | None = None):
 	"""构造 Agent（真实起浏览器，需 Chrome 远程调试端口）。
 
 	独立函数便于测试 monkeypatch。``task`` 在构造时传入——system prompt 在 __init__ 就按
 	task 建好，事后改 ``agent.task`` 不会重建 prompt。``load_and_rerun`` 读
 	``settings.agent.rerun_history_dir``（与 list/load 一致，除非 ``--history-dir`` 覆盖）。
 	强制 ``enable_observability=True``：web 端靠 EventBus 事件流驱动 SSE（live task 必需）。
+	``model``（T2 I5）：仅本任务 override ``settings.llm.model``——``load_settings`` 每次
+	新造 Settings，无交叉污染；不校验模型名（LLM 端点报错经 /task/start 400 透传）。
 	"""
 	from tree_walker import Agent, BrowserSession, LLMClient
 	from tree_walker.config import load_settings
@@ -284,6 +425,8 @@ def _build_agent(task: str = ""):
 		raise RuntimeError("Chrome 未以 --remote-debugging-port 启动（settings.browser.ws_url 为空）")
 	settings.agent.enable_observability = True  # live task 靠 EventBus → SSE
 	settings.agent.enable_skill_injection = True  # P6 后续 I1：live 控制台默认带 skill（loader 对无 skill host 返回 ""，无副作用）
+	if model:
+		settings.llm.model = model  # I5：本次 override（设置面 LLM_MODEL 是「改默认」，两层并存 §8.9）
 	llm = LLMClient(settings.llm)
 	browser = BrowserSession(settings.browser)
 	return Agent(task=task, llm=llm, browser=browser, settings=settings.agent)
@@ -722,6 +865,8 @@ async def _handle_task_start(request: web.Request) -> web.Response:
 	task_text = body.get("task", "").strip() if isinstance(body, dict) else ""
 	if not task_text:
 		return web.json_response({"error": "missing task"}, status=400)
+	# T2 I5（M6）：按任务指定模型（空 = 跟随设置默认）；后端不校验模型名（LLM 端点报错透传）
+	model = (body.get("model") or "").strip() if isinstance(body, dict) else ""
 	record = bool(isinstance(body, dict) and body.get("record"))
 	# 直播视口（P6 后续 A）：viewport_mode=livestream 走 CDP 连续推流；其余（含缺省）= screenshots 每步一帧
 	vp_mode = "livestream" if (isinstance(body, dict) and body.get("viewport_mode") == "livestream") else "screenshots"
@@ -736,7 +881,9 @@ async def _handle_task_start(request: web.Request) -> web.Response:
 			status=409)
 
 	try:
-		agent = _build_agent(task=task_text)
+		# issue #163：_build_agent 内 load_settings→_fetch_ws_url 是同步 httpx.get（最长 5s），
+		# 在 loop 上直接跑会卡住全部端点——丢线程池。
+		agent = await asyncio.to_thread(_build_agent, task=task_text, model=model or None)
 	except Exception as e:
 		return web.json_response({"error": str(e)}, status=400)
 
@@ -744,7 +891,8 @@ async def _handle_task_start(request: web.Request) -> web.Response:
 	agent._setup_signal_handler = lambda: None
 
 	queue: asyncio.Queue = asyncio.Queue()
-	handle = LiveTaskHandle(agent=agent, queue=queue, record=record, vp_mode=vp_mode)
+	handle = LiveTaskHandle(
+		agent=agent, queue=queue, task_text=task_text, record=record, vp_mode=vp_mode)
 
 	# 直播视口（P6 后续 A）：livestream 模式建最新帧槽 + 配 browser sink（run 时 browser.start()
 	# 会话就绪自动 startScreencast；browser 侧采集，零 race）。screenshots 模式 frame_slot 留 None。
@@ -797,7 +945,13 @@ async def _handle_task_start(request: web.Request) -> web.Response:
 	async def run_live() -> None:
 		try:
 			await agent.run(keep_alive=True)  # 不让 run 关浏览器——收尾要先刷完截图采集再关，否则末步截图 race 输给 browser.stop
-			final: dict = {"type": "done", "success": True}
+			# issue #164：成功与否取 agent 真实终态（末步 done 结果的 success），而非
+			# 「会话正常返回」——max_steps 封顶 / done(success=False) 的诚实上报、以及
+			# 用户中止（无 done）不再被标成成功。history 拿不到时保守回落 True（旧语义）。
+			_hist = getattr(agent, "history", None)
+			_success_fn = getattr(_hist, "is_successful", None)
+			success = bool(_success_fn()) if callable(_success_fn) else True
+			final: dict = {"type": "done", "success": success}
 		except Exception as e:
 			logger.exception("live task %s 崩溃", task_id)
 			final = {"type": "done", "success": False, "error": str(e)}
@@ -907,6 +1061,97 @@ async def _handle_task_resume(request: web.Request) -> web.Response:
 
 async def _handle_task_stop(request: web.Request) -> web.Response:
 	return await _handle_task_control(request, "stop")
+
+
+def _live_phase(handle: LiveTaskHandle) -> str:
+	"""handle → 展示相位：done（final 已存）/ paused（agent.state.paused）/ running。
+
+	``state`` 用 getattr 链取——测试植入的 SimpleNamespace mock agent 可能没有该属性，
+	拿不到就并进 running（paused 非关键信息，§8 决策 6 同款降级原则）。
+	"""
+	if handle.final_event is not None:
+		return "done"
+	state = getattr(handle.agent, "state", None)
+	if state is not None and getattr(state, "paused", False):
+		return "paused"
+	return "running"
+
+
+async def _handle_task_list(request: web.Request) -> web.Response:
+	"""侧栏「进行中」zone（T2 H）：列出活跃/最近 live task（只读）。
+
+	不持久化——tw-web 常驻进程内存即真源；前端刷新后靠此端点恢复入口（已消费事件
+	不可恢复为已知局限，plan §8.5）。顺序 = dict 插入序（新→旧；start 时已清已结束
+	handle，列表天然很短）。``saved`` = 录制落库文件名（有则展示，点击侧栏项后自然
+	出现在流程库）。
+	"""
+	items = []
+	for tid, h in _LIVE_TASKS.items():
+		final = h.final_event or {}
+		items.append({
+			"task_id": tid,
+			"task": h.task_text,
+			"phase": _live_phase(h),
+			"success": final.get("success"),
+			"saved": final.get("saved"),
+			"viewport_mode": h.vp_mode,
+		})
+	return web.json_response({"tasks": items})
+
+
+# ── 任务历史（T2 I6，与 TUI 共享）────────────────────────────────────────────
+
+# 与 TUI 同一文件（tui/app.py HISTORY_FILE）同格式（list[str]）——两端任务历史互通。
+# 模块级常量便于测试 monkeypatch 到 tmp_path。
+_TASK_HISTORY_FILE = Path.home() / ".treewalker" / "history.json"
+
+
+def _load_task_history() -> list[str]:
+	"""读共享任务历史；缺失/损坏/非字符串成员 → []（TUI ``_load_history`` 同款容错）。"""
+	try:
+		data = json.loads(_TASK_HISTORY_FILE.read_text(encoding="utf-8"))
+	except (json.JSONDecodeError, OSError):
+		return []
+	return data if isinstance(data, list) and all(isinstance(x, str) for x in data) else []
+
+
+def _append_task_history(task: str) -> list[str]:
+	"""append + 连续去重 + ``[-100:]`` 截断后写盘（逐行对齐 TUI ``_save_history``）。
+
+	写失败仅告警不抛（历史非关键路径，TUI 同款）；``mkdir(parents=True)`` 首次写入建目录。
+	"""
+	hist = _load_task_history()
+	if not hist or task != hist[-1]:  # 连续重复不重复记（TUI 同款）
+		hist.append(task)
+	hist = hist[-100:]
+	try:
+		_TASK_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+		_TASK_HISTORY_FILE.write_text(
+			json.dumps(hist, ensure_ascii=False, indent=2), encoding="utf-8")
+	except OSError as e:
+		logger.warning("Failed to save task history: %s", e)
+	return hist
+
+
+async def _handle_task_history_get(request: web.Request) -> web.Response:
+	"""任务历史（I6）：``GET /task/history`` → ``{"tasks": [...]}``（新→旧按写入序）。"""
+	return web.json_response({"tasks": _load_task_history()})
+
+
+async def _handle_task_history_post(request: web.Request) -> web.Response:
+	"""任务历史（I6）：``POST /task/history`` body ``{"task": "..."}`` → append + 落盘。
+
+	前端在**启动成功后**才调（§8.8：启动失败的任务不污染历史；TUI 是提交时存，此处有意不同）。
+	"""
+	try:
+		body = await request.json()
+	except Exception:
+		return web.json_response({"error": "invalid json"}, status=400)
+	task = body.get("task", "").strip() if isinstance(body, dict) else ""
+	if not task:
+		return web.json_response({"error": "missing task"}, status=400)
+	count = len(_append_task_history(task))
+	return web.json_response({"ok": True, "count": count})
 
 
 async def _handle_task_screencast(request: web.Request) -> web.StreamResponse:

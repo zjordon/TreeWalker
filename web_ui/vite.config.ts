@@ -13,6 +13,7 @@ export default defineConfig({
       "/history": { target: "http://127.0.0.1:8766", changeOrigin: true },
       "/task": { target: "http://127.0.0.1:8766", changeOrigin: true },
       "/skills": { target: "http://127.0.0.1:8766", changeOrigin: true },
+      "/settings": { target: "http://127.0.0.1:8766", changeOrigin: true },
       "/health": { target: "http://127.0.0.1:8766", changeOrigin: true },
     },
   },

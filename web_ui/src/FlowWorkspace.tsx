@@ -1,22 +1,41 @@
 import { useReducer, useCallback, useEffect, useState } from "react";
 import { initialState, reducer } from "./reducer";
 import * as api from "./api";
+import { useAppNav } from "./appNav";
+import { useLiveTask } from "./liveContext";
 import ActionList from "./components/ActionList";
 import ActionEditor from "./components/ActionEditor";
 import VariablePanel from "./components/VariablePanel";
 import RunPanel from "./components/RunPanel";
 import BatchRunPanel from "./components/BatchRunPanel";
 import DetailView from "./components/DetailView";
+import LiveZone from "./components/LiveZone";
+import type { LiveTaskItem } from "./types";
 
 // P6 流程库工作区：左 sidebar 列流程（点击加载）+ 编辑/重放/详情 tab（M4）。
 // reducer / handlers / 子组件全部复用原编辑器（零回归），仅把渲染重排成 sidebar + tab。
 // 运行（live 探索）在 AppShell 的「探索」模式（RunView）；技能/设置后置。
+// T2 H（M2）：sidebar 顶部加「进行中」zone（活跃/最近 live task，点击回运行视图）。
 type Tab = "edit" | "replay" | "detail";
 
 export default function FlowWorkspace() {
 	const [state, dispatch] = useReducer(reducer, initialState);
 	const [files, setFiles] = useState<string[]>([]);
 	const [tab, setTab] = useState<Tab>("edit");
+	const nav = useAppNav();
+	const live = useLiveTask();
+
+	// T2 H（M2）：点击 zone 项 → 回运行视图。taskId 不同（如刷新后恢复入口）才 ADOPT
+	// 接管（重置展示字段 + SSE 重订）；单槽并发下 running 至多一个，多数情况只是切模式。
+	const onOpenLive = useCallback(
+		(item: LiveTaskItem) => {
+			if (live && live.state.taskId !== item.task_id) {
+				live.dispatch({ type: "ADOPT", taskId: item.task_id });
+			}
+			nav?.setMode("explore");
+		},
+		[live, nav],
+	);
 
 	const refresh = useCallback(async () => {
 		try {
@@ -39,6 +58,14 @@ export default function FlowWorkspace() {
 			dispatch({ type: "STATUS", status: `加载失败: ${e}` });
 		}
 	}, []);
+
+	// T2 I4（M8）：命令面板「打开流程」跳入（context flowsName 变化）→ 预选加载（仿 SkillsShell）
+	useEffect(() => {
+		const n = nav?.flowsName;
+		if (n && n !== state.loadedName) {
+			void onLoad(n);
+		}
+	}, [nav?.flowsName, state.loadedName, onLoad]);
 
 	const onDetect = useCallback(async () => {
 		if (!state.loadedName) return;
@@ -126,6 +153,7 @@ export default function FlowWorkspace() {
 	return (
 		<div className="flow-workspace">
 			<aside className="flow-sidebar">
+				<LiveZone onOpen={onOpenLive} />
 				<h2>流程库</h2>
 				<ul className="var-list flow-list">
 					{files.length === 0 && <li className="muted">（空）</li>}

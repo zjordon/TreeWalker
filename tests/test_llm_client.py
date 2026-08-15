@@ -6,6 +6,7 @@ from typing import Any
 
 import asyncio
 import os
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -434,3 +435,38 @@ class TestUsagePassthrough:
         with patch.object(client.client.messages, "create", return_value=resp):
             result = asyncio.run(client.get_action("sys", [], {"name": "tool"}))
         assert result["usage"] is None
+
+
+# ── Non-blocking loop tests（issue #163）──────────────────────────────
+
+
+class TestNonBlockingLoop:
+    """同步 ``messages.create`` 必须经 ``asyncio.to_thread``——LLM 往返期间事件循环保持
+    可调度。否则 tw-web 全部 HTTP 端点随 agent 的 LLM 调用一起卡死（0 CPU 等同步 socket，
+    真机观测数十秒到数分钟）。判据：慢 create 期间并发的 ticker 协程持续推进。"""
+
+    @pytest.mark.asyncio
+    async def test_get_action_offloads_create_to_thread(self):
+        client = LLMClient(LLMSettings(api_key="test-key"))
+
+        def slow_create(**kwargs):
+            time.sleep(0.2)  # 模拟一次慢 LLM 往返
+            return TestUsagePassthrough._response(
+                {"action": {"name": "done", "params": {"text": "x", "success": True}}},
+                usage=None,
+            )
+
+        client.client.messages.create = slow_create
+        ticks = 0
+
+        async def ticker():
+            nonlocal ticks
+            for _ in range(30):
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        task = asyncio.create_task(ticker())
+        result = await client.get_action("sys", [{"role": "user", "content": "hi"}], {"name": "t"})
+        await task
+        assert result["action"]["name"] == "done"
+        assert ticks >= 15  # 若 create 阻塞 loop，0.2s 内 ticker 几乎无法推进

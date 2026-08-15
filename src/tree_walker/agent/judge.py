@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 
@@ -107,7 +108,10 @@ class JudgeEvaluator:
             return None
 
         try:
-            response = self._llm.client.messages.create(
+            # issue #163：judge 的同步 ``messages.create`` 直接 await 会卡死事件循环
+            # （tw-web 真机观测：judge 阶段全部端点无响应 4-5 分钟）。经 to_thread 丢线程池。
+            response = await asyncio.to_thread(
+                self._llm.client.messages.create,
                 model=self._llm.model,
                 max_tokens=self._llm.max_tokens,
                 system=_JUDGE_SYSTEM_PROMPT,

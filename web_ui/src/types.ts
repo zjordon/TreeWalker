@@ -113,6 +113,16 @@ export interface Highlight {
 	bbox: { left: number; top: number; width: number; height: number }; // ∈ [0,1]
 }
 
+// T2 H（M2）：侧栏「进行中」zone 条目（镜像后端 GET /task/list）
+export interface LiveTaskItem {
+	task_id: string;
+	task: string;
+	phase: "running" | "paused" | "done";
+	success?: boolean | null;
+	saved?: string | null;
+	viewport_mode?: string;
+}
+
 export interface LiveState {
 	phase: LivePhase;
 	taskId: string | null;
@@ -126,6 +136,7 @@ export interface LiveState {
 	highlights: Highlight[]; // I3：当前步 tool_call 元素高亮（step_start 清空）
 	tokens: { in: number; out: number }; // I2：累计 input/output tokens（ModelResultEvent）
 	elapsedMs: number; // I2：累计运行耗时（StepEndEvent.duration_seconds 累加）
+	selectedEvent: number | null; // T2 G（M7）：时间线选中事件（events 数组索引；右 Context 面板数据源）
 	status: string;
 	result: { success?: boolean; error?: string; saved?: string } | null;
 }

@@ -178,7 +178,11 @@ class LLMClient:
         self._filter_sensitive_in_messages(messages, sensitive_map)
 
         try:
-            response = self.client.messages.create(
+            # issue #163：Anthropic 同步客户端的 create 是阻塞调用——直接 await 会卡死整个
+            # 事件循环（tw-web 期间所有 HTTP 端点无响应、0 CPU 等同步 socket）。经
+            # asyncio.to_thread 丢线程池，事件循环保持可服务（SSE/控制端点/其他任务）。
+            response = await asyncio.to_thread(
+                self.client.messages.create,
                 model=self.model,
                 max_tokens=self.max_tokens,
                 system=system_prompt,
@@ -315,19 +319,16 @@ class LLMClient:
     async def _extract_call(
         self, *, call_timeout: float | None, **create_kwargs: Any
     ):
-        """``messages.create`` 的薄封装：``call_timeout`` 非空时用 ``asyncio.wait_for`` 包裹。
+        """``messages.create`` 的薄封装：恒经 ``asyncio.to_thread``（issue #163），``call_timeout`` 非空时再包 ``asyncio.wait_for``。
 
-        Anthropic 同步客户端的 ``messages.create`` 是阻塞调用；``call_timeout`` 非空时
-        经 ``asyncio.to_thread`` 丢到线程池再用 ``asyncio.wait_for`` 计时。超时抛
-        ``asyncio.TimeoutError``（不会被 ``extract`` 的 RateLimit/APIError 分支捕获），
-        交由 ``_action_extract`` 映射成分级错误。
+        Anthropic 同步客户端的 ``messages.create`` 是阻塞调用——直接调用会卡死事件循环
+        （tw-web 期间所有端点无响应）。超时抛 ``asyncio.TimeoutError``（不会被 ``extract``
+        的 RateLimit/APIError 分支捕获），交由 ``_action_extract`` 映射成分级错误。
         """
+        coro = asyncio.to_thread(self.client.messages.create, **create_kwargs)
         if call_timeout:
-            return await asyncio.wait_for(
-                asyncio.to_thread(self.client.messages.create, **create_kwargs),
-                timeout=call_timeout,
-            )
-        return self.client.messages.create(**create_kwargs)
+            return await asyncio.wait_for(coro, timeout=call_timeout)
+        return await coro
 
     async def extract(
         self,
