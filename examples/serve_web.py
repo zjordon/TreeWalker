@@ -1,10 +1,10 @@
-"""Example: 启动 P4 可视化编辑器后端（阶段②）。
+"""Example: 启动 TreeWalker web 后端（tw-web 的示例入口，独立于 ``tw-web`` CLI）。
 
-编辑器后端独立于录制后端（录制迁 TreeForge），操作 ``rerun_history_dir`` 下的历史 JSON。
-前端 SPA（阶段③）接入后，浏览器开 http://127.0.0.1:8766/ 编辑；当前可用 curl 测试端点。
+web 后端独立于录制后端（录制迁 TreeForge），操作 ``rerun_history_dir`` 下的历史 JSON，
+并承载 live agent 控制台 + 流程库。浏览器开 http://127.0.0.1:8766/ 。
 
 Usage:
-    uv run python examples/serve_history_editor.py [--host 127.0.0.1] [--port 8766] [--cdp-port 9223] [--history-dir rerun-history]
+    uv run python examples/serve_web.py [--host 127.0.0.1] [--port 8766] [--cdp-port 9223] [--history-dir rerun-history]
 """
 
 import argparse
@@ -14,11 +14,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from tree_walker.history_editor.server import run_server
+from tree_walker.web.server import run_server
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="P4 可视化编辑器后端")
+    p = argparse.ArgumentParser(description="TreeWalker web 后端")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8766)
     p.add_argument(
@@ -35,8 +35,7 @@ def main() -> None:
     args = p.parse_args()
     # 试跑/开始批量经 _build_agent → load_settings() 读 CDP_PORT 连 Chrome；显式置默认 9223
     os.environ["CDP_PORT"] = str(args.cdp_port)
-    print(f"编辑器后端: http://{args.host}:{args.port}/history/list  (Chrome CDP 端口={args.cdp_port})")
-    print("(前端 SPA 待阶段③接入；当前可用 curl 测试端点，如 curl 'http://.../history/list')")
+    print(f"TreeWalker web: http://{args.host}:{args.port}/  (Chrome CDP 端口={args.cdp_port})")
     run_server(host=args.host, port=args.port, history_dir=args.history_dir)
 
 

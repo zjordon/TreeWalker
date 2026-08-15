@@ -43,7 +43,7 @@
 └───────────────┬──────────────────────────────────────────────────┘
                 │ REST + SSE（同源 / Vite proxy）
 ┌───────────────▼──────────────────────────────────────────────────┐
-│ 后端 aiohttp（history_editor/server.py）                          │
+│ 后端 aiohttp（web/server.py）                          │
 │  新增 /skills/{list,get,put}（复用 resolve_rerun_path 路径校验）   │
 │  EventBus→SSE 不改（"*" 订阅 + model_dump 自动转发新事件/新字段） │
 └───────────────┬──────────────────────────────────────────────────┘
@@ -241,7 +241,7 @@ height% = bbox.height / viewport.height × 100
 
 | 里程碑 | 内容 | 验收 |
 |---|---|---|
-| **M1** B 后端 `/skills/*` | list/get/put 端点 + 路径校验 + put 后 invalidate live loader | 单测：仿 `test_history_editor_server.py`，断言 list/get/put + `..` 拒绝 + put 后 loader 缓存失效 |
+| **M1** B 后端 `/skills/*` | list/get/put 端点 + 路径校验 + put 后 invalidate live loader | 单测：仿 `test_web_server.py`，断言 list/get/put + `..` 拒绝 + put 后 loader 缓存失效 |
 | **M2** B 前端 技能面 | 启用 `skills` mode + `SkillsShell` 分栏 + api 三方法 | vitest：列表/切换/保存流程；真机：改 B站 selectors.md 保存→重跑生效 |
 | **M3** I1 活动 skill | `_build_agent` 强制开 skill + `SkillActiveEvent`（step.py）+ reducer + RunView chip + 点进技能面 | 单测：emit 事件字段；vitest：reducer `skill_active`；真机：跑抖音任务 chip 显示 `creator.douyin.com` |
 | **M4** I2 token·耗时环 | `LLMClient.get_action` 透传 usage + `ModelResultEvent` 填 token + reducer 累加 + `<TokenRing/>` | 单测：`get_action` 返回含 usage（mock SDK response）；vitest：reducer 累加；真机：环随步增长 |

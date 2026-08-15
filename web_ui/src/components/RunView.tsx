@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useReducer } from "react";
+import { useCallback, useEffect, useReducer, useState } from "react";
 import { initialLiveState, liveReducer } from "../liveReducer";
 import * as api from "../api";
 import { useAppNav } from "../appNav";
@@ -11,6 +11,10 @@ export default function RunView() {
 	const nav = useAppNav();
 	const running = state.phase === "running" || state.phase === "paused";
 	const finished = state.phase === "done" || state.phase === "error";
+	// 直播视口（A）：livestream 模式开第二个 EventSource 订阅 /task/screencast 连续帧；仅对新任务生效
+	const [vpMode, setVpMode] = useState<"screenshots" | "livestream">("screenshots");
+	// running（含 paused）才开帧流；任务结束（done/error）或切走即关，防 EventSource 自动重连
+	const frameStreamOn = vpMode === "livestream" && !!state.taskId && running;
 
 	const onStart = useCallback(async () => {
 		if (!state.task.trim()) return;
@@ -21,12 +25,13 @@ export default function RunView() {
 				state.task,
 				fps.length ? fps : undefined,
 				state.record,
+				vpMode,
 			);
 			dispatch({ type: "STARTING", taskId: task_id });
 		} catch (e) {
 			dispatch({ type: "STATUS", status: `启动失败: ${e}` });
 		}
-	}, [state.task, state.filePaths, state.record]);
+	}, [state.task, state.filePaths, state.record, vpMode]);
 
 	// SSE 订阅（依赖 taskId：仅新任务建连；done 由 handler 关闭、不重建；events/logs 变化不触发）
 	useEffect(() => {
@@ -35,6 +40,15 @@ export default function RunView() {
 		const es = api.subscribeTaskEvents(tid, (ev) => dispatch({ type: "EVENT", event: ev }));
 		return () => es.close();
 	}, [state.taskId]);
+
+	// 直播视口（A）：livestream 额外订阅 /task/screencast 连续帧 → 帧复用 screenshot 渲染
+	useEffect(() => {
+		if (!frameStreamOn || !state.taskId) return;
+		const es = api.subscribeTaskFrames(state.taskId, (frame) =>
+			dispatch({ type: "EVENT", event: { type: "screencast", data: frame.data } }),
+		);
+		return () => es.close();
+	}, [frameStreamOn, state.taskId]);
 
 	const onControl = useCallback(
 		async (action: "pause" | "resume" | "stop") => {
@@ -70,6 +84,16 @@ export default function RunView() {
 					rows={1}
 				/>
 				<div className="bar">
+					<select
+						className="vp-mode"
+						value={vpMode}
+						onChange={(e) => setVpMode(e.target.value as "screenshots" | "livestream")}
+						disabled={running}
+						title="视口推流模式（仅对新任务生效）"
+					>
+						<option value="screenshots">📷 截图</option>
+						<option value="livestream">📡 直播</option>
+					</select>
 					<label className="record-toggle">
 						<input
 							type="checkbox"
@@ -116,7 +140,7 @@ export default function RunView() {
 			</div>
 
 			<div className="run-body">
-				<BrowserView mode="screenshots" screenshot={state.screenshot} highlights={state.highlights} />
+				<BrowserView mode={vpMode} screenshot={state.screenshot} highlights={state.highlights} />
 				<div className="panel timeline">
 					<h2>步骤时间线</h2>
 					<div className="run-stats muted">

@@ -32,6 +32,7 @@
 - **方案**：**走 agent 侧** CDP `Page.startScreencast`（按帧率推流，~1-4 fps 可配），避开 web 层异步采集与浏览器生命周期的 race（`04` 复盘的截图坑教训）。后端新增 screencast 推帧端点（或复用 `/task/events` 加 `screenshot` 高频帧）；前端 `BrowserView mode` 切换，标注层复用。
 - **依赖**：无（CDP 原生）。
 - **开放问题**：帧率/带宽控制（降采样 + 仅最新帧 + 前端不可见不推）；与截图流共存还是替代。
+- **详细实施方案**：见 [`08-livestream-viewport-plan.md`](08-livestream-viewport-plan.md)。08 调研后对上述开放问题给了定论——帧率走源头 `everyNthFrame` 限速 + 最新帧槽 + 前端不可见关流；截图流与直播**mode 互斥**（非共存）；并核实 cdp_use 的 `Page.startScreencast/stopScreencast/screencastFrame` 全套 API 现成可用。
 
 ### B. 技能面（Skills）
 - **现状**：探索模式无「活动技能」标示；顶部「技能」disabled 占位。
@@ -109,3 +110,5 @@
 若继续推进 P6 后续，建议顺序：**B 技能面 → I（Run 增强，尤其 I1/I2/I3）→ A 直播视口**（T1，高价值或用户明确想要，无阻塞），再视需要进 T2。T3 待解阻塞或主线出结论。
 
 > 「B + I1/I2/I3」的详细实施方案见 [`06-skills-and-run-enhancements-plan.md`](06-skills-and-run-enhancements-plan.md)。注意：06 调研后**勘误了本文对 I1/I2/I3 现状的若干描述**（见 06 §1）——I2 非「累加即可」（需先从 `LLMClient` 透传 usage）、I3 DOM 接线已现成（工作量更小）、I1 需新事件 + 强制开 skill。
+
+> 「A 直播视口」的详细实施方案见 [`08-livestream-viewport-plan.md`](08-livestream-viewport-plan.md)。08 核实 cdp_use screencast API 全现成，方案落点：browser 侧 `start_screencast/stop_screencast` + 独立 `/task/screencast` SSE（最新帧槽）+ 前端 `BrowserView` 双 mode 共渲染；M1（screencast 原语）先做以 de-risk CDP/线程模型。

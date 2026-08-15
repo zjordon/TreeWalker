@@ -93,11 +93,12 @@ export async function startTask(
 	task: string,
 	filePaths?: string[],
 	record?: boolean,
+	viewportMode?: "screenshots" | "livestream",
 ): Promise<{ task_id: string }> {
 	const r = await fetch(`${TASK}/start`, {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ task, file_paths: filePaths, record }),
+		body: JSON.stringify({ task, file_paths: filePaths, record, viewport_mode: viewportMode }),
 	});
 	if (!r.ok) throw new Error((await r.json()).error || "start failed");
 	return await r.json();
@@ -121,6 +122,17 @@ export function subscribeTaskEvents(
 			if (t === "done") es.close();
 		});
 	}
+	return es;
+}
+
+export function subscribeTaskFrames(
+	taskId: string,
+	onFrame: (f: { data: string }) => void,
+): EventSource {
+	// 直播视口（A）：独立 SSE（/task/screencast），仅 livestream 任务。收帧即更新 state.screenshot
+	// （经 reducer screencast 分支）。此流不发 done——由 RunView 在任务结束时 es.close()（防自动重连）。
+	const es = new EventSource(`${TASK}/screencast?task_id=${encodeURIComponent(taskId)}`);
+	es.addEventListener("screencast", (ev: MessageEvent) => onFrame(JSON.parse(ev.data)));
 	return es;
 }
 

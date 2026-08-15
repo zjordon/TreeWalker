@@ -1,4 +1,4 @@
-"""P4 可视化编辑器后端——独立 aiohttp 服务。
+"""TreeWalker web 后端——aiohttp 服务（live agent 控制台 + 流程库 + 技能面 + 直播视口）。
 
 操作 ``rerun_history_dir`` 下的 AgentHistoryList JSON，供浏览器 SPA 编辑器调用。
 **独立于 ``recorder/server.py``**：录制将迁 TreeForge，而编辑器操作的是重放端资产
@@ -27,6 +27,7 @@ import base64
 import csv
 import json
 import logging
+import threading
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -75,6 +76,8 @@ class LiveTaskHandle:
 	record: bool = False                        # 录制开关 → 结束调 agent.save_history
 	log_handler: Any = None                     # P6 M2：日志事件化 handler（结束摘除）
 	capture_tasks: set = field(default_factory=set)  # P6 M2：挂起的截图采集任务
+	vp_mode: str = "screenshots"                # 直播视口（A）：screenshots（每步一帧）/ livestream（CDP 推流）
+	frame_slot: Any = None                      # 直播视口（A）：_LatestFrameSlot（仅 livestream 非 None）
 
 
 # live task 与 batch 共享单槽、互斥（§8 决策 1：同 Chrome 单 BrowserSession 抢 CDP target）。
@@ -104,6 +107,7 @@ async def make_app(history_dir: str = "rerun-history", skills_dir: str | None = 
 	# Live agent 探索任务（P6 M1）：必须在 catch-all 之前注册
 	app.router.add_post("/task/start", _handle_task_start)
 	app.router.add_get("/task/events", _handle_task_events)
+	app.router.add_get("/task/screencast", _handle_task_screencast)  # 直播视口（A）：最新帧独立 SSE
 	app.router.add_post("/task/pause", _handle_task_pause)
 	app.router.add_post("/task/resume", _handle_task_resume)
 	app.router.add_post("/task/stop", _handle_task_stop)
@@ -525,6 +529,9 @@ class _SseLogHandler(logging.Handler):
 # SSE 推帧降采样目标（带宽：§8 决策 2 内联 base64；Pillow 缺失时 resize 为 no-op）
 _SCREENSHOT_TARGET = (1280, 800)
 
+# 直播视口（A）投递节流下限（秒）：出帧节奏 ≥ 此间隔（≈8fps 上限），lag 上界 ≈ 此值 + loop 忙时延迟
+_SC_DELIVERY_MIN_INTERVAL = 0.12
+
 
 async def _capture_screenshot(agent: Any, step: int, queue: asyncio.Queue) -> None:
 	"""step_end 触发：抓一张截图 → 降采样 → base64 data URL → 入队（{type:"screenshot"}）。
@@ -548,6 +555,144 @@ async def _capture_screenshot(agent: Any, step: int, queue: asyncio.Queue) -> No
 		logger.debug("screenshot: captured step=%d (%d bytes)", step, len(img))
 	except Exception as e:
 		logger.warning("screenshot: capture failed step=%d: %r", step, e, exc_info=True)
+
+
+class _LatestFrameSlot:
+	"""直播视口（P6 后续 A）：单槽最新帧缓冲。
+
+	覆盖式存最新帧 + ``asyncio.Event`` 唤醒 SSE 消费者——慢消费者绝不堆积，中间帧被
+	丢弃。线程安全靠调用方在 loop 线程操作：``set`` 经 ``loop.call_soon_threadsafe``
+	进 loop（CDP 帧回调在 WS 读线程触发，见 ``session.py`` 的 ``_setup_event_tracking``
+	注释），``wait``/``take`` 由 SSE handler 在 loop 线程调。
+	"""
+
+	def __init__(self) -> None:
+		self._frame: dict | None = None
+		self._event = asyncio.Event()
+		self.ever_received: bool = False  # 诊断：是否曾收到过帧（看门狗用）
+
+	def set(self, frame: dict) -> None:
+		"""存最新帧（覆盖旧帧）。须在 loop 线程调（经 call_soon_threadsafe）。"""
+		self._frame = frame
+		self.ever_received = True
+		self._event.set()
+
+	async def wait(self, timeout: float | None = None) -> None:
+		"""阻塞至有帧可用；带 timeout 则超时抛 ``asyncio.TimeoutError``。"""
+		if timeout is None:
+			await self._event.wait()
+		else:
+			await asyncio.wait_for(self._event.wait(), timeout=timeout)
+
+	def take(self) -> dict | None:
+		"""取走并清空最新帧（取后 Event 复位）。无帧返回 None。"""
+		frame, self._frame = self._frame, None
+		self._event.clear()
+		return frame
+
+	def wake(self) -> None:
+		"""唤醒消费者但不放帧（收尾用：让 /task/screencast SSE 立即醒来检查 final_event 退出）。"""
+		self._event.set()
+
+	@property
+	def pending(self) -> bool:
+		"""是否有未取走的帧。"""
+		return self._frame is not None
+
+
+def _make_screencast_frame_handler(loop, slot: "_LatestFrameSlot", browser: Any):
+	"""构造 CDP ``screencastFrame`` 回调（直播视口，P6 后续 A）。
+
+	回调在 CDP WS 读线程触发（``session.py`` 注释）→ 投递与 ack 都经 loop 移交：
+
+	- **定节奏投递（throttle，关键）**：有帧在流时，投递间隔 ≥ ``_SC_DELIVERY_MIN_INTERVAL``，
+	  每次投「最新帧」。三种方案的取舍——①每帧各排一个回调：loop 忙于 agent DOM/LLM 时
+	  积压、末尾慢慢 drain → 画面滞后；②严格合并成 1 次：忙窗内到达的帧全被并掉，出帧率
+	  跌破 Chrome 推帧率 → 卡顿（v1 教训）；③本方案（节流窗）：出帧后开一个 interval 窗，
+	  窗到期若有新帧则续投——出帧节奏平稳（≈1/interval 上限）、lag 上界 ≈ interval、无积压。
+	- **ack**：Chrome 收不到 ``screencastFrameAck`` 会暂停推帧，故每帧 ack；ack coro 内吞
+	  ``ConnectionError``/``RuntimeError``（收尾 client stopping 时无碍），并取走 task
+	  异常，避免 "Task exception was never retrieved" 噪声。
+
+	注意 ``sessionId`` 双义：帧事件 ``sessionId``(int) = **screencast 会话 id**（给 ack）；
+	CDP 调用 ``session_id=`` = **target 会话 id**（``browser.current_session_id``）。
+	"""
+	received = [0]  # 已收帧数（首帧打 info 日志——诊断 screencast 是否真有帧流入）
+	# 节流投递的线程安全状态：最新待投帧 + 投递管道是否在飞（在飞 = 已排 _deliver 或节流窗未到期）
+	sc: dict = {"frame": None, "active": False}
+	sc_lock = threading.Lock()
+
+	def _pump():
+		"""节流窗到期：有新帧 → 续投（_deliver 会再开下一个窗）；无 → 挂起管道（下帧由 WS 线程重触发）。"""
+		with sc_lock:
+			has = sc["frame"] is not None
+			if not has:
+				sc["active"] = False  # 与判定同一锁内，防「刚挂起又有帧入槽但不再触发」的丢帧竞态
+		if has:
+			_deliver()
+
+	def _deliver():
+		with sc_lock:
+			frame, sc["frame"] = sc["frame"], None
+			if frame is None:
+				sc["active"] = False  # 防御：空投时挂起（同锁内防丢触发）
+		if frame is None:
+			return
+		slot.set(frame)
+		try:
+			loop.call_later(_SC_DELIVERY_MIN_INTERVAL, _pump)  # 开节流窗，维持出帧节奏
+		except RuntimeError:
+			with sc_lock:
+				sc["active"] = False  # loop 已关（收尾）
+
+	def _on_frame(event, _cdp_sid=None):
+		received[0] += 1
+		if received[0] == 1:
+			logger.info("livestream: 首帧 screencast 已收到（sessionId=%s）", event.get("sessionId"))
+		data = event.get("data")
+		meta = event.get("metadata") or {}
+		frame = {
+			"type": "screencast",
+			"data": f"data:image/jpeg;base64,{data}" if data else None,
+			"width": meta.get("deviceWidth"),
+			"height": meta.get("deviceHeight"),
+			"scale": meta.get("pageScaleFactor"),
+		}
+		# 管道挂起时才触发投递；在飞期间新帧只入槽，由节流窗到期的 _pump 续投（节奏不丢）
+		with sc_lock:
+			sc["frame"] = frame
+			inactive = not sc["active"]
+			if inactive:
+				sc["active"] = True
+		if inactive:
+			try:
+				loop.call_soon_threadsafe(_deliver)
+			except RuntimeError:
+				pass  # loop 已关（收尾）
+		# ack 维持连续流（Chrome 收不到 ack 会暂停推帧）：每帧一个，丢到 loop 线程发
+		sid = event.get("sessionId")
+		client = getattr(browser, "client", None)
+		if sid is not None and client is not None:
+			_sess = getattr(browser, "current_session_id", None)
+
+			def _spawn_ack(_client=client, _sid=sid, _sess=_sess):
+				async def _ack():
+					try:
+						await _client.send.Page.screencastFrameAck(
+							{"sessionId": _sid}, session_id=_sess,
+						)
+					except (ConnectionError, RuntimeError) as e:
+						# 收尾时 client 正 stopping——ack 失败无碍（推流已停），吞掉避免噪声
+						logger.debug("screencast ack 失败（忽略，多为收尾）: %s", e)
+				# 取走异常，防 "Task exception was never retrieved"
+				t = asyncio.ensure_future(_ack())
+				t.add_done_callback(lambda x: x.exception() if not x.cancelled() else None)
+
+			try:
+				loop.call_soon_threadsafe(_spawn_ack)
+			except RuntimeError:
+				pass  # loop 已关
+	return _on_frame
 
 
 def _has_active_agent_task() -> bool:
@@ -578,6 +723,8 @@ async def _handle_task_start(request: web.Request) -> web.Response:
 	if not task_text:
 		return web.json_response({"error": "missing task"}, status=400)
 	record = bool(isinstance(body, dict) and body.get("record"))
+	# 直播视口（P6 后续 A）：viewport_mode=livestream 走 CDP 连续推流；其余（含缺省）= screenshots 每步一帧
+	vp_mode = "livestream" if (isinstance(body, dict) and body.get("viewport_mode") == "livestream") else "screenshots"
 
 	# 清已结束 live handle（防 dict 无限增长）+ 单槽互斥
 	for old_id, h in list(_LIVE_TASKS.items()):
@@ -597,15 +744,38 @@ async def _handle_task_start(request: web.Request) -> web.Response:
 	agent._setup_signal_handler = lambda: None
 
 	queue: asyncio.Queue = asyncio.Queue()
-	handle = LiveTaskHandle(agent=agent, queue=queue, record=record)
+	handle = LiveTaskHandle(agent=agent, queue=queue, record=record, vp_mode=vp_mode)
+
+	# 直播视口（P6 后续 A）：livestream 模式建最新帧槽 + 配 browser sink（run 时 browser.start()
+	# 会话就绪自动 startScreencast；browser 侧采集，零 race）。screenshots 模式 frame_slot 留 None。
+	if vp_mode == "livestream":
+		_sc_loop = asyncio.get_running_loop()
+		handle.frame_slot = _LatestFrameSlot()
+		_on_frame = _make_screencast_frame_handler(_sc_loop, handle.frame_slot, agent.browser)
+		agent.browser.configure_screencast(
+			_on_frame, format="jpeg", quality=60, max_width=1280, every_nth_frame=2)
+		# 诊断看门狗：Page.startScreencast 只采集「可见」tab——窗口被最小化/完全遮挡时 Chrome
+		# 不推帧（captureScreenshot 无此限制，故截图模式正常）。6s 无帧即提醒（最常见原因）。
+		_slot = handle.frame_slot
+		def _sc_watchdog():
+			if not _slot.ever_received:
+				logger.warning(
+					"livestream: 启动 6s 仍未收到任何 screencast 帧。最常见原因：Chrome 调试窗口"
+					"（9223）被最小化或完全遮挡——Page.startScreencast 只采集可见 tab。"
+					"请恢复显示该窗口后重试；或用 --disable-features=CalculateNativeWinOcclusion "
+					"--disable-backgrounding-occluded-windows 启动 Chrome。")
+		_sc_loop.call_later(6.0, _sc_watchdog)
 
 	# 订阅 EventBus → 事件入队（SSE 消费）。emit 同步调 handler，与 agent 同 asyncio 线程，put_nowait 安全。
 	if getattr(agent, "_obs_bus", None) is not None:
 		def on_event(event) -> None:
 			queue.put_nowait({"type": event.event_type, **event.model_dump(mode="json")})
 
-		# P6 M2：step_end 时调度一张截图采集（每步一帧，§8 决策 2 内联 base64）
+		# P6 M2：step_end 时调度一张截图采集（每步一帧，§8 决策 2 内联 base64）。
+		# 直播视口（A）：livestream 模式由 CDP screencast 连续推帧，不再每步采集（mode 互斥，省带宽）
 		def on_step_end(event) -> None:
+			if vp_mode != "screenshots":
+				return
 			logger.debug("screenshot: scheduled step=%d", event.step)
 			t = asyncio.create_task(_capture_screenshot(agent, event.step, queue))
 			handle.capture_tasks.add(t)
@@ -663,6 +833,10 @@ async def _handle_task_start(request: web.Request) -> web.Response:
 					logger.warning("save_history 失败: %s", e)
 			handle.final_event = final
 			await queue.put(final)
+			# 直播视口（A）：唤醒帧槽让 /task/screencast SSE 立即检查 final_event 并退出
+			# （推流本身已由上面 browser.stop() → stop_screencast 停止，M1 stop() 钩子）
+			if handle.frame_slot is not None:
+				handle.frame_slot.wake()
 			# 不立即 pop：保留 handle 供 SSE 重连补发 final_event；由下次 start 或 on_shutdown 回收。
 
 	handle.task = asyncio.create_task(run_live())
@@ -733,6 +907,57 @@ async def _handle_task_resume(request: web.Request) -> web.Response:
 
 async def _handle_task_stop(request: web.Request) -> web.Response:
 	return await _handle_task_control(request, "stop")
+
+
+async def _handle_task_screencast(request: web.Request) -> web.StreamResponse:
+	"""直播视口（P6 后续 A）：连续推最新帧的独立 SSE。
+
+	与 ``/task/events`` 物理隔离——帧洪水不挤占步骤/日志流；只推 ``_LatestFrameSlot`` 的
+	最新帧（慢消费者不堆积，中间帧丢弃）。仅 livestream 任务（``handle.frame_slot`` 非 None）
+	有此流，否则 404。EventSource 只支持 GET → 此端点必须 GET。任务与 SSE 解耦：客户端断开
+	任务继续、handler 退出（= 后端停推带宽）。任务结束 ``run_live`` 会 ``frame_slot.wake()``，
+	本 handler 立即醒来检查 ``final_event`` 退出。
+	"""
+	task_id = request.query.get("task_id")
+	if not task_id:
+		return web.json_response({"error": "missing task_id"}, status=400)
+	handle = _LIVE_TASKS.get(task_id)
+	if handle is None:
+		return web.json_response({"error": "unknown task_id"}, status=404)
+	if handle.frame_slot is None:
+		return web.json_response({"error": "no livestream for this task"}, status=404)
+
+	resp = web.StreamResponse(status=200, headers={
+		"Content-Type": "text/event-stream",
+		"Cache-Control": "no-cache",
+		"Connection": "keep-alive",
+		"X-Accel-Buffering": "no",  # 防代理缓冲（prod 同源无 nginx，加上无害）
+	})
+	await resp.prepare(request)
+	try:
+		while True:
+			try:
+				await asyncio.wait_for(handle.frame_slot.wait(), timeout=15.0)
+			except asyncio.TimeoutError:
+				await resp.write(b": keepalive\n\n")  # SSE 注释，客户端忽略；防空闲断连
+				if handle.final_event is not None:    # 任务已结束 → 收尾退出
+					break
+				continue
+			frame = handle.frame_slot.take()
+			if frame is not None:
+				payload = {k: v for k, v in frame.items() if k != "type"}
+				await resp.write(_sse_event("screencast", payload))
+			# wake() 收尾（无帧）或已刷完末帧且任务结束 → 退出
+			if handle.final_event is not None and not handle.frame_slot.pending:
+				break
+	except (ConnectionResetError, asyncio.CancelledError):
+		pass  # 客户端断开（关页/切走）：任务继续，handler 退出 = 后端停推带宽
+	finally:
+		try:
+			await resp.write_eof()
+		except Exception:
+			pass
+	return resp
 
 
 _STATIC_DIR = Path(__file__).parent / "static"

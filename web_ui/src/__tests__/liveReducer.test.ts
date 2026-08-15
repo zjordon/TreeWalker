@@ -27,6 +27,14 @@ describe("liveReducer (P6 M3)", () => {
 		expect(s.events).toHaveLength(1);
 	});
 
+	it("EVENT screencast → 更新 screenshot（直播视口 A，复用字段）", () => {
+		let s = liveReducer(initialLiveState, { type: "STARTING", taskId: "t1" });
+		s = liveReducer(s, { type: "EVENT", event: { type: "screencast", data: "data:frame1" } });
+		expect(s.screenshot).toBe("data:frame1");
+		s = liveReducer(s, { type: "EVENT", event: { type: "screencast", data: "data:frame2" } });
+		expect(s.screenshot).toBe("data:frame2");
+	});
+
 	it("EVENT done(success) → phase done + saved 入 result", () => {
 		let s = liveReducer(initialLiveState, { type: "STARTING", taskId: "t1" });
 		s = liveReducer(s, { type: "EVENT", event: { type: "done", success: true, saved: "20260812.json" } });

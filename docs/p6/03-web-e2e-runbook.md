@@ -59,7 +59,7 @@ npm run dev
 
 看到 `Local: http://127.0.0.1:5173/` 即可。（`vite.config.ts` 已代理 `/task` `/history` `/health` → 8766。）
 
-> **prod 模式替代**（不想开三个终端）：在仓库根跑 `.\scripts\build_editor.ps1`（`npm run build` + 拷 `dist`→`src/tree_walker/history_editor/static`），然后只跑步骤 1+2，浏览器开 **http://127.0.0.1:8766/**，省掉步骤 3。
+> **prod 模式替代**（不想开三个终端）：在仓库根跑 `.\scripts\build_editor.ps1`（`npm run build` + 拷 `dist`→`src/tree_walker/web/static`），然后只跑步骤 1+2，浏览器开 **http://127.0.0.1:8766/**，省掉步骤 3。
 
 ---
 

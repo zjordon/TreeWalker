@@ -81,6 +81,8 @@ ul.var-list li { padding: 4px 0; border-bottom: 1px dashed #eee; display: flex; 
 .hl-box { position: absolute; border: 2px solid #ff6f00; box-shadow: 0 0 0 2px rgba(255,111,0,0.4); pointer-events: none; box-sizing: border-box; }
 .hl-label { position: absolute; top: -16px; left: -2px; background: #ff6f00; color: #fff; font-size: 11px; padding: 0 4px; border-radius: 2px; }
 .browser-placeholder { padding: 40px; }
+.mode-badge { position: absolute; top: 6px; right: 8px; z-index: 2; font-size: 12px; padding: 1px 6px; border-radius: 3px; background: rgba(0,0,0,0.6); color: #fff; }
+.mode-badge.live { background: #ff6f00; }
 .annotation { margin-top: 6px; color: #555; font-size: 12px; }
 .skill-chip { display: inline-flex; align-items: center; }
 .chip-btn { padding: 2px 8px; font-size: 12px; border-color: #90caf9; background: #e3f2fd; }

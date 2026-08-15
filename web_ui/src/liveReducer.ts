@@ -66,7 +66,8 @@ export function liveReducer(state: LiveState, action: LiveAction): LiveState {
 			if (e.type === "log") {
 				return { ...state, logs: [...state.logs, e] };
 			}
-			if (e.type === "screenshot") {
+			if (e.type === "screenshot" || e.type === "screencast") {
+				// 直播视口（A）：screencast 帧复用 screenshot 字段（同为 data URL，渲染路径一致）
 				const data = e.data as string | undefined;
 				return { ...state, screenshot: data ?? state.screenshot };
 			}

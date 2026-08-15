@@ -106,7 +106,7 @@ async def _rerun(settings, rerun_path: str, variables: dict[str, str], debug: bo
 	type=int,
 	default=9223,
 	help="Chrome 远程调试端口：live 任务/试跑/批量连这个端口（默认 9223，与 web/重放路径 "
-	     "serve_history_editor/csv_rerun 一致；tw-tui 走 config 默认 9222）",
+	     "serve_web/csv_rerun 一致；tw-tui 走 config 默认 9222）",
 )
 @click.option(
 	"--history-dir",
@@ -122,7 +122,7 @@ def web(host: str, port: int, cdp_port: int, history_dir: str | None) -> None:
 	"""
 	import os
 
-	from tree_walker.history_editor.server import run_server
+	from tree_walker.web.server import run_server
 
 	logging.basicConfig(level=logging.INFO)
 	# _build_agent 经 load_settings 读 CDP_PORT 连 Chrome；显式置默认 9223（web/重放路径约定端口）

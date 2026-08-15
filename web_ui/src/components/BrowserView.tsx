@@ -1,5 +1,5 @@
-// P6 实时浏览器视图。mode='screenshots' 订阅最新帧 data URL；mode='livestream' 后置。
-// 标注层（高亮 agent 当前操作元素）独立于 mode——先在截图流做好，直播视口直接复用（§4.2 机制 2）。
+// P6 实时浏览器视图。screenshots 模式订阅每步截图；livestream 模式订阅 CDP screencast 连续帧；
+// 两者都喂 screenshot（data URL），渲染路径一致。标注层（高亮 agent 当前操作元素）独立于 mode（§4.2 机制 2）。
 import type { Highlight } from "../types";
 
 interface Props {
@@ -17,16 +17,15 @@ export default function BrowserView({ mode, screenshot, highlights = [] }: Props
 	return (
 		<div className="browser-view">
 			<div className="browser-frame">
-				{mode === "screenshots" ? (
-					screenshot ? (
-						<img src={screenshot} alt="browser" />
-					) : (
-						<div className="muted browser-placeholder">等待截图…</div>
-					)
+				{mode === "livestream" && <span className="mode-badge live">● 直播</span>}
+				{screenshot ? (
+					<img src={screenshot} alt="browser" />
 				) : (
-					<div className="muted browser-placeholder">直播视口（后置）</div>
+					<div className="muted browser-placeholder">
+						{mode === "livestream" ? "等待直播帧…" : "等待截图…"}
+					</div>
 				)}
-				{mode === "screenshots" && screenshot &&
+				{screenshot &&
 					highlights.map((h) => (
 						<div
 							key={h.index}

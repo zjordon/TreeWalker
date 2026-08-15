@@ -237,4 +237,4 @@ rerun-history/
 web_ui/node_modules/
 web_ui/dist/
 # 编辑器前端构建产物（由 scripts/build_editor.ps1 生成，不进 git）
-src/tree_walker/history_editor/static/
+src/tree_walker/web/static/

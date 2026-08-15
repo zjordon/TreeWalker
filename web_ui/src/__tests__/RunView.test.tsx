@@ -7,6 +7,7 @@ const { apiMocks } = vi.hoisted(() => ({
 	apiMocks: {
 		startTask: vi.fn(),
 		subscribeTaskEvents: vi.fn(),
+		subscribeTaskFrames: vi.fn(),
 		controlTask: vi.fn(),
 	},
 }));
@@ -30,8 +31,10 @@ describe("RunView (P6 M3)", () => {
 	beforeEach(() => {
 		apiMocks.startTask.mockReset();
 		apiMocks.subscribeTaskEvents.mockReset();
+		apiMocks.subscribeTaskFrames.mockReset();
 		apiMocks.controlTask.mockReset();
 		apiMocks.subscribeTaskEvents.mockReturnValue({ close: vi.fn() } as unknown as EventSource);
+		apiMocks.subscribeTaskFrames.mockReturnValue({ close: vi.fn() } as unknown as EventSource);
 	});
 
 	it("空 task 时发送按钮 disabled", () => {
@@ -47,7 +50,7 @@ describe("RunView (P6 M3)", () => {
 		expect(btn.disabled).toBe(false);
 		fireEvent.click(btn);
 		await waitFor(() =>
-			expect(apiMocks.startTask).toHaveBeenCalledWith("搜索猫", undefined, false),
+			expect(apiMocks.startTask).toHaveBeenCalledWith("搜索猫", undefined, false, "screenshots"),
 		);
 	});
 
@@ -99,5 +102,28 @@ describe("RunView (P6 M3)", () => {
 		});
 		await waitFor(() => expect(container.textContent).toContain("member.bilibili.com"));
 		expect(container.textContent).toContain("120字");
+	});
+
+	it("切到直播模式 → startTask 带 livestream + 开 subscribeTaskFrames", async () => {
+		apiMocks.startTask.mockResolvedValue({ task_id: "t1" });
+		const { container } = render(<RunView />);
+		fireEvent.change(container.querySelector("select")!, { target: { value: "livestream" } });
+		setTask(container, "x");
+		fireEvent.click(findButton(container, "▶ 发送"));
+		await waitFor(() =>
+			expect(apiMocks.startTask).toHaveBeenCalledWith("x", undefined, false, "livestream"),
+		);
+		await waitFor(() =>
+			expect(apiMocks.subscribeTaskFrames).toHaveBeenCalledWith("t1", expect.any(Function)),
+		);
+	});
+
+	it("截图模式（默认）不开 subscribeTaskFrames", async () => {
+		apiMocks.startTask.mockResolvedValue({ task_id: "t1" });
+		const { container } = render(<RunView />);
+		setTask(container, "x");
+		fireEvent.click(findButton(container, "▶ 发送"));
+		await waitFor(() => expect(apiMocks.startTask).toHaveBeenCalled());
+		expect(apiMocks.subscribeTaskFrames).not.toHaveBeenCalled();
 	});
 });

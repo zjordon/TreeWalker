@@ -37,4 +37,24 @@ describe("BrowserView (P6 后续 I3)", () => {
 		const { container } = render(<BrowserView mode="screenshots" screenshot="data:x" />);
 		expect(container.querySelector(".hl-box")).toBeNull();
 	});
+
+	it("livestream 模式同样渲染 img + 高亮 + 直播徽标", () => {
+		const { container } = render(
+			<BrowserView
+				mode="livestream"
+				screenshot="data:image/jpeg;base64,xxx"
+				highlights={[{ index: 2, bbox: { left: 0.25, top: 0.25, width: 0.5, height: 0.5 } }]}
+			/>,
+		);
+		expect(container.querySelector("img")).toBeTruthy();
+		expect(container.querySelector(".mode-badge.live")?.textContent).toContain("直播");
+		const box = container.querySelector(".hl-box") as HTMLElement;
+		expect(box.style.left).toBe("25%");
+		expect(box.style.width).toBe("50%");
+	});
+
+	it("livestream 无帧时显示直播占位", () => {
+		const { container } = render(<BrowserView mode="livestream" screenshot={null} />);
+		expect(container.textContent).toContain("等待直播帧");
+	});
 });

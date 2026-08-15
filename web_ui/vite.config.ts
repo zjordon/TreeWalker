@@ -3,7 +3,7 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
 // dev: Vite 5173 代理 /history + /health → aiohttp 8766（同源免 CORS）
-// prod: vite build → dist/，由 aiohttp history_editor/static 托管
+// prod: vite build → dist/，由 aiohttp web/static 托管
 export default defineConfig({
   plugins: [react()],
   server: {

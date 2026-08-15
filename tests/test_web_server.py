@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock
 from aiohttp.test_utils import TestClient, TestServer
 
 from tree_walker.agent.views import ActionResult, AgentHistory, AgentHistoryList
-from tree_walker.history_editor.server import make_app
+from tree_walker.web.server import make_app
 
 
 @pytest_asyncio.fixture
@@ -120,7 +120,7 @@ async def test_health(client):
 
 @pytest.mark.asyncio
 async def test_serve_index(client):
-    from tree_walker.history_editor.server import _STATIC_DIR
+    from tree_walker.web.server import _STATIC_DIR
 
     if not (_STATIC_DIR / "index.html").exists():
         pytest.skip("前端未构建（跑 scripts/build_editor.ps1）")
@@ -143,7 +143,7 @@ async def test_rerun(client, tmp_path, monkeypatch):
         AgentHistory(step_number=1, model_output={"actions": []}, result=[])]))
     fake_agent = SimpleNamespace(load_and_rerun=AsyncMock(
         return_value=[ActionResult(is_done=True, success=True, extracted_content="ok")]))
-    monkeypatch.setattr("tree_walker.history_editor.server._build_agent", lambda: fake_agent)
+    monkeypatch.setattr("tree_walker.web.server._build_agent", lambda: fake_agent)
     resp = await client.post("/history/rerun", params={"name": "a.json"}, json={"variables": {}})
     assert resp.status == 200
     data = await resp.json()
@@ -161,7 +161,7 @@ async def test_rerun_missing_name(client):
 async def test_rerun_build_agent_error(client, monkeypatch):
     def boom():
         raise RuntimeError("Chrome 未启动")
-    monkeypatch.setattr("tree_walker.history_editor.server._build_agent", boom)
+    monkeypatch.setattr("tree_walker.web.server._build_agent", boom)
     resp = await client.post("/history/rerun", params={"name": "a.json"}, json={})
     assert resp.status == 400
     assert "Chrome" in (await resp.json())["error"]
@@ -183,7 +183,7 @@ async def test_save_rejects_unequal_pairing(client):
 
 def _strip_live_log_handlers():
     """摘除可能泄漏到 tree_walker logger 的 _SseLogHandler（测试隔离）。"""
-    from tree_walker.history_editor.server import _SseLogHandler
+    from tree_walker.web.server import _SseLogHandler
     tw = logging.getLogger("tree_walker")
     for h in list(tw.handlers):
         if isinstance(h, _SseLogHandler):
@@ -193,7 +193,7 @@ def _strip_live_log_handlers():
 @pytest.fixture(autouse=True)
 def _isolate_agent_tasks():
     """每个测试前后清空模块级 _BATCH_TASKS / _LIVE_TASKS + 摘除泄漏的日志 handler。"""
-    from tree_walker.history_editor import server
+    from tree_walker.web import server
     server._BATCH_TASKS.clear()
     server._LIVE_TASKS.clear()
     _strip_live_log_handlers()
@@ -222,7 +222,7 @@ async def test_batch_start_uploads_csv(client, tmp_path, monkeypatch):
     _save_blank_history(tmp_path)
     fake_agent = SimpleNamespace(
         batch_rerun=AsyncMock(return_value=[]), stop=lambda: None)
-    monkeypatch.setattr("tree_walker.history_editor.server._build_agent", lambda: fake_agent)
+    monkeypatch.setattr("tree_walker.web.server._build_agent", lambda: fake_agent)
     resp = await client.post(
         "/history/batch/start", params={"name": "a.json"},
         data=_csv_formdata("email\na@b.com\nc@d.com"))
@@ -258,7 +258,7 @@ async def test_batch_start_traversal_rejected(client):
 async def test_batch_start_empty_csv(client, tmp_path, monkeypatch):
     _save_blank_history(tmp_path)
     fake_agent = SimpleNamespace(batch_rerun=AsyncMock(return_value=[]), stop=lambda: None)
-    monkeypatch.setattr("tree_walker.history_editor.server._build_agent", lambda: fake_agent)
+    monkeypatch.setattr("tree_walker.web.server._build_agent", lambda: fake_agent)
     resp = await client.post(
         "/history/batch/start", params={"name": "a.json"},
         data=_csv_formdata("email"))  # 只表头
@@ -276,7 +276,7 @@ async def test_batch_concurrent_rejected(client, tmp_path, monkeypatch):
         return []
 
     fake_agent = SimpleNamespace(batch_rerun=slow_batch, stop=lambda: None)
-    monkeypatch.setattr("tree_walker.history_editor.server._build_agent", lambda: fake_agent)
+    monkeypatch.setattr("tree_walker.web.server._build_agent", lambda: fake_agent)
     resp1 = await client.post(
         "/history/batch/start", params={"name": "a.json"},
         data=_csv_formdata("email\na@b.com"))
@@ -302,7 +302,7 @@ async def test_batch_progress_sse(client, tmp_path, monkeypatch):
         return [r0, r1]
 
     fake_agent = SimpleNamespace(batch_rerun=fake_batch, stop=lambda: None)
-    monkeypatch.setattr("tree_walker.history_editor.server._build_agent", lambda: fake_agent)
+    monkeypatch.setattr("tree_walker.web.server._build_agent", lambda: fake_agent)
     resp = await client.post(
         "/history/batch/start", params={"name": "a.json"},
         data=_csv_formdata("email\na@b.com\nc@d.com"))
@@ -353,7 +353,7 @@ def _live_agent(*, run=None, bus=None, history=None, browser=None):
 @pytest.mark.asyncio
 async def test_task_start_returns_task_id(client, monkeypatch):
     monkeypatch.setattr(
-        "tree_walker.history_editor.server._build_agent", lambda *, task="": _live_agent())
+        "tree_walker.web.server._build_agent", lambda *, task="": _live_agent())
     resp = await client.post("/task/start", json={"task": "帮我搜索猫"})
     assert resp.status == 200
     assert "task_id" in (await resp.json())
@@ -375,7 +375,7 @@ async def test_task_start_invalid_json(client):
 async def test_task_start_build_agent_error(client, monkeypatch):
     def boom(*, task=""):
         raise RuntimeError("Chrome 未启动")
-    monkeypatch.setattr("tree_walker.history_editor.server._build_agent", boom)
+    monkeypatch.setattr("tree_walker.web.server._build_agent", boom)
     resp = await client.post("/task/start", json={"task": "x"})
     assert resp.status == 400
     assert "Chrome" in (await resp.json())["error"]
@@ -390,7 +390,7 @@ async def test_task_start_concurrent_with_live_rejected(client, monkeypatch):
         return AgentHistoryList()
 
     monkeypatch.setattr(
-        "tree_walker.history_editor.server._build_agent",
+        "tree_walker.web.server._build_agent",
         lambda *, task="": _live_agent(run=slow_run))
     r1 = await client.post("/task/start", json={"task": "a"})
     assert r1.status == 200
@@ -409,7 +409,7 @@ async def test_batch_rejected_when_live_active(client, tmp_path, monkeypatch):
         return AgentHistoryList()
 
     monkeypatch.setattr(
-        "tree_walker.history_editor.server._build_agent",
+        "tree_walker.web.server._build_agent",
         lambda *, task="": _live_agent(run=slow_run))
     _save_blank_history(tmp_path)
     r_live = await client.post("/task/start", json={"task": "a"})
@@ -435,7 +435,7 @@ async def test_task_events_sse(client, monkeypatch):
         return AgentHistoryList()
 
     monkeypatch.setattr(
-        "tree_walker.history_editor.server._build_agent",
+        "tree_walker.web.server._build_agent",
         lambda *, task="": _live_agent(run=emitting_run, bus=bus))
     resp = await client.post("/task/start", json={"task": "x"})
     task_id = (await resp.json())["task_id"]
@@ -472,7 +472,7 @@ async def test_task_control_pause_resume_stop(client, monkeypatch):
     agent.resume = lambda: calls.append("resume")
     agent.stop = lambda: calls.append("stop")
     monkeypatch.setattr(
-        "tree_walker.history_editor.server._build_agent", lambda *, task="": agent)
+        "tree_walker.web.server._build_agent", lambda *, task="": agent)
     r = await client.post("/task/start", json={"task": "x"})
     task_id = (await r.json())["task_id"]
 
@@ -505,7 +505,7 @@ async def test_task_record_saves_history(client, monkeypatch):
     agent.run = quick_run
     agent.save_history = fake_save
     monkeypatch.setattr(
-        "tree_walker.history_editor.server._build_agent", lambda *, task="": agent)
+        "tree_walker.web.server._build_agent", lambda *, task="": agent)
     r = await client.post("/task/start", json={"task": "x", "record": True})
     task_id = (await r.json())["task_id"]
 
@@ -533,7 +533,7 @@ async def test_task_events_run_error(client, monkeypatch):
         raise RuntimeError("agent 炸了")
 
     monkeypatch.setattr(
-        "tree_walker.history_editor.server._build_agent",
+        "tree_walker.web.server._build_agent",
         lambda *, task="": _live_agent(run=boom_run))
     resp = await client.post("/task/start", json={"task": "x"})
     task_id = (await resp.json())["task_id"]
@@ -552,7 +552,7 @@ async def test_task_events_replay_after_done(client, monkeypatch):
         return AgentHistoryList()
 
     monkeypatch.setattr(
-        "tree_walker.history_editor.server._build_agent",
+        "tree_walker.web.server._build_agent",
         lambda *, task="": _live_agent(run=quick))
     resp = await client.post("/task/start", json={"task": "x"})
     task_id = (await resp.json())["task_id"]
@@ -585,7 +585,7 @@ async def test_task_record_save_failure(client, monkeypatch):
     agent = _live_agent(run=quick, history=hist)
     agent.save_history = bad_save
     monkeypatch.setattr(
-        "tree_walker.history_editor.server._build_agent", lambda *, task="": agent)
+        "tree_walker.web.server._build_agent", lambda *, task="": agent)
     r = await client.post("/task/start", json={"task": "x", "record": True})
     task_id = (await r.json())["task_id"]
 
@@ -602,9 +602,9 @@ async def test_task_start_clears_finished_handle(client, monkeypatch):
         return AgentHistoryList()
 
     monkeypatch.setattr(
-        "tree_walker.history_editor.server._build_agent",
+        "tree_walker.web.server._build_agent",
         lambda *, task="": _live_agent(run=quick))
-    from tree_walker.history_editor import server
+    from tree_walker.web import server
 
     r1 = await client.post("/task/start", json={"task": "a"})
     task1 = (await r1.json())["task_id"]
@@ -624,7 +624,7 @@ async def test_task_start_clears_finished_handle(client, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_sse_log_handler_enqueues():
-    from tree_walker.history_editor.server import _SseLogHandler
+    from tree_walker.web.server import _SseLogHandler
     q: asyncio.Queue = asyncio.Queue()
     h = _SseLogHandler(q)
     log = logging.getLogger("tree_walker.agent.unit_test")
@@ -649,7 +649,7 @@ async def test_task_events_include_logs(client, monkeypatch):
         return AgentHistoryList()
 
     monkeypatch.setattr(
-        "tree_walker.history_editor.server._build_agent",
+        "tree_walker.web.server._build_agent",
         lambda *, task="": _live_agent(run=logging_run))
     resp = await client.post("/task/start", json={"task": "x"})
     task_id = (await resp.json())["task_id"]
@@ -679,7 +679,7 @@ async def test_task_events_include_screenshot(client, monkeypatch):
         return AgentHistoryList()
 
     monkeypatch.setattr(
-        "tree_walker.history_editor.server._build_agent",
+        "tree_walker.web.server._build_agent",
         lambda *, task="": _live_agent(run=stepping_run, bus=bus, browser=browser))
     resp = await client.post("/task/start", json={"task": "x"})
     task_id = (await resp.json())["task_id"]
@@ -718,7 +718,7 @@ async def test_screenshot_downsampled_via_resize(client, monkeypatch):
         return AgentHistoryList()
 
     monkeypatch.setattr(
-        "tree_walker.history_editor.server._build_agent",
+        "tree_walker.web.server._build_agent",
         lambda *, task="": _live_agent(run=stepping_run, bus=bus, browser=browser))
     resp = await client.post("/task/start", json={"task": "x"})
     task_id = (await resp.json())["task_id"]
@@ -727,6 +727,131 @@ async def test_screenshot_downsampled_via_resize(client, monkeypatch):
     async for _ in resp.content:
         pass
     assert seen.get("target") == (1280, 800)
+
+
+# ── 直播视口（P6 后续 A）viewport_mode / screencast SSE ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_task_start_livestream_configures_screencast(client, monkeypatch):
+    """viewport_mode=livestream → browser.configure_screencast 被调，且 step_end 不采集截图（mode 互斥）。"""
+    from tree_walker.observability import EventBus
+    from tree_walker.observability.events import StepEndEvent
+
+    bus = EventBus()
+    configured = []
+    browser = SimpleNamespace(
+        configure_screencast=lambda cb, **k: configured.append((cb, k)),
+        take_screenshot=AsyncMock(return_value=b"\x89PNG"),
+    )
+
+    async def stepping_run(keep_alive=False):
+        bus.emit(StepEndEvent(step=1, session_id="t", duration_seconds=0.1,
+                              is_done=True, consecutive_failures=0))
+        return AgentHistoryList()
+
+    monkeypatch.setattr(
+        "tree_walker.web.server._build_agent",
+        lambda *, task="": _live_agent(run=stepping_run, bus=bus, browser=browser))
+    resp = await client.post("/task/start", json={"task": "x", "viewport_mode": "livestream"})
+    assert resp.status == 200
+    task_id = (await resp.json())["task_id"]
+
+    resp = await client.get("/task/events", params={"task_id": task_id})
+    async for _ in resp.content:
+        pass
+
+    assert len(configured) == 1                       # 配了 screencast sink
+    _cb, kw = configured[0]
+    assert callable(_cb)                              # 帧回调已注入
+    assert kw["format"] == "jpeg"
+    assert kw["max_width"] == 1280
+    assert kw["every_nth_frame"] == 2
+    assert browser.take_screenshot.await_count == 0   # livestream 不走每步截图
+
+
+@pytest.mark.asyncio
+async def test_task_start_screenshots_mode_no_screencast(client, monkeypatch):
+    """默认 screenshots 模式 → 不配 screencast，仍每步截图（回归：现状不变）。"""
+    from tree_walker.observability import EventBus
+    from tree_walker.observability.events import StepEndEvent
+
+    bus = EventBus()
+    configured = []
+    browser = SimpleNamespace(
+        configure_screencast=lambda *a, **k: configured.append(k),
+        take_screenshot=AsyncMock(return_value=b"\x89PNG"),
+    )
+
+    async def stepping_run(keep_alive=False):
+        bus.emit(StepEndEvent(step=1, session_id="t", duration_seconds=0.1,
+                              is_done=True, consecutive_failures=0))
+        return AgentHistoryList()
+
+    monkeypatch.setattr(
+        "tree_walker.web.server._build_agent",
+        lambda *, task="": _live_agent(run=stepping_run, bus=bus, browser=browser))
+    resp = await client.post("/task/start", json={"task": "x"})  # 不带 viewport_mode
+    task_id = (await resp.json())["task_id"]
+
+    resp = await client.get("/task/events", params={"task_id": task_id})
+    async for _ in resp.content:
+        pass
+
+    assert configured == []                           # screenshots 不配 screencast
+    assert browser.take_screenshot.await_count >= 1   # 仍每步截图（现状不变）
+
+
+@pytest.mark.asyncio
+async def test_task_screencast_streams_latest_frame(client, monkeypatch):
+    """/task/screencast 推最新帧；run 期间推入帧槽的帧被消费为 screencast 事件。"""
+    from tree_walker.web.server import _LIVE_TASKS
+
+    async def streaming_run(keep_alive=False):
+        # 单槽：只有一个 live handle；run 期间往帧槽推一帧（模拟 CDP screencast 回调）
+        handle = next(iter(_LIVE_TASKS.values()))
+        handle.frame_slot.set({"type": "screencast",
+                               "data": "data:image/jpeg;base64,AAA",
+                               "width": 1280, "height": 800})
+        return AgentHistoryList()
+
+    browser = SimpleNamespace(configure_screencast=lambda *a, **k: None)
+    monkeypatch.setattr(
+        "tree_walker.web.server._build_agent",
+        lambda *, task="": _live_agent(run=streaming_run, browser=browser))
+    resp = await client.post("/task/start", json={"task": "x", "viewport_mode": "livestream"})
+    task_id = (await resp.json())["task_id"]
+
+    resp = await client.get("/task/screencast", params={"task_id": task_id})
+    assert resp.headers["Content-Type"] == "text/event-stream"
+    events = []
+    async for raw in resp.content:
+        s = raw.decode().strip()
+        if s.startswith("event: screencast"):
+            events.append(s)
+    assert events  # 收到至少一帧
+
+
+@pytest.mark.asyncio
+async def test_task_screencast_404_for_screenshots_task(client, monkeypatch):
+    """screenshots 任务 frame_slot 为 None → /task/screencast 404。"""
+    monkeypatch.setattr(
+        "tree_walker.web.server._build_agent",
+        lambda *, task="": _live_agent())
+    resp = await client.post("/task/start", json={"task": "x"})  # screenshots
+    task_id = (await resp.json())["task_id"]
+    resp = await client.get("/task/events", params={"task_id": task_id})  # 喝完让 run 收尾
+    async for _ in resp.content:
+        pass
+    resp = await client.get("/task/screencast", params={"task_id": task_id})
+    assert resp.status == 404
+    assert "no livestream" in (await resp.json())["error"]
+
+
+@pytest.mark.asyncio
+async def test_task_screencast_missing_and_unknown_task(client):
+    assert (await client.get("/task/screencast")).status == 400               # 缺 task_id
+    assert (await client.get("/task/screencast", params={"task_id": "nope"})).status == 404
 
 
 @pytest.mark.asyncio
@@ -743,7 +868,7 @@ async def test_task_events_include_skill_active(client, monkeypatch):
         return AgentHistoryList()
 
     monkeypatch.setattr(
-        "tree_walker.history_editor.server._build_agent",
+        "tree_walker.web.server._build_agent",
         lambda *, task="": _live_agent(run=run_with_skill, bus=bus))
     resp = await client.post("/task/start", json={"task": "上传视频"})
     task_id = (await resp.json())["task_id"]
@@ -884,7 +1009,7 @@ async def test_skills_put_missing_content(skills_client):
 async def test_skills_put_invalidates_live_loader(skills_client):
     # /skills/put 写盘后，正在跑的 live agent 的 _skill_loader.invalidate(host) 应被调用
     cli, _ = skills_client
-    from tree_walker.history_editor import server
+    from tree_walker.web import server
 
     class _FakeLoader:
         def __init__(self):
@@ -908,7 +1033,7 @@ async def test_skills_put_invalidates_live_loader(skills_client):
 async def test_skills_put_skips_loader_when_absent(skills_client):
     # live agent 无 _skill_loader 属性（如 mock）→ getattr 防 AttributeError，不崩
     cli, _ = skills_client
-    from tree_walker.history_editor import server
+    from tree_walker.web import server
 
     server._LIVE_TASKS["t-bare"] = SimpleNamespace(
         agent=SimpleNamespace(stop=lambda: None), task=None)  # 无 _skill_loader

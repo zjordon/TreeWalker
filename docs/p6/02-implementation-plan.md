@@ -2,7 +2,7 @@
 
 > 状态：**方案已定**（2026-08-11）。IA + 实施细节均已锁，可进入实施（M1 起）。
 > 关联：issue #162 / ROADMAP P6。
-> 前置：扩展现有 `web_ui`（React + reducer）+ `history_editor/server.py`（aiohttp，端口 8766），非重写。
+> 前置：扩展现有 `web_ui`（React + reducer）+ `web/server.py`（aiohttp，端口 8766），非重写。
 
 ---
 
@@ -29,7 +29,7 @@
 └───────────────┬──────────────────────────────────────────────┘
                 │ REST + SSE（同源 / Vite proxy）
 ┌───────────────▼──────────────────────────────────────────────┐
-│ 后端 aiohttp（history_editor/server.py，扩 make_app）          │
+│ 后端 aiohttp（web/server.py，扩 make_app）          │
 │  现有 /history/*（list/load/save/detect/rerun/batch）不变     │
 │  新增 /task/*（live agent 控制台）：                          │
 │   POST /task/start · GET /task/events(SSE) ·                  │
@@ -55,7 +55,7 @@
 
 ### 2.1 模块布局
 
-在 `history_editor/server.py` 的 `make_app` 注册新路由组 `/task/*`（不新建服务、不新开端口，统一入口）。新增一个 `LiveTaskHandle`（与 `BatchTaskHandle` 并列，模块级 dict `_LIVE_TASKS`）。
+在 `web/server.py` 的 `make_app` 注册新路由组 `/task/*`（不新建服务、不新开端口，统一入口）。新增一个 `LiveTaskHandle`（与 `BatchTaskHandle` 并列，模块级 dict `_LIVE_TASKS`）。
 
 > 单并发约束：与 batch 共享「同 Chrome 单 BrowserSession 抢 CDP target」的限制。**live task 与 batch 共享一个并发槽、互斥**（§8 决策 1）——同一时刻仅一个 agent 跑。
 
@@ -211,7 +211,7 @@ pauseTask/resumeTask/stopTask(taskId)
 
 ## 4. CLI 一等化 & TUI 下线
 
-- 现 editor 后端是 `examples/serve_history_editor.py`（非一等入口）。新增 CLI 子命令（如 `treewalker web [--host] [--port] [--cdp-port]`），`cli.py` 加 `serve` 子命令调用 `run_server`。
+- 现 editor 后端是 `examples/serve_web.py`（非一等入口）。新增 CLI 子命令（如 `treewalker web [--host] [--port] [--cdp-port]`），`cli.py` 加 `serve` 子命令调用 `run_server`。
 - TUI（`treewalker` 默认进 TUI）在 live 控制台验收通过后 deprecated → 移除 `tui/` + `cli.py` 的 TUI 分支（P6 收尾）。
 
 ---
@@ -220,7 +220,7 @@ pauseTask/resumeTask/stopTask(taskId)
 
 | 里程碑 | 内容 | 验收 |
 |---|---|---|
-| **M1** 后端 live task | `LiveTaskHandle` + `/task/start` + `/task/events`(SSE，EventBus→Queue) + `/task/{pause,resume,stop}` | 单测：mock agent，事件入队 + SSE 格式；端点单测仿 `test_history_editor_server.py` |
+| **M1** 后端 live task | `LiveTaskHandle` + `/task/start` + `/task/events`(SSE，EventBus→Queue) + `/task/{pause,resume,stop}` | 单测：mock agent，事件入队 + SSE 格式；端点单测仿 `test_web_server.py` |
 | **M2** 日志事件化 + 截图推帧 | `_SseLogHandler` + `ScreenshotEvent` → 同一 SSE 流 | 单测：log handler emit 入队；截图降采样 |
 | **M3** 前端 App Shell + Run 视图 | 注册表 shell + sidebar + Run 视图（输入/BrowserView 截图/时间线/日志/控制/录制）接 M1/M2 | 真机跑通一个真任务（看实时步骤+截图+日志，能暂停/停止/录制存盘） |
 | **M4** 折叠 Edit/Replay | 现组件包成 Edit/Replay tab，从 sidebar 选 Flow 加载 | 现编辑/批量 e2e 零回归 |
@@ -231,7 +231,7 @@ pauseTask/resumeTask/stopTask(taskId)
 
 ## 6. 测试策略
 
-- **后端**：`LiveTaskHandle` 单测（mock agent.run + `_obs_bus`，断言事件→queue→SSE）；端点单测（start/events/pause/resume/stop，仿 `test_history_editor_server.py` 的 monkeypatch 套路）；日志 handler 单测。
+- **后端**：`LiveTaskHandle` 单测（mock agent.run + `_obs_bus`，断言事件→queue→SSE）；端点单测（start/events/pause/resume/stop，仿 `test_web_server.py` 的 monkeypatch 套路）；日志 handler 单测。
 - **前端**：shell 注册表 reducer 单测；Run 视图组件测（仿 `BatchRunPanel.test.tsx`，mock EventSource）；折叠后编辑/批量现有测试零回归。
 - **覆盖率** >85%（项目目标）。
 - **真机 e2e**：M3 在抖音/B站真跑一个任务验收 live 控制台。

@@ -8,7 +8,7 @@
 
 ## 0. 背景
 
-P6 已决策（2026-08-11，见 issue #162）：把 TUI（`tui/`）的能力迁到浏览器端 web，统一交互入口。**TUI 并存保留**（`tw-tui` + `tw-web` 共存，web 为主）——原计划「迁移完下掉 TUI」，2026-08-12 修订为并存（见 `04` §一·1）。范围 = live agent 控制台 + 统一现有 `history_editor` 入口，**不含手工录制**（Chrome 扩展，迁 TreeForge）。
+P6 已决策（2026-08-11，见 issue #162）：把 TUI（`tui/`）的能力迁到浏览器端 web，统一交互入口。**TUI 并存保留**（`tw-tui` + `tw-web` 共存，web 为主）——原计划「迁移完下掉 TUI」，2026-08-12 修订为并存（见 `04` §一·1）。范围 = live agent 控制台 + 统一现有 `web` 入口，**不含手工录制**（Chrome 扩展，迁 TreeForge）。
 
 本提案调研 OpenClaw / hermes-agent / browser-use webui / Skyvern 等成熟 agent 交付界面，结合 TreeWalker 的定位与实际能力，给出 web 前端的**信息架构与界面框架**，供讨论定调。
 
@@ -37,7 +37,7 @@ TreeWalker 要承载的能力（实际代码位置）：
 | 实时日志/事件（`EventBus`/`_obs_bus`） | 运行视图：步骤时间线 + 日志流 |
 | 运行控制（`pause/resume/stop`） | 运行视图顶栏按钮 |
 | agent 轨迹录制（`record-switch` → `save_history`） | 运行视图：录制开关，结束存为 Flow |
-| 历史编辑（`history_editor`：action list/editor + 变量面板） | **编辑视图**（现有 React 资产，折叠进来） |
+| 历史编辑（`web`：action list/editor + 变量面板） | **编辑视图**（现有 React 资产，折叠进来） |
 | 单次试跑 / CSV 批量（`batch_rerun` + SSE） | **重放视图**：试跑 + 批量进度 |
 | 历史管理（`rerun_history_dir`） | **侧栏流程库** |
 | skill 注入（`domain-skills/<host>/`） | 运行视图「活动技能」标示 + **技能面**（查看/编辑） |

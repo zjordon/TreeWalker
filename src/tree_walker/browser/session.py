@@ -1342,6 +1342,11 @@ class BrowserSession:
             stability_window=_settings.network_idle_stability_window,
             poll_interval=_settings.network_idle_poll_interval,
         )
+        # 直播视口（P6 后续 A）：run 前 configure_screencast 设 sink，start() 会话
+        # 就绪自动 startScreencast，stop() 收尾。帧回调在 CDP WS 读线程触发。
+        self._screencast_sink: tuple | None = None  # (on_frame, kwargs)
+        self._screencast_on_frame = None             # 当前注册的帧回调
+        self._screencast_on: bool = False            # 是否正在推流
 
     async def start(
         self,
@@ -1358,6 +1363,14 @@ class BrowserSession:
         """
         self.client = CDPClient(self.ws_url)
         await self._connect()
+        # 直播视口（P6 后续 A）：run 前若已 configure_screencast，会话就绪即起推流
+        # （browser 侧自动、browser 必活时采集——零 race，践行 04 复盘 §三·1）
+        if self._screencast_sink is not None:
+            _sc_cb, _sc_kw = self._screencast_sink
+            try:
+                await self.start_screencast(_sc_cb, **_sc_kw)
+            except Exception as e:
+                logger.warning("screencast 启动失败（降级为无直播）: %s", e)
         if track_downloads:
             await self._setup_download_tracking(downloads_path)
         self._enable_recent_events = enable_recent_events
@@ -1693,6 +1706,12 @@ class BrowserSession:
             except OSError:
                 logger.warning("failed to remove temp upload file %r", p)
         self._upload_temp_paths.clear()
+        # 直播视口：先停推流再断 CDP（CDP 会话还活着才能干净 stop；幂等 no-op）
+        try:
+            if self._screencast_on:
+                await self.stop_screencast()
+        except Exception as e:
+            logger.debug("stop() 内 stop_screencast no-op: %s", e)
         if self.client:
             await self.client.stop()
             self.client = None
@@ -1809,6 +1828,67 @@ class BrowserSession:
             screenshot=screenshot,
             recent_events=self.consume_recent_events(),  # P1b：每步 consume，避免重复
         )
+
+    # ── 直播视口（CDP Page.startScreencast 连续推流，P6 后续 A）──────────
+
+    def configure_screencast(self, on_frame, **kwargs) -> None:
+        """声明「run 前要直播」——存回调 + 参数，真正 ``startScreencast`` 延到
+        ``start()`` 会话就绪（browser 侧自动起，零 race）。
+
+        ``on_frame`` 签名 ``(event, cdp_session_id)``，在 CDP WS 读线程触发（见
+        ``_setup_event_tracking`` 注释），实现方须用 ``loop.call_soon_threadsafe``
+        移交 loop 线程后再操作 asyncio 对象。``kwargs`` 透传给 ``start_screencast``。
+        """
+        self._screencast_sink = (on_frame, kwargs)
+
+    async def start_screencast(
+        self,
+        on_frame,
+        *,
+        format: str = "jpeg",
+        quality: int = 60,
+        max_width: int | None = None,
+        every_nth_frame: int = 4,
+    ) -> None:
+        """启动 CDP ``Page.startScreencast`` 连续推流（直播视口）。
+
+        仿 ``_setup_download_tracking``（register + send）与 ``take_screenshot``
+        （``send.Page.*`` + ``current_session_id``）。``on_frame`` 每帧回调，载荷
+        ``{data(base64), metadata, sessionId}``（cdp_use ``events.py:300-305``）；回调
+        在 CDP WS 读线程触发，调用方须线程安全移交 loop。幂等：重复调用先 stop 再 start。
+        ``max_width`` 只限宽以保宽高比（高亮层归一化 bbox 百分比依赖）。
+        """
+        if self.client is None:
+            raise RuntimeError("screencast 需先 start() 连接 CDP")
+        if self._screencast_on:
+            await self.stop_screencast()
+        self._screencast_on_frame = on_frame
+        self.client.register.Page.screencastFrame(on_frame)  # 单回调覆盖式注册
+        params: dict = {"format": format, "quality": int(quality)}
+        if max_width is not None:
+            params["maxWidth"] = int(max_width)
+        params["everyNthFrame"] = int(every_nth_frame)
+        await self.client.send.Page.startScreencast(
+            params, session_id=self.current_session_id,
+        )
+        self._screencast_on = True
+        logger.info(
+            "screencast: startScreencast 成功（session=%s, format=%s, everyNthFrame=%s, maxWidth=%s）",
+            self.current_session_id, format, every_nth_frame, max_width,
+        )
+
+    async def stop_screencast(self) -> None:
+        """停止推流。幂等：未起推流 / client 已断 → no-op（不发 CDP）。"""
+        if not self._screencast_on:
+            return
+        self._screencast_on = False
+        client = self.client
+        if client is None:
+            return
+        try:
+            await client.send.Page.stopScreencast(None, session_id=self.current_session_id)
+        except Exception as e:
+            logger.debug("stopScreencast failed (ignored): %s", e)
 
     async def take_screenshot(
         self,
