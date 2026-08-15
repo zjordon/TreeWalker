@@ -46,17 +46,25 @@ cp .env.example .env
 ZHIPU_API_KEY=your_api_key_here
 ```
 
-**3. 启动 TUI**
+**3. 启动界面**
+
+TreeWalker 提供两个入口（都是 live agent 控制台）：`tw-web` 默认连 Chrome **9223**（web/重放路径约定端口，与 `serve_web`/`csv_rerun` 一致），`tw-tui` 连 Chrome **9222**（config 默认）。按惯例分用两个端口，即可各开一个 Chrome 实例互不干扰。
+
+**Web 前端**（`tw-web`，推荐——可视化实时步骤/截图/日志，流程库编辑/批量重放）：
+
+```bash
+cd web_ui && npm install && npm run build && cd ..   # 首次需构建前端
+tw-web                                                # 开 http://127.0.0.1:8766/
+```
+
+**TUI**（`tw-tui`，终端）：
 
 ```bash
 tw-tui
+tw-tui -t "打开百度搜索今天的新闻"                     # 直接指定任务
 ```
 
-或直接指定任务：
-
-```bash
-tw-tui -t "打开百度搜索今天的新闻"
-```
+> 完整 Web 功能见下方「Web 前端」章节。
 
 ## 编程接口
 
@@ -101,10 +109,10 @@ asyncio.run(main())
 
 ## 截图
 
-<!-- 在此处添加 TUI 界面截图 -->
-<!-- ![TreeWalker TUI](docs/screenshots/tui-demo.png) -->
+<!-- 在此处添加界面截图 -->
+<!-- ![TreeWalker Web](docs/screenshots/web-demo.png) -->
 
-> 截图占位 — 运行 `tw-tui` 即可看到完整 TUI 界面
+> 截图占位 — 运行 `tw-web`（浏览器）或 `tw-tui`（终端）即可看到完整界面
 
 ## 架构
 
@@ -142,6 +150,8 @@ asyncio.run(main())
 ```
 
 Agent 在每一步循环中：**感知**页面 DOM → **思考**下一步动作 → **执行**浏览器操作，直到任务完成。
+
+> 前端入口：TUI（`tw-tui`，终端）与 Web（`tw-web`，浏览器，推荐）——两者驱动同一个 Agent Loop。
 
 ## 高级特性
 
@@ -210,46 +220,50 @@ await agent.load_and_rerun("myflow.json", variables={"email": "new@x.com"})
 > 完整设计、架构、方案演进与架构反思见 [docs/user_recording/](docs/user_recording/)：
 > [`README.md`](docs/user_recording/README.md) · [`redesign.md`](docs/user_recording/redesign.md) · [`semantic-clue-replay.md`](docs/user_recording/semantic-clue-replay.md) · [`recorder-timing-solutions.md`](docs/user_recording/recorder-timing-solutions.md)
 
-## 历史可视化编辑 + CSV 批量重放
+## Web 前端（tw-web）
 
-录制或 agent 探索产出的历史（`rerun-history/*.json`）可用浏览器编辑器可视化编辑（删除误录步、改 input 文本、把某个值标注为变量），再喂 CSV 多行数据批量重放——**录制一次，批量执行 N 次**。
+`tw-web` 是浏览器端统一界面，承接 TUI 全部交互能力，更适合复杂交付与可视化。两个模式：
 
-### 可视化编辑器
+- **探索**（live agent 控制台）：输入任务 → 实时看 agent 的步骤时间线、浏览器截图、日志流；可暂停 / 停止；开「录制轨迹」把本次 `AgentHistory` 存盘成可重放流程。
+- **流程库**：管理/编辑/重放已存历史（`rerun-history/*.json`）——可视化编辑动作、标注变量、单次试跑、CSV 批量、详情查看。
 
-独立 HTTP 后端 + 浏览器 SPA（React+Vite，操作重放端历史，与录制扩展解耦）：拖拽重排步骤、改 input 文本、删步、人工标注变量、试跑（真实起浏览器）。
+### 启动
 
-**首次使用需构建前端**（生成 `history_editor/static/`）：
+首次需构建前端（生成 `web/static/`）：
 ```bash
-./scripts/build_editor.sh        # mac / linux（或 bash scripts/build_editor.sh）
-.\scripts\build_editor.ps1       # Windows
+cd web_ui && npm install && npm run build && cd ..
+# 或 ./scripts/build_editor.sh（mac/linux）/ .\scripts\build_editor.ps1（Windows）
 ```
 
-启动后端（默认 http://127.0.0.1:8766/）：
+启动（默认 http://127.0.0.1:8766/，连 Chrome 9223）：
 ```bash
-uv run python examples/serve_history_editor.py
+tw-web
 ```
 
-浏览器打开 `http://127.0.0.1:8766/` → 选历史文件 → 加载：
+前端开发模式（热重载，免构建）：
+```bash
+tw-web                            # 终端1：后端 8766
+cd web_ui && npm run dev          # 终端2：Vite 5173（proxy → 8766）
+# 浏览器开 http://127.0.0.1:5173/
+```
+
+### 流程库：可视化编辑
+
+浏览器打开 `tw-web` → 顶部「流程库」→ 左侧选历史文件 → 加载：
 
 - **动作列表**（可拖拽重排）：每步的动作类型 / 目标元素 / 参数
 - **编辑**：改 input 的 text、删除误录步
 - **标注变量**：把任意 input 的 text 标为变量（指定变量名），补 `detect_variables` 自动检测识别不了的字段（商品名、订单备注等无规律值）
 - **检测变量**：自动检测（email/phone/name 等有规律字段）∪ 人工标注
-- **试跑**：调 `/history/rerun`（真实起浏览器），每步 ✓/✗
+- **试跑**：真实起浏览器，每步 ✓/✗
+- **详情**：元信息 + 每步动作/结果/状态摘要 master-detail
 - **保存**：写回 `rerun-history/*.json`
 
-**前端开发模式**（热重载，免构建）：
-```bash
-uv run python examples/serve_history_editor.py   # 终端1：后端 8766
-cd history_editor_ui; npm run dev                # 终端2：Vite 5173（proxy → 8766）
-# 浏览器开 http://127.0.0.1:5173/
-```
-
-> 完整方案与业界调研见 [docs/p4/](docs/p4/)。
+> 完整方案见 [docs/p4/](docs/p4/)（编辑器）+ [docs/p6/](docs/p6/)（live 控制台 + 流程库 IA/实施/e2e/复盘）。
 
 ### CSV 批量重放
 
-变量名 = CSV 列头（对齐「检测变量」结果）：
+「流程库 → 重放」上传 CSV（变量名 = 列头，对齐「检测变量」），录制一次批量执行 N 次，步级实时进度可中止。或用 CLI / 编程接口：
 
 ```bash
 # data.csv
@@ -257,7 +271,7 @@ email,name
 alice@example.com,Alice
 bob@example.com,Bob
 
-# 批量重放（需 Chrome 调试端口 + ZHIPU_API_KEY）
+# CLI 批量重放（examples/csv_rerun.py 默认连 Chrome 9223，见脚本注释；需 LLM key）
 uv run python examples/csv_rerun.py myflow.json data.csv
 ```
 

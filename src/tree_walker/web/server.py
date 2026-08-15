@@ -1,0 +1,1239 @@
+"""TreeWalker web 后端——aiohttp 服务（live agent 控制台 + 流程库 + 技能面 + 直播视口）。
+
+操作 ``rerun_history_dir`` 下的 AgentHistoryList JSON，供浏览器 SPA 编辑器调用。
+**独立于 ``recorder/server.py``**：录制将迁 TreeForge，而编辑器操作的是重放端资产
+（history），故自成一个轻量服务，不 import / 不依赖 ``tree_walker.recorder``。
+
+端点：
+
+- ``GET /history/list``              列出可用历史（rerun_history_dir 下 *.json）
+- ``GET /history/load?name=``        加载历史 JSON
+- ``POST /history/save?name=``       保存历史 JSON（body: history dict）
+- ``GET /history/detect?name=``      返回 detect ∪ manual 变量
+- ``POST /history/rerun?name=``      试跑（body: {variables}），调 Agent.load_and_rerun
+- ``GET /skills/list``               列出 domain-skills 下的 host 目录（技能面）
+- ``GET /skills/get?host=``          读该 host 的 _sop/selectors/quirks 三文件
+- ``POST /skills/put?host=&file=``   写回某文件（body: {content}），并失效 live loader 缓存
+- ``GET /health``                    健康检查
+
+路径校验复用 ``rerun.resolve_rerun_path``（拒绝绝对路径 / ``..`` 越界）。``/history/rerun``
+会真实起浏览器（BrowserSession），需 Chrome 远程调试端口。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import csv
+import json
+import logging
+import os
+import threading
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from aiohttp import web
+
+from tree_walker.agent.rerun import resolve_rerun_path
+from tree_walker.agent.variable_detector import (
+	detect_variables_in_history,
+	merge_variable_sources,
+)
+from tree_walker.agent.views import AgentHistoryList
+
+logger = logging.getLogger(__name__)
+
+_HISTORY_DIR_KEY = web.AppKey("history_dir", str)
+_SKILLS_DIR_KEY = web.AppKey("skills_dir", str)
+
+
+@dataclass
+class BatchTaskHandle:
+	"""运行中的 CSV 批量重放任务句柄（issue #155）。单进程 web.run_app，模块级 dict 存。"""
+
+	agent: Any                       # Agent 实例（cancel 调 agent.stop()）
+	queue: asyncio.Queue             # 进度事件（worker put / SSE handler get）
+	total_rows: int
+	csv_path: Path                   # 上传的 CSV 临时文件（任务结束删除）
+	task: asyncio.Task | None = None           # create_task 后回填
+	final_event: dict | None = None            # 任务结束存最终事件（SSE 重连补发）
+
+
+# task_id → handle。单进程单线程 asyncio，无需锁。单并发防同 Chrome 多 BrowserSession 抢 target。
+_BATCH_TASKS: dict[str, BatchTaskHandle] = {}
+_MAX_CONCURRENT_BATCH = 1
+
+
+@dataclass
+class LiveTaskHandle:
+	"""运行中的 live agent 探索任务句柄（P6 M1/M2）。单进程 web.run_app，模块级 dict 存。"""
+
+	agent: Any                       # Agent 实例（cancel 调 agent.stop()）
+	queue: asyncio.Queue             # 事件流（EventBus handler put / SSE handler get）
+	task: asyncio.Task | None = None           # create_task 后回填
+	final_event: dict | None = None            # 任务结束存最终事件（SSE 重连补发）
+	task_text: str = ""                          # 任务文本（/task/list 给侧栏「进行中」zone 展示，T2 H）
+	record: bool = False                        # 录制开关 → 结束调 agent.save_history
+	log_handler: Any = None                     # P6 M2：日志事件化 handler（结束摘除）
+	capture_tasks: set = field(default_factory=set)  # P6 M2：挂起的截图采集任务
+	vp_mode: str = "screenshots"                # 直播视口（A）：screenshots（每步一帧）/ livestream（CDP 推流）
+	frame_slot: Any = None                      # 直播视口（A）：_LatestFrameSlot（仅 livestream 非 None）
+
+
+# live task 与 batch 共享单槽、互斥（§8 决策 1：同 Chrome 单 BrowserSession 抢 CDP target）。
+_LIVE_TASKS: dict[str, LiveTaskHandle] = {}
+
+
+async def make_app(history_dir: str = "rerun-history", skills_dir: str | None = None) -> web.Application:
+	"""构造编辑器 aiohttp Application。``history_dir``/``skills_dir`` 由调用方传入（便于测试）。"""
+	app = web.Application(client_max_size=10 * 1024 * 1024)  # 默认 1MiB 不够 CSV 上传（issue #155）
+	app[_HISTORY_DIR_KEY] = history_dir
+	if skills_dir is None:  # 默认取 settings.agent.skills_dir（"domain-skills"）
+		try:
+			from tree_walker.config import load_settings
+			skills_dir = load_settings().agent.skills_dir
+		except Exception:
+			skills_dir = "domain-skills"
+	app[_SKILLS_DIR_KEY] = skills_dir
+	app.router.add_get("/history/list", _handle_list)
+	app.router.add_get("/history/load", _handle_load)
+	app.router.add_post("/history/save", _handle_save)
+	app.router.add_get("/history/detect", _handle_detect)
+	app.router.add_post("/history/rerun", _handle_rerun)
+	# CSV 批量重放（issue #155）：必须在 catch-all 之前注册，否则被 SPA fallback 吞
+	app.router.add_post("/history/batch/start", _handle_batch_start)
+	app.router.add_get("/history/batch/progress", _handle_batch_progress)
+	app.router.add_post("/history/batch/cancel", _handle_batch_cancel)
+	# Live agent 探索任务（P6 M1）：必须在 catch-all 之前注册
+	app.router.add_post("/task/start", _handle_task_start)
+	app.router.add_get("/task/events", _handle_task_events)
+	app.router.add_get("/task/screencast", _handle_task_screencast)  # 直播视口（A）：最新帧独立 SSE
+	app.router.add_post("/task/pause", _handle_task_pause)
+	app.router.add_post("/task/resume", _handle_task_resume)
+	app.router.add_post("/task/stop", _handle_task_stop)
+	app.router.add_get("/task/list", _handle_task_list)  # 侧栏「进行中」zone（T2 H）
+	# 任务历史（T2 I6）：与 TUI 共享 ~/.treewalker/history.json，两端互通
+	app.router.add_get("/task/history", _handle_task_history_get)
+	app.router.add_post("/task/history", _handle_task_history_post)
+	# Skills 技能面（P6 后续 B）：必须在 catch-all 之前注册
+	app.router.add_get("/skills/list", _handle_skills_list)
+	app.router.add_get("/skills/get", _handle_skills_get)
+	app.router.add_post("/skills/put", _handle_skills_put)
+	# Settings 设置面（T2 C）：必须在 catch-all 之前注册
+	app.router.add_get("/settings/get", _handle_settings_get)
+	app.router.add_post("/settings/set", _handle_settings_set)
+	app.router.add_get("/health", _handle_health)
+	app.on_shutdown.append(_on_batch_shutdown)  # 进程退出时停所有批量任务、关浏览器
+	# 前端 SPA（构建产物在 _STATIC_DIR）：/assets/* 静态资源 + GET / 入口 + catch-all 回退
+	if (_STATIC_DIR / "assets").is_dir():
+		app.router.add_static("/assets", str(_STATIC_DIR / "assets"))
+	app.router.add_get("/", _serve_index)
+	app.router.add_get("/{tail:.*}", _serve_index)  # SPA fallback（最后注册，/history/* 精确优先）
+	return app
+
+
+def _dir(request: web.Request) -> str:
+	return request.app[_HISTORY_DIR_KEY]
+
+
+async def _handle_list(request: web.Request) -> web.Response:
+	root = Path(_dir(request))
+	files = sorted(p.name for p in root.glob("*.json")) if root.is_dir() else []
+	return web.json_response({"files": files})
+
+
+async def _handle_load(request: web.Request) -> web.Response:
+	name = request.query.get("name")
+	if not name:
+		return web.json_response({"error": "missing name"}, status=400)
+	try:
+		path = resolve_rerun_path(_dir(request), name)
+		history = AgentHistoryList.load_from_file(path)
+	except (ValueError, FileNotFoundError) as e:
+		return web.json_response({"error": str(e)}, status=400)
+	return web.json_response({"history": history.model_dump(mode="json")})
+
+
+async def _handle_save(request: web.Request) -> web.Response:
+	name = request.query.get("name")
+	if not name:
+		return web.json_response({"error": "missing name"}, status=400)
+	try:
+		body = await request.json()
+	except Exception:
+		return web.json_response({"error": "invalid json"}, status=400)
+	try:
+		path = resolve_rerun_path(_dir(request), name)
+		history = AgentHistoryList.load_from_dict(body)
+		_assert_pairing(history)  # 防御：前端 bug 致不等长时拒绝
+		history.save_to_file(path)
+	except Exception as e:  # 越界 / pydantic 校验失败 / 等长断言 / IO
+		return web.json_response({"error": str(e)}, status=400)
+	return web.json_response({"ok": True, "path": str(path)})
+
+
+def _assert_pairing(history: AgentHistoryList) -> None:
+	"""防御性校验：每步 actions 与 interacted_element 等长（重放定位不变量）。
+
+	前端拖拽/编辑若破坏此不变量，在此拒绝保存。``interacted_element`` 为 None（老格式）
+	时跳过——None 在重放端按"无元素线索"处理，不破坏按位对应。
+	"""
+	for h in history.history:
+		actions = (h.model_output or {}).get("actions") or []
+		ie = h.interacted_element
+		if ie is not None and len(ie) != len(actions):
+			raise ValueError(
+				f"step {h.step_number}: actions({len(actions)}) 与 interacted_element"
+				f"({len(ie)}) 不等长，破坏重放定位不变量"
+			)
+
+
+async def _handle_detect(request: web.Request) -> web.Response:
+	name = request.query.get("name")
+	if not name:
+		return web.json_response({"error": "missing name"}, status=400)
+	try:
+		path = resolve_rerun_path(_dir(request), name)
+		history = AgentHistoryList.load_from_file(path)
+	except (ValueError, FileNotFoundError) as e:
+		return web.json_response({"error": str(e)}, status=400)
+	merged = merge_variable_sources(
+		detect_variables_in_history(history), history.manual_variables
+	)
+	return web.json_response({
+		"variables": {k: v.model_dump(mode="json") for k, v in merged.items()},
+	})
+
+
+# ── Skills 技能面（P6 后续 B）───────────────────────────────────────────────
+
+# 技能三文件白名单（与 skills/loader.py:_SKILL_FILES 一致）
+_SKILL_FILE_WHITELIST = ("_sop.md", "selectors.md", "quirks.md")
+
+
+def _skills_dir(request: web.Request) -> str:
+	return request.app[_SKILLS_DIR_KEY]
+
+
+def _validate_skill_host(host: str | None) -> str:
+	"""host 必须是单段（非空、无路径分隔、非 ./..），防越界创建/读取。"""
+	if not host:
+		raise ValueError("missing host")
+	if host in (".", "..") or "/" in host or "\\" in host or Path(host).parts != (host,):
+		raise ValueError(f"非法 host: {host!r}")
+	return host
+
+
+async def _handle_skills_list(request: web.Request) -> web.Response:
+	"""列出 skills_dir 下所有 host 目录（Immediate subdirs）。"""
+	root = Path(_skills_dir(request))
+	hosts = sorted(p.name for p in root.iterdir() if p.is_dir()) if root.is_dir() else []
+	return web.json_response({"hosts": hosts})
+
+
+async def _handle_skills_get(request: web.Request) -> web.Response:
+	"""读该 host 的三文件（缺失/空 → 空串）。路径经 resolve_rerun_path 校验。"""
+	host = request.query.get("host")
+	try:
+		host = _validate_skill_host(host)
+		root = _skills_dir(request)
+		files: dict[str, str] = {}
+		for fname in _SKILL_FILE_WHITELIST:
+			path = resolve_rerun_path(root, f"{host}/{fname}")
+			files[fname] = path.read_text(encoding="utf-8") if path.is_file() else ""
+	except (ValueError, OSError) as e:
+		return web.json_response({"error": str(e)}, status=400)
+	return web.json_response({"host": host, "files": files})
+
+
+async def _handle_skills_put(request: web.Request) -> web.Response:
+	"""写回某文件（body: {content}）。file 白名单 + 路径校验；写盘后失效 live loader 缓存。"""
+	host = request.query.get("host")
+	fname = request.query.get("file")
+	try:
+		body = await request.json()
+	except Exception:
+		return web.json_response({"error": "invalid json"}, status=400)
+	content = body.get("content") if isinstance(body, dict) else None
+	try:
+		host = _validate_skill_host(host)
+		if fname not in _SKILL_FILE_WHITELIST:
+			raise ValueError(f"非法 file（白名单 {_SKILL_FILE_WHITELIST}）: {fname!r}")
+		if not isinstance(content, str):
+			raise ValueError("missing content")
+		root = _skills_dir(request)
+		path = resolve_rerun_path(root, f"{host}/{fname}")
+		path.parent.mkdir(parents=True, exist_ok=True)  # 新 host → 建目录
+		path.write_text(content, encoding="utf-8")
+	except (ValueError, OSError) as e:
+		return web.json_response({"error": str(e)}, status=400)
+	# 热更新：写盘后失效正在跑的 live agent 的 skill 缓存（单槽，至多一个；getattr 防 mock 无该属性）
+	for h in _LIVE_TASKS.values():
+		loader = getattr(h.agent, "_skill_loader", None)
+		if loader is not None:
+			loader.invalidate(host)
+	return web.json_response({"ok": True})
+
+
+# ── Settings 设置面（T2 C）──────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class SettingField:
+	"""设置面可编辑项（注册表条目）。
+
+	``env`` 即写 ``os.environ`` 的键——``load_settings`` 每任务现读 env，故 SET 后对
+	下一个任务即时生效（进程内存 override，**不写 ``.env``**，plan §8.1）。注册表是
+	SET 的白名单（防任意 env 注入）；``CDP_PORT`` 等进程级 env（CLI 层固定）不进表。
+	默认值须与 ``config.load_settings`` 的 fallback 一致。
+	"""
+
+	key: str                     # 展示名（前端 id）
+	env: str                     # 环境变量名（白名单键）
+	type: str                    # str | int | float | bool | enum
+	default: str                 # 默认值（字符串形式）
+	section: str                 # llm | agent | browser | advanced
+	choices: tuple[str, ...] = ()  # enum 候选
+	sensitive: bool = False        # GET 时脱敏
+
+
+# 不追求全量（load_settings 有 80+ env）——按「用户会想调的」精选；加项 = 加一行。
+_SETTINGS_FIELDS: tuple[SettingField, ...] = (
+	# LLM
+	SettingField("模型", "LLM_MODEL", "str", "glm-5.1", "llm"),
+	SettingField("Base URL", "LLM_BASE_URL", "str", "https://open.bigmodel.cn/api/anthropic", "llm"),
+	SettingField("Max Tokens", "LLM_MAX_TOKENS", "int", "4096", "llm"),
+	SettingField("输出模式", "LLM_OUTPUT_MODE", "enum", "standard", "llm",
+	             choices=("standard", "flash", "thinking")),
+	SettingField("API Key", "ZHIPU_API_KEY", "str", "", "llm", sensitive=True),
+	SettingField("Fallback 模型", "FALLBACK_LLM_MODEL", "str", "", "llm"),
+	# Agent
+	SettingField("最大步数", "AGENT_MAX_STEPS", "int", "100", "agent"),
+	SettingField("最大失败数", "AGENT_MAX_FAILURES", "int", "5", "agent"),
+	SettingField("LLM 超时(秒)", "AGENT_LLM_TIMEOUT", "int", "120", "agent"),
+	SettingField("Action 超时(秒)", "AGENT_ACTION_TIMEOUT", "int", "30", "agent"),
+	SettingField("计划模式", "AGENT_ENABLE_PLANNING", "bool", "true", "agent"),
+	# 注：默认 false = env 层默认（config.py）；web live 任务由 _build_agent 强制开
+	SettingField("Skill 注入", "AGENT_ENABLE_SKILL_INJECTION", "bool", "false", "agent"),
+	# Browser（cdp_port 由 tw-web CLI 决定，不在此暴露）
+	SettingField("高亮反馈", "BROWSER_HIGHLIGHT_INTERACTION", "bool", "true", "browser"),
+	# 高级
+	SettingField("重放步间延迟(秒)", "AGENT_RERUN_DELAY_BETWEEN_ACTIONS", "float", "1.0", "advanced"),
+	SettingField("步间隔封顶(秒)", "AGENT_RERUN_MAX_STEP_INTERVAL", "float", "5.0", "advanced"),
+	SettingField("重放等元素", "AGENT_RERUN_WAIT_FOR_ELEMENTS", "bool", "false", "advanced"),
+)
+
+
+def _validate_setting_value(field: SettingField, raw: str) -> str:
+	"""按 type 校验并规范化值；非法 raise ValueError（handler → 400）。bool 统一小写。"""
+	if field.type == "bool":
+		if raw.lower() not in ("true", "false"):
+			raise ValueError(f"{field.env} 须为 true/false: {raw!r}")
+		return raw.lower()
+	if field.type == "enum":
+		if raw not in field.choices:
+			raise ValueError(f"{field.env} 须为 {list(field.choices)} 之一: {raw!r}")
+		return raw
+	if field.type == "int":
+		int(raw)  # 仅校验可解析（防 "abc"/"1.5"）
+	elif field.type == "float":
+		float(raw)
+	return raw
+
+
+def _mask_secret(value: str) -> str:
+	"""敏感值脱敏：非空 → ``****`` + 尾 4 位（空值原样返回，前端显示 placeholder）。"""
+	return ("****" + value[-4:]) if value else value
+
+
+async def _handle_settings_get(request: web.Request) -> web.Response:
+	"""设置面数据源：注册表字段 + 当前有效值（env 现读，无则默认）。
+
+	敏感字段（API key）非空时掩码 + ``masked:true``；``applies`` 明示生效范围——只影响
+	之后构造的 agent（`_build_agent` 每任务调 load_settings），运行中任务不受影响。
+	"""
+	fields = []
+	for f in _SETTINGS_FIELDS:
+		value = os.environ.get(f.env, f.default)
+		masked = bool(f.sensitive and value)
+		fields.append({
+			"key": f.key,
+			"env": f.env,
+			"section": f.section,
+			"type": f.type,
+			"choices": list(f.choices),
+			"default": f.default,
+			"sensitive": f.sensitive,  # 前端区分「敏感未设置」（masked=False + value=""）与普通空字段
+			"value": _mask_secret(value) if masked else value,
+			"masked": masked,
+		})
+	return web.json_response({"fields": fields, "applies": "new_tasks"})
+
+
+async def _handle_settings_set(request: web.Request) -> web.Response:
+	"""应用配置：body ``{env: value}`` 逐项校验（注册表白名单 + type）→ ``os.environ`` 内存 override。
+
+	敏感字段：空值或 ``****`` 开头（GET 的掩码串原样回传）→ 跳过不写，防掩码覆盖真值。
+	部分合法 + 部分非法 → 整体 400（原子性：先全量校验再统一写入）。
+	"""
+	try:
+		body = await request.json()
+	except Exception:
+		return web.json_response({"error": "invalid json"}, status=400)
+	if not isinstance(body, dict):
+		return web.json_response({"error": "body 须为 {env: value} 对象"}, status=400)
+
+	registry = {f.env: f for f in _SETTINGS_FIELDS}
+	updates: dict[str, str] = {}
+	try:
+		for env, value in body.items():
+			field = registry.get(env)
+			if field is None:
+				raise ValueError(f"未知配置项（不在注册表）: {env}")
+			if isinstance(value, bool):  # JSON true/false → 字符串
+				value = "true" if value else "false"
+			elif not isinstance(value, str):
+				value = str(value)
+			if field.sensitive and (not value.strip() or value.startswith("****")):
+				continue  # 未改动/掩码回传 → 跳过
+			updates[env] = _validate_setting_value(field, value)
+	except (ValueError, TypeError) as e:
+		return web.json_response({"error": str(e)}, status=400)
+
+	for env, value in updates.items():
+		os.environ[env] = value
+	return web.json_response({"ok": True, "applied": sorted(updates), "applies": "new_tasks"})
+
+
+def _build_agent(task: str = "", model: str | None = None):
+	"""构造 Agent（真实起浏览器，需 Chrome 远程调试端口）。
+
+	独立函数便于测试 monkeypatch。``task`` 在构造时传入——system prompt 在 __init__ 就按
+	task 建好，事后改 ``agent.task`` 不会重建 prompt。``load_and_rerun`` 读
+	``settings.agent.rerun_history_dir``（与 list/load 一致，除非 ``--history-dir`` 覆盖）。
+	强制 ``enable_observability=True``：web 端靠 EventBus 事件流驱动 SSE（live task 必需）。
+	``model``（T2 I5）：仅本任务 override ``settings.llm.model``——``load_settings`` 每次
+	新造 Settings，无交叉污染；不校验模型名（LLM 端点报错经 /task/start 400 透传）。
+	"""
+	from tree_walker import Agent, BrowserSession, LLMClient
+	from tree_walker.config import load_settings
+
+	settings = load_settings()
+	if not settings.browser.ws_url:
+		raise RuntimeError("Chrome 未以 --remote-debugging-port 启动（settings.browser.ws_url 为空）")
+	settings.agent.enable_observability = True  # live task 靠 EventBus → SSE
+	settings.agent.enable_skill_injection = True  # P6 后续 I1：live 控制台默认带 skill（loader 对无 skill host 返回 ""，无副作用）
+	if model:
+		settings.llm.model = model  # I5：本次 override（设置面 LLM_MODEL 是「改默认」，两层并存 §8.9）
+	llm = LLMClient(settings.llm)
+	browser = BrowserSession(settings.browser)
+	return Agent(task=task, llm=llm, browser=browser, settings=settings.agent)
+
+
+async def _handle_rerun(request: web.Request) -> web.Response:
+	"""试跑：调 Agent.load_and_rerun(name, variables)，返回每步 ActionResult。
+
+	真实起浏览器（BrowserSession）；变量替换走 detect ∪ manual（load_and_rerun 内部）。
+	"""
+	name = request.query.get("name")
+	if not name:
+		return web.json_response({"error": "missing name"}, status=400)
+	try:
+		body = await request.json()
+	except Exception:
+		body = {}
+	try:
+		agent = _build_agent()
+		results = await agent.load_and_rerun(name, variables=body.get("variables") or None)
+		return web.json_response({"results": [r.model_dump(mode="json") for r in results]})
+	except Exception as e:
+		return web.json_response({"error": str(e)}, status=400)
+
+
+def _sse_event(event_type: str, data: dict) -> bytes:
+	"""格式化一条 SSE 消息（`event: <type>\\ndata: <json>\\n\\n`）。"""
+	payload = json.dumps(data, ensure_ascii=False)
+	return f"event: {event_type}\ndata: {payload}\n\n".encode("utf-8")
+
+
+async def _handle_batch_start(request: web.Request) -> web.Response:
+	"""启动 CSV 批量重放：multipart 上传 CSV → 落盘 → 起 task → 返 {task_id, total_rows}。
+
+	单并发（`_MAX_CONCURRENT_BATCH`）：同 Chrome 多 BrowserSession 抢 CDP target。
+	"""
+	name = request.query.get("name")
+	if not name:
+		return web.json_response({"error": "missing name"}, status=400)
+	try:
+		resolve_rerun_path(_dir(request), name)  # 越界校验
+	except ValueError as e:
+		return web.json_response({"error": str(e)}, status=400)
+
+	# 清已结束 batch handle（防 dict 无限增长）
+	for old_id, h in list(_BATCH_TASKS.items()):
+		if h.final_event is not None:
+			_BATCH_TASKS.pop(old_id, None)
+	# live task 与 batch 共享单槽、互斥（§8 决策 1）
+	if _has_active_agent_task():
+		return web.json_response(
+			{"error": "已有 agent 任务在运行（live task 与批量共享单槽），请先等待完成或中止"},
+			status=409)
+
+	# 读 multipart 的 file part
+	try:
+		reader = await request.multipart()
+		csv_part = None
+		while True:
+			part = await reader.next()
+			if part is None:
+				break
+			if part.name == "file":
+				csv_part = part
+				break
+	except Exception:
+		return web.json_response({"error": "invalid multipart"}, status=400)
+	if csv_part is None:
+		return web.json_response({"error": "missing CSV file part 'file'"}, status=400)
+
+	# 落盘到 rerun_history_dir 下唯一名（复用 resolve_rerun_path 校验）
+	csv_name = f"batch_{uuid.uuid4().hex[:8]}.csv"
+	try:
+		csv_path = resolve_rerun_path(_dir(request), csv_name)
+		with open(csv_path, "wb") as f:
+			while True:
+				chunk = await csv_part.read_chunk()
+				if not chunk:
+					break
+				f.write(chunk)
+	except Exception as e:
+		return web.json_response({"error": f"CSV 写入失败: {e}"}, status=500)
+
+	# 计数 + 空校验
+	try:
+		with open(csv_path, newline="", encoding="utf-8") as f:
+			total_rows = sum(1 for _ in csv.DictReader(f))
+	except Exception as e:
+		csv_path.unlink(missing_ok=True)
+		return web.json_response({"error": f"CSV 解析失败: {e}"}, status=400)
+	if total_rows == 0:
+		csv_path.unlink(missing_ok=True)
+		return web.json_response({"error": "CSV 无数据行（只有表头或空）"}, status=400)
+
+	# 建 agent + handle + 起 task（先存 dict 再 create_task，消除 cancel 竞态）
+	try:
+		agent = _build_agent()
+	except Exception as e:
+		csv_path.unlink(missing_ok=True)
+		return web.json_response({"error": str(e)}, status=400)
+
+	task_id = uuid.uuid4().hex[:8]
+	queue: asyncio.Queue = asyncio.Queue()
+	handle = BatchTaskHandle(
+		agent=agent, queue=queue, total_rows=total_rows, csv_path=csv_path)
+	_BATCH_TASKS[task_id] = handle
+
+	async def run_batch() -> None:
+		async def on_row(result):
+			await queue.put({"type": "row", **result.model_dump(mode="json")})
+
+		async def on_step(step_index, total, step_results):
+			last = step_results[-1] if step_results else None
+			await queue.put({
+				"type": "step", "step_index": step_index, "total": total,
+				"success": not any(r.error for r in step_results),
+				"extracted_content": last.extracted_content if last else None,
+				"error": next((r.error for r in step_results if r.error), None),
+			})
+		try:
+			results = await agent.batch_rerun(name, csv_path, on_row=on_row, on_step=on_step)
+			succeeded = sum(1 for r in results if r.success)
+			final = {"type": "done", "total": len(results),
+			         "succeeded": succeeded, "failed": len(results) - succeeded}
+		except Exception as e:  # batch 整体崩溃（行级异常已在 batch_rerun 内兜住）
+			logger.exception("批量任务 %s 崩溃", task_id)
+			final = {"type": "done", "total": 0, "succeeded": 0,
+			         "failed": 0, "error": str(e)}
+		finally:
+			handle.final_event = final
+			await queue.put(final)
+			csv_path.unlink(missing_ok=True)
+			# 不立即 pop：保留 handle 供 SSE 重连补发 final_event；由下次 start 清理或 on_shutdown 回收。
+
+	handle.task = asyncio.create_task(run_batch())
+	return web.json_response({"task_id": task_id, "total_rows": total_rows})
+
+
+async def _handle_batch_progress(request: web.Request) -> web.StreamResponse:
+	"""SSE 行级进度流。EventSource 只支持 GET → 此端点必须 GET（issue #155）。"""
+	task_id = request.query.get("task_id")
+	if not task_id:
+		return web.json_response({"error": "missing task_id"}, status=400)
+	handle = _BATCH_TASKS.get(task_id)
+	if handle is None:
+		return web.json_response({"error": "unknown task_id"}, status=404)
+
+	resp = web.StreamResponse(status=200, headers={
+		"Content-Type": "text/event-stream",
+		"Cache-Control": "no-cache",
+		"Connection": "keep-alive",
+		"X-Accel-Buffering": "no",  # 防代理缓冲（prod 同源无 nginx，加上无害）
+	})
+	await resp.prepare(request)
+	try:
+		# 任务在客户端连入前就完成且队列已空 → 补发最终事件
+		if handle.final_event is not None and handle.queue.empty():
+			await resp.write(_sse_event("done", handle.final_event))
+			return resp
+		while True:
+			try:
+				event = await asyncio.wait_for(handle.queue.get(), timeout=15.0)
+			except asyncio.TimeoutError:
+				await resp.write(b": keepalive\n\n")  # SSE 注释，客户端忽略；防空闲断连
+				continue
+			await resp.write(_sse_event(event["type"], event))
+			if event["type"] == "done":
+				break
+	except (ConnectionResetError, asyncio.CancelledError):
+		pass  # 客户端断开：任务继续（SSE 与任务解耦），handler 退出
+	finally:
+		try:
+			await resp.write_eof()
+		except Exception:
+			pass
+	return resp
+
+
+async def _handle_batch_cancel(request: web.Request) -> web.Response:
+	"""协作式中止：agent.stop() 设 state.stopped=True，重放循环在行/步边界退出（issue #155）。"""
+	task_id = request.query.get("task_id")
+	if not task_id:
+		return web.json_response({"error": "missing task_id"}, status=400)
+	handle = _BATCH_TASKS.get(task_id)
+	if handle is None:
+		return web.json_response({"error": "unknown task_id"}, status=404)
+	handle.agent.stop()  # 协作式（非 task.cancel，避免丢 finally 的 browser.stop）
+	return web.json_response({"ok": True})
+
+
+async def _on_batch_shutdown(app: web.Application) -> None:
+	"""进程退出（SIGINT/SIGTERM）：停所有批量 + live 任务、关浏览器、超时强 cancel。"""
+	for h in list(_BATCH_TASKS.values()):
+		h.agent.stop()
+	for h in list(_LIVE_TASKS.values()):
+		h.agent.stop()
+	all_handles = [*_BATCH_TASKS.values(), *_LIVE_TASKS.values()]
+	tasks = [h.task for h in all_handles if h.task and not h.task.done()]
+	if tasks:
+		try:
+			await asyncio.wait_for(
+				asyncio.gather(*tasks, return_exceptions=True), timeout=10.0)
+		except asyncio.TimeoutError:
+			for h in all_handles:
+				if h.task and not h.task.done():
+					h.task.cancel()
+			await asyncio.gather(
+				*[h.task for h in all_handles if h.task], return_exceptions=True)
+	_BATCH_TASKS.clear()
+	_LIVE_TASKS.clear()
+
+
+async def _handle_health(request: web.Request) -> web.Response:
+	return web.json_response({"ok": True})
+
+
+# ── Live agent 探索任务（P6 M1 / M2）────────────────────────────────────────
+
+
+class _SseLogHandler(logging.Handler):
+	"""把 tree_walker 日志事件化推入 live task 的 SSE 队列（P6 M2）。
+
+	替代 TUI 的 RichLogHandler：record → {type:"log"} put_nowait 进同一队列，与 EventBus
+	事件同流推前端。emit 内自守异常（logging 标准做法，防 handler 自爆）。
+	"""
+
+	def __init__(self, queue: asyncio.Queue) -> None:
+		super().__init__()
+		self._queue = queue
+
+	def emit(self, record: logging.LogRecord) -> None:
+		try:
+			self._queue.put_nowait({
+				"type": "log",
+				"level": record.levelname,
+				"msg": record.getMessage(),
+				"logger": record.name,
+			})
+		except Exception:  # 日志非关键，防自爆
+			pass
+
+
+# SSE 推帧降采样目标（带宽：§8 决策 2 内联 base64；Pillow 缺失时 resize 为 no-op）
+_SCREENSHOT_TARGET = (1280, 800)
+
+# 直播视口（A）投递节流下限（秒）：出帧节奏 ≥ 此间隔（≈8fps 上限），lag 上界 ≈ 此值 + loop 忙时延迟
+_SC_DELIVERY_MIN_INTERVAL = 0.12
+
+
+async def _capture_screenshot(agent: Any, step: int, queue: asyncio.Queue) -> None:
+	"""step_end 触发：抓一张截图 → 降采样 → base64 data URL → 入队（{type:"screenshot"}）。
+
+	零 agent 改动（直接调 browser.take_screenshot，默认 PNG）；失败静默（截图非关键路径）。
+	"""
+	browser = getattr(agent, "browser", None)
+	take = getattr(browser, "take_screenshot", None)
+	if take is None:
+		logger.warning("screenshot: agent 上无 browser.take_screenshot（agent.browser=%r）", browser)
+		return
+	try:
+		img = await take()
+		from tree_walker.browser.image_utils import resize_screenshot_bytes
+		img = resize_screenshot_bytes(img, _SCREENSHOT_TARGET)
+		queue.put_nowait({
+			"type": "screenshot",
+			"step": step,
+			"data": "data:image/png;base64," + base64.b64encode(img).decode("ascii"),
+		})
+		logger.debug("screenshot: captured step=%d (%d bytes)", step, len(img))
+	except Exception as e:
+		logger.warning("screenshot: capture failed step=%d: %r", step, e, exc_info=True)
+
+
+class _LatestFrameSlot:
+	"""直播视口（P6 后续 A）：单槽最新帧缓冲。
+
+	覆盖式存最新帧 + ``asyncio.Event`` 唤醒 SSE 消费者——慢消费者绝不堆积，中间帧被
+	丢弃。线程安全靠调用方在 loop 线程操作：``set`` 经 ``loop.call_soon_threadsafe``
+	进 loop（CDP 帧回调在 WS 读线程触发，见 ``session.py`` 的 ``_setup_event_tracking``
+	注释），``wait``/``take`` 由 SSE handler 在 loop 线程调。
+	"""
+
+	def __init__(self) -> None:
+		self._frame: dict | None = None
+		self._event = asyncio.Event()
+		self.ever_received: bool = False  # 诊断：是否曾收到过帧（看门狗用）
+
+	def set(self, frame: dict) -> None:
+		"""存最新帧（覆盖旧帧）。须在 loop 线程调（经 call_soon_threadsafe）。"""
+		self._frame = frame
+		self.ever_received = True
+		self._event.set()
+
+	async def wait(self, timeout: float | None = None) -> None:
+		"""阻塞至有帧可用；带 timeout 则超时抛 ``asyncio.TimeoutError``。"""
+		if timeout is None:
+			await self._event.wait()
+		else:
+			await asyncio.wait_for(self._event.wait(), timeout=timeout)
+
+	def take(self) -> dict | None:
+		"""取走并清空最新帧（取后 Event 复位）。无帧返回 None。"""
+		frame, self._frame = self._frame, None
+		self._event.clear()
+		return frame
+
+	def wake(self) -> None:
+		"""唤醒消费者但不放帧（收尾用：让 /task/screencast SSE 立即醒来检查 final_event 退出）。"""
+		self._event.set()
+
+	@property
+	def pending(self) -> bool:
+		"""是否有未取走的帧。"""
+		return self._frame is not None
+
+
+def _make_screencast_frame_handler(loop, slot: "_LatestFrameSlot", browser: Any):
+	"""构造 CDP ``screencastFrame`` 回调（直播视口，P6 后续 A）。
+
+	回调在 CDP WS 读线程触发（``session.py`` 注释）→ 投递与 ack 都经 loop 移交：
+
+	- **定节奏投递（throttle，关键）**：有帧在流时，投递间隔 ≥ ``_SC_DELIVERY_MIN_INTERVAL``，
+	  每次投「最新帧」。三种方案的取舍——①每帧各排一个回调：loop 忙于 agent DOM/LLM 时
+	  积压、末尾慢慢 drain → 画面滞后；②严格合并成 1 次：忙窗内到达的帧全被并掉，出帧率
+	  跌破 Chrome 推帧率 → 卡顿（v1 教训）；③本方案（节流窗）：出帧后开一个 interval 窗，
+	  窗到期若有新帧则续投——出帧节奏平稳（≈1/interval 上限）、lag 上界 ≈ interval、无积压。
+	- **ack**：Chrome 收不到 ``screencastFrameAck`` 会暂停推帧，故每帧 ack；ack coro 内吞
+	  ``ConnectionError``/``RuntimeError``（收尾 client stopping 时无碍），并取走 task
+	  异常，避免 "Task exception was never retrieved" 噪声。
+
+	注意 ``sessionId`` 双义：帧事件 ``sessionId``(int) = **screencast 会话 id**（给 ack）；
+	CDP 调用 ``session_id=`` = **target 会话 id**（``browser.current_session_id``）。
+	"""
+	received = [0]  # 已收帧数（首帧打 info 日志——诊断 screencast 是否真有帧流入）
+	# 节流投递的线程安全状态：最新待投帧 + 投递管道是否在飞（在飞 = 已排 _deliver 或节流窗未到期）
+	sc: dict = {"frame": None, "active": False}
+	sc_lock = threading.Lock()
+
+	def _pump():
+		"""节流窗到期：有新帧 → 续投（_deliver 会再开下一个窗）；无 → 挂起管道（下帧由 WS 线程重触发）。"""
+		with sc_lock:
+			has = sc["frame"] is not None
+			if not has:
+				sc["active"] = False  # 与判定同一锁内，防「刚挂起又有帧入槽但不再触发」的丢帧竞态
+		if has:
+			_deliver()
+
+	def _deliver():
+		with sc_lock:
+			frame, sc["frame"] = sc["frame"], None
+			if frame is None:
+				sc["active"] = False  # 防御：空投时挂起（同锁内防丢触发）
+		if frame is None:
+			return
+		slot.set(frame)
+		try:
+			loop.call_later(_SC_DELIVERY_MIN_INTERVAL, _pump)  # 开节流窗，维持出帧节奏
+		except RuntimeError:
+			with sc_lock:
+				sc["active"] = False  # loop 已关（收尾）
+
+	def _on_frame(event, _cdp_sid=None):
+		received[0] += 1
+		if received[0] == 1:
+			logger.info("livestream: 首帧 screencast 已收到（sessionId=%s）", event.get("sessionId"))
+		data = event.get("data")
+		meta = event.get("metadata") or {}
+		frame = {
+			"type": "screencast",
+			"data": f"data:image/jpeg;base64,{data}" if data else None,
+			"width": meta.get("deviceWidth"),
+			"height": meta.get("deviceHeight"),
+			"scale": meta.get("pageScaleFactor"),
+		}
+		# 管道挂起时才触发投递；在飞期间新帧只入槽，由节流窗到期的 _pump 续投（节奏不丢）
+		with sc_lock:
+			sc["frame"] = frame
+			inactive = not sc["active"]
+			if inactive:
+				sc["active"] = True
+		if inactive:
+			try:
+				loop.call_soon_threadsafe(_deliver)
+			except RuntimeError:
+				pass  # loop 已关（收尾）
+		# ack 维持连续流（Chrome 收不到 ack 会暂停推帧）：每帧一个，丢到 loop 线程发
+		sid = event.get("sessionId")
+		client = getattr(browser, "client", None)
+		if sid is not None and client is not None:
+			_sess = getattr(browser, "current_session_id", None)
+
+			def _spawn_ack(_client=client, _sid=sid, _sess=_sess):
+				async def _ack():
+					try:
+						await _client.send.Page.screencastFrameAck(
+							{"sessionId": _sid}, session_id=_sess,
+						)
+					except (ConnectionError, RuntimeError) as e:
+						# 收尾时 client 正 stopping——ack 失败无碍（推流已停），吞掉避免噪声
+						logger.debug("screencast ack 失败（忽略，多为收尾）: %s", e)
+				# 取走异常，防 "Task exception was never retrieved"
+				t = asyncio.ensure_future(_ack())
+				t.add_done_callback(lambda x: x.exception() if not x.cancelled() else None)
+
+			try:
+				loop.call_soon_threadsafe(_spawn_ack)
+			except RuntimeError:
+				pass  # loop 已关
+	return _on_frame
+
+
+def _has_active_agent_task() -> bool:
+	"""live task 与 batch 共享单槽、互斥（§8 决策 1）：任一在跑即占用。"""
+	if any(h.final_event is None for h in _LIVE_TASKS.values()):
+		return True
+	if any(h.final_event is None for h in _BATCH_TASKS.values()):
+		return True
+	return False
+
+
+def _live_record_filename() -> str:
+	"""live task 录制文件名（yyyyMMddHHmm.json，同 TUI ``_record_filename`` 约定）。"""
+	from datetime import datetime
+
+	return datetime.now().strftime("%Y%m%d%H%M") + ".json"
+
+
+async def _handle_task_start(request: web.Request) -> web.Response:
+	"""启动 live agent 探索：建 Agent（真实 task + 强制 observability）→ 订阅 _obs_bus
+	入队 → create_task(agent.run) → 返 {task_id}。单槽互斥（§8 决策 1）：任一在跑即 409。
+	"""
+	try:
+		body = await request.json()
+	except Exception:
+		return web.json_response({"error": "invalid json"}, status=400)
+	task_text = body.get("task", "").strip() if isinstance(body, dict) else ""
+	if not task_text:
+		return web.json_response({"error": "missing task"}, status=400)
+	# T2 I5（M6）：按任务指定模型（空 = 跟随设置默认）；后端不校验模型名（LLM 端点报错透传）
+	model = (body.get("model") or "").strip() if isinstance(body, dict) else ""
+	record = bool(isinstance(body, dict) and body.get("record"))
+	# 直播视口（P6 后续 A）：viewport_mode=livestream 走 CDP 连续推流；其余（含缺省）= screenshots 每步一帧
+	vp_mode = "livestream" if (isinstance(body, dict) and body.get("viewport_mode") == "livestream") else "screenshots"
+
+	# 清已结束 live handle（防 dict 无限增长）+ 单槽互斥
+	for old_id, h in list(_LIVE_TASKS.items()):
+		if h.final_event is not None:
+			_LIVE_TASKS.pop(old_id, None)
+	if _has_active_agent_task():
+		return web.json_response(
+			{"error": "已有 agent 任务在运行（live task 与批量共享单槽），请先等待完成或中止"},
+			status=409)
+
+	try:
+		# issue #163：_build_agent 内 load_settings→_fetch_ws_url 是同步 httpx.get（最长 5s），
+		# 在 loop 上直接跑会卡住全部端点——丢线程池。
+		agent = await asyncio.to_thread(_build_agent, task=task_text, model=model or None)
+	except Exception as e:
+		return web.json_response({"error": str(e)}, status=400)
+
+	# 同 TUI：web 用端点控制 pause/resume/stop，不走 SIGINT
+	agent._setup_signal_handler = lambda: None
+
+	queue: asyncio.Queue = asyncio.Queue()
+	handle = LiveTaskHandle(
+		agent=agent, queue=queue, task_text=task_text, record=record, vp_mode=vp_mode)
+
+	# 直播视口（P6 后续 A）：livestream 模式建最新帧槽 + 配 browser sink（run 时 browser.start()
+	# 会话就绪自动 startScreencast；browser 侧采集，零 race）。screenshots 模式 frame_slot 留 None。
+	if vp_mode == "livestream":
+		_sc_loop = asyncio.get_running_loop()
+		handle.frame_slot = _LatestFrameSlot()
+		_on_frame = _make_screencast_frame_handler(_sc_loop, handle.frame_slot, agent.browser)
+		agent.browser.configure_screencast(
+			_on_frame, format="jpeg", quality=60, max_width=1280, every_nth_frame=2)
+		# 诊断看门狗：Page.startScreencast 只采集「可见」tab——窗口被最小化/完全遮挡时 Chrome
+		# 不推帧（captureScreenshot 无此限制，故截图模式正常）。6s 无帧即提醒（最常见原因）。
+		_slot = handle.frame_slot
+		def _sc_watchdog():
+			if not _slot.ever_received:
+				logger.warning(
+					"livestream: 启动 6s 仍未收到任何 screencast 帧。最常见原因：Chrome 调试窗口"
+					"（9223）被最小化或完全遮挡——Page.startScreencast 只采集可见 tab。"
+					"请恢复显示该窗口后重试；或用 --disable-features=CalculateNativeWinOcclusion "
+					"--disable-backgrounding-occluded-windows 启动 Chrome。")
+		_sc_loop.call_later(6.0, _sc_watchdog)
+
+	# 订阅 EventBus → 事件入队（SSE 消费）。emit 同步调 handler，与 agent 同 asyncio 线程，put_nowait 安全。
+	if getattr(agent, "_obs_bus", None) is not None:
+		def on_event(event) -> None:
+			queue.put_nowait({"type": event.event_type, **event.model_dump(mode="json")})
+
+		# P6 M2：step_end 时调度一张截图采集（每步一帧，§8 决策 2 内联 base64）。
+		# 直播视口（A）：livestream 模式由 CDP screencast 连续推帧，不再每步采集（mode 互斥，省带宽）
+		def on_step_end(event) -> None:
+			if vp_mode != "screenshots":
+				return
+			logger.debug("screenshot: scheduled step=%d", event.step)
+			t = asyncio.create_task(_capture_screenshot(agent, event.step, queue))
+			handle.capture_tasks.add(t)
+			t.add_done_callback(handle.capture_tasks.discard)
+
+		agent._obs_bus.subscribe("*", on_event)
+		agent._obs_bus.subscribe("step_end", on_step_end)
+
+	# P6 M2：日志事件化——挂 _SseLogHandler 到 tree_walker logger，record → {type:"log"} 入同一队列
+	log_handler = _SseLogHandler(queue)
+	tw_logger = logging.getLogger("tree_walker")
+	tw_logger.setLevel(logging.INFO)  # 同 TUI：INFO 起推
+	tw_logger.addHandler(log_handler)
+	handle.log_handler = log_handler
+
+	task_id = uuid.uuid4().hex[:8]
+	_LIVE_TASKS[task_id] = handle
+
+	async def run_live() -> None:
+		try:
+			await agent.run(keep_alive=True)  # 不让 run 关浏览器——收尾要先刷完截图采集再关，否则末步截图 race 输给 browser.stop
+			# issue #164：成功与否取 agent 真实终态（末步 done 结果的 success），而非
+			# 「会话正常返回」——max_steps 封顶 / done(success=False) 的诚实上报、以及
+			# 用户中止（无 done）不再被标成成功。history 拿不到时保守回落 True（旧语义）。
+			_hist = getattr(agent, "history", None)
+			_success_fn = getattr(_hist, "is_successful", None)
+			success = bool(_success_fn()) if callable(_success_fn) else True
+			final: dict = {"type": "done", "success": success}
+		except Exception as e:
+			logger.exception("live task %s 崩溃", task_id)
+			final = {"type": "done", "success": False, "error": str(e)}
+		finally:
+			# P6 M2 收尾：刷挂起的截图采集（给它们一刻完成，再发 done）、摘除日志 handler
+			if handle.capture_tasks:
+				try:
+					await asyncio.wait_for(
+						asyncio.gather(*handle.capture_tasks, return_exceptions=True),
+						timeout=5.0)
+				except asyncio.TimeoutError:
+					for t in list(handle.capture_tasks):
+						t.cancel()
+				handle.capture_tasks.clear()
+			# keep_alive=True：run 没关浏览器，截图采集刷完后这里收尾关
+			_stop = getattr(getattr(agent, "browser", None), "stop", None)
+			if _stop is not None:
+				try:
+					await _stop()
+				except Exception as e:
+					logger.warning("browser stop 失败: %s", e)
+			if handle.log_handler is not None:
+				logging.getLogger("tree_walker").removeHandler(handle.log_handler)
+			# 录制：把本次 AgentHistory 存盘（同 TUI _maybe_save_recording，空 history 跳过）
+			if handle.record:
+				try:
+					hist = getattr(agent, "history", None)
+					if hist and getattr(hist, "history", None):
+						name = _live_record_filename()
+						agent.save_history(name)
+						final = {**final, "saved": name}
+				except Exception as e:
+					logger.warning("save_history 失败: %s", e)
+			handle.final_event = final
+			await queue.put(final)
+			# 直播视口（A）：唤醒帧槽让 /task/screencast SSE 立即检查 final_event 并退出
+			# （推流本身已由上面 browser.stop() → stop_screencast 停止，M1 stop() 钩子）
+			if handle.frame_slot is not None:
+				handle.frame_slot.wake()
+			# 不立即 pop：保留 handle 供 SSE 重连补发 final_event；由下次 start 或 on_shutdown 回收。
+
+	handle.task = asyncio.create_task(run_live())
+	return web.json_response({"task_id": task_id})
+
+
+async def _handle_task_events(request: web.Request) -> web.StreamResponse:
+	"""SSE 事件流：EventBus 事件 + done。EventSource 只支持 GET → 此端点必须 GET。"""
+	task_id = request.query.get("task_id")
+	if not task_id:
+		return web.json_response({"error": "missing task_id"}, status=400)
+	handle = _LIVE_TASKS.get(task_id)
+	if handle is None:
+		return web.json_response({"error": "unknown task_id"}, status=404)
+
+	resp = web.StreamResponse(status=200, headers={
+		"Content-Type": "text/event-stream",
+		"Cache-Control": "no-cache",
+		"Connection": "keep-alive",
+		"X-Accel-Buffering": "no",  # 防代理缓冲（prod 同源无 nginx，加上无害）
+	})
+	await resp.prepare(request)
+	try:
+		# 任务在客户端连入前就完成且队列已空 → 补发最终事件
+		if handle.final_event is not None and handle.queue.empty():
+			await resp.write(_sse_event("done", handle.final_event))
+			return resp
+		while True:
+			try:
+				event = await asyncio.wait_for(handle.queue.get(), timeout=15.0)
+			except asyncio.TimeoutError:
+				await resp.write(b": keepalive\n\n")  # SSE 注释，客户端忽略；防空闲断连
+				continue
+			etype = event.get("type", "message")
+			payload = {k: v for k, v in event.items() if k != "type"}
+			await resp.write(_sse_event(etype, payload))
+			if etype == "done":
+				break
+	except (ConnectionResetError, asyncio.CancelledError):
+		pass  # 客户端断开：任务继续（SSE 与任务解耦），handler 退出
+	finally:
+		try:
+			await resp.write_eof()
+		except Exception:
+			pass
+	return resp
+
+
+async def _handle_task_control(request: web.Request, action: str) -> web.Response:
+	"""pause/resume/stop 共用：协作式（agent.pause/resume/stop）。"""
+	task_id = request.query.get("task_id")
+	if not task_id:
+		return web.json_response({"error": "missing task_id"}, status=400)
+	handle = _LIVE_TASKS.get(task_id)
+	if handle is None:
+		return web.json_response({"error": "unknown task_id"}, status=404)
+	getattr(handle.agent, action)()  # pause / resume / stop
+	return web.json_response({"ok": True})
+
+
+async def _handle_task_pause(request: web.Request) -> web.Response:
+	return await _handle_task_control(request, "pause")
+
+
+async def _handle_task_resume(request: web.Request) -> web.Response:
+	return await _handle_task_control(request, "resume")
+
+
+async def _handle_task_stop(request: web.Request) -> web.Response:
+	return await _handle_task_control(request, "stop")
+
+
+def _live_phase(handle: LiveTaskHandle) -> str:
+	"""handle → 展示相位：done（final 已存）/ paused（agent.state.paused）/ running。
+
+	``state`` 用 getattr 链取——测试植入的 SimpleNamespace mock agent 可能没有该属性，
+	拿不到就并进 running（paused 非关键信息，§8 决策 6 同款降级原则）。
+	"""
+	if handle.final_event is not None:
+		return "done"
+	state = getattr(handle.agent, "state", None)
+	if state is not None and getattr(state, "paused", False):
+		return "paused"
+	return "running"
+
+
+async def _handle_task_list(request: web.Request) -> web.Response:
+	"""侧栏「进行中」zone（T2 H）：列出活跃/最近 live task（只读）。
+
+	不持久化——tw-web 常驻进程内存即真源；前端刷新后靠此端点恢复入口（已消费事件
+	不可恢复为已知局限，plan §8.5）。顺序 = dict 插入序（新→旧；start 时已清已结束
+	handle，列表天然很短）。``saved`` = 录制落库文件名（有则展示，点击侧栏项后自然
+	出现在流程库）。
+	"""
+	items = []
+	for tid, h in _LIVE_TASKS.items():
+		final = h.final_event or {}
+		items.append({
+			"task_id": tid,
+			"task": h.task_text,
+			"phase": _live_phase(h),
+			"success": final.get("success"),
+			"saved": final.get("saved"),
+			"viewport_mode": h.vp_mode,
+		})
+	return web.json_response({"tasks": items})
+
+
+# ── 任务历史（T2 I6，与 TUI 共享）────────────────────────────────────────────
+
+# 与 TUI 同一文件（tui/app.py HISTORY_FILE）同格式（list[str]）——两端任务历史互通。
+# 模块级常量便于测试 monkeypatch 到 tmp_path。
+_TASK_HISTORY_FILE = Path.home() / ".treewalker" / "history.json"
+
+
+def _load_task_history() -> list[str]:
+	"""读共享任务历史；缺失/损坏/非字符串成员 → []（TUI ``_load_history`` 同款容错）。"""
+	try:
+		data = json.loads(_TASK_HISTORY_FILE.read_text(encoding="utf-8"))
+	except (json.JSONDecodeError, OSError):
+		return []
+	return data if isinstance(data, list) and all(isinstance(x, str) for x in data) else []
+
+
+def _append_task_history(task: str) -> list[str]:
+	"""append + 连续去重 + ``[-100:]`` 截断后写盘（逐行对齐 TUI ``_save_history``）。
+
+	写失败仅告警不抛（历史非关键路径，TUI 同款）；``mkdir(parents=True)`` 首次写入建目录。
+	"""
+	hist = _load_task_history()
+	if not hist or task != hist[-1]:  # 连续重复不重复记（TUI 同款）
+		hist.append(task)
+	hist = hist[-100:]
+	try:
+		_TASK_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+		_TASK_HISTORY_FILE.write_text(
+			json.dumps(hist, ensure_ascii=False, indent=2), encoding="utf-8")
+	except OSError as e:
+		logger.warning("Failed to save task history: %s", e)
+	return hist
+
+
+async def _handle_task_history_get(request: web.Request) -> web.Response:
+	"""任务历史（I6）：``GET /task/history`` → ``{"tasks": [...]}``（新→旧按写入序）。"""
+	return web.json_response({"tasks": _load_task_history()})
+
+
+async def _handle_task_history_post(request: web.Request) -> web.Response:
+	"""任务历史（I6）：``POST /task/history`` body ``{"task": "..."}`` → append + 落盘。
+
+	前端在**启动成功后**才调（§8.8：启动失败的任务不污染历史；TUI 是提交时存，此处有意不同）。
+	"""
+	try:
+		body = await request.json()
+	except Exception:
+		return web.json_response({"error": "invalid json"}, status=400)
+	task = body.get("task", "").strip() if isinstance(body, dict) else ""
+	if not task:
+		return web.json_response({"error": "missing task"}, status=400)
+	count = len(_append_task_history(task))
+	return web.json_response({"ok": True, "count": count})
+
+
+async def _handle_task_screencast(request: web.Request) -> web.StreamResponse:
+	"""直播视口（P6 后续 A）：连续推最新帧的独立 SSE。
+
+	与 ``/task/events`` 物理隔离——帧洪水不挤占步骤/日志流；只推 ``_LatestFrameSlot`` 的
+	最新帧（慢消费者不堆积，中间帧丢弃）。仅 livestream 任务（``handle.frame_slot`` 非 None）
+	有此流，否则 404。EventSource 只支持 GET → 此端点必须 GET。任务与 SSE 解耦：客户端断开
+	任务继续、handler 退出（= 后端停推带宽）。任务结束 ``run_live`` 会 ``frame_slot.wake()``，
+	本 handler 立即醒来检查 ``final_event`` 退出。
+	"""
+	task_id = request.query.get("task_id")
+	if not task_id:
+		return web.json_response({"error": "missing task_id"}, status=400)
+	handle = _LIVE_TASKS.get(task_id)
+	if handle is None:
+		return web.json_response({"error": "unknown task_id"}, status=404)
+	if handle.frame_slot is None:
+		return web.json_response({"error": "no livestream for this task"}, status=404)
+
+	resp = web.StreamResponse(status=200, headers={
+		"Content-Type": "text/event-stream",
+		"Cache-Control": "no-cache",
+		"Connection": "keep-alive",
+		"X-Accel-Buffering": "no",  # 防代理缓冲（prod 同源无 nginx，加上无害）
+	})
+	await resp.prepare(request)
+	try:
+		while True:
+			try:
+				await asyncio.wait_for(handle.frame_slot.wait(), timeout=15.0)
+			except asyncio.TimeoutError:
+				await resp.write(b": keepalive\n\n")  # SSE 注释，客户端忽略；防空闲断连
+				if handle.final_event is not None:    # 任务已结束 → 收尾退出
+					break
+				continue
+			frame = handle.frame_slot.take()
+			if frame is not None:
+				payload = {k: v for k, v in frame.items() if k != "type"}
+				await resp.write(_sse_event("screencast", payload))
+			# wake() 收尾（无帧）或已刷完末帧且任务结束 → 退出
+			if handle.final_event is not None and not handle.frame_slot.pending:
+				break
+	except (ConnectionResetError, asyncio.CancelledError):
+		pass  # 客户端断开（关页/切走）：任务继续，handler 退出 = 后端停推带宽
+	finally:
+		try:
+			await resp.write_eof()
+		except Exception:
+			pass
+	return resp
+
+
+_STATIC_DIR = Path(__file__).parent / "static"
+
+
+async def _serve_index(request: web.Request) -> web.Response:
+	"""托管前端 SPA 入口（构建产物；未构建时提示）。
+
+	SPA fallback：未知路径（非 /history/*、非 /assets/*）回 index.html，让前端路由接管。
+	"""
+	path = _STATIC_DIR / "index.html"
+	if not path.exists():
+		return web.json_response(
+			{"error": "前端未构建。跑 scripts/build_editor.ps1（prod）或 cd web_ui && npm run dev（dev）"},
+			status=404,
+		)
+	return web.FileResponse(path)
+
+
+def run_server(
+	host: str = "127.0.0.1",
+	port: int = 8766,
+	history_dir: str | None = None,
+) -> None:
+	"""阻塞运行编辑器 HTTP 服务。默认端口 8766（避开录制后端 8765）。"""
+	if history_dir is None:
+		from tree_walker.config import load_settings
+
+		try:
+			history_dir = load_settings().agent.rerun_history_dir
+		except Exception:
+			history_dir = "rerun-history"
+	logger.info("编辑器后端 history_dir=%s, http://%s:%s", history_dir, host, port)
+	web.run_app(make_app(history_dir), host=host, port=port)

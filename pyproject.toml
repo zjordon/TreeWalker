@@ -21,6 +21,7 @@ docs = ["pypdf>=4.0.0", "python-docx>=1.1.0"]
 
 [project.scripts]
 tw-tui = "tree_walker.cli:main"
+tw-web = "tree_walker.cli:web"
 
 [build-system]
 requires = ["hatchling"]

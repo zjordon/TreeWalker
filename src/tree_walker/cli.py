@@ -96,3 +96,36 @@ async def _rerun(settings, rerun_path: str, variables: dict[str, str], debug: bo
 		print(summary.extracted_content)
 	else:
 		print("Rerun produced no summary")
+
+
+@click.command()
+@click.option("--host", default="127.0.0.1", help="web 服务监听地址")
+@click.option("--port", type=int, default=8766, help="web 服务端口（默认 8766）")
+@click.option(
+	"--cdp-port",
+	type=int,
+	default=9223,
+	help="Chrome 远程调试端口：live 任务/试跑/批量连这个端口（默认 9223，与 web/重放路径 "
+	     "serve_web/csv_rerun 一致；tw-tui 走 config 默认 9222）",
+)
+@click.option(
+	"--history-dir",
+	default=None,
+	help="历史 JSON 根目录（默认 settings.agent.rerun_history_dir）",
+)
+def web(host: str, port: int, cdp_port: int, history_dir: str | None) -> None:
+	"""启动 TreeWalker web 前端（P6：live agent 控制台 + 流程库 编辑/重放/详情）。
+
+	浏览器端统一入口，承接 TUI 能力（运行/重放/录制）。先构建前端
+	（``cd web_ui && npm run build``），再跑本命令；浏览器开 http://<host>:<port>/ 。
+	Chrome 需以 ``--remote-debugging-port=<cdp-port>`` 启动。
+	"""
+	import os
+
+	from tree_walker.web.server import run_server
+
+	logging.basicConfig(level=logging.INFO)
+	# _build_agent 经 load_settings 读 CDP_PORT 连 Chrome；显式置默认 9223（web/重放路径约定端口）
+	os.environ["CDP_PORT"] = str(cdp_port)
+	print(f"TreeWalker web: http://{host}:{port}/  (Chrome CDP 端口={cdp_port})")
+	run_server(host=host, port=port, history_dir=history_dir)

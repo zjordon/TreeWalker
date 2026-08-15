@@ -318,6 +318,44 @@ class TestJudgeEvaluatorJudge:
         assert result is None
 
 
+# ── Non-blocking loop（issue #163）─────────────────────────────────────
+
+
+class TestJudgeNonBlocking:
+    """judge 的同步 ``messages.create`` 必须经 ``asyncio.to_thread``——真机曾观测 judge
+    阶段 tw-web 全部端点无响应 4-5 分钟。判据同 test_llm_client：慢 create 期间
+    ticker 协程持续推进。"""
+
+    def test_judge_offloads_create_to_thread(self):
+        import time
+
+        response = _FakeResponse([_FakeToolUseBlock({"reasoning": "ok", "verdict": True})])
+
+        def slow_create(*args, **kwargs):
+            time.sleep(0.2)
+            return response
+
+        llm = _fake_llm(None)
+        llm.client.messages.create.side_effect = slow_create
+        ticks = 0
+
+        async def ticker():
+            nonlocal ticks
+            for _ in range(30):
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        async def main():
+            task = asyncio.create_task(ticker())
+            result = await JudgeEvaluator(llm=llm).judge(task="t", history=_history_with())
+            await task
+            return result
+
+        result = asyncio.run(main())
+        assert result is not None and result.verdict is True
+        assert ticks >= 15  # 若 create 阻塞 loop，ticker 几乎不动
+
+
 class TestConfigDefaults:
     """方案 §3.1:Judge 默认开启 + 新截断阈值默认值。"""
 

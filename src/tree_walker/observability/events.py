@@ -44,6 +44,10 @@ class ToolCallEvent(BaseEvent):
     params: dict[str, Any] = Field(default_factory=dict)
     action_index: int = 0
     total_actions: int = 1
+    # P6 后续 I3：目标元素几何（归一化百分比 [0,1]，相对视口）。无 index / 拿不到节点 / 拿不到视口 → None。
+    element_index: int | None = None
+    element_bbox: dict[str, float] | None = None  # {"left","top","width","height"}，均 ∈ [0,1]
+    element_xpath: str | None = None
 
 
 class ToolResultEvent(BaseEvent):
@@ -76,3 +80,16 @@ class SessionEndEvent(BaseEvent):
     total_duration_seconds: float
     summary: str
     evaluation: dict[str, Any] | None = None
+
+
+class SkillActiveEvent(BaseEvent):
+    """本步活动的 domain skill（P6 后续 I1）：host + 是否命中 + 文本字数。
+
+    每步在算完 ``skill_desc`` 后由 step 流程 emit（仅 host/命中/字数，不传全文）。
+    web 前端据此在 RunView 标示「活动技能」chip。
+    """
+
+    event_type: str = "skill_active"
+    host: str | None = None
+    skill_loaded: bool = False
+    char_count: int = 0
