@@ -5,6 +5,50 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.16.0] - 2026-08-15
+
+### Added
+
+**交互前端 TUI→浏览器端（ROADMAP P6 / #162，PR #166 全量交付）**——把 TUI 的 live agent
+控制台迁到浏览器端，`tw-web` 成为一等 CLI（默认 CDP 9223）；**TUI 并存保留**
+（原「迁移完下掉」决策修订，web 为主、TUI 为辅）。分四批交付：
+
+- **首期**：web live 控制台（`/task/*` SSE：EventBus 事件流 + 日志事件化 + 截图推帧；
+  暂停/恢复/停止；录制轨迹落库）+ 流程库（编辑：动作列表/拖拽/变量标注；重放：试跑
+  + CSV 批量 SSE 步级进度与协作中止；详情）+ AppShell 注册表驱动四模式；后端包
+  `history_editor`→`web`
+- **T1·技能与 Run 增强**：技能面 `/skills/*`（分栏查看/编辑三文件，写后 invalidate
+  在跑 agent 的 loader 缓存）；Run 视图活动 skill 标示（`SkillActiveEvent`）、token/耗时
+  统计环（`LLMClient` 透传 usage）、元素高亮标注层（`ToolCallEvent` 归一化 bbox +
+  viewport，前端百分比定位）
+- **T1·直播视口**：CDP `Page.startScreencast` 连续推流（browser 侧采集 + 独立
+  `/task/screencast` 最新帧 SSE，节流窗定节奏投递；与截图流 mode 互斥）
+- **T2 中期批次**：设置面 `/settings/*`（注册表驱动，进程内存 override 不写 .env，
+  敏感字段脱敏、白名单校验、原子写入）；侧栏「进行中」zone（live reducer 提升到
+  AppShell 级 context——切模式不丢状态，`GET /task/list` + 30s 轮询）；Run 视图右
+  Context 面板（时间线选中事件详情：tool_call params/xpath/bbox、model_result、
+  skill_active）；⌘K 命令面板（跳转/流程/技能/最近任务/模型，懒加载失败降级）；TopBar
+  模型选择（`/task/start` model 按任务 override + localStorage）；任务历史（与 TUI 共享
+  `~/.treewalker/history.json`，↑↓ 翻历史）；前端 api 统一 readJson 守卫（非 JSON 响应
+  可诊断报错）
+
+### Fixed
+
+- **#163**：`LLMClient.get_action`/`_extract_call`、`judge.judge` 的同步
+  `messages.create` 在事件循环上直接调用（agent LLM 往返期间 tw-web 全部 HTTP 端点
+  无响应，最长 4-5 分钟）→ 全部 `asyncio.to_thread` 化；`_build_agent` 内
+  `_fetch_ws_url` 同步 httpx.get 同样丢线程池
+- **#164**：`/task/list` 的 success 误报（max_steps 封顶 + Judge FAILED 仍显示 ✓）→
+  `run_live` 终态改取 `agent.history.is_successful()`
+- **#165**：`skill_active` 事件被前端 reducer 拦截不进时间线（右栏 Context 面板对应
+  分支不可达）→ 放行入时间线
+
+### Docs
+
+- `docs/p6/01–12`：UI 框架提案 / 实施计划 / 复盘 / 后续 backlog（T2/T3 分期）/ T2
+  详细计划（goal 卡体例）/ 四批真机 e2e runbook（场景 A–R）
+- ROADMAP：P6（TUI→浏览器端）标记 ✅ 完成；下一阶段主要方向转为 P7
+
 ## [0.15.0] - 2026-08-11
 
 ### Added
