@@ -73,7 +73,7 @@ agent 探索时按 host 读 `domain-skills/<host>/` 注入上下文（默认关�
 
 ## 下一阶段计划
 
-> P1、P4、P5、P6 已完成；下一阶段主要方向 = **P7（WebArena 基准评测）**；P2（进行中）、P3（备选）为既有项；P6 后续远期项（编排/定时/多 agent 等）见 `docs/p6/05` §3。
+> P1、P4、P5、P6 已完成；下一阶段主要方向 = **P7（WebArena 基准评测与短板反哺）**，远期布局 **P8（扩展化：浏览器扩展伴随形态，调研已完成）**；P2（进行中）、P3（备选）为既有项；P6 后续远期项（编排/定时/多 agent 等）见 `docs/p6/05` §3。
 
 ### P2 —— agent 自动探索可靠性提升（🟡 进行中：P0 已交付，P1-P3 暂缓）
 
@@ -156,7 +156,7 @@ agent 探索时按 host 读 `domain-skills/<host>/` 注入上下文（默认关�
   - `tw-web` CLI + web live 控制台；技能/设置走注册表模式（enabled 开关即出现，不改 shell）
   - 复杂交付（批量、实时进度、配置）统一走 web；TUI 并存保留
 
-### P7 —— WebArena 基准评测与短板改进（🟡 进行中：harness 已通 + 首站点基线已出）
+### P7 —— WebArena 基准评测与短板改进（🟡 进行中：首站点全量基线 + 失败归因已出）
 
 **目标**：用 WebArena 标准 812 任务基准量化 TreeWalker 端到端浏览器操作能力，定位短板反哺改进。
 
@@ -165,29 +165,73 @@ agent 探索时按 host 读 `domain-skills/<host>/` 注入上下文（默认关�
 > 用 `CDPPageAdapter` 鸭子类型把 CDP 适配成 Playwright Page（`url`/`goto`/`content`/`evaluate` 四接口）+ worker 线程同步/异步桥接。
 > 评测原理见工作空间 `docs/benchmark-principles.md`，首次跑通复盘见 `docs/setup-retrospective-2026-08-07.md`。
 >
-> **当前进度**：smoke harness 已建（`smoke_test.py`/`runner.py`/`cdp_evaluator.py`/`task_selector.py`/`analyze_results.py`），
-> smoke 链路已验证通过（Task 0 端到端成功，2026-08-07）；shopping_admin 站点已跑出基线 **SR = 50%（28/56）**。
+> **当前进度（2026-08-14）**：shopping_admin 站点 **184 任务全量跑完，总 SR = 34.8%**（GLM-5.2，
+> 判分链路零异常、数字可信）；120 个失败任务逐个归因完成（9 类失败模式 + 5 个能力短板 + 改进建议）。
+> 报告：`docs/shopping_admin-results-2026-08-14.md` / `docs/failure-analysis-2026-08-14.md`。
 
 - [x] **smoke 链路打通**（10 任务子集，验证「链路通」而非跑分）
   - `CDPPageAdapter` + 同步/异步桥接（worker 线程跑 evaluator，`run_coroutine_threadsafe` + `wrap_future` 防死锁）
   - cookie 注入修复（CDP + localhost + domain 假成功坑，改用 `url` 参数）—— 首次 SR=0 的元凶
   - 4 个 setup bug 修复（pyproject 路径 / hatchling target / openai 2.x `openai.error` shim / cookie）+ 10 个 cdp_evaluator 单测全过
-- [ ] **全量 812 任务跑分**
-  - 去掉 task_selector 的 smoke 过滤，让 smoke_test 读全量任务列表（含断点续跑 resume）
-  - 覆盖全部 5 站点（shopping_admin 已通；补 shopping / gitlab / reddit / map / wikipedia 镜像与 cookie）
+- [x] **shopping_admin 全量基线**（184 任务，2026-08-08~14 断点续跑）
+  - 总 SR **34.8%**（GPT-4 论文参考 ~40-45%，GLM-5.2 达到合理区间）；判分 0 异常
+  - 按 eval_type：string_match **53.4%** / program_html **17.2%** / url_match **14.3%**（三种 string_match 判分方式 50-56% 一致，无系统偏差）
+  - 关键规律：**步数越多 SR 越低**——10-19 步 61.5% vs 30 步撞上限 7.1%；53% 任务落在 20-29 步「差一点没做完」
+  - 判分链路 4 个工程修复（cookie url 参数 / 答案提取 / fuzzy_match 改 GLM / sys.path）
+- [x] **失败任务归因分析**（120 个，LLM 分类 + 关键词回落，`analyze_failures.py`）
+  - 查询类死于**数据获取与解读**（66%）、操作类死于**表单交互**（26%+20%），两类都受步数预算挤压（各 20%）
+  - 五个具体短板：①分页数据不完整就下结论 ②多轮聚合超步数预算 ③Magento 表单对 CDP 输入不友好且无提交兜底 ④异步渲染网格没等/没滚误判无数据 ⑤REST API 探测 401 浪费步数
+- [ ] **短板反哺改进**（本阶段的真正产出；按投入产出排序，来自失败归因）
+  - 数据完整性自检规则（汇报前核对 grid total vs 提取行数，prompt 层改动，预计影响 ~15% 失败）
+  - 批量提取优先策略（聚合型任务优先一次 JS 遍历+客户端聚合，~15%）
+  - `submit_form` 原子动作（requestSubmit + change 事件序列，绕开模拟点击保存不可靠，~18%）
+  - 异步渲染等待策略（Magento grid 类页面等 Knockout 渲染完成再提取）
+  - 步数预算感知（剩余 <1/3 且任务未过半 → 切激进批量策略，避免 REST 探测烧步数）
+- [ ] **扩展到全量 812 任务**
+  - 补齐 shopping / gitlab / reddit（+可选 map / wikipedia）Docker 镜像与 cookie，断点续跑
   - 预计 ~1 周 + $300–500 LLM 费用；按站点 / eval_type 分组出 SR（`analyze_results.py` 已就绪）
 - [ ] **模型交叉实验**（分离「架构差」与「模型差」）
   - 至少三组：TreeWalker+GLM / TreeWalker+Claude / browser-use+Claude
   - 只有同模型对比（TreeWalker vs browser-use，都接 Claude）才能把差距归因到 agent 架构本身
 - [ ] **WebArena-Hard 258 子集**
   - 从 [ServiceNow/webarena-verified](https://github.com/ServiceNow/webarena-verified) 取 hard task_id 列表跑分，提升区分度
-- [ ] **短板定位与反哺改进**（本阶段的真正产出）
-  - 拉「TreeWalker 失败但 browser-use 成功」的任务逐条看 history，归因到具体能力缺口
-  - 命中 P2（探索可靠性）/ 重放端 / DOM 快照 / 动作能力等改进点，回流成本 ROADMAP 条目
 - [ ] **判分对齐清理**（已知技术债）
-  - trajectory 转换是简化的（program_html 依赖中间步骤页面快照，目前只 string_match/url_match 准）
-  - exact_match 45 任务的答案提取对齐（`runner.extract_concise_answer`：长汇报 → 精简答案）
+  - trajectory 转换仍是简化的（program_html 依赖中间步骤页面快照——SR 17.2% 偏低的部分原因；完整保存每步页面状态可提升可信度）
   - beartype 全局 monkey-patch（smoke 可接受，长期跑分建议精细化）
+  - ~~exact_match 答案提取~~（已修，14 任务不再误判）/ ~~fuzzy_match 判分器~~（已改 GLM）
+
+### P8 —— TreeWalker 扩展化：浏览器扩展伴随形态（💡 规划中：调研已完成）
+
+**目标**：把 TreeWalker 的 agent 能力搬进浏览器扩展，以「伴随形态」触达 C 端用户——在用户**正在用的真实浏览器**里（已登录、已有书签）做副驾驶，与平台形态（CDP + Python，批量自动化 / 开发者场景）**双形态并存**，共用同一套 CDP 内核。
+
+> 调研完成（2026-08-12，知识库 `ai/agent/browser-agent-extension-migration-research.md`）。
+> 背景判断：独立「AI 浏览器壳」品类已被证伪（OpenAI Atlas 关停），但浏览器 Agent **能力层**被三巨头集体吸收（Google 原生内置 / Anthropic / OpenAI 扩展）——TreeWalker 只做能力层不碰壳子，扩展是绕不开的 C 端形态。
+>
+> **关键技术事实**：`chrome.debugger` 本质就是把 CDP 暴露给扩展用——与 TreeWalker 的 cdp-use **同一个协议**，只是连接对象从「自己启动的浏览器实例」换成「用户正在用的真实浏览器」。
+
+**架构选型（已定）：模式 C —— CDP 网关桥 + Native Messaging**
+
+```
+Chrome 扩展（Web Store 分发）                TreeWalker Python 进程（本地）
+  Side Panel UI（对话）                        Agent / AgentState / Tools
+  Service Worker                               MessageManager / LoopDetector
+    · chrome.debugger.attach/sendCommand  ←→   录制-重放 / Skill 注入
+    · CDP 命令透传（= cdp-use 等价物）  native messaging（stdin/stdout）
+                                              唯一改动：CDP 命令发往扩展桥
+                    ↘ chrome.debugger 透传
+                      用户真实浏览器（已登录、书签密码全保留）
+```
+
+- 核心判断：**Python agent loop（25 个动作闭包 / act 引擎 / MessageManager 压缩 / LoopDetector / 录制-重放 / skill 注入）是核心资产，不为上扩展用 JS 重写**——模式 C 只换「CDP 命令发往哪里」这一层连接，agent 一行不改
+- 对比弃选：模式 A 纯扩展（agent loop 全重写 JS，投资回报最差）/ 模式 B 混合 remote-port（用户须特殊参数启动 Chrome，UX 致命）
+- 附带好处：迭代快的部分（agent loop / prompt / 动作空间）全留 Python 端即改即生效；扩展只承载稳定的 CDP 桥 + UI，规避 Web Store 审核慢
+- 已知限制：chrome.debugger attach 后浏览器顶部有「正在调试此标签页」黄条（行业通病，Anthropic/OpenAI 扩展同样有），UI 需提前引导；MV3 service worker 30s 休眠对模式 C 无影响（loop 在 Python 端）
+- 开源参考：**WebBrain**（最完整纯扩展 agent，ax tree 同源 + token 压缩同类，强烈精读）/ **BrowserBee**（playwright-crx + 任务记忆=录制-重放同理念）/ **chrome-cdp-skill**（最薄的 CDP 网关，桥部分直接参考）
+
+- [ ] **最小可行验证**：最小扩展跑通 `chrome.debugger.attach` + `sendCommand('Page.captureScreenshot')` / `DOM.getDocument`（「扩展拿到 CDP 数据」跑通，剩下就是接 Python 桥）
+- [ ] **Native Messaging 桥**：注册 host（JSON 配置 + 可执行入口），扩展 ↔ Python 进程 stdin/stdout 通信；cdp-use 连接层改造支持「桥模式」
+- [ ] **Side Panel UI**：对话界面 + 任务展示 + 高危操作确认（参考 Anthropic 安全模型：站点级权限 / 分类屏蔽 / 敏感操作前确认——prompt injection 是浏览器 agent 核心威胁）
+- [ ] **Web Store 打包分发**（Python 端可打包安装，降低「要装 Python」摩擦）
 
 ---
 
@@ -213,7 +257,8 @@ agent 探索时按 host 读 `domain-skills/<host>/` 注入上下文（默认关�
 | P4 | 录制-重放体验打磨 | ✅ | #149/#150 可视化编辑 + #153 多 action 变量 + #155 CSV 批量 Web UI（步级实时+中止） |
 | P5 | 变量识别扩展到选择类动作 | ✅ | 原生 select #157/#159 + 自定义下拉 #160/PR#161（B站/抖音真机验证）|
 | P6 | TUI → 浏览器端 | ✅ | PR #166 全量交付（#162 关闭）：tw-web live 控制台 + 流程库 + 技能面 + 直播视口 + 设置面 + T2 批次；TUI 并存保留；e2e A–R 全绿 |
-| P7 | WebArena 基准评测与短板改进 | 🟡 | smoke 通 + shopping_admin 基线 SR=50%；全量 812 + 模型交叉 + 短板反哺待做 |
+| P7 | WebArena 基准评测与短板改进 | 🟡 | shopping_admin 184 全量 **SR=34.8%**（GLM-5.2，判分 0 异常）+ 120 失败归因（5 短板）；短板反哺 / 全量 812 / 模型交叉待做 |
+| P8 | 扩展化：浏览器扩展伴随形态 | 💡 | 调研完成（2026-08-12）：模式 C（chrome.debugger=CDP + Native Messaging 桥，Python agent 零重写）；最小验证 / 桥 / UI / 上架待做 |
 
 ---
 
