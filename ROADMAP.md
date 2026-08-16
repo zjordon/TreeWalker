@@ -209,29 +209,31 @@ agent 探索时按 host 读 `domain-skills/<host>/` 注入上下文（默认关�
 >
 > **关键技术事实**：`chrome.debugger` 本质就是把 CDP 暴露给扩展用——与 TreeWalker 的 cdp-use **同一个协议**，只是连接对象从「自己启动的浏览器实例」换成「用户正在用的真实浏览器」。
 
-**架构选型（已定）：模式 C —— CDP 网关桥 + Native Messaging**
+**架构方向（选型未最终定；硬约束已明确：C 端零额外安装）**
+
+> 调研报告（知识库）曾基于「复用 Python agent loop 资产」推荐**模式 C**（扩展只做 CDP 桥 + Native Messaging，agent 跑本地 Python 进程）。但**面向 C 端分发，安装便利性是硬约束**——不能要求用户额外安装 Python 程序。倾向与主流做法（Anthropic / OpenAI 扩展）一致：**agent 全部能力做进扩展（纯扩展形态，即调研中的模式 A）**，自包含、Web Store 一键安装即用。
+> 模式 C 降级为**备选**（仅当纯扩展移植成本被验证不可接受时回退，或作为开发者场景的本地工具形态保留）。
 
 ```
-Chrome 扩展（Web Store 分发）                TreeWalker Python 进程（本地）
-  Side Panel UI（对话）                        Agent / AgentState / Tools
-  Service Worker                               MessageManager / LoopDetector
-    · chrome.debugger.attach/sendCommand  ←→   录制-重放 / Skill 注入
-    · CDP 命令透传（= cdp-use 等价物）  native messaging（stdin/stdout）
-                                              唯一改动：CDP 命令发往扩展桥
-                    ↘ chrome.debugger 透传
-                      用户真实浏览器（已登录、书签密码全保留）
+Chrome 扩展（自包含，Web Store 一键安装）
+  Side Panel UI（对话 / 任务展示 / 高危确认）
+  Service Worker（编排 + 调云端 LLM）
+    · chrome.debugger.attach / sendCommand（= CDP，cdp-use 等价物）
+    · content script（DOM 读写 / 可访问性树，辅助通道）
+    · agent loop 以 TS 在扩展内实现（动作执行 / 压缩 / 循环检测）
+                ↘ chrome.debugger
+                  用户真实浏览器（已登录、书签密码全保留，无需装任何东西）
 ```
 
-- 核心判断：**Python agent loop（25 个动作闭包 / act 引擎 / MessageManager 压缩 / LoopDetector / 录制-重放 / skill 注入）是核心资产，不为上扩展用 JS 重写**——模式 C 只换「CDP 命令发往哪里」这一层连接，agent 一行不改
-- 对比弃选：模式 A 纯扩展（agent loop 全重写 JS，投资回报最差）/ 模式 B 混合 remote-port（用户须特殊参数启动 Chrome，UX 致命）
-- 附带好处：迭代快的部分（agent loop / prompt / 动作空间）全留 Python 端即改即生效；扩展只承载稳定的 CDP 桥 + UI，规避 Web Store 审核慢
-- 已知限制：chrome.debugger attach 后浏览器顶部有「正在调试此标签页」黄条（行业通病，Anthropic/OpenAI 扩展同样有），UI 需提前引导；MV3 service worker 30s 休眠对模式 C 无影响（loop 在 Python 端）
-- 开源参考：**WebBrain**（最完整纯扩展 agent，ax tree 同源 + token 压缩同类，强烈精读）/ **BrowserBee**（playwright-crx + 任务记忆=录制-重放同理念）/ **chrome-cdp-skill**（最薄的 CDP 网关，桥部分直接参考）
+- **主要代价（要正视）**：Python agent loop（25 个动作闭包 / act 引擎 / MessageManager 压缩 / LoopDetector / 录制-重放 / skill 注入）需以 TS 在扩展内**重新实现**——WebBrain 已证明该形态成立（ax tree 同源、token 压缩同类问题），可作蓝本
+- **MV3 service worker 30s 休眠**在纯扩展形态下成为必须正面处理的问题（agent loop 就住在 service worker 里）——参考 WebBrain 的状态外置/可恢复设计
+- 已知限制：chrome.debugger attach 后浏览器顶部有「正在调试此标签页」黄条（行业通病，Anthropic/OpenAI 扩展同样有），UI 需提前引导
+- 开源参考：**WebBrain**（最完整纯扩展 agent，强烈精读——重点看 service worker 怎么组织 sendCommand、步数与压缩管理）/ **BrowserBee**（playwright-crx + 任务记忆=录制-重放同理念）/ **chrome-cdp-skill**（最薄 chrome.debugger 封装，CDP 调用部分可参考）
 
-- [ ] **最小可行验证**：最小扩展跑通 `chrome.debugger.attach` + `sendCommand('Page.captureScreenshot')` / `DOM.getDocument`（「扩展拿到 CDP 数据」跑通，剩下就是接 Python 桥）
-- [ ] **Native Messaging 桥**：注册 host（JSON 配置 + 可执行入口），扩展 ↔ Python 进程 stdin/stdout 通信；cdp-use 连接层改造支持「桥模式」
-- [ ] **Side Panel UI**：对话界面 + 任务展示 + 高危操作确认（参考 Anthropic 安全模型：站点级权限 / 分类屏蔽 / 敏感操作前确认——prompt injection 是浏览器 agent 核心威胁）
-- [ ] **Web Store 打包分发**（Python 端可打包安装，降低「要装 Python」摩擦）
+- [ ] **最小可行验证**：最小扩展跑通 `chrome.debugger.attach` + `sendCommand('Page.captureScreenshot')` / `DOM.getDocument`（「扩展拿到 CDP 数据」跑通，是任何架构的共同前提）
+- [ ] **纯扩展 agent loop（TS）设计与移植**：动作子集对齐 TreeWalker 语义（click / input_text / extract / done…）→ act 执行引擎 → 消息压缩与循环检测；MV3 休眠下的状态持久化与恢复
+- [ ] **Side Panel UI + 安全模型**：对话界面 + 任务展示 + 高危操作确认（参考 Anthropic 安全模型：站点级权限 / 分类屏蔽 / 敏感操作前确认——prompt injection 是浏览器 agent 核心威胁）
+- [ ] **Web Store 打包分发**（自包含零外部依赖；模型 key 走扩展内配置或用户自带）
 
 ---
 
@@ -258,7 +260,7 @@ Chrome 扩展（Web Store 分发）                TreeWalker Python 进程（�
 | P5 | 变量识别扩展到选择类动作 | ✅ | 原生 select #157/#159 + 自定义下拉 #160/PR#161（B站/抖音真机验证）|
 | P6 | TUI → 浏览器端 | ✅ | PR #166 全量交付（#162 关闭）：tw-web live 控制台 + 流程库 + 技能面 + 直播视口 + 设置面 + T2 批次；TUI 并存保留；e2e A–R 全绿 |
 | P7 | WebArena 基准评测与短板改进 | 🟡 | shopping_admin 184 全量 **SR=34.8%**（GLM-5.2，判分 0 异常）+ 120 失败归因（5 短板）；短板反哺 / 全量 812 / 模型交叉待做 |
-| P8 | 扩展化：浏览器扩展伴随形态 | 💡 | 调研完成（2026-08-12）：模式 C（chrome.debugger=CDP + Native Messaging 桥，Python agent 零重写）；最小验证 / 桥 / UI / 上架待做 |
+| P8 | 扩展化：浏览器扩展伴随形态 | 💡 | 调研完成（2026-08-12）；架构倾向**纯扩展**（agent 全做进扩展，C 端零额外安装——不要求装 Python，调研原推荐的 Python 桥模式降为备选），选型未最终定；最小验证 / TS 移植 / UI / 上架待做 |
 
 ---
 
