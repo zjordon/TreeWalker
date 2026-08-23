@@ -20,6 +20,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from pydantic import ValidationError
 
 from tree_walker.browser.session import BrowserSession
 from tree_walker.browser.views import (
@@ -30,6 +31,7 @@ from tree_walker.browser.views import (
 	SerializedDOMState,
 )
 from tree_walker.tools.actions import Tools
+from tree_walker.tools.models import ClickParams, InputTextParams
 
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
@@ -578,3 +580,91 @@ class TestFetchSelectOptions:
 	async def test_returns_empty_list_on_non_list_value(self):
 		s, _ = self._make_session(None)
 		assert await s.fetch_select_options(1) == []
+
+
+# ── R7-1: click 无效果检测（P7 02 方案·8/17）──────────────────────────
+
+
+class TestClickNoEffectDetection:
+	"""按钮类点击后页面指纹不变 → ⚠️ 提示（「点了没反应」当步可感知）。
+
+	B3-2 后 evaluate 调用为 4 次：点击前（指纹, 表单值摘要）+ 点击后（指纹, [必要时]表单值摘要）。
+	"""
+
+	@pytest.mark.asyncio
+	async def test_button_click_no_effect_appends_warning(self):
+		entry = _make_entry(backend_node_id=42)  # 默认 tag=BUTTON
+		state = _make_state({5: entry})
+		browser = _make_browser()
+		browser.evaluate = AsyncMock(side_effect=["fp|100|5000", "10,10", "fp|100|5000", "10,10"])
+
+		result = await Tools().execute("click", {"index": 5}, browser, browser_state=state)
+
+		assert result.error is None
+		assert "no visible effect" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_button_click_effect_no_warning(self):
+		entry = _make_entry(backend_node_id=42)
+		state = _make_state({5: entry})
+		browser = _make_browser()
+		browser.evaluate = AsyncMock(side_effect=["fp|100|5000", "10,10", "fp|105|6200", "10,10"])
+
+		result = await Tools().execute("click", {"index": 5}, browser, browser_state=state)
+
+		assert result.error is None
+		assert "no visible effect" not in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_non_button_target_skips_fingerprint(self):
+		entry = _make_entry(tag="A", backend_node_id=42)
+		state = _make_state({5: entry})
+		browser = _make_browser()
+		browser.evaluate = AsyncMock()
+
+		result = await Tools().execute("click", {"index": 5}, browser, browser_state=state)
+
+		assert result.error is None
+		browser.evaluate.assert_not_awaited()
+
+	@pytest.mark.asyncio
+	async def test_button_click_form_reset_detected(self):
+		"""B3-2：页面未变但表单值被清 → 专属提示（值是 property，指纹检测不到）。"""
+		entry = _make_entry(backend_node_id=42)
+		state = _make_state({5: entry})
+		browser = _make_browser()
+		# 前指纹相同（页面无变化），但表单值摘要从 "10,10"（两字段有值）变 "0,0"（被清空）
+		browser.evaluate = AsyncMock(side_effect=["fp|100|5000", "10,10", "fp|100|5000", "0,0"])
+
+		result = await Tools().execute("click", {"index": 5}, browser, browser_state=state)
+
+		assert result.error is None
+		assert "reset the form" in result.extracted_content
+		assert "no visible effect" not in result.extracted_content  # 优先给更具体的清值提示
+
+
+# ── P8: 参数模型 exactly-one 校验（步内拦截裸参数动作）───────────────
+
+
+class TestLocatorParamsExactlyOne:
+	"""click/input_text 裸发（无 index/element_id）在 Pydantic 层被拒——
+	step 层 _validate_params_or_retry 带错误信息步内重试，不再烧一整步。"""
+
+	def test_click_bare_rejected(self):
+		with pytest.raises(ValidationError):
+			ClickParams()
+
+	def test_click_both_rejected(self):
+		with pytest.raises(ValidationError):
+			ClickParams(index=1, element_id=2)
+
+	def test_click_exactly_one_accepted(self):
+		assert ClickParams(index=5).index == 5
+		assert ClickParams(element_id=7).element_id == 7
+
+	def test_input_text_bare_rejected(self):
+		with pytest.raises(ValidationError):
+			InputTextParams(text="x")
+
+	def test_input_text_exactly_one_accepted(self):
+		assert InputTextParams(index=1, text="x").index == 1

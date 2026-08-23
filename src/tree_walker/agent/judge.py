@@ -108,30 +108,39 @@ class JudgeEvaluator:
             return None
 
         try:
-            # issue #163：judge 的同步 ``messages.create`` 直接 await 会卡死事件循环
-            # （tw-web 真机观测：judge 阶段全部端点无响应 4-5 分钟）。经 to_thread 丢线程池。
-            response = await asyncio.to_thread(
-                self._llm.client.messages.create,
-                model=self._llm.model,
-                max_tokens=self._llm.max_tokens,
-                system=_JUDGE_SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": prompt}],
-                tools=[_JUDGE_TOOL_SCHEMA],
-                tool_choice={"type": "tool", "name": "agent_response"},
-            )
+            # B3-3（P7 02 批次三）：空响应（无 tool_use 块）先 nudge 重试一次再放弃
+            # （批次二验收两跑均现 "Judge returned no tool_use block"——judge 侧同款
+            # 空 LLM 响应，仿 client.py R1 的做法）。
+            messages: list[dict] = [{"role": "user", "content": prompt}]
+            for attempt in (1, 2):
+                # issue #163：judge 的同步 ``messages.create`` 直接 await 会卡死事件循环
+                # （tw-web 真机观测：judge 阶段全部端点无响应 4-5 分钟）。经 to_thread 丢线程池。
+                response = await asyncio.to_thread(
+                    self._llm.client.messages.create,
+                    model=self._llm.model,
+                    max_tokens=self._llm.max_tokens,
+                    system=_JUDGE_SYSTEM_PROMPT,
+                    messages=messages,
+                    tools=[_JUDGE_TOOL_SCHEMA],
+                    tool_choice={"type": "tool", "name": "agent_response"},
+                )
 
-            for block in response.content:
-                if getattr(block, "type", None) == "tool_use":
-                    data = block.input
-                    return JudgementResult(
-                        reasoning=data.get("reasoning"),
-                        verdict=bool(data.get("verdict", False)),
-                        failure_reason=data.get("failure_reason"),
-                        impossible_task=bool(data.get("impossible_task", False)),
-                        captcha=bool(data.get("captcha", False)),
-                    )
+                for block in response.content:
+                    if getattr(block, "type", None) == "tool_use":
+                        data = block.input
+                        return JudgementResult(
+                            reasoning=data.get("reasoning"),
+                            verdict=bool(data.get("verdict", False)),
+                            failure_reason=data.get("failure_reason"),
+                            impossible_task=bool(data.get("impossible_task", False)),
+                            captcha=bool(data.get("captcha", False)),
+                        )
 
-            logger.warning("Judge returned no tool_use block")
+                logger.warning("Judge returned no tool_use block (attempt %d/2)", attempt)
+                messages = messages + [{
+                    "role": "user",
+                    "content": "Respond now using the agent_response tool with your JSON verdict.",
+                }]
             return None
         except Exception:
             logger.exception("Judge evaluation failed")

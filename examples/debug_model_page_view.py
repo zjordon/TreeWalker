@@ -11,7 +11,7 @@
 忠实复现 TreeWalker 每一步发给 LLM 的 user message（页面结构部分）。
 
 用法：
-  1. Chrome 以 --remote-debugging-port=9222 启动，停在抖音「封面选择/编辑」区。
+  1. Chrome 以 --remote-debugging-port=9223 启动，停在抖音「封面选择/编辑」区。
   2. uv run python examples/debug_model_page_view.py
   3. 完整输出另存到 examples/_model_page_view.txt（便于编辑器里搜索 file input 行）。
 """
@@ -21,6 +21,11 @@ import os
 import sys
 
 sys.path.insert(0, f"{__file__}/../src")
+
+# 固定连 9223（tw-web / P7 验证端口）。必须在 import tree_walker.* 之前设置：
+# config.py import 时 load_dotenv 不覆盖已存在的环境变量，先设这里 .env 的
+# CDP_PORT=9222 才不会生效。
+os.environ["CDP_PORT"] = "9223"
 
 from tree_walker.browser.session import BrowserSession
 from tree_walker.config import load_settings
@@ -42,7 +47,7 @@ def _short(s, n=80):
 async def main():
 	settings = load_settings()
 	if not settings.browser.ws_url:
-		print("Error: 无法连接 Chrome（确认以 --remote-debugging-port=9222 启动并停在抖音封面区）")
+		print("Error: 无法连接 Chrome（确认以 --remote-debugging-port=9223 启动并停在抖音封面区）")
 		sys.exit(1)
 
 	print("=" * 92)

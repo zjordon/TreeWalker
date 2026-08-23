@@ -51,7 +51,7 @@ class TruncationSettings:
     extract_call_timeout: float = 0.0        # inner LLM-call timeout seconds (0 = disabled)
     read_file_max_chars: int = 5000          # file read tool result
     eval_result_max_chars: int = 2000        # JavaScript eval result
-    display_max_chars: int = 500             # ActionResult display string
+    display_max_chars: int = 4000            # ActionResult 渲染上限（__str__ → LLM 每步可见一次；500 时代 evaluate/find_elements 全量结果只见 ~10 行——P7 task1 R3a，docs/p7/02）
     dom_excerpt_max_chars: int = 2000        # DOM excerpt persisted per step for Judge review
     search_page_save_threshold: int = 10000  # search_page result >= this → write to file (mirrors extract)
     search_page_output_dir: str = "search_page_output"  # dir for oversized match lists (env-config)
@@ -165,6 +165,15 @@ class AgentSettings:
     exploration_actionability_stable: bool = False
     exploration_actionability_stable_interval: float = 0.1
     exploration_actionability_stable_tolerance: float = 1.0
+    # B3-1（P7 02 批次三）：探索端页面级 settle——导航后等页面 JS 就绪（requirejs
+    # 模块数连续 N 次 poll 不变）再放行动作。元素级 actionability 从 t≈0.1s 就绿灯
+    # （部件初始化不改变元素几何/可见性），但 requirejs 页面的部件武装要 ~6-14s，
+    # 窗口内输入的值会被迟到部件清掉（P12 输入侧失败，batch2_task1.log Step 6-8 实锤）。
+    # 无 requirejs 的页面即刻就绪（零开销）；超时降级放行（不引入新失败）。
+    exploration_page_settle: bool = True
+    exploration_page_settle_timeout: float = 10.0
+    exploration_page_settle_poll: float = 0.5
+    exploration_page_settle_stable_polls: int = 4
     # ── 等待机制 阶段 3：networkidle（默认关）+ 重放端 upload 等待 ──
     # get_state 前等 networkidle（缺口 2）；默认关 = 零行为变更。
     # 开启条件：页面变化由 AJAX 驱动（readyState 常年 complete 的 SPA）。超时降级不抛错。
@@ -180,7 +189,8 @@ class FallbackLLMSettings:
     model: str = ""
     api_key: str | None = None
     base_url: str = "https://open.bigmodel.cn/api/anthropic"
-    max_tokens: int = 4096
+    # 与 LLMSettings.max_tokens 同理：fallback 也跑同一套 agent 决策（含 thinking）
+    max_tokens: int = 16384
 
 
 @dataclass
@@ -188,7 +198,11 @@ class LLMSettings:
     model: str = "glm-5.1"
     api_key: str | None = None
     base_url: str = "https://open.bigmodel.cn/api/anthropic"
-    max_tokens: int = 4096
+    # 单次响应输出上限（thinking 计入）。4096 时难推理步的思考即可写满额度 →
+    # 返回体只剩 thinking 块、无动作 → client.py 零重试 fallback done 猝死
+    # （P7 task 1 两度复现，见 docs/p7/01-task1-trajectory-anatomy.md 附三）。
+    # GLM 上下文窗口 ≥128K，16384 给 thinking+动作留足余量。
+    max_tokens: int = 16384
     fallback: FallbackLLMSettings | None = None
     output_mode: str = "standard"  # "standard" | "flash" | "thinking"
 
@@ -367,7 +381,7 @@ def load_settings() -> Settings:
             extract_call_timeout=float(os.environ.get("AGENT_EXTRACT_CALL_TIMEOUT", "0")),
             read_file_max_chars=int(os.environ.get("AGENT_TRUNCATE_READ_FILE", "5000")),
             eval_result_max_chars=int(os.environ.get("AGENT_TRUNCATE_EVAL_RESULT", "2000")),
-            display_max_chars=int(os.environ.get("AGENT_TRUNCATE_DISPLAY", "500")),
+            display_max_chars=int(os.environ.get("AGENT_TRUNCATE_DISPLAY", "4000")),
             dom_excerpt_max_chars=int(os.environ.get("AGENT_TRUNCATE_DOM_EXCERPT", "2000")),
             search_page_save_threshold=int(os.environ.get("AGENT_SEARCH_PAGE_SAVE_THRESHOLD", "10000")),
             search_page_output_dir=os.environ.get("AGENT_SEARCH_PAGE_OUTPUT_DIR", "search_page_output"),
@@ -417,6 +431,11 @@ def load_settings() -> Settings:
         exploration_actionability_stable=os.environ.get("AGENT_EXPLORATION_ACTIONABILITY_STABLE", "").lower() == "true",
         exploration_actionability_stable_interval=float(os.environ.get("AGENT_EXPLORATION_ACTIONABILITY_STABLE_INTERVAL", "0.1")),
         exploration_actionability_stable_tolerance=float(os.environ.get("AGENT_EXPLORATION_ACTIONABILITY_STABLE_TOLERANCE", "1.0")),
+        # B3-1：探索端页面级 settle（默认开）——导航后等 requirejs 模块数稳定
+        exploration_page_settle=os.environ.get("AGENT_PAGE_SETTLE", "true").lower() == "true",
+        exploration_page_settle_timeout=float(os.environ.get("AGENT_PAGE_SETTLE_TIMEOUT", "10.0")),
+        exploration_page_settle_poll=float(os.environ.get("AGENT_PAGE_SETTLE_POLL", "0.5")),
+        exploration_page_settle_stable_polls=int(os.environ.get("AGENT_PAGE_SETTLE_STABLE_POLLS", "4")),
         # 等待机制 阶段 3：networkidle 开关 + 重放端 upload 等待（默认值对齐现状 = 零行为变更）
         rerun_wait_for_networkidle=os.environ.get("AGENT_RERUN_WAIT_FOR_NETWORKIDLE", "").lower() == "true",
         rerun_upload_wait_video=float(os.environ.get("AGENT_RERUN_UPLOAD_WAIT_VIDEO", "5.0")),
@@ -453,7 +472,7 @@ def load_settings() -> Settings:
                 "FALLBACK_LLM_BASE_URL",
                 "https://open.bigmodel.cn/api/anthropic",
             ),
-            max_tokens=int(os.environ.get("FALLBACK_LLM_MAX_TOKENS", "4096")),
+            max_tokens=int(os.environ.get("FALLBACK_LLM_MAX_TOKENS", "16384")),
         )
     output_mode = os.environ.get("LLM_OUTPUT_MODE", "standard")
     if output_mode not in ("standard", "flash", "thinking"):
@@ -464,7 +483,7 @@ def load_settings() -> Settings:
         model=os.environ.get("LLM_MODEL", "glm-5.1"),
         api_key=api_key,
         base_url=os.environ.get("LLM_BASE_URL", "https://open.bigmodel.cn/api/anthropic"),
-        max_tokens=int(os.environ.get("LLM_MAX_TOKENS", "4096")),
+        max_tokens=int(os.environ.get("LLM_MAX_TOKENS", "16384")),
         fallback=fallback_settings,
         output_mode=output_mode,
     )

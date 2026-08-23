@@ -1,4 +1,4 @@
-"""Tests for the navigate action: errorText mapping, new_tab, health check.
+﻿"""Tests for the navigate action: errorText mapping, new_tab, health check.
 
 Covers:
 - errorText / network-error mapping: ``browser.navigate`` raising a CDP
@@ -19,12 +19,14 @@ Covers:
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pydantic import ValidationError
 
 from tree_walker.agent.views import ActionResult  # noqa: F401  (asserts shape only)
+from tree_walker.browser.session import BrowserSession
 from tree_walker.browser.views import (
 	BrowserStateSummary,
 	EnhancedDOMTreeNode,
@@ -294,3 +296,117 @@ class TestNavigateParams:
 	def test_schema_has_new_tab_default(self):
 		schema = NavigateParams.model_json_schema()
 		assert schema["properties"]["new_tab"]["default"] is False
+
+
+# ── B3-1: 页面级 settle（P7 02 批次三）───────────────────────────────
+
+
+class TestNavigatePageSettle:
+	"""navigate 后调 wait_for_page_settle，就绪信息进回显；settle 失败不阻断导航。"""
+
+	@pytest.mark.asyncio
+	async def test_settle_ready_appends_note(self):
+		browser = _make_browser()
+		browser.wait_for_page_settle = AsyncMock(
+			return_value={"ready": True, "stage": "requirejs", "n": 199, "waited": 2.5}
+		)
+
+		result = await Tools().execute(
+			"navigate", {"url": "https://example.com"}, browser,
+		)
+
+		assert result.error is None
+		assert "page settled: requirejs, 2.5s" in result.extracted_content
+		browser.wait_for_page_settle.assert_awaited_once()
+
+	@pytest.mark.asyncio
+	async def test_settle_timeout_appends_warning_note(self):
+		browser = _make_browser()
+		browser.wait_for_page_settle = AsyncMock(
+			return_value={"ready": False, "stage": "requirejs", "n": 61,
+				"timeout": True, "waited": 10.0}
+		)
+
+		result = await Tools().execute(
+			"navigate", {"url": "https://example.com"}, browser,
+		)
+
+		assert result.error is None
+		assert "not confirmed" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_settle_failure_does_not_break_navigation(self):
+		"""settle 抛异常（如 mock 不可 await）→ 静默降级，导航照常成功。"""
+		browser = _make_browser()
+		browser.wait_for_page_settle = MagicMock(return_value="not-awaitable")
+
+		result = await Tools().execute(
+			"navigate", {"url": "https://example.com"}, browser,
+		)
+
+		assert result.error is None
+		assert "Navigated to https://example.com" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_new_tab_skips_settle(self):
+		browser = _make_browser()
+		browser.wait_for_page_settle = AsyncMock()
+
+		result = await Tools().execute(
+			"navigate", {"url": "https://example.com", "new_tab": True}, browser,
+		)
+
+		assert result.error is None
+		browser.wait_for_page_settle.assert_not_awaited()
+
+
+# ── B3-1: wait_for_page_settle 单元（session 层）─────────────────────
+
+
+class TestWaitForPageSettle:
+	"""requirejs 模块数连续 stable_polls 次不变 → 就绪；无 requirejs 即刻就绪；超时降级。"""
+
+	def _session(self) -> BrowserSession:
+		return BrowserSession(ws_url="ws://localhost:9223/test")
+
+	def test_no_requirejs_ready_immediately(self):
+		s = self._session()
+		with patch.object(s, "evaluate", AsyncMock(
+			return_value='{"ready": true, "stage": "no-requirejs", "n": 0}'
+		)) as ev:
+			st = asyncio.run(s.wait_for_page_settle(timeout=1.0, poll=0.0))
+		assert st["ready"] is True
+		assert st["stage"] == "no-requirejs"
+		assert ev.await_count == 1
+
+	def test_requirejs_stable_after_consecutive_polls(self):
+		s = self._session()
+		# stable_polls=4 语义 = 首次计数 + 后续 4 次相同（共 5 个相同采样）→ 第 6 次就绪
+		seq = ['{"ready": false, "stage": "requirejs", "n": 61}'] + \
+			['{"ready": false, "stage": "requirejs", "n": 140}'] * 5
+		with patch.object(s, "evaluate", AsyncMock(side_effect=seq)) as ev:
+			st = asyncio.run(s.wait_for_page_settle(timeout=5.0, poll=0.0, stable_polls=4))
+		assert st["ready"] is True
+		assert st["n"] == 140
+		assert ev.await_count == 6
+
+	def test_timeout_degrades_not_ready(self):
+		s = self._session()
+		# 计数一直变化（无限序列）→ 到超时仍未稳定 → ready=False（放行但标记）
+		counter = {"i": 0}
+
+		def _ever_changing(*a, **k):
+			counter["i"] += 1
+			return '{"ready": false, "stage": "requirejs", "n": %d}' % (counter["i"] * 10)
+
+		with patch.object(s, "evaluate", AsyncMock(side_effect=_ever_changing)):
+			st = asyncio.run(s.wait_for_page_settle(timeout=0.1, poll=0.0))
+		assert st["ready"] is False
+		assert st.get("timeout") is True
+
+	def test_evaluate_exception_returns_error_dict(self):
+		s = self._session()
+		with patch.object(s, "evaluate", AsyncMock(side_effect=RuntimeError("cdp down"))):
+			st = asyncio.run(s.wait_for_page_settle(timeout=1.0))
+		assert st["ready"] is False
+		assert "cdp down" in st.get("error", "")

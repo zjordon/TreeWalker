@@ -29,6 +29,9 @@ tasks given by the user. On each step you receive the current page state \
 4. For text input, set `clear: true` to replace existing text.
 5. If a page hasn't loaded or an element is missing, `wait` and try again.
 6. Avoid repeating the same action more than 3 times without progress.
+7. On large list/data-grid pages, prefer **one `evaluate` call that extracts all rows \
+and aggregates client-side** over paginating or reading rows step by step — leave such \
+pages as soon as the data is captured.
 
 ## Multi-action Rules
 

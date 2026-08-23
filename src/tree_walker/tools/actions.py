@@ -366,6 +366,61 @@ _SEARCH_ENGINE_URLS: dict[str, str] = {
 
 # ── Navigate health check / error mapping (mirrors browser-use) ──────
 
+# R7-1（P7 02 方案·8/17）：click 无效果检测的页面指纹——URL + 元素数 + outerHTML
+# 长度。BUTTON/INPUT[submit|button] 的语义是触发动作，点击后页面应有变化；指纹
+# 不变 = 处理器未挂 / 提交被静默拦截（Magento 报表 Show Report 型失败）。
+# JS 无反斜杠（避开 evaluate 转义链路）。
+_JS_PAGE_FINGERPRINT = """
+(function(){
+	return [location.href, document.querySelectorAll('*').length,
+		document.documentElement.outerHTML.length].join('|');
+})()"""
+
+# R7-1：点击后等待页面反应的秒数（DOM 更新/导航/表单回显）
+_CLICK_EFFECT_WAIT = 0.6
+
+# B3-2（P7 02 批次三）：表单字段值摘要——input.value 是 property 非 attribute，
+# outerHTML 指纹检测不到「值被页面部件清掉」（R7-1 盲区，batch2_task1.log Step 6-8
+# 实锤：点击后字段被迟到部件重置为空）。按表单收集前 30 个字段值的长度指纹。
+# JS 无反斜杠（避开 evaluate 转义链路）。
+_JS_FORM_VALUES = """
+(function(){
+	var out = [];
+	for (var i = 0; i < document.forms.length && i < 5; i++){
+		var els = document.forms[i].elements;
+		var vals = [];
+		for (var j = 0; j < els.length && j < 30; j++){
+			vals.push(String(els[j].value || '').length);
+		}
+		out.push(vals.join(','));
+	}
+	return out.join('|');
+})()"""
+
+# R7-2（P7 02 方案·8/16）：input_text 回读页面验证标记——「值在但被验证器拒绝」
+# 时提交会被静默拦截，让 LLM 当步感知。JS 无反斜杠。
+_JS_VALIDATION_STATE = """
+(function(){
+	var el = document.activeElement;
+	if (!el || el === document.body) { return ''; }
+	var marks = [];
+	if (el.getAttribute && el.getAttribute('aria-invalid') === 'true'){ marks.push('aria-invalid'); }
+	var cls = String(el.className || '');
+	var parts = cls.split(' ');
+	var bad = ['mage-error', 'error', 'invalid', 'input-error', '_error'];
+	for (var i = 0; i < parts.length; i++){
+		if (bad.indexOf(parts[i]) >= 0){ marks.push('class:' + parts[i]); break; }
+	}
+	var wrap = el.closest ? el.closest('.admin__field, .field, .form-group, .has-error') : null;
+	if (wrap){
+		var msg = wrap.querySelector('.mage-error, .error, .admin__field-error, .field-error, ._error');
+		if (msg && msg.textContent && msg.textContent.trim()){
+			marks.push('msg:' + msg.textContent.trim().slice(0, 80));
+		}
+	}
+	return marks.join('; ');
+})()"""
+
 # 等待/重试时长（秒），参照 browser_use/tools/service.py:501-523
 _NAVIGATE_EMPTY_RETRY_WAIT = 3.0   # 首次发现空 DOM 后等待重查
 _NAVIGATE_EMPTY_RELOAD_WAIT = 5.0  # reload 后等待
@@ -399,6 +454,10 @@ class Tools:
         upload_verify_enabled: bool = True,
         upload_verify_wait_s: float = 1.5,
         upload_verify_interval_s: float = 0.25,
+        page_settle_enabled: bool = True,
+        page_settle_timeout: float = 10.0,
+        page_settle_poll: float = 0.5,
+        page_settle_stable_polls: int = 4,
     ) -> None:
         # 二.E：output_model 须在 _register_all 之前落到 self / registry（_register_all 据此选变体）。
         self._output_model = output_model
@@ -416,6 +475,12 @@ class Tools:
         self._upload_verify_enabled = upload_verify_enabled
         self._upload_verify_wait_s = upload_verify_wait_s
         self._upload_verify_interval_s = upload_verify_interval_s
+        # B3-1（P7 02 批次三）：探索端页面级 settle——navigate 后等 requirejs 模块数
+        # 稳定再放行（元素级 actionability 检查不了部件武装，P12 输入侧失败）。
+        self._page_settle_enabled = page_settle_enabled
+        self._page_settle_timeout = page_settle_timeout
+        self._page_settle_poll = page_settle_poll
+        self._page_settle_stable_polls = page_settle_stable_polls
 
     # ── Public API ─────────────────────────────────────────────────────
 
@@ -503,8 +568,29 @@ class Tools:
             # 健康检查：仅当前标签页 + http(s) URL（chrome://、about:、new_tab=True 跳过）
             if not new_tab:
                 await self._navigate_health_check(url, browser)
+            # B3-1：页面级 settle——等 requirejs 模块数稳定（无 requirejs 零开销）。
+            # 降级放行：超时/异常不阻断导航（独立 try，勿让 settle 失败变成导航失败）。
+            settle_note = ""
+            if self._page_settle_enabled and not new_tab:
+                try:
+                    settle = await browser.wait_for_page_settle(
+                        timeout=self._page_settle_timeout,
+                        poll=self._page_settle_poll,
+                        stable_polls=self._page_settle_stable_polls,
+                    )
+                    stage = settle.get("stage", "?")
+                    if settle.get("ready"):
+                        settle_note = f" (page settled: {stage}, {settle.get('waited', 0)}s)"
+                    else:
+                        settle_note = (
+                            f" (page settle {stage} not confirmed after "
+                            f"{settle.get('waited', 0)}s — page JS may still be loading)"
+                        )
+                    logger.info("page settle: %s", settle)
+                except Exception as e:
+                    logger.debug("page settle skipped: %s", e)
             memory = (
-                f"Opened new tab with URL {url}" if new_tab else f"Navigated to {url}"
+                f"Opened new tab with URL {url}" if new_tab else f"Navigated to {url}{settle_note}"
             )
             logger.info(memory)
             return ActionResult(extracted_content=memory, long_term_memory=memory)
@@ -632,6 +718,13 @@ class Tools:
 
         # 3. 普通点击：highlight -> click_element，映射 bool 信号
         tabs_before = tuple(t.target_id for t in await browser.get_tabs())  # G7 新页检测快照
+        # R7-1：按钮类目标先取点击前指纹（无效果检测；非按钮零开销）
+        # B3-2：同时取表单字段值摘要（值是 property，指纹检测不到清值）
+        fp_before = None
+        fv_before = None
+        if tag == "BUTTON" or (tag == "INPUT" and attrs.get("type") in ("submit", "button")):
+            fp_before = await self._page_fingerprint(browser)
+            fv_before = await self._form_values_digest(browser)
         try:
             await browser.highlight_element(backend_id)
             clicked = await browser.click_element(backend_id)
@@ -652,8 +745,61 @@ class Tools:
         # 4. 成功回显（对齐 navigate/go_back 风格）+ 新标签页检测（G7）
         memory = self._describe_click(entry, params["index"])
         memory += await self._detect_new_tab_opened(browser, tabs_before)
+        # R7-1：按钮类目标的「无可见效果」检测——指纹不变 = 处理器未挂/提交被
+        # 静默拦截（8/17 型「点了没反应」），提示 LLM 当步重查而不是误诊。
+        # B3-2：页面未变但表单值变了（尤其变短/清空）= 迟到部件重置表单——
+        # 单独提示（值是 property，页面指纹本来检测不到）。
+        if fp_before is not None:
+            await asyncio.sleep(_CLICK_EFFECT_WAIT)
+            fp_after = await self._page_fingerprint(browser)
+            if fp_after is not None and fp_after == fp_before:
+                fv_after = await self._form_values_digest(browser)
+                if (
+                    fv_before is not None and fv_after is not None
+                    and fv_after != fv_before
+                ):
+                    memory += (
+                        "  ⚠️ The click changed form field values but the page did not "
+                        "navigate/update — a page widget likely reset the form. Verify the "
+                        "field values now; re-enter them or set via JS before resubmitting."
+                    )
+                else:
+                    memory += (
+                        "  ⚠️ The click had no visible effect (page unchanged). The button may "
+                        "have no handler attached or the submit was blocked silently — re-observe "
+                        "the form (values/validation marks), consider retrying, or trigger the "
+                        "page's own submit function via evaluate."
+                    )
         logger.info(memory)
         return ActionResult(extracted_content=memory, long_term_memory=memory)
+
+    async def _page_fingerprint(self, browser: BrowserSession) -> str | None:
+        """轻量页面指纹（URL | 元素数 | outerHTML 长度）。失败返回 None（跳过检测）。"""
+        try:
+            return await browser.evaluate(_JS_PAGE_FINGERPRINT)
+        except Exception as e:
+            logger.debug("page fingerprint failed: %s", e)
+            return None
+
+    async def _form_values_digest(self, browser: BrowserSession) -> str | None:
+        """表单字段值摘要（前 5 个表单 × 前 30 字段的值长度）。失败返回 None。"""
+        try:
+            return await browser.evaluate(_JS_FORM_VALUES)
+        except Exception as e:
+            logger.debug("form values digest failed: %s", e)
+            return None
+
+    async def _read_validation_state(self, browser: BrowserSession) -> str:
+        """读 activeElement 的页面验证标记（aria-invalid / 错误 class / 错误文案）。
+
+        R7-2：input_text 回读用——「值在但被验证器拒绝」时提交会被静默拦截，
+        让 LLM 当步感知。失败/无标记返回 ''。
+        """
+        try:
+            return (await browser.evaluate(_JS_VALIDATION_STATE) or "").strip()
+        except Exception as e:
+            logger.debug("validation-state read failed: %s", e)
+            return ""
 
     @staticmethod
     def _describe_click(entry: Any, index: int) -> str:
@@ -1003,6 +1149,15 @@ class Tools:
                 f"  ⚠️ Note: the field's actual value {actual!r} differs from "
                 f"the intended {text!r}. The site may have reformatted, truncated, "
                 f"or rejected the input — re-observe before continuing."
+            )
+        # R7-2（P7 02 方案·8/16）：值可能在但被页面验证器拒绝（如 Magento 报表
+        # 日期字段被标 invalid 时提交会被静默拦截）——回读验证标记，LLM 当步自愈。
+        vstate = await self._read_validation_state(browser)
+        if vstate:
+            memory += (
+                f"  ⚠️ The field is marked INVALID by the page validator ({vstate}) — "
+                f"the value will likely be rejected on submit. Re-observe the field, "
+                f"use the component's own picker/API, or set it via evaluate."
             )
         if is_combo:
             memory += (

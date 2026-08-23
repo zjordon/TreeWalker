@@ -1,6 +1,27 @@
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator
+from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator, model_validator
+
+
+class _LocatorParamsMixin(BaseModel):
+	"""P8：index/element_id 二选一（exactly-one）校验的公共基类。
+
+	GLM 偶发裸发动作（click 不带 index，8/17 两跑合计 7 次）——两字段都可选时
+	Pydantic 校验放行，要到执行层守卫才报错，白烧一整步。子类挂上本 mixin 后，
+	step 层 `_validate_params_or_retry` 会在步内拦截并带错误信息重试 LLM，
+	不再消耗步数预算。（validator 必须在类体内定义——pydantic v2 按类创建时
+	收集，事后 setattr 不注册。）
+	"""
+
+	@model_validator(mode="after")
+	def _check_exactly_one_locator(self) -> "_LocatorParamsMixin":
+		# 子类（ClickParams/InputTextParams）保证 index/element_id 字段存在
+		if (self.index is None) == (self.element_id is None):  # type: ignore[attr-defined]
+			raise ValueError(
+				"provide exactly one of `index` or `element_id` "
+				"(currently both missing or both given)"
+			)
+		return self
 
 
 class NavigateParams(BaseModel):
@@ -12,7 +33,7 @@ class NavigateParams(BaseModel):
     )
 
 
-class ClickParams(BaseModel):
+class ClickParams(_LocatorParamsMixin):
     model_config = ConfigDict(extra="forbid")
     index: int | None = Field(
         default=None,
@@ -26,7 +47,7 @@ class ClickParams(BaseModel):
     )
 
 
-class InputTextParams(BaseModel):
+class InputTextParams(_LocatorParamsMixin):
     model_config = ConfigDict(extra="forbid")
     index: int | None = Field(
         default=None,
@@ -641,7 +662,9 @@ ACTION_DEFINITIONS: dict[str, tuple[type[BaseModel], str, bool]] = {
         "an IIFE with try-catch so errors become return values; use only browser "
         "APIs (no Node.js). Supports async (await / fetch). Result is normalized "
         "to a string (objects -> JSON). Escape hatch when find_elements / "
-        "search_page / click cannot express the need.",
+        "search_page / click cannot express the need. Avoid backslash escapes in "
+        "the code (they get mangled in transport): for newlines/tabs inside regex "
+        "use String.fromCharCode(10)/String.fromCharCode(9) instead of \\n/\\t.",
         True,
     ),
     "search_page": (

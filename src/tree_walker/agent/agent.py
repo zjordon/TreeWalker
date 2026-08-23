@@ -58,7 +58,7 @@ class Agent(StepPipeline, RerunMixin):
         self.llm = llm
         self.browser = browser
         _settings = settings or AgentSettings()
-        self.tools = tools or Tools(truncation=_settings.truncation, allowed_upload_paths=_settings.allowed_upload_paths, allowed_write_paths=_settings.allowed_write_paths, allowed_read_paths=_settings.allowed_read_paths, display_files_in_done_text=_settings.display_files_in_done_text, output_model=output_model, upload_verify_enabled=_settings.upload_verify_enabled, upload_verify_wait_s=_settings.upload_verify_wait_s, upload_verify_interval_s=_settings.upload_verify_interval_s)
+        self.tools = tools or Tools(truncation=_settings.truncation, allowed_upload_paths=_settings.allowed_upload_paths, allowed_write_paths=_settings.allowed_write_paths, allowed_read_paths=_settings.allowed_read_paths, display_files_in_done_text=_settings.display_files_in_done_text, output_model=output_model, upload_verify_enabled=_settings.upload_verify_enabled, upload_verify_wait_s=_settings.upload_verify_wait_s, upload_verify_interval_s=_settings.upload_verify_interval_s, page_settle_enabled=_settings.exploration_page_settle, page_settle_timeout=_settings.exploration_page_settle_timeout, page_settle_poll=_settings.exploration_page_settle_poll, page_settle_stable_polls=_settings.exploration_page_settle_stable_polls)
         if _settings.action_page_filters:
             self.tools.apply_page_filters(_settings.action_page_filters)
 

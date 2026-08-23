@@ -466,6 +466,16 @@ def _validate_and_fix_javascript(code: str) -> str:
         lambda m: f'.matches(`{m.group(1)}`)',
         fixed,
     )
+    # 7（R5，P7 task1 附一）：LLM 在 JSON 里少写一层反斜杠时，`\n` 被 JSON 解析
+    # 成真实换行进入正则字面量——`.replace(/\n/g, ...)` 实际变成
+    # `.replace(/<换行>/g, ...)` → SyntaxError "Invalid regular expression:
+    # missing /"。把单字符正则类里的裸控制字符转义回字面量形式（保守：只处理
+    # /\n/ /\t/ /\r/（含 flags），不动其他结构）。
+    fixed = re.sub(
+        r"/([\n\t\r])/([a-z]*)",
+        lambda m: "/" + {"\n": "\\n", "\t": "\\t", "\r": "\\r"}[m.group(1)] + "/" + m.group(2),
+        fixed,
+    )
     return fixed
 
 
@@ -2515,6 +2525,63 @@ class BrowserSession:
             )
         except Exception as e:
             logger.debug("_force_set_value failed: %s", e)
+
+    # B3-1（P7 02 批次三）：页面级 settle 探测 JS——readyState + requirejs 模块数。
+    # JS 无反斜杠（避开 evaluate 转义链路）。无 requirejs 的页面直接就绪（零等待）。
+    _PAGE_SETTLE_JS = """
+(function(){
+	if (document.readyState !== 'complete') { return JSON.stringify({ready: false, stage: 'readyState', n: 0}); }
+	try {
+		var ctx = (window.require && require.s && require.s.contexts) ? require.s.contexts._ : null;
+		if (!ctx) { return JSON.stringify({ready: true, stage: 'no-requirejs', n: 0}); }
+		var n = Object.keys(ctx.defined || {}).length;
+		return JSON.stringify({ready: false, stage: 'requirejs', n: n});
+	} catch (e) { return JSON.stringify({ready: true, stage: 'error', n: 0}); }
+})()"""
+
+    async def wait_for_page_settle(
+        self,
+        timeout: float = 10.0,
+        poll: float = 0.5,
+        stable_polls: int = 4,
+    ) -> dict:
+        """等页面 JS 就绪：requirejs 模块数连续 ``stable_polls`` 次 poll 不变，或无 requirejs。
+
+        B3-1（P7 02 批次三）：元素级 actionability 检查不了部件初始化（不动元素几何），
+        requirejs 页面的部件武装要 ~6-14s；窗口内输入的值会被迟到部件清掉
+        （P12 输入侧失败）。降级原则同 actionability：超时/异常都安全返回，不阻断导航。
+
+        Returns:
+            诊断 dict：{ready, stage, n, waited}（timeout 到点时 ready=False 仍放行）。
+        """
+        start = time.monotonic()
+        last_n: int | None = None
+        stable = 0
+        try:
+            while True:
+                raw = await self.evaluate(self._PAGE_SETTLE_JS)
+                try:
+                    st = json.loads(raw) if isinstance(raw, str) else {}
+                except (TypeError, ValueError):
+                    st = {}
+                if st.get("ready"):
+                    return {**st, "waited": round(time.monotonic() - start, 2)}
+                n = int(st.get("n", 0) or 0)
+                if n == last_n:
+                    stable += 1
+                    if stable >= stable_polls:
+                        return {"ready": True, "stage": st.get("stage"), "n": n,
+                                "waited": round(time.monotonic() - start, 2)}
+                else:
+                    stable = 0
+                last_n = n
+                if time.monotonic() - start >= timeout:
+                    return {"ready": False, "stage": st.get("stage"), "n": n, "timeout": True,
+                            "waited": round(time.monotonic() - start, 2)}
+                await asyncio.sleep(poll)
+        except Exception as e:
+            return {"ready": False, "error": str(e)[:120],
+                    "waited": round(time.monotonic() - start, 2)}
 
     async def _clear_text_field(self) -> bool:
         """Three-layer clear strategy, mirrors browser-use _clear_text_field.
