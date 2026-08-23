@@ -612,6 +612,21 @@ class TestEvaluatePreprocessorAndNormalizer:
 		clean = "return 1 + 2"
 		assert _validate_and_fix_javascript(clean) == clean
 
+	def test_fix_raw_control_char_in_regex(self):
+		# R5（P7 task1 附一）：LLM 少写反斜杠 → JSON 解析把 \n 变真实换行进入
+		# 正则字面量（轨迹一 Step 12 实锤：SyntaxError "Invalid regular expression:
+		# missing /"）。单字符正则类 /\n/ /\t/ /\r/（含 flags）应被转义回字面量。
+		broken = "out.push(rows[i].innerText.replace(/" + chr(10) + "/g,'~'))"
+		fixed = _validate_and_fix_javascript(broken)
+		assert fixed == "out.push(rows[i].innerText.replace(/\\n/g,'~'))"
+		fixed_t = _validate_and_fix_javascript("a.replace(/" + chr(9) + "/g,'x')")
+		assert fixed_t == "a.replace(/\\t/g,'x')"
+		fixed_r = _validate_and_fix_javascript("a.replace(/" + chr(13) + "/,'x')")
+		assert fixed_r == "a.replace(/\\r/,'x')"
+		# 正常除法不受影响
+		division = "var x = b / c / d;"
+		assert _validate_and_fix_javascript(division) == division
+
 	# --- _normalize_eval_result ---
 
 	def test_normalize_dict(self):

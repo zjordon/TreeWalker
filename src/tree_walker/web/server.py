@@ -304,7 +304,7 @@ _SETTINGS_FIELDS: tuple[SettingField, ...] = (
 	# LLM
 	SettingField("模型", "LLM_MODEL", "str", "glm-5.1", "llm"),
 	SettingField("Base URL", "LLM_BASE_URL", "str", "https://open.bigmodel.cn/api/anthropic", "llm"),
-	SettingField("Max Tokens", "LLM_MAX_TOKENS", "int", "4096", "llm"),
+	SettingField("Max Tokens", "LLM_MAX_TOKENS", "int", "16384", "llm"),
 	SettingField("输出模式", "LLM_OUTPUT_MODE", "enum", "standard", "llm",
 	             choices=("standard", "flash", "thinking")),
 	SettingField("API Key", "ZHIPU_API_KEY", "str", "", "llm", sensitive=True),

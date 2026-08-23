@@ -233,6 +233,10 @@ __marimo__/
 # Rerun history files (recorded session outputs; regenerable, may contain recorded page/form data)
 rerun-history/
 
+# Run artifacts (regenerable debug/eval outputs; never commit)
+evaluate_output/
+examples/_model_page_view.txt
+
 # Frontend (web_ui React+Vite; npm 依赖与构建产物不进 git)
 web_ui/node_modules/
 web_ui/dist/

@@ -17,6 +17,9 @@ logger = logging.getLogger(__name__)
 # URL shortening threshold
 _URL_MIN_LENGTH = 100
 
+# R4（P7 02 方案）：text-not-tool_use 重试上限——旧实现无限递归
+_TEXT_RETRY_MAX = 2
+
 
 class LLMClient:
     """Wraps Anthropic SDK with tool_use for the agent loop.
@@ -44,7 +47,8 @@ class LLMClient:
         # Fallback LLM support
         self._fallback_client: Anthropic | None = None
         self._fallback_model: str | None = None
-        self._fallback_max_tokens: int = 4096
+        # 与 LLMSettings.max_tokens 同步（fallback 也跑 agent 决策，thinking 计入输出）
+        self._fallback_max_tokens: int = 16384
         self._using_fallback: bool = False
 
         if s.fallback and s.fallback.model:
@@ -168,8 +172,21 @@ class LLMClient:
         system_prompt: str,
         messages: list[dict[str, Any]],
         tool_schema: dict[str, Any],
+        *,
+        _no_action_retry_used: bool = False,
+        _text_retry_count: int = 0,
     ) -> dict[str, Any]:
-        """Call the LLM and return a parsed agent response."""
+        """Call the LLM and return a parsed agent response.
+
+        ``_no_action_retry_used``：R1（P7 task1 附三）空响应重试的防递归标志——
+        内部重试递归置 True；外部每步调用不传 → 每步重置。
+
+        ``_text_retry_count``：R4（P7 02 方案）text-not-tool_use 重试计数——
+        旧实现对「有文本但非工具调用」无限递归重试（runner 只能靠 600s 总闸
+        防挂死，且每次重试带全上下文，是 wall-clock 的主要贡献者之一）。上限
+        _TEXT_RETRY_MAX 次；超限返回空 dict 哨兵，交 step 层既有的
+        clarification 重试 → fallback done 梯子接管（总调用次数有界）。
+        """
         # URL shortening
         url_map = self._shorten_urls_in_messages(messages)
 
@@ -197,7 +214,11 @@ class LLMClient:
             # (5xx, 402, ...) are all subclasses of APIError, so this single
             # except is behaviorally equivalent to browser-use's explicit set.
             if self._try_switch_to_fallback(e):
-                return await self.get_action(system_prompt, messages, tool_schema)
+                return await self.get_action(
+                    system_prompt, messages, tool_schema,
+                    _no_action_retry_used=_no_action_retry_used,
+                    _text_retry_count=_text_retry_count,
+                )
             raise
 
         # P6 后续 I2：捕获 SDK 返回的 token usage（透传给 step → ModelResultEvent）。
@@ -237,15 +258,60 @@ class LLMClient:
                     logger.info("Parsed LLM text response as JSON")
                     tool_input = parsed
                 else:
-                    logger.warning("LLM returned text (not tool_use), retrying with explicit prompt")
+                    # R4（P7 02 方案）：text-not-tool_use 重试上限——旧实现无限递归
+                    # （runner 靠 600s 总闸兜底）。超限返回空 dict 哨兵，step 层
+                    # 既有梯子（clarification 重试一次 → fallback done）接管。
+                    if _text_retry_count >= _TEXT_RETRY_MAX:
+                        logger.warning(
+                            "LLM returned text (not tool_use) %d times — returning empty for "
+                            "step-level retry ladder",
+                            _text_retry_count + 1,
+                        )
+                        return {}
+                    # R4：指令型重试消息（压重试轮的输出长度，旧文案偏解释型）
+                    logger.warning(
+                        "LLM returned text (not tool_use), retrying with directive prompt (%d/%d)",
+                        _text_retry_count + 1, _TEXT_RETRY_MAX,
+                    )
                     retry_messages = list(messages) + [
                         {"role": "assistant", "content": text_content},
-                        {"role": "user", "content": "You must respond using the agent_response tool. Call it now with your evaluation, memory, next goal, and action."},
+                        {"role": "user", "content": (
+                            "Do not explain. Call the agent_response tool now with your "
+                            "evaluation, memory, next goal, and action."
+                        )},
                     ]
-                    return await self.get_action(system_prompt, retry_messages, tool_schema)
+                    return await self.get_action(
+                        system_prompt, retry_messages, tool_schema,
+                        _no_action_retry_used=_no_action_retry_used,
+                        _text_retry_count=_text_retry_count + 1,
+                    )
 
         if not tool_input:
-            logger.warning("LLM returned no parseable response, using fallback done")
+            # R2（P7 task1 附三）：空响应的关键证据上抛 WARNING——stop_reason 与
+            # output_tokens 可直接判别「thinking 耗尽 max_tokens」（stop_reason=
+            # max_tokens 且 output_tokens ≈ 上限），不必再靠 DEBUG 复跑推断。
+            logger.warning(
+                "LLM returned no parseable response (stop_reason=%s, output_tokens=%s, blocks=%s)",
+                getattr(response, "stop_reason", None),
+                (_usage_dict or {}).get("output_tokens"),
+                block_types,
+            )
+            # R1（P7 task1 附三）：空响应（含 thinking-only）不再直接死刑——对齐上方
+            # text-retry 的做法先重试一次；_no_action_retry_used 防递归无界。
+            if not _no_action_retry_used:
+                retry_messages = list(messages) + [
+                    {"role": "user", "content": (
+                        "Your previous response contained no action. Respond now with "
+                        "the agent_response tool, including your evaluation, memory, "
+                        "next goal, and action."
+                    )},
+                ]
+                return await self.get_action(
+                    system_prompt, retry_messages, tool_schema,
+                    _no_action_retry_used=True,
+                    _text_retry_count=_text_retry_count,
+                )
+            logger.warning("LLM still returned no parseable response after retry, using fallback done")
             result = {
                 "evaluation_previous_goal": "No response from LLM",
                 "memory": "",

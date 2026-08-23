@@ -303,6 +303,35 @@ class TestJudgeEvaluatorJudge:
         ))
         assert result is None
 
+    def test_retries_once_on_empty_then_succeeds(self):
+        """B3-3：空响应（无 tool_use 块）先 nudge 重试一次——批次二验收两跑均现
+        "Judge returned no tool_use block"，仿 client.py R1 的做法。"""
+        empty = _FakeResponse([SimpleNamespace(type="text", text="thinking aloud")])
+        ok = _FakeResponse([_FakeToolUseBlock({"reasoning": "ok", "verdict": True})])
+        llm = _fake_llm(None)
+        llm.client.messages.create.side_effect = [empty, ok]
+
+        result = asyncio.run(JudgeEvaluator(llm=llm).judge(
+            task="t", history=_history_with(),
+        ))
+
+        assert result is not None
+        assert result.verdict is True
+        assert llm.client.messages.create.call_count == 2
+
+    def test_returns_none_after_retry_exhausted(self):
+        """连续两次空响应 → 放弃返回 None（有界，不无限重试）。"""
+        empty = _FakeResponse([SimpleNamespace(type="text", text="still no tool")])
+        llm = _fake_llm(None)
+        llm.client.messages.create.side_effect = [empty, empty]
+
+        result = asyncio.run(JudgeEvaluator(llm=llm).judge(
+            task="t", history=_history_with(),
+        ))
+
+        assert result is None
+        assert llm.client.messages.create.call_count == 2
+
     def test_returns_none_on_llm_exception(self):
         llm = _fake_llm(None)
         llm.client.messages.create.side_effect = RuntimeError("boom")

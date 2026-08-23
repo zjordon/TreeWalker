@@ -500,3 +500,41 @@ class TestInputTextClearDefault:
 		)
 
 		browser.type_text.assert_awaited_once_with("x", clear=False)
+
+
+# ── R7-2: 验证状态可见性（P7 02 方案·8/16）────────────────────────────
+
+
+class TestValidationStateVisibility:
+	"""「值在但被页面验证器拒绝」→ 回读验证标记进 ⚠️，LLM 当步自愈。"""
+
+	@pytest.mark.asyncio
+	async def test_invalid_mark_appends_warning(self):
+		entry = _make_entry(backend_node_id=42, attributes={"type": "text"})
+		state = _make_state({5: entry})
+		browser = _make_browser(read_return="01/01/2022")
+		browser.evaluate = AsyncMock(
+			return_value="aria-invalid; msg:This is a required field"
+		)
+
+		result = await Tools().execute(
+			"input_text", {"index": 5, "text": "01/01/2022"}, browser, browser_state=state,
+		)
+
+		assert result.error is None
+		assert "INVALID" in result.extracted_content
+		assert "This is a required field" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_clean_field_no_validation_warning(self):
+		entry = _make_entry(backend_node_id=42, attributes={"type": "text"})
+		state = _make_state({5: entry})
+		browser = _make_browser(read_return="01/01/2022")
+		browser.evaluate = AsyncMock(return_value="")
+
+		result = await Tools().execute(
+			"input_text", {"index": 5, "text": "01/01/2022"}, browser, browser_state=state,
+		)
+
+		assert result.error is None
+		assert "INVALID" not in result.extracted_content

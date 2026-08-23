@@ -470,3 +470,148 @@ class TestNonBlockingLoop:
         await task
         assert result["action"]["name"] == "done"
         assert ticks >= 15  # 若 create 阻塞 loop，0.2s 内 ticker 几乎无法推进
+
+
+# ── Empty/unparseable response retry（P7 task1 附三 R1/R2）────────────
+
+
+class TestNoParseableResponseRetry:
+    """空响应（含 thinking-only）先重试一次，仍败才 fallback done。
+
+    背景：docs/p7/01-task1-trajectory-anatomy.md 附三——thinking 耗尽 max_tokens
+    时返回体只剩 thinking 块（无 tool_use/无 text），旧代码零重试直接合成
+    done(success=False) 终结任务（两跑分别死于 Step 16/11）。
+    """
+
+    @staticmethod
+    def _thinking_only_response() -> MagicMock:
+        """只含 thinking 块的响应。block.text 显式置 ""：真实 ThinkingBlock 无
+        .text；MagicMock 会自动造任意属性，不置空会让 client 文本回退拼接 Mock 而炸。
+        """
+        block = MagicMock()
+        block.type = "thinking"
+        block.text = ""
+        resp = MagicMock()
+        resp.content = [block]
+        resp.stop_reason = "max_tokens"
+        resp.usage = MagicMock(input_tokens=100, output_tokens=16384)
+        return resp
+
+    @staticmethod
+    def _tool_use_response() -> MagicMock:
+        block = MagicMock()
+        block.type = "tool_use"
+        block.name = "agent_response"
+        block.input = {
+            "evaluation_previous_goal": "ok",
+            "memory": "m",
+            "next_goal": "g",
+            "action": {"name": "click", "params": {"index": 1}},
+        }
+        resp = MagicMock()
+        resp.content = [block]
+        resp.stop_reason = "end_turn"
+        return resp
+
+    def test_retry_once_then_success(self):
+        """首次 thinking-only → nudge 重试 → 第二次拿到动作，任务不终止。"""
+        client = LLMClient(LLMSettings(api_key="test-key"))
+        with patch.object(
+            client.client.messages, "create",
+            side_effect=[self._thinking_only_response(), self._tool_use_response()],
+        ) as mock_create:
+            result = asyncio.run(
+                client.get_action("sys", [{"role": "user", "content": "hi"}], {"name": "t"}),
+            )
+        assert mock_create.call_count == 2
+        assert result["action"]["name"] == "click"
+        # 重试请求带上了明确的 nudge 消息
+        retry_msgs = mock_create.call_args_list[1].kwargs["messages"]
+        assert any("contained no action" in str(m.get("content", "")) for m in retry_msgs)
+
+    def test_fallback_done_after_retry_exhausted(self, caplog):
+        """连续两次 thinking-only → 恰好重试一次后 fallback done，无无限递归。"""
+        client = LLMClient(LLMSettings(api_key="test-key"))
+        with patch.object(
+            client.client.messages, "create",
+            side_effect=[self._thinking_only_response(), self._thinking_only_response()],
+        ) as mock_create:
+            with caplog.at_level("WARNING", logger="tree_walker.llm.client"):
+                result = asyncio.run(
+                    client.get_action("sys", [{"role": "user", "content": "hi"}], {"name": "t"}),
+                )
+        assert mock_create.call_count == 2
+        assert result["action"]["name"] == "done"
+        assert result["action"]["params"]["success"] is False
+        # R2：诊断证据（stop_reason / output_tokens / blocks）随 WARNING 落日志
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any("stop_reason=max_tokens" in m for m in msgs)
+        assert any("output_tokens=16384" in m for m in msgs)
+        assert any("blocks=['thinking']" in m for m in msgs)
+        assert any("still returned no parseable response after retry" in m for m in msgs)
+
+
+# ── Text-not-tool_use retry cap（P7 02 方案 R4）──────────────────────
+
+
+class TestTextRetryCap:
+    """R4：text-not-tool_use 重试上限（旧实现无限递归，runner 靠 600s 兜底）。
+
+    上限 2 次；超限返回空 dict 哨兵 → step 层既有梯子（clarification 重试 →
+    fallback done）接管，总调用次数有界。
+    """
+
+    @staticmethod
+    def _text_response(text: str = "Let me think about this step by step.") -> MagicMock:
+        block = MagicMock()
+        block.type = "text"
+        block.text = text  # 非 JSON，走 text-retry 分支
+        resp = MagicMock()
+        resp.content = [block]
+        resp.stop_reason = "end_turn"
+        return resp
+
+    @staticmethod
+    def _tool_use_response() -> MagicMock:
+        block = MagicMock()
+        block.type = "tool_use"
+        block.name = "agent_response"
+        block.input = {
+            "evaluation_previous_goal": "ok",
+            "memory": "m",
+            "next_goal": "g",
+            "action": {"name": "click", "params": {"index": 1}},
+        }
+        resp = MagicMock()
+        resp.content = [block]
+        resp.stop_reason = "end_turn"
+        return resp
+
+    def test_cap_exhausted_returns_empty_sentinel(self):
+        """连续 3 次文本响应 → 恰好 1+2 次调用后返回 {}，不再递归。"""
+        client = LLMClient(LLMSettings(api_key="test-key"))
+        with patch.object(
+            client.client.messages, "create",
+            side_effect=[self._text_response(), self._text_response(), self._text_response()],
+        ) as mock_create:
+            result = asyncio.run(
+                client.get_action("sys", [{"role": "user", "content": "hi"}], {"name": "t"}),
+            )
+        assert mock_create.call_count == 3  # 1 次初始 + 2 次重试，无界递归被封顶
+        assert result == {}  # 哨兵：step 层 _is_valid_action 判假 → 梯子接管
+
+    def test_retry_then_success_with_directive_message(self):
+        """第 3 次返回 tool_use → 成功；重试请求带指令型消息。"""
+        client = LLMClient(LLMSettings(api_key="test-key"))
+        with patch.object(
+            client.client.messages, "create",
+            side_effect=[self._text_response(), self._text_response(), self._tool_use_response()],
+        ) as mock_create:
+            result = asyncio.run(
+                client.get_action("sys", [{"role": "user", "content": "hi"}], {"name": "t"}),
+            )
+        assert mock_create.call_count == 3
+        assert result["action"]["name"] == "click"
+        # R4：重试消息为指令型（压重试轮输出长度）
+        retry_msgs = mock_create.call_args_list[1].kwargs["messages"]
+        assert any("Do not explain" in str(m.get("content", "")) for m in retry_msgs)
