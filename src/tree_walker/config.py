@@ -83,8 +83,14 @@ class AgentSettings:
     message_compaction: MessageCompactionSettings | None = None
     enable_message_typing: bool = True  # P0：消息分类管理（state 替换/context 清理），关则回退原始 append
     enable_page_stats: bool = True  # P1a：state 消息渲染 [Page Stats]（links/交互/iframe/骨架屏），关则不渲染
+    # P7 tool_layer B2：state 消息渲染 [Grid]（UI 网格 total/sorting/活动过滤残留，
+    # 防「脑补已排序」与残留过滤误读）。session 侧照常采集，此 flag 只控渲染。
+    enable_grid_meta: bool = True
     enable_sensitive_description: bool = True  # P1d：state 消息渲染 [Available Secrets]（按 URL 过滤告知可用占位符）
-    enable_skill_injection: bool = False  # P1：按 host 读 domain-skills/<host>/ 注入 [Domain Skill]（默认关 = 零行为变更）
+    # P1：按 host 读 domain-skills/<host>/ 注入 [Domain Skill]。P7 form_interaction
+    # 建议4 起默认开：无对应 host 目录的页面零注入（loader 返回 ""），有目录才有
+    # 行为变化；AGENT_ENABLE_SKILL_INJECTION=false 可关。
+    enable_skill_injection: bool = True
     max_history_items: int = 10  # P1c：<agent_history> 滑动窗口大小（compactor 启用时自动降到 5）
     enable_recent_events: bool = False  # P1b：state 消息渲染 [Recent Events]（首期仅 dialog；CDP 回调风险，默认关）
     truncation: TruncationSettings = field(default_factory=TruncationSettings)
@@ -245,6 +251,11 @@ class BrowserSettings:
     network_idle_stability_window: float = 0.5  # "无新请求 N 秒"判 idle（秒）；§6 推荐；Playwright 0.5
     network_idle_poll_interval: float = 0.1  # wait_until_idle 轮询间隔（秒）；对齐 page_settle_poll
     wait_between_actions: float = 0.0
+    # P7 form_interaction 建议3（493 挂死样本）：JS dialog（alert/confirm/prompt/
+    # beforeunload）自动处理——挂起的 dialog 冻结页面 JS，Runtime.evaluate 随之挂起，
+    # agent 循环挂死到任务超时。beforeunload→accept（放行导航），其余→dismiss（不替
+    # 用户确认危险操作）；每次处理记入 [Recent Events] 告知 LLM。
+    auto_handle_js_dialog: bool = True
 
 
 @dataclass
@@ -368,8 +379,9 @@ def load_settings() -> Settings:
         message_compaction=message_compaction,
         enable_message_typing=os.environ.get("AGENT_ENABLE_MESSAGE_TYPING", "true").lower() == "true",
         enable_page_stats=os.environ.get("AGENT_ENABLE_PAGE_STATS", "true").lower() == "true",
+        enable_grid_meta=os.environ.get("AGENT_ENABLE_GRID_META", "true").lower() == "true",
         enable_sensitive_description=os.environ.get("AGENT_ENABLE_SENSITIVE_DESCRIPTION", "true").lower() == "true",
-        enable_skill_injection=os.environ.get("AGENT_ENABLE_SKILL_INJECTION", "").lower() == "true",
+        enable_skill_injection=os.environ.get("AGENT_ENABLE_SKILL_INJECTION", "true").lower() == "true",
         max_history_items=int(os.environ.get("AGENT_MAX_HISTORY_ITEMS", "10")),
         enable_recent_events=os.environ.get("AGENT_ENABLE_RECENT_EVENTS", "false").lower() == "true",
         truncation=TruncationSettings(
@@ -505,6 +517,7 @@ def load_settings() -> Settings:
         heavy_page_element_threshold=int(os.environ.get("DOM_HEAVY_PAGE_THRESHOLD", "10000")),
         circuit_breaker_threshold=int(os.environ.get("DOM_CIRCUIT_BREAKER_THRESHOLD", "3")),
         circuit_breaker_recovery_s=float(os.environ.get("DOM_CIRCUIT_BREAKER_RECOVERY_S", "30.0")),
+        auto_handle_js_dialog=os.environ.get("BROWSER_AUTO_HANDLE_JS_DIALOG", "true").lower() != "false",
         highlight=HighlightSettings(
             enabled=os.environ.get("BROWSER_HIGHLIGHT_ENABLED", "true").lower() != "false",
             interaction_enabled=os.environ.get("BROWSER_HIGHLIGHT_INTERACTION", "true").lower() != "false",

@@ -35,6 +35,34 @@ class SkillLoader:
     def __init__(self, skills_dir: str | Path) -> None:
         self._dir = Path(skills_dir)
         self._cache: dict[str, str] = {}
+        # P7 form_interaction 建议4 补丁：解析后的 skills 根目录（首次使用时定根，
+        # 见 _resolve_dir）。None = 尚未解析。
+        self._resolved_root: Path | None = None
+
+    def _resolve_dir(self) -> Path:
+        """解析 skills 根目录：相对路径优先按 CWD，找不到则回退到 tree_walker
+        包所在仓库根下的同名目录。
+
+        背景（2026-08-24 WebArena 重跑核查）：评测 runner 以独立工作空间为 CWD
+        （evals/webarena），相对的 ``domain-skills`` 在那里不存在——手册放在
+        TreeWalker 仓库根，editable 安装（site-packages 的 .pth 指回本仓库 src）
+        时按 ``loader.py`` 的上级回退即可命中。非 editable 安装时回退目录同样
+        不存在，行为与原先一致（无 skill）。
+        """
+        if self._resolved_root is not None:
+            return self._resolved_root
+        root = self._dir
+        if not root.is_dir() and not root.is_absolute():
+            pkg_repo_root = Path(__file__).resolve().parents[3]
+            fallback = pkg_repo_root / root.name
+            if fallback.is_dir():
+                logger.info(
+                    "skill: skills_dir %s not found under CWD %s — using package repo root %s",
+                    root, Path.cwd(), fallback,
+                )
+                root = fallback
+        self._resolved_root = root
+        return root
 
     def load_for_host(self, host: str | None) -> str:
         """Return rendered skill text for ``host`` (empty string if none).
@@ -46,7 +74,7 @@ class SkillLoader:
             return ""
         if host in self._cache:
             return self._cache[host]
-        host_dir = self._dir / host
+        host_dir = self._resolve_dir() / host
         if not host_dir.is_dir():
             # 首次访问该 host 且无对应目录——打日志便于排查 host 不匹配
             # （如 agent 访问 member.bilibili.com 但 skill 放在 www.bilibili.com）

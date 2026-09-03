@@ -198,9 +198,10 @@ class TestTypeTextCharByChar:
 		expr = call_args[0][0]["expression"]
 		assert "InputEvent" in expr
 		assert "__vue__" in expr
-		# 'change'/'blur' must NOT be dispatched — they can trigger framework
-		# side effects (e.g. tag-input clearing value on blur).
-		assert "Event('change'" not in expr
+		# P7 form_interaction 建议2：'change' 必须派发——KO value 绑定默认听 change，
+		# 漏发会让 KO 表单（Magento admin）Save 提交空值（695/700/702/542 实证）。
+		assert "Event('change'" in expr
+		# 'blur' 仍不派发（下拉收起、tag-input 清值等副作用）。
 		assert "Event('blur'" not in expr
 
 	@pytest.mark.asyncio

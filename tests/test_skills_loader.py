@@ -7,6 +7,7 @@ the enable switch (that is an agent-layer concern, see test_agent_skill_injectio
 
 from __future__ import annotations
 
+from tree_walker.skills import loader as loader_module
 from tree_walker.skills.loader import SkillLoader
 
 
@@ -14,6 +15,48 @@ def _write_skill(host_dir, name: str, content: str) -> None:
     """Write a skill file under a host dir (host_dir is a pathlib.Path)."""
     host_dir.mkdir(parents=True, exist_ok=True)
     (host_dir / name).write_text(content, encoding="utf-8")
+
+
+class TestRepoRootFallback:
+    """P7 form_interaction 建议4 补丁：相对 skills_dir 在 CWD 下不存在时，回退到
+    tree_walker 包所在仓库根下的同名目录（评测 runner 的 CWD 是独立工作空间，
+    evals/webarena 下没有 domain-skills；editable 安装时包路径即指向本仓库）。"""
+
+    def test_fallback_to_package_repo_root(self, tmp_path, monkeypatch):
+        # 伪造仓库结构：<repo>/domain-skills/<host>/_sop.md + src/tree_walker/skills/loader.py
+        repo = tmp_path / "fakerepo"
+        _write_skill(repo / "domain-skills" / "h.com", "_sop.md", "sop-text")
+        fake_loader_file = repo / "src" / "tree_walker" / "skills" / "loader.py"
+        fake_loader_file.parent.mkdir(parents=True)
+
+        # CWD 切到一个没有 domain-skills 的目录
+        cwd = tmp_path / "cwd"
+        cwd.mkdir()
+        monkeypatch.chdir(cwd)
+        monkeypatch.setattr(loader_module, "__file__", str(fake_loader_file))
+
+        text = SkillLoader("domain-skills").load_for_host("h.com")
+        assert "sop-text" in text
+
+    def test_cwd_hit_takes_precedence(self, tmp_path, monkeypatch):
+        # CWD 下存在 domain-skills 时优先 CWD（原行为不变）
+        _write_skill(tmp_path / "domain-skills" / "h.com", "_sop.md", "cwd-text")
+        monkeypatch.chdir(tmp_path)
+
+        text = SkillLoader("domain-skills").load_for_host("h.com")
+        assert "cwd-text" in text
+
+    def test_absolute_path_bypasses_fallback(self, tmp_path, monkeypatch):
+        # 绝对路径不存在时保持原行为（不回退、无 skill），绝不指向别处
+        repo = tmp_path / "fakerepo"
+        _write_skill(repo / "domain-skills" / "h.com", "_sop.md", "sop-text")
+        monkeypatch.setattr(
+            loader_module, "__file__",
+            str(repo / "src" / "tree_walker" / "skills" / "loader.py"),
+        )
+
+        missing = tmp_path / "no-such-dir"
+        assert SkillLoader(missing).load_for_host("h.com") == ""
 
 
 class TestLoadForHost:

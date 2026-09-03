@@ -28,7 +28,7 @@ from tree_walker.agent.views import (
     redact_sensitive_string,
 )
 from tree_walker.browser.views import BrowserStateSummary, DOMInteractedElement
-from tree_walker.browser.url_utils import extract_host
+from tree_walker.browser.url_utils import extract_host_with_port
 from tree_walker.prompts.system_prompt import build_state_message, build_system_prompt
 
 if TYPE_CHECKING:
@@ -101,6 +101,7 @@ class StepPipeline:
     messages: list[dict[str, Any]]
     _enable_message_typing: bool
     _enable_page_stats: bool
+    _enable_grid_meta: bool  # P7 tool_layer B2：[Grid] 元信息渲染开关（session 侧照常采集）
     _enable_sensitive_description: bool
     _enable_skill_injection: bool
     _max_history_items: int
@@ -261,6 +262,9 @@ class StepPipeline:
             if (self._enable_page_stats and browser_state.dom_state)
             else None
         )
+        # P7 tool_layer B2：网格元信息（total/sorting/活动过滤残留）——防 128 型
+        # 「脑补已排序」与残留过滤误读；非网格页 grid_meta 为 None 不渲染。
+        grid_meta = browser_state.grid_meta if self._enable_grid_meta else None
         sensitive_desc = (
             self._build_sensitive_description(browser_state.url)
             if self._enable_sensitive_description
@@ -276,7 +280,7 @@ class StepPipeline:
         # 仅 host/命中/字数，不传全文；emit 同步、与 agent 同线程，安全。
         if self._obs_bus:
             from tree_walker.observability.events import SkillActiveEvent
-            _skill_host = extract_host(browser_state.url)
+            _skill_host = extract_host_with_port(browser_state.url)
             self._obs_bus.emit(SkillActiveEvent(
                 step=self.state.n_steps, session_id=self._obs_session_id,
                 host=_skill_host,
@@ -299,6 +303,7 @@ class StepPipeline:
             page_stats=page_stats,
             sensitive_description=sensitive_desc,
             skill_description=skill_desc,
+            grid_meta=grid_meta,
         )
         self._set_state_message(state_msg)  # P0：替换唯一 state 消息（避免完整 DOM 随步数累积）
 

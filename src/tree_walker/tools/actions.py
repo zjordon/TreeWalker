@@ -413,13 +413,155 @@ _JS_VALIDATION_STATE = """
 	}
 	var wrap = el.closest ? el.closest('.admin__field, .field, .form-group, .has-error') : null;
 	if (wrap){
-		var msg = wrap.querySelector('.mage-error, .error, .admin__field-error, .field-error, ._error');
-		if (msg && msg.textContent && msg.textContent.trim()){
-			marks.push('msg:' + msg.textContent.trim().slice(0, 80));
+		var msgs = wrap.querySelectorAll('.mage-error, .error, .admin__field-error, .field-error, ._error');
+		// P7 tool_layer B3 收窄（2026-08-28）：仅当报错文案归属本字段才计入——
+		// mage-error 的 for= 属性指向本 input id，或 input 自身带 invalid 标记。
+		// 780/782 轨迹实证误报：价格字段 input 后总提示 "This is a required
+		// field."（表单其他字段的校验文案），狼来了效应盖过真警告。
+		var selfMarked = marks.length > 0;
+		for (var mi = 0; mi < msgs.length; mi++){
+			var m = msgs[mi];
+			var forAttr = m.getAttribute ? m.getAttribute('for') : null;
+			var owned = (forAttr && el.id && forAttr === el.id) || selfMarked;
+			if (owned && m.textContent && m.textContent.trim()){
+				marks.push('msg:' + m.textContent.trim().slice(0, 80));
+				break;
+			}
 		}
 	}
 	return marks.join('; ');
 })()"""
+
+# P7 tool_layer B3（2026-08-28）：click 后页面消息（保存成功/失败浮层）显式确认。
+# 指纹比较只能区分「变/没变」，无法区分「保存成功弹了 toast」——Magento 的
+# 成功/失败态是 .message-success / .message-error / [data-ui-id=messages] 浮层
+# （780/782 的 "You saved the product." 目前只能靠 LLM 从快照自己发现）。
+# JS 无反斜杠；至多 3 条、每条 160 字符。
+_JS_PAGE_MESSAGES = """
+(function(){
+	var sels = ['.message-success', '.message-error', '.message-warning',
+		'.message-notice', '[data-ui-id="messages"] .message'];
+	var seen = {}, out = [];
+	for (var i = 0; i < sels.length; i++){
+		var els = document.querySelectorAll(sels[i]);
+		for (var j = 0; j < els.length; j++){
+			var t = (els[j].textContent || '').trim();
+			if (!t) { continue; }
+			var cls = String(els[j].className || '');
+			var tag2 = cls.indexOf('error') >= 0 ? 'ERROR: '
+				: cls.indexOf('success') >= 0 ? 'SUCCESS: '
+				: cls.indexOf('warning') >= 0 ? 'WARNING: ' : 'NOTICE: ';
+			var line = tag2 + t.slice(0, 160);
+			if (!seen[line]) { seen[line] = 1; out.push(line); }
+			if (out.length >= 3) { break; }
+		}
+		if (out.length >= 3) { break; }
+	}
+	return out.join(' | ');
+})()"""
+
+# P7 tool_layer B1（2026-08-28）：read_grid 的两条回落通道（主通道 uiRegistry 在
+# browser/session.py read_ui_grid）。JS 无反斜杠；args 模式下代码被包成非异步
+# function(...a){ BODY }，故 BODY return 一个 Promise（IIFE）由 awaitPromise 兜住。
+# 探针实证（examples/p7_probe_grid_channels.py C 段）：legacy ExtJS 网格
+# （评论网格）window.<x>GridJsObject 持 {url, pageVar, sortVar, dirVar}，
+# url + '?isAjax=true&limit=N' 返回含行 HTML 片段可 DOMParser 解析。
+_LEGACY_GRID_READ_JS = """
+return (async function(){
+    var p = a[0];
+    try {
+        var objs = [];
+        for (var k in window) {
+            var v;
+            try { v = window[k]; } catch (e) { continue; }
+            if (/GridJsObject$/.test(k) && v && typeof v === 'object' && v.url) { objs.push(v); }
+        }
+        if (!objs.length) { return JSON.stringify({channel_error: 'no-legacy-grid'}); }
+        var g = objs[0];
+        var fk = '';
+        var fkEl = document.querySelector('input[name=form_key]');
+        if (fkEl) { fk = fkEl.value; }
+        else if (typeof window.FORM_KEY === 'string') { fk = window.FORM_KEY; }
+        var parts = ['isAjax=1', 'limit=' + (p.paging ? p.paging.pageSize : 200),
+            (g.pageVar || 'page') + '=' + (p.paging ? p.paging.current : 1)];
+        if (fk) { parts.push('form_key=' + encodeURIComponent(fk)); }
+        if (p.sorting && p.sorting.field) {
+            parts.push((g.sortVar || 'sort') + '=' + encodeURIComponent(p.sorting.field));
+            parts.push((g.dirVar || 'dir') + '=' + (p.sorting.direction || 'asc'));
+        }
+        var r = await fetch(g.url + '?' + parts.join('&'), {
+            headers: { 'X-Requested-With': 'XMLHttpRequest' }, credentials: 'same-origin'
+        });
+        var t = await r.text();
+        var doc = new DOMParser().parseFromString(t, 'text/html');
+        var heads = [];
+        var ths = doc.querySelectorAll('thead tr th');
+        for (var i = 0; i < ths.length; i++) { heads.push((ths[i].innerText || ths[i].textContent || '').trim()); }
+        var rows = [];
+        var trs = doc.querySelectorAll('tbody tr');
+        for (var j = 0; j < trs.length; j++) {
+            var cells = trs[j].querySelectorAll('td');
+            if (!cells.length) { continue; }
+            var row = {};
+            for (var c = 0; c < cells.length; c++) {
+                var key = (c < heads.length && heads[c]) ? heads[c] : ('col' + c);
+                var val = (cells[c].innerText || cells[c].textContent || '').trim();
+                if (p.fields && p.fields.length && p.fields.indexOf(key) < 0) { continue; }
+                row[key] = val;
+            }
+            rows.push(row);
+        }
+        var info = doc.querySelector('.admin__data-grid-info');
+        return JSON.stringify({
+            channel: 'legacy_ajax', namespace: (g.containerId || ''),
+            rows: rows, rows_returned: rows.length,
+            info: info ? info.textContent.trim().slice(0, 80) : null,
+            applied: { sorting: p.sorting || null,
+                page_size: p.paging ? p.paging.pageSize : 200,
+                page: p.paging ? p.paging.current : 1 },
+            active_before: null, partial: false
+        });
+    } catch (e) { return JSON.stringify({channel_error: 'js-error: ' + e.message}); }
+})()
+"""
+
+# 通道 3：DOM 表格兜底（通用站点）。只读当前页可见行——无服务端排序/翻页，
+# KO 冻结页行文本可能为空（settle 后 kick 已自动解锁，这里不再重复 kick）。
+_DOM_TABLE_READ_JS = """
+return (async function(){
+    var p = a[0];
+    try {
+        var tables = document.querySelectorAll('table');
+        var best = null, bestRows = 0;
+        for (var i = 0; i < tables.length; i++) {
+            var n = tables[i].querySelectorAll('tbody tr').length;
+            if (n > bestRows) { bestRows = n; best = tables[i]; }
+        }
+        if (!best || !bestRows) { return JSON.stringify({channel_error: 'no-table'}); }
+        var heads = [];
+        var ths = best.querySelectorAll('thead th');
+        for (var j = 0; j < ths.length; j++) { heads.push((ths[j].innerText || ths[j].textContent || '').trim()); }
+        var rows = [];
+        var trs = best.querySelectorAll('tbody tr');
+        for (var k = 0; k < trs.length; k++) {
+            var cells = trs[k].querySelectorAll('td');
+            if (!cells.length) { continue; }
+            var row = {};
+            for (var c = 0; c < cells.length; c++) {
+                var key = (c < heads.length && heads[c]) ? heads[c] : ('col' + c);
+                if (p.fields && p.fields.length && p.fields.indexOf(key) < 0) { continue; }
+                row[key] = (cells[c].innerText || cells[c].textContent || '').trim();
+            }
+            rows.push(row);
+        }
+        return JSON.stringify({
+            channel: 'dom_table', namespace: null, rows: rows, rows_returned: rows.length,
+            applied: null, active_before: null, partial: false,
+            note: 'DOM channel: current-page visible rows only; no server-side sorting/paging'
+        });
+    } catch (e) { return JSON.stringify({channel_error: 'js-error: ' + e.message}); }
+})()
+"""
 
 # 等待/重试时长（秒），参照 browser_use/tools/service.py:501-523
 _NAVIGATE_EMPTY_RETRY_WAIT = 3.0   # 首次发现空 DOM 后等待重查
@@ -585,6 +727,13 @@ class Tools:
                         settle_note = (
                             f" (page settle {stage} not confirmed after "
                             f"{settle.get('waited', 0)}s — page JS may still be loading)"
+                        )
+                    # P7 form_interaction 建议1：settle 检测到 KO 网格行渲染冻结时已强制
+                    # 产帧解锁——回显给 LLM，提示行数据此刻起应可读。
+                    if settle.get("grid_kick"):
+                        settle_note += (
+                            " (data-grid render kick applied — frozen grid rows forced"
+                            " to render; if rows still look empty, take a screenshot)"
                         )
                     logger.info("page settle: %s", settle)
                 except Exception as e:
@@ -770,8 +919,27 @@ class Tools:
                         "the form (values/validation marks), consider retrying, or trigger the "
                         "page's own submit function via evaluate."
                     )
+            # P7 tool_layer B3：页面消息显式确认——保存成功/失败浮层是比指纹更
+            # 强的信号（指纹变了≠保存成功；toast 文案才是确定性的"已保存"证据）。
+            # 异步保存（指纹不变）同样能被 toast 捕获。仅在按钮类目标后读，控制成本。
+            page_msg = await self._read_page_messages(browser)
+            if page_msg:
+                flag = "⚠️" if page_msg.startswith("ERROR:") else "✅"
+                memory += f"  {flag} Page message after click: {page_msg}"
         logger.info(memory)
         return ActionResult(extracted_content=memory, long_term_memory=memory)
+
+    async def _read_page_messages(self, browser: BrowserSession) -> str:
+        """读页面消息浮层（.message-success / .message-error / ...），B3 用。
+
+        返回形如 ``SUCCESS: You saved the product.`` 的拼接串（至多 3 条）；
+        无消息/失败返回 ''。前缀带类型，调用方据此选 ✅/⚠️。
+        """
+        try:
+            return (await browser.evaluate(_JS_PAGE_MESSAGES) or "").strip()
+        except Exception as e:
+            logger.debug("page-messages read failed: %s", e)
+            return ""
 
     async def _page_fingerprint(self, browser: BrowserSession) -> str | None:
         """轻量页面指纹（URL | 元素数 | outerHTML 长度）。失败返回 None（跳过检测）。"""
@@ -2312,7 +2480,11 @@ class Tools:
         return ActionResult(extracted_content=memory, long_term_memory=memory)
 
     async def _action_evaluate(self, params: dict, browser: BrowserSession) -> ActionResult:
-        code = params["code"]
+        # P7 form_interaction 建议5③：registry 不校验 execute 路径，params 缺 code 时
+        # 返回友好错误而非 KeyError traceback（703 step 8 的 bug）。
+        code = params.get("code")
+        if code is None:
+            return ActionResult(error="Evaluate failed: missing required param `code`.")
         # 阶段二（二.B–二.F）：新增参数。registry 不校验 execute 路径（params 是 raw
         # dict），故在此读取 + 运行时守卫；见 memory action-params-no-runtime-validation。
         await_promise = params.get("await_promise", True)
@@ -2390,6 +2562,129 @@ class Tools:
             visible = text[:limit]
             memory = _eval_long_term_memory(text)
         return ActionResult(extracted_content=visible, long_term_memory=memory, metadata=metadata)
+
+    # ── read_grid（P7 tool_layer B1）────────────────────────────────────
+
+    async def _action_read_grid(self, params: dict, browser: BrowserSession) -> ActionResult:
+        """网格结构化读取：uiRegistry（KO/UI 组件网格）→ legacy AJAX → DOM 表格。
+
+        返回结构化 rows + 元信息（total/sorting/活动过滤残留），大结果落盘走
+        evaluate 同款分级。只读数据通道——不更新页面 UI（过滤芯片）。
+        """
+        # 参数守卫（registry 不校验 execute 路径；memory: action-params-no-runtime-validation）
+        namespace = params.get("namespace")
+        if namespace is not None and not isinstance(namespace, str):
+            return ActionResult(error="read_grid failed: namespace must be a string.")
+        filters = params.get("filters")
+        if filters is not None and not isinstance(filters, dict):
+            return ActionResult(error="read_grid failed: filters must be an object, e.g. {'status': 'complete'}.")
+        search = params.get("search")
+        if search is not None and not isinstance(search, str):
+            return ActionResult(error="read_grid failed: search must be a string.")
+        sorting_raw = params.get("sorting")
+        sorting = None
+        if isinstance(sorting_raw, str) and sorting_raw.strip():
+            parts = sorting_raw.strip().split()
+            direction = parts[1].lower() if len(parts) > 1 else "asc"
+            sorting = {"field": parts[0], "direction": direction if direction in ("asc", "desc") else "asc"}
+        try:
+            page_size = int(params.get("page_size", 200))
+            page = int(params.get("page", 1))
+        except (TypeError, ValueError):
+            return ActionResult(error="read_grid failed: page_size/page must be integers.")
+        page_size = max(1, min(page_size, 2000))
+        page = max(1, page)
+        fields = params.get("fields")
+        if fields is not None and (
+            not isinstance(fields, list) or not all(isinstance(f, str) for f in fields)
+        ):
+            return ActionResult(error="read_grid failed: fields must be a list of strings.")
+        fresh = bool(params.get("fresh", True))
+
+        payload = {
+            "namespace": namespace, "filters": filters, "search": search,
+            "sorting": sorting, "paging": {"pageSize": page_size, "current": page},
+            "fields": fields, "fresh": fresh, "waitMs": 8000,
+        }
+
+        # 通道 1：uiRegistry（Magento admin 列表页 KO 网格）
+        result = await browser.read_ui_grid(payload)
+        notes: list[str] = []
+        # 通道 2：legacy ExtJS 网格（评论网格等，无 uiRegistry；不支持 filters/search）
+        if "channel_error" in result:
+            legacy = await self._eval_grid_channel(browser, _LEGACY_GRID_READ_JS, payload)
+            if legacy is not None and "channel_error" not in legacy:
+                if filters or search:
+                    legacy["note"] = ((legacy.get("note") or "")
+                                      + " legacy channel: filters/search not applied (paging/sorting only)")
+                result = legacy
+        # 通道 3：DOM 表格兜底（通用站点 / 前两条通道全无）
+        if "channel_error" in result:
+            dom = await self._eval_grid_channel(browser, _DOM_TABLE_READ_JS, payload)
+            if dom is not None and "channel_error" not in dom:
+                result = dom
+
+        if "channel_error" in result:
+            return ActionResult(error=(
+                f"read_grid failed: {result['channel_error']} "
+                "(no UI-component grid, legacy grid, or table found on this page)"
+            ))
+
+        # 大结果落盘（镜像 _action_evaluate 的分级策略；OSError 不失败只 warning）
+        text = json.dumps(result, ensure_ascii=False, default=str)
+        tr = self._truncation
+        saved_to = None
+        if len(text) >= tr.eval_save_threshold:
+            try:
+                os.makedirs(tr.eval_output_dir, exist_ok=True)
+                fpath = os.path.join(tr.eval_output_dir, f"grid_{int(time.time() * 1000)}.json")
+                with open(fpath, "w", encoding="utf-8", newline="") as f:
+                    f.write(text)
+                saved_to = fpath
+            except OSError as e:
+                logger.warning("read_grid: save to file failed: %s", e)
+
+        meta_bits: list[str] = []
+        if result.get("namespace"):
+            meta_bits.append(f"ns={result['namespace']}")
+        meta_bits.append(f"rows={result.get('rows_returned', len(result.get('rows', [])))}")
+        if result.get("total_records") is not None:
+            meta_bits.append(f"total={result['total_records']}")
+        applied = result.get("applied") or {}
+        s = applied.get("sorting")
+        if isinstance(s, dict) and s.get("field"):
+            meta_bits.append(f"sorted={s.get('field')} {s.get('direction', 'asc')}")
+        ab = result.get("active_before") or {}
+        if ab.get("filters") or ab.get("search"):
+            leftover = json.dumps({"filters": ab.get("filters"), "search": ab.get("search")}, ensure_ascii=False)
+            notes.append(f"cleared leftover grid state before read: {leftover[:140]}")
+        if result.get("partial"):
+            notes.append("partial: data was still loading when the read returned — totals may be stale; retry if counts look short")
+
+        if saved_to:
+            visible = (f"read_grid [{' | '.join(meta_bits)}] full result ({len(text)} chars) "
+                       f"saved to {saved_to}. Preview: {text[:300]}...")
+        else:
+            visible = f"read_grid [{' | '.join(meta_bits)}] {text[:tr.eval_result_max_chars]}"
+        for n in notes:
+            visible += f"  ⚠️ {n}"
+        memory = "read_grid: " + ", ".join(meta_bits) + (f", saved={saved_to}" if saved_to else "")
+        return ActionResult(extracted_content=visible, long_term_memory=memory)
+
+    async def _eval_grid_channel(
+        self, browser: BrowserSession, js: str, payload: dict,
+    ) -> dict | None:
+        """跑一条回落通道 JS 并解析 dict；异常/不可解析返回 None（不抛）。"""
+        try:
+            raw = await browser.evaluate(js, args=[payload], await_promise=True, timeout_ms=30000)
+        except Exception as e:
+            logger.debug("grid channel evaluate failed: %s", e)
+            return None
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+            return parsed if isinstance(parsed, dict) else None
+        except (TypeError, ValueError):
+            return None
 
     async def _action_search_page(self, params: dict, browser: BrowserSession) -> ActionResult:
         query = params["query"]

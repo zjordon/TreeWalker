@@ -133,6 +133,9 @@ class BrowserStateSummary(BaseModel):
 	tabs: list[TabInfo] = Field(default_factory=list)
 	dom_state: SerializedDOMState | None = None
 	screenshot: bytes | None = None
+	# P7 tool_layer B2：UI 网格元信息（namespace/total_records/sorting/active_filters）。
+	# 非网格页为 None；由 session.get_state → _read_grid_meta 产出。
+	grid_meta: dict[str, Any] | None = None
 	recent_events: list[BrowserEvent] = Field(default_factory=list)  # P1b：每步 consume
 
 	class Config:

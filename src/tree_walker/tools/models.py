@@ -395,11 +395,13 @@ class ReplaceFileParams(BaseModel):
 class EvaluateParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
     code: str = Field(description=(
-        "JavaScript to execute in the page. Best practice: wrap in an IIFE "
-        "((function(){try{...}catch(e){return 'Error: '+e.message}})()) so a "
-        "thrown error becomes a return value, not a tool failure. Use ONLY "
-        "browser APIs (document, window, fetch); NO Node.js APIs. Return a "
-        "primitive or a JSON-serializable object/array. Keep output small."
+        "JavaScript to execute in the page. The code runs as a SCRIPT BODY — "
+        "a top-level `return` is a SyntaxError unless wrapped, so use an IIFE: "
+        "((function(){try{...}catch(e){return 'Error: '+e.message}})()). "
+        "Contrast: with `args`/`elements` the code IS wrapped as "
+        "function(...a){ ... } and then MUST `return`. Use ONLY browser APIs "
+        "(document, window, fetch); NO Node.js APIs. Return a primitive or a "
+        "JSON-serializable object/array. Keep output small."
     ))
     # ── 阶段二（二.B）：per-call 执行控制 ──
     await_promise: bool = Field(
@@ -502,6 +504,57 @@ class SearchPageParams(BaseModel):
     search_attributes: bool = Field(
         default=False,
         description="Also search element attribute values (href / value / data-* etc). Returns a separate attribute_matches list; offset applies to text matches only.",
+    )
+
+
+class ReadGridParams(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    namespace: str | None = Field(
+        default=None,
+        description=(
+            "Grid namespace, e.g. 'sales_order_grid' / 'product_listing'. Omit to "
+            "auto-detect from the current page (first non-notification UI-component "
+            "grid data source)."
+        ),
+    )
+    filters: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Grid filters applied server-side, e.g. {'status':'complete'} or "
+            "{'qty':{'from':2,'to':3}}. Replaces current filters (leftover bookmark "
+            "filters are cleared first). Pass {} to read unfiltered."
+        ),
+    )
+    search: str | None = Field(
+        default=None,
+        description="Fulltext keyword for the grid's search box (replaces current).",
+    )
+    sorting: str | None = Field(
+        default=None,
+        description=(
+            "'<field> <asc|desc>', e.g. 'created_at desc'. REQUIRED for top-N / "
+            "latest / max queries — grid row order is otherwise NOT guaranteed."
+        ),
+    )
+    page_size: int = Field(
+        default=200, ge=1, le=2000,
+        description="Rows per page for this read (server-side paging; use 1000+ to read all).",
+    )
+    page: int = Field(default=1, ge=1, description="1-based page number to read.")
+    fields: list[str] | None = Field(
+        default=None,
+        description=(
+            "Row fields to return, e.g. ['entity_id','increment_id','created_at','status']. "
+            "Omit for all grid columns."
+        ),
+    )
+    fresh: bool = Field(
+        default=True,
+        description=(
+            "True (default): clear leftover server-side bookmark filters/search before "
+            "applying the given params — grids inherit filter state from previous "
+            "sessions. False: apply on top of the current state."
+        ),
     )
 
 
@@ -679,6 +732,18 @@ ACTION_DEFINITIONS: dict[str, tuple[type[BaseModel], str, bool]] = {
             "Read-only — does not scroll or highlight (use find_text for that)."
         ),
         False,
+    ),
+    "read_grid": (
+        ReadGridParams,
+        (
+            "Read structured rows from the page's data grid (KO/UI-component grids, "
+            "legacy grids, or plain HTML tables) — bypasses row-render freezes and "
+            "returns JSON rows plus metadata (total_records, sorting, active filters). "
+            "Pass sorting='field desc' for top-N/latest queries — never assume row "
+            "order. Read-only data channel: does NOT update the page UI (filter chips) "
+            "— tasks graded on visible filter state must use the Filters panel."
+        ),
+        True,
     ),
     "done": (
         DoneParams,

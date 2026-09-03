@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from tree_walker.browser.url_utils import extract_host
+from tree_walker.browser.url_utils import extract_host, extract_host_with_port
 from tree_walker.browser.views import BrowserStateSummary, SerializedDOMState
 from tree_walker.prompts.system_prompt import build_state_message
 
@@ -57,6 +57,24 @@ class TestExtractHost:
 
         monkeypatch.setattr(url_utils, "urlparse", boom)
         assert url_utils.extract_host("https://x.com") is None
+
+
+class TestExtractHostWithPort:
+    """P7 form_interaction 建议4：domain-skills 目录 key 的端口限定形态。"""
+
+    def test_ported_url_uses_host_port_key(self):
+        assert extract_host_with_port("http://localhost:7780/admin") == "localhost_7780"
+
+    def test_portless_url_keeps_bare_host(self):
+        assert extract_host_with_port("https://www.bilibili.com/v/1") == "www.bilibili.com"
+
+    def test_default_port_https_omitted_when_explicit_443(self):
+        # 显式写 443 也带后缀（key 只认 URL 字面端口，不做协议默认端口换算）
+        assert extract_host_with_port("https://example.com:443/") == "example.com_443"
+
+    def test_garbage_rejected_same_as_extract_host(self):
+        for bad in ("", None, "not a url at all"):
+            assert extract_host_with_port(bad) is None
 
 
 class TestDomainSkillRendering:
@@ -145,6 +163,18 @@ class TestBuildSkillDescription:
         assert "AAA" in agent._build_skill_description("https://a.com/")
         assert "BBB" in agent._build_skill_description("https://b.com/")
 
+    def test_port_qualified_host_gets_own_skill(self, tmp_path):
+        """P7 form_interaction 建议4：带端口的 host 用 host_port 目录——
+        localhost:7780（Magento）与 localhost:5173（tw-web 前端）互不误注入。"""
+        self._write_skill(tmp_path / "localhost_7780", "_sop.md", "magento-sop")
+        self._write_skill(tmp_path / "localhost_5173", "_sop.md", "webui-sop")
+
+        agent = self._agent(tmp_path)
+        assert "magento-sop" in agent._build_skill_description("http://localhost:7780/admin/")
+        assert "webui-sop" in agent._build_skill_description("http://localhost:5173/")
+        # 无对应目录的端口不回退到其他端口的 skill
+        assert agent._build_skill_description("http://localhost:9999/") is None
+
 
 class TestEnableSwitch:
     """开关门控：默认关，开关关时不注入（即使文件在），开关开时注入。
@@ -154,10 +184,12 @@ class TestEnableSwitch:
     验证门控语义，并端到端验证渲染。
     """
 
-    def test_default_is_off(self):
+    def test_default_is_on(self):
+        """P7 form_interaction 建议4 起默认开：无对应 host 目录的页面零注入，
+        有目录才有行为变化；env AGENT_ENABLE_SKILL_INJECTION=false 可关。"""
         from tree_walker.config import AgentSettings
 
-        assert AgentSettings().enable_skill_injection is False
+        assert AgentSettings().enable_skill_injection is True
 
     def test_construct_arg_enables(self):
         from tree_walker.config import AgentSettings

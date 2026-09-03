@@ -371,9 +371,12 @@ class TestWaitForPageSettle:
 
 	def test_no_requirejs_ready_immediately(self):
 		s = self._session()
-		with patch.object(s, "evaluate", AsyncMock(
-			return_value='{"ready": true, "stage": "no-requirejs", "n": 0}'
-		)) as ev:
+		# P7 form_interaction 建议1：settle 后挂了 grid kick（内部也会 evaluate）——
+		# 本组测试聚焦 settle 轮询语义，kick 挂 no-op。
+		with patch.object(s, "_kick_frozen_data_grid", AsyncMock(return_value=None)), \
+				patch.object(s, "evaluate", AsyncMock(
+					return_value='{"ready": true, "stage": "no-requirejs", "n": 0}'
+				)) as ev:
 			st = asyncio.run(s.wait_for_page_settle(timeout=1.0, poll=0.0))
 		assert st["ready"] is True
 		assert st["stage"] == "no-requirejs"
@@ -384,7 +387,8 @@ class TestWaitForPageSettle:
 		# stable_polls=4 语义 = 首次计数 + 后续 4 次相同（共 5 个相同采样）→ 第 6 次就绪
 		seq = ['{"ready": false, "stage": "requirejs", "n": 61}'] + \
 			['{"ready": false, "stage": "requirejs", "n": 140}'] * 5
-		with patch.object(s, "evaluate", AsyncMock(side_effect=seq)) as ev:
+		with patch.object(s, "_kick_frozen_data_grid", AsyncMock(return_value=None)), \
+				patch.object(s, "evaluate", AsyncMock(side_effect=seq)) as ev:
 			st = asyncio.run(s.wait_for_page_settle(timeout=5.0, poll=0.0, stable_polls=4))
 		assert st["ready"] is True
 		assert st["n"] == 140
