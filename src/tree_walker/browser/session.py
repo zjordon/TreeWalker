@@ -503,6 +503,37 @@ def _normalize_eval_result(result_data: dict) -> str:
     return str(value)
 
 
+def _syntax_repair_candidates(code: str, err_text: str) -> list[str]:
+    """P7 form_interaction 建议5：按已知 SyntaxError 生成确定性修复候选（按序试跑）。
+
+    2026-08-23 复盘（batch1 task-505 step 12 等，同类错误批次内 8 处）：
+    - ``Illegal return statement``：LLM 写了顶层裸 return——Runtime.evaluate 按
+      脚本体执行（Playwright 字符串路径实测同样拒绝，惯例是调用方自包）。包一层
+      IIFE 即合法。注意与 ``args``/``elements`` 模式相反：那边代码被包进
+      ``function(...a){...}``，裸 return 合法且必须——schema 描述已明示两种模式差异。
+    - ``Missing catch or finally after try``：LLM 写了 try 没 catch（常伴随少一个
+      闭合大括号）。真实失败样本呈两种形态：①括号均衡、仅缺 catch（catch 插在最后
+      一个 ``}`` 之前可修）；②连函数闭合括号也缺（去掉尾部 ``})()`` 再补
+      ``}catch(...){...}})()`` 可修）。两个候选按序试跑，语法错误无副作用，试错安全。
+
+    其余错误返回空列表（不自愈，原样抛出）。
+    """
+    if "Illegal return statement" in err_text:
+        return ["(()=>{\n" + code + "\n})()"]
+    if "Missing catch or finally after try" in err_text:
+        catch = "catch(e){return 'Error: '+e.message}"
+        candidates: list[str] = []
+        # 形态①：括号均衡、仅缺 catch —— 插在最后一个 } 之前
+        idx = code.rfind("}")
+        if idx > 0:
+            candidates.append(code[:idx] + catch + code[idx:])
+        # 形态②：连函数闭合括号也缺 —— 去掉尾部 })() 重建闭合
+        if code.endswith("})()"):
+            candidates.append(code[:-4] + "}" + catch + "})()")
+        return candidates
+    return []
+
+
 def _format_eval_exception(exception: dict, validated_code: str) -> str:
     """Build a debugging-rich error message from CDP exceptionDetails.
 
@@ -1345,6 +1376,14 @@ class BrowserSession:
         self._recent_events: deque[BrowserEvent] = deque(maxlen=20)
         self._recent_events_lock = threading.Lock()
         self._enable_recent_events: bool = False
+        # P7 form_interaction 建议3（493 挂死样本）：JS dialog 自动处理。挂起的
+        # alert/confirm/prompt/beforeunload 会阻塞页面 JS——Runtime.evaluate 冻结，
+        # agent 循环随之挂死到任务超时。_connect 注册 javascriptDialogOpening 回调，
+        # 事件到来即在事件循环上发 Page.handleJavaScriptDialog（beforeunload=accept
+        # 放行导航，其余 dismiss），并把处理动作记入 recent_events 告知 LLM。
+        self._auto_dialog_enabled: bool = _settings.auto_handle_js_dialog
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._dialog_tasks: set[asyncio.Task] = set()
         # 阶段3：networkidle 追踪（always-on；wait 由 get_state(wait_networkidle=...) 显式触发）。
         # tracker 维护 inflight 请求集合；Network.enable + 回调注册在 _connect 内完成。
         self._network_idle_tracker = NetworkIdleTracker(
@@ -1384,13 +1423,8 @@ class BrowserSession:
         if track_downloads:
             await self._setup_download_tracking(downloads_path)
         self._enable_recent_events = enable_recent_events
-        if enable_recent_events:
-            try:
-                await self._setup_event_tracking()
-            except Exception as e:
-                # 事件采集失败不能拖垮启动——降级为不采集
-                logger.warning("recent_events setup failed (degrading to off): %s", e)
-                self._enable_recent_events = False
+        # P7 form_interaction 建议3：dialog 回调注册移入 _connect（无条件、单点、
+        # 重连覆盖）——这里不再重复注册。enable_recent_events 仅保留给未来其他事件类型。
 
     async def _connect(self) -> None:
         """Perform CDP connection, target discovery, and session setup.
@@ -1401,6 +1435,9 @@ class BrowserSession:
         """
         # 阶段3：新会话清旧 inflight 残留（inflight 是 per-session 的）。
         self._network_idle_tracker.reset()
+        # P7 form_interaction 建议3：记录事件循环，供 ws 读线程的 dialog 回调把
+        # 自动处理移交回 loop 线程（call_soon_threadsafe + create_task）。
+        self._loop = asyncio.get_running_loop()
         try:
             await self.client.start()
         except Exception as connect_err:
@@ -1431,6 +1468,13 @@ class BrowserSession:
 
         await self.client.send.Page.enable({}, session_id=self.current_session_id)
         await self.client.send.DOM.enable({}, session_id=self.current_session_id)
+        # P7 form_interaction 建议3：dialog 回调 always-on（自动处理 + 记录），
+        # 不再依赖 enable_recent_events——挂起的 dialog 会冻结整个 agent 循环。
+        # 注册幂等（cdp_use 单回调覆盖式），重连/重复调用安全；失败降级为不处理。
+        try:
+            await self._setup_event_tracking()
+        except Exception as e:
+            logger.warning("dialog handler registration failed (degrading): %s", e)
         # 阶段3：启用 Network 域 + 注册空闲追踪回调（always-on；wait 由 get_state 显式触发）。
         # 失败 → tracker 降级 disabled，wait_until_idle 即时返回（对齐 recent_events 降级）。
         try:
@@ -1676,20 +1720,61 @@ class BrowserSession:
         download 由 ``_setup_download_tracking`` → ``[Downloads]`` 覆盖；cdp_use 单回调
         机制（``registry._handlers[method] = callback`` 覆盖式）下不能双注册
         ``Browser.downloadWillBegin``，故这里不监听 download。
-        回调在 websocket 读线程触发 → ``record_event`` 用锁保证线程安全。
+
+        P7 form_interaction 建议3：本方法由 ``_connect`` **无条件**调用（重连也覆盖）——
+        dialog 回调除了记录事件，还负责自动处理：挂起的 JS dialog 会阻塞页面 JS
+        （Runtime.evaluate 冻结，agent 循环挂死，WebArena task 493 样本）。事件本体
+        **无条件记录**（自动处理必须让 LLM 看见）；``enable_recent_events`` 只保留给
+        未来的其他事件类型。回调在 websocket 读线程触发 → ``record_event`` 用锁保证
+        线程安全；自动处理经 ``call_soon_threadsafe`` 移交事件循环线程。
         """
         def _on_javascript_dialog(event: dict, session_id: str | None = None) -> None:
             # event: {url, message, type: alert/confirm/prompt/beforeunload}
             message = event.get("message", "") or event.get("url", "")
             dialog_type = event.get("type", "alert")
+            accept = dialog_type == "beforeunload"
+            action = "auto-accepted" if accept else "auto-dismissed"
+            # 记录事件（无条件——自动处理对 LLM 必须可见）
+            prefix = f"[{dialog_type}] {message}" if message else f"[{dialog_type}]"
             self.record_event(BrowserEvent(
                 type="dialog",
-                message=f"[{dialog_type}] {message}" if message else f"[{dialog_type}]",
+                message=f"{prefix} ({action})",
                 timestamp=time.time(),
             ))
+            # 调度自动处理（ws 读线程 → 事件循环线程）
+            loop = self._loop
+            if not self._auto_dialog_enabled or loop is None:
+                return
+
+            def _spawn() -> None:
+                task = loop.create_task(self._auto_handle_dialog(accept, session_id))
+                self._dialog_tasks.add(task)
+                task.add_done_callback(self._dialog_tasks.discard)
+
+            try:
+                loop.call_soon_threadsafe(_spawn)
+            except RuntimeError:
+                logger.debug("dialog auto-handle scheduling skipped (loop closed)")
 
         self.client.register.Page.javascriptDialogOpening(_on_javascript_dialog)
-        logger.info("recent_events tracking enabled (dialog)")
+        logger.info(
+            "recent_events tracking enabled (dialog; auto_handle=%s)", self._auto_dialog_enabled,
+        )
+
+    async def _auto_handle_dialog(self, accept: bool, session_id: str | None) -> None:
+        """自动处理挂起的 JS dialog（beforeunload→accept 放行导航，其余→dismiss）。
+
+        dismiss 策略最安全：confirm 型弹窗被取消而非确认（不会替用户点头危险操作）；
+        alert 型 accept/dismiss 等价。失败仅 debug 记录（dialog 可能已被页面侧关闭）。
+        """
+        try:
+            await self.client.send.Page.handleJavaScriptDialog(
+                {"accept": accept, "promptText": ""},
+                session_id=session_id or self.current_session_id,
+            )
+            logger.info("JS dialog auto-handled (accept=%s)", accept)
+        except Exception as e:
+            logger.debug("handleJavaScriptDialog failed (already closed?): %s", e)
 
     def record_event(self, event: BrowserEvent) -> None:
         """线程安全地追加一个浏览器事件（CDP 回调线程调用）。deque maxlen 自动溢出。"""
@@ -1830,12 +1915,17 @@ class BrowserSession:
             except Exception:
                 pass
 
+        # P7 tool_layer B2：网格元信息（UI 网格的 total/sorting/活动过滤）——
+        # 读的是组件数据层，行渲染冻结不影响；非网格页按 URL 缓存跳过（零重复成本）。
+        grid_meta = await self._read_grid_meta(url)
+
         return BrowserStateSummary(
             url=url,
             title=title,
             tabs=tabs,
             dom_state=dom_state,
             screenshot=screenshot,
+            grid_meta=grid_meta,  # P7 tool_layer B2
             recent_events=self.consume_recent_events(),  # P1b：每步 consume，避免重复
         )
 
@@ -2551,9 +2641,28 @@ class BrowserSession:
         requirejs 页面的部件武装要 ~6-14s；窗口内输入的值会被迟到部件清掉
         （P12 输入侧失败）。降级原则同 actionability：超时/异常都安全返回，不阻断导航。
 
+        P7 form_interaction 建议1（docs/p7/form_interaction/01-failure-analysis.md 发现1）：
+        settle 结束后调用 ``_kick_frozen_data_grid``——窗口不可见（最小化/完全遮挡）时
+        合成器不产帧，KO 数据网格行保持未渲染模板（记录数可见、行文本全空），一次丢弃式
+        截图强制产帧即可解锁（7 正例的"screenshot kick"）。诊断键 ``grid_kick`` 并入返回值。
+
         Returns:
-            诊断 dict：{ready, stage, n, waited}（timeout 到点时 ready=False 仍放行）。
+            诊断 dict：{ready, stage, n, waited}（timeout 到点时 ready=False 仍放行），
+            可能附 {grid_kick, grid_rows, grid_rendered}。
         """
+        result = await self._settle_poll(timeout, poll, stable_polls)
+        kick = await self._kick_frozen_data_grid()
+        if kick:
+            result = {**result, **kick}
+        return result
+
+    async def _settle_poll(
+        self,
+        timeout: float = 10.0,
+        poll: float = 0.5,
+        stable_polls: int = 4,
+    ) -> dict:
+        """``wait_for_page_settle`` 的轮询主体（拆出以便 settle 后挂 grid kick）。"""
         start = time.monotonic()
         last_n: int | None = None
         stable = 0
@@ -2582,6 +2691,259 @@ class BrowserSession:
         except Exception as e:
             return {"ready": False, "error": str(e)[:120],
                     "waited": round(time.monotonic() - start, 2)}
+
+    # P7 form_interaction 建议1：KO 数据网格"行渲染冻结"检测。记录数文本可见但
+    # tbody 行 innerText/textContent 全空 = 模板未绑定（窗口不产帧时的典型状态）。
+    _GRID_EMPTY_ROWS_JS = """
+(function(){
+    var rows = document.querySelectorAll('.admin__data-grid tbody tr, table.data-grid tbody tr');
+    if (!rows.length) { return JSON.stringify({grid: false}); }
+    for (var i = 0; i < rows.length; i++) {
+        var t = (rows[i].innerText || rows[i].textContent || '').trim();
+        if (t) { return JSON.stringify({grid: true, empty: false, rows: rows.length}); }
+    }
+    return JSON.stringify({grid: true, empty: true, rows: rows.length});
+})()"""
+
+    async def _kick_frozen_data_grid(self) -> dict | None:
+        """检测数据网格行渲染冻结，并用一次丢弃式截图强制产帧（"screenshot kick"）。
+
+        WebArena form_interaction 批次的实证：窗口最小化/遮挡 → 合成器不产帧 →
+        KO 网格行保持空模板；``Page.captureScreenshot`` 强制合成一帧后行随即渲染
+        （454/196/493/543/546/551/504 七任务截图即渲染，464/503 未截图永不渲染）。
+        无网格/行有文本的页面零开销（一次 evaluate 即返回）。永不 raise。
+        """
+        try:
+            raw = await self.evaluate(self._GRID_EMPTY_ROWS_JS)
+            try:
+                st = json.loads(raw) if isinstance(raw, str) else {}
+            except (TypeError, ValueError):
+                return None
+            if not st.get("grid") or not st.get("empty"):
+                return None
+            # kick：整视口低质量 jpeg，字节直接丢弃（只借"强制产一帧"的副作用）
+            await self.take_screenshot(format="jpeg", quality=20)
+            await asyncio.sleep(0.3)
+            raw2 = await self.evaluate(self._GRID_EMPTY_ROWS_JS)
+            try:
+                st2 = json.loads(raw2) if isinstance(raw2, str) else {}
+            except (TypeError, ValueError):
+                st2 = {}
+            rendered = bool(st2.get("grid") and not st2.get("empty"))
+            logger.info(
+                "data-grid render kick: rows=%s rendered_after=%s (frozen KO grid, forced one frame)",
+                st.get("rows"), rendered,
+            )
+            return {"grid_kick": True, "grid_rows": st.get("rows"), "grid_rendered": rendered}
+        except Exception as e:
+            logger.debug("data-grid render kick skipped: %s", e)
+            return None
+
+    # ── UI 网格结构化读取 / 元信息（P7 tool_layer B1+B2，2026-08-28）─────────
+    #
+    # 背景（docs/p7/tool_layer/01-feasibility-and-impl-plan.md）：Magento KO 网格
+    # 行渲染冻结 + LLM 手写 JS 语法税 + 行序无保证。实证（探针
+    # examples/p7_probe_grid_channels.py）：mui/index/render 在本环境返回脚手架
+    # HTML 不可用；可靠通道是 uiRegistry data source（ds.data.items 行数组 +
+    # ds.params.{filters,paging,sorting} 活动状态 + ds.data.totalRecords）。
+    # JS 无反斜杠（避开 evaluate 转义链路）；args 走 callFunctionOn JSON 编组。
+
+    # B1：结构化读网格。args 模式下代码被包成非异步 function(...a){ BODY }，
+    # 故 BODY 必须 return 一个 Promise（IIFE），由 awaitPromise 兜住。
+    _GRID_READ_JS = """
+return (async function(){
+    var p = a[0];
+    try {
+        if (typeof require !== 'function') { return JSON.stringify({channel_error: 'no-requirejs'}); }
+        var reg = await new Promise(function(r){ require(['uiRegistry'], r); });
+        var names = await new Promise(function(resolve){
+            var acc = [];
+            try { reg.get(function(c){ if (c && c.name) { acc.push(c.name); } return false; }); }
+            catch (e) {}
+            setTimeout(function(){ resolve(acc); }, 300);
+        });
+        var real = names.filter(function(n){ return n.indexOf('notification_area') !== 0; });
+        var ns = p.namespace || null;
+        if (!ns) {
+            for (var i = 0; i < real.length; i++) {
+                var n = real[i];
+                if (n.slice(-12) === '_data_source' && n.indexOf('.') === n.lastIndexOf('.')) {
+                    ns = n.split('.')[0]; break;
+                }
+            }
+        }
+        if (!ns) { return JSON.stringify({channel_error: 'no-grid', candidates: real.slice(0, 10)}); }
+        var ds = await new Promise(function(resolve){
+            var done = false;
+            reg.get(ns + '.' + ns + '_data_source', function(c){ done = true; resolve(c); });
+            setTimeout(function(){ if (!done) { resolve(null); } }, 1500);
+        });
+        if (!ds || !ds.data) { return JSON.stringify({channel_error: 'no-grid', namespace: ns}); }
+        function realFilters(f) {
+            var out = {};
+            f = f || {};
+            for (var k in f) {
+                if (k !== 'placeholder' && Object.prototype.hasOwnProperty.call(f, k)) { out[k] = f[k]; }
+            }
+            return out;
+        }
+        var activeBefore = {
+            filters: realFilters(ds.params && ds.params.filters),
+            search: (ds.params && ds.params.search) || '',
+            sorting: (ds.params && ds.params.sorting)
+                ? JSON.parse(JSON.stringify(ds.params.sorting)) : null
+        };
+        if (p.fresh) {
+            ds.set('params.filters', {placeholder: false});
+            ds.set('params.search', '');
+        }
+        if (p.filters) { ds.set('params.filters', Object.assign({placeholder: false}, p.filters)); }
+        if (typeof p.search === 'string' && p.search) { ds.set('params.search', p.search); }
+        if (p.sorting) { ds.set('params.sorting', p.sorting); }
+        if (p.paging) { ds.set('params.paging', p.paging); }
+        var reloaded = false;
+        try { if (typeof ds.reload === 'function') { ds.reload(); reloaded = true; } } catch (e) {}
+        try { ds.set('params.t', Date.now()); reloaded = true; } catch (e) {}
+        var stable = !reloaded;
+        if (reloaded) {
+            var last = '', stableCount = 0, t0 = Date.now();
+            while (Date.now() - t0 < (p.waitMs || 8000)) {
+                await new Promise(function(r){ setTimeout(r, 250); });
+                var d0 = ds.data || {};
+                var it0 = (d0.items instanceof Array) ? d0.items : [];
+                var cur = [d0.totalRecords || 0, it0.length,
+                    it0.length ? JSON.stringify(it0[0].entity_id || it0[0].id || '') : ''].join(':');
+                if (cur === last) { stableCount++; if (stableCount >= 2) { stable = true; break; } }
+                else { stableCount = 0; last = cur; }
+            }
+        }
+        var d = ds.data || {};
+        var items = (d.items instanceof Array) ? d.items : [];
+        var rows = items;
+        if (p.fields && p.fields.length) {
+            rows = items.map(function(it){
+                var r2 = {};
+                for (var j = 0; j < p.fields.length; j++) {
+                    var k = p.fields[j];
+                    if (it && Object.prototype.hasOwnProperty.call(it, k)) { r2[k] = it[k]; }
+                }
+                return r2;
+            });
+        }
+        return JSON.stringify({
+            channel: 'uiregistry', namespace: ns, rows: rows,
+            total_records: d.totalRecords,
+            applied: {
+                filters: realFilters(ds.params && ds.params.filters),
+                search: (ds.params && ds.params.search) || '',
+                sorting: (ds.params && ds.params.sorting) || null,
+                paging: (ds.params && ds.params.paging) || null
+            },
+            active_before: activeBefore, partial: !stable
+        });
+    } catch (e) { return JSON.stringify({channel_error: 'js-error: ' + e.message}); }
+})()
+"""
+
+    async def read_ui_grid(self, payload: dict, timeout_ms: int | None = None) -> dict:
+        """B1：UI 组件网格（uiRegistry）结构化读取。
+
+        ``payload`` 键见 ``tools.models.ReadGridParams``（namespace/filters/search/
+        sorting/paging/fields/fresh，另可带 waitMs 覆盖稳定轮询上限）。
+        成功返回 ``{channel, namespace, rows, total_records, applied, active_before,
+        partial}``；通道不可用返回 ``{channel_error}``（no-requirejs / no-grid /
+        js-error / evaluate-failed / unparseable），由调用方决定回落。
+        """
+        try:
+            raw = await self.evaluate(
+                self._GRID_READ_JS, args=[payload], await_promise=True, timeout_ms=timeout_ms,
+            )
+        except Exception as e:
+            return {"channel_error": f"evaluate-failed: {e}"}
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+            return parsed if isinstance(parsed, dict) else {"channel_error": "unexpected-result"}
+        except (TypeError, ValueError):
+            return {"channel_error": f"unparseable: {str(raw)[:120]}"}
+
+    # B2：快照网格元信息（get_state 附带）。只读、不 reload——报告「现在」的
+    # total/sorting/活动过滤；排序与首行值一起回，供上层核对声明与实际一致。
+    _GRID_META_JS = """
+(async function(){
+    try {
+        var wrap = document.querySelectorAll('.admin__data-grid-wrap, table.data-grid');
+        if (wrap.length === 0) { return ''; }
+        if (typeof require !== 'function') { return ''; }
+        var reg = await new Promise(function(r){ require(['uiRegistry'], r); });
+        var names = await new Promise(function(resolve){
+            var acc = [];
+            try { reg.get(function(c){ if (c && c.name) { acc.push(c.name); } return false; }); }
+            catch (e) {}
+            setTimeout(function(){ resolve(acc); }, 300);
+        });
+        var dsName = null;
+        for (var i = 0; i < names.length; i++) {
+            var n = names[i];
+            if (n.indexOf('notification_area') !== 0 && n.slice(-12) === '_data_source'
+                && n.indexOf('.') === n.lastIndexOf('.')) { dsName = n; break; }
+        }
+        if (!dsName) { return ''; }
+        var ds = await new Promise(function(resolve){
+            var done = false;
+            reg.get(dsName, function(c){ done = true; resolve(c); });
+            setTimeout(function(){ if (!done) { resolve(null); } }, 1200);
+        });
+        if (!ds || !ds.data) { return ''; }
+        var d = ds.data, prm = ds.params || {};
+        var filters = {}, f = prm.filters || {};
+        for (var k in f) {
+            if (k !== 'placeholder' && Object.prototype.hasOwnProperty.call(f, k)) { filters[k] = f[k]; }
+        }
+        var sorting = prm.sorting || null;
+        var first = (d.items instanceof Array && d.items.length) ? d.items[0] : null;
+        var firstVal = null;
+        if (first && sorting && sorting.field && Object.prototype.hasOwnProperty.call(first, sorting.field)) {
+            firstVal = String(first[sorting.field]).slice(0, 40);
+        }
+        return JSON.stringify({
+            namespace: dsName.split('.')[0],
+            rows_loaded: (d.items instanceof Array) ? d.items.length : 0,
+            total_records: (typeof d.totalRecords !== 'undefined') ? d.totalRecords : null,
+            page: prm.paging ? prm.paging.current : null,
+            page_size: prm.paging ? prm.paging.pageSize : null,
+            sorting: sorting,
+            first_sorted_value: firstVal,
+            active_filters: filters,
+            active_search: prm.search || ''
+        });
+    } catch (e) { return ''; }
+})()"""
+
+    async def _read_grid_meta(self, url: str) -> dict | None:
+        """B2：读当前页网格元信息；非网格页按 URL 缓存（跳过重复探测）。
+
+        失败一律 None（元信息是增强不是依赖）。网格页每步重读——total/过滤随
+        动作变化正是要暴露的信息。
+        """
+        no_grid_urls = getattr(self, "_grid_no_grid_urls", None)
+        if no_grid_urls is None:
+            no_grid_urls = self._grid_no_grid_urls = set()
+        if url in no_grid_urls:
+            return None
+        try:
+            raw = await self.evaluate(self._GRID_META_JS, timeout_ms=8000)
+        except Exception as e:
+            logger.debug("grid meta read failed: %s", e)
+            return None
+        text = raw if isinstance(raw, str) else ""
+        if not text.strip():
+            no_grid_urls.add(url)
+            return None
+        try:
+            meta = json.loads(text)
+            return meta if isinstance(meta, dict) else None
+        except (TypeError, ValueError):
+            return None
 
     async def _clear_text_field(self) -> bool:
         """Three-layer clear strategy, mirrors browser-use _clear_text_field.
@@ -2753,11 +3115,15 @@ class BrowserSession:
     async def _trigger_framework_events(self) -> None:
         """Dispatch framework-compatible DOM events on the focused element.
 
-        Triggers InputEvent('input') (primary for React/Vue v-model) and a
-        deferred Event('input') for Vue reactivity. We intentionally do NOT
-        dispatch 'change' or 'blur' — those can trigger framework side
-        effects (e.g. a tag-input clearing its value on blur) that wipe
-        the value we just typed.
+        Triggers InputEvent('input') (primary for React/Vue v-model), a
+        'change' Event, and a deferred Event('input') for Vue reactivity.
+
+        P7 form_interaction 建议2（docs/p7/form_interaction/01-failure-analysis.md
+        发现3）：打字路径现在也派发 'change'。Knockout 的 value 绑定默认只监听
+        'change'——漏发会让 KO 表单（Magento admin 商品/价格规则表单）Save 时提交
+        空值/表单被清空（695/700/702/542 四任务实证）；_force_set_value 与
+        _clear_text_field 本就派发 change，打字路径补齐后行为一致。'blur' 仍不派发
+        （会触发下拉收起、tag-input 清值等副作用）。
 
         Best-effort — failures are logged but do not raise.
         """
@@ -2779,6 +3145,12 @@ class BrowserSession:
                                 data: el.value,
                                 inputType: 'insertText'
                             }));
+                        } catch(e) {}
+
+                        // change — P7 form_interaction 建议2：KO value 绑定默认听
+                        // change；不派发则 KO 表单提交时读到空值。
+                        try {
+                            el.dispatchEvent(new Event('change', {bubbles: true}));
                         } catch(e) {}
 
                         // Vue reactivity trigger — check element AND ancestors
@@ -3197,7 +3569,37 @@ class BrowserSession:
                 session_id=sid,
             )
         if result.get("exceptionDetails"):
-            raise RuntimeError(_format_eval_exception(result["exceptionDetails"], validated_code))
+            exc = result["exceptionDetails"]
+            err_text = str(exc.get("text", ""))
+            # P7 form_interaction 建议5：已知 SyntaxError 的确定性自愈（仅无输入路径——
+            # args/elements 模式代码在函数体内，裸 return 合法，语法错误形态不同）。
+            # 候选按序试跑（语法错误无副作用）；全部失败则抛原错误（附截断提示）。
+            if not use_call_fn:
+                for candidate in _syntax_repair_candidates(validated_code, err_text):
+                    retry = await self.client.send.Runtime.evaluate(
+                        {
+                            "expression": candidate,
+                            "returnByValue": not return_element_ids,
+                            "awaitPromise": await_promise,
+                            "userGesture": user_gesture,
+                            "timeout": timeout_ms if timeout_ms is not None else 30000,
+                        },
+                        session_id=sid,
+                    )
+                    if (not retry.get("exceptionDetails")
+                            and not retry.get("result", {}).get("wasThrown")):
+                        logger.info(
+                            "evaluate syntax self-heal applied (%s → retry succeeded)",
+                            err_text.splitlines()[0][:80],
+                        )
+                        result = retry
+                        break
+            if result.get("exceptionDetails"):
+                msg = _format_eval_exception(result["exceptionDetails"], validated_code)
+                if "Unexpected end of input" in err_text:
+                    msg += ("\n⚠️ The code looks truncated — split it into shorter "
+                            "evaluate calls.")
+                raise RuntimeError(msg)
         result_data = result.get("result", {})
         if result_data.get("wasThrown"):
             raise RuntimeError("JavaScript execution failed (wasThrown=true)")

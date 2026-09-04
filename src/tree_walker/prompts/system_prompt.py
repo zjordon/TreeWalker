@@ -150,6 +150,7 @@ def build_state_message(
     planning_nudge: str | None = None,
     download_notice: str | None = None,
     page_stats: dict[str, Any] | None = None,
+    grid_meta: dict[str, Any] | None = None,
     sensitive_description: str | None = None,
     skill_description: str | None = None,
 ) -> str:
@@ -206,6 +207,37 @@ def build_state_message(
         if page_stats.get('skeleton'):
             stats += " SKELETON/LOADING (page may not be fully rendered)"
         parts.append(stats)
+
+    # P7 tool_layer B2：UI 网格元信息——排序状态 + 总数 + 活动过滤残留。
+    # 防 128 型「脑补已按日期排序」（8/26 轨迹 S1 自述 sorted by Purchase Date
+    # desc，实为任意序）与残留书签过滤误读（跨会话存活）。
+    if grid_meta:
+        ns = grid_meta.get('namespace') or 'grid'
+        total = grid_meta.get('total_records')
+        loaded = grid_meta.get('rows_loaded')
+        page = grid_meta.get('page')
+        page_size = grid_meta.get('page_size')
+        parts.append(f"[Grid] {ns} | rows {loaded} of {total}"
+                     + (f" (page {page}, {page_size}/page)" if page else ""))
+        s = grid_meta.get('sorting')
+        if isinstance(s, dict) and s.get('field'):
+            line = f"  sorted: {s.get('field')} {s.get('direction', 'asc')}"
+            fv = grid_meta.get('first_sorted_value')
+            if fv is not None:
+                line += f" (first row: {fv})"
+            parts.append(line)
+        else:
+            parts.append("  sorted: (none — do NOT assume any row order; pass sorting to read_grid)")
+        leftover = []
+        if grid_meta.get('active_filters'):
+            leftover.append(f"filters={grid_meta['active_filters']}")
+        if grid_meta.get('active_search'):
+            leftover.append(f"search={grid_meta['active_search']!r}")
+        if leftover:
+            parts.append("  ⚠️ active " + " ".join(leftover)
+                         + " — leftover from a previous session (server-side bookmark), "
+                           "not from your actions; totals above are already filtered")
+        parts.append("")
 
     # Tabs
     if len(browser_state.tabs) > 1:

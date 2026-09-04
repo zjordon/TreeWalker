@@ -17,7 +17,7 @@ from tree_walker.agent.rerun import RerunMixin
 from tree_walker.agent.step import StepPipeline
 from tree_walker.agent.views import AgentHistoryList, ActionResult, AgentState
 from tree_walker.browser.session import BrowserSession
-from tree_walker.browser.url_utils import extract_host
+from tree_walker.browser.url_utils import extract_host_with_port
 from tree_walker.config import AgentSettings, LLMSettings
 from tree_walker.llm.client import LLMClient
 from tree_walker.prompts.system_prompt import build_system_prompt
@@ -117,6 +117,7 @@ class Agent(StepPipeline, RerunMixin):
         self.messages: list[dict[str, Any]] = []
         self._enable_message_typing = _settings.enable_message_typing
         self._enable_page_stats = _settings.enable_page_stats
+        self._enable_grid_meta = _settings.enable_grid_meta  # P7 tool_layer B2
         self._enable_sensitive_description = _settings.enable_sensitive_description
         self._enable_skill_injection = _settings.enable_skill_injection
         # P1：skill 注入（默认关）。loader 无条件构建（构造零 IO），门控在调用点（step.py _prepare_context）。
@@ -444,7 +445,9 @@ class Agent(StepPipeline, RerunMixin):
         ``enable_skill_injection`` 控制（默认关）。开关门控在调用点（step.py
         ``_prepare_context``），本方法入口不加内守卫，严格镜像亲兄弟。
         """
-        host = extract_host(page_url)
+        # P7 form_interaction 建议4：端口限定 key（localhost_7780）——本机不同端口
+        # 的服务各挂各的 skill，互不误注入；无端口的 host 行为不变。
+        host = extract_host_with_port(page_url)
         if not host:
             return None
         text = self._skill_loader.load_for_host(host)
