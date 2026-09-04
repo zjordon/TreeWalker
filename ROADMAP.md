@@ -6,6 +6,11 @@
 >
 > **更新（2026-08-01）**：skill 注入（v0.12.0，#141/#142）+ DOM 快照抽取到 dom-snapshot（PR #144）均已落地；
 > 下一阶段核心转为 P2「agent 自动探索可靠性提升」。
+>
+> **更新（2026-09-05）**：原 P7（评测）与 P9（改进三路线）内容大量重合，已合并为
+> P7「WebArena 基准评测与改进闭环」（P9 编号撤销）。TreeForge 站点级 skill 全量验证
+> **SR 65.2%（120/184）**，较反节流基线 52.2% **+13pp**；工具层首批（read_grid 网格通道等）
+> 已交付。下一优先：**任务级 skill 优化** 与 **完整环境 + 全量 812 评测**。
 
 ---
 
@@ -73,7 +78,10 @@ agent 探索时按 host 读 `domain-skills/<host>/` 注入上下文（默认关�
 
 ## 下一阶段计划
 
-> P1、P4、P5、P6 已完成；下一阶段主要方向 = **P7（WebArena 基准评测与短板反哺）**，远期布局 **P8（扩展化：浏览器扩展伴随形态，调研已完成）**；P2（进行中）、P3（备选）为既有项；P6 后续远期项（编排/定时/多 agent 等）见 `docs/p6/05` §3。
+> P1、P4、P5、P6 已完成；下一阶段主要方向 = **P7（WebArena 基准评测与改进闭环，2026-09-05 吸收原 P9）**，
+> 当前两条并行主线：**① 改进路线三——任务级 skill 优化**（失败已按模板收敛，投入产出最高的下一步）、
+> **② 完整 WebArena 环境 + 全量 812 任务评测**（首个 812 口径分数）。
+> 远期布局 **P8（扩展化）**；P2（进行中）、P3（备选）为既有项；P6 后续远期项见 `docs/p6/05` §3。
 
 ### P2 —— agent 自动探索可靠性提升（🟡 进行中：P0 已交付，P1-P3 暂缓）
 
@@ -156,25 +164,32 @@ agent 探索时按 host 读 `domain-skills/<host>/` 注入上下文（默认关�
   - `tw-web` CLI + web live 控制台；技能/设置走注册表模式（enabled 开关即出现，不改 shell）
   - 复杂交付（批量、实时进度、配置）统一走 web；TUI 并存保留
 
-### P7 —— WebArena 基准评测与短板改进（🟡 进行中：反节流新基线 52.2% · 首批短板反哺已交付 · 蓝图三路线已定）
+### P7 —— WebArena 基准评测与改进闭环（🟡 进行中：主口径 52.2% · 站点 skill 变体 65.2% · 当前优先 = 任务级 skill + 全量 812）
 
-**目标**：用 WebArena 标准 812 任务基准量化 TreeWalker 端到端浏览器操作能力，定位短板反哺改进。
+**目标**：用 WebArena 标准 812 任务基准量化 TreeWalker 端到端浏览器操作能力，走「评测 → 失败归因 → 三路线改进反哺 → 重评测」闭环。
+（2026-09-05 吸收原 P9「工具层 + 站点/任务级 skill」三路线，P9 编号撤销。）
 
 > 评测工作空间是**独立项目** `D:\dev\git\z_jordon\evals\webarena`（不在本仓库，editable install 依赖 `tree_walker`）。
 > 架构决策（**方案 A**）：TreeWalker 用原生 CDP 跑任务，WebArena 原版 evaluator **零改动复用**，
 > 用 `CDPPageAdapter` 鸭子类型把 CDP 适配成 Playwright Page（`url`/`goto`/`content`/`evaluate` 四接口）+ worker 线程同步/异步桥接。
 > 评测原理见工作空间 `docs/benchmark-principles.md`，首次跑通复盘见 `docs/setup-retrospective-2026-08-07.md`。
 >
-> **当前进度（2026-08-14）**：shopping_admin 站点 **184 任务全量跑完，总 SR = 34.8%**（GLM-5.2，
-> 判分链路零异常、数字可信）；120 个失败任务逐个归因完成（9 类失败模式 + 5 个能力短板 + 改进建议）。
-> 报告：`docs/shopping_admin-results-2026-08-14.md` / `docs/failure-analysis-2026-08-14.md`。
->
-> **进度更新（2026-08-23）**：反节流 flags + 数据重置后**全量重跑，SR = 52.2%（96/184）**
-> （工作空间 `results/shopping_admin_antithrottle.json`）——证实 8 月上旬无人值守基线（34.8%）中
-> 一批「表单交互失败」是 Chrome 后台节流伪影（P12 结案，本仓库 `docs/p7/02` §4d：**所有自动化
-> Chrome 必须带反节流三 flags**）。88 个失败任务轨迹已收集；env_issue 类 21 个深析完成（本仓库
-> `docs/p7/env_issue/01`：真环境故障仅 4-5 个、12 个属归类水分）；据此确定三路线优化蓝图（→ P9）。
-> 首批短板反哺（工程层三批次 + 批量提取提示）已随 #167 / PR #168 交付（2026-08-23 合并）。
+> **评测时间线**：
+> - **2026-08-14**：shopping_admin 184 全量，无人值守基线 **SR 34.8%**（GLM-5.2，判分链路零异常）；
+>   120 失败逐个归因（9 类失败模式 + 5 短板）。报告：工作空间 `docs/shopping_admin-results-2026-08-14.md` / `docs/failure-analysis-2026-08-14.md`
+> - **2026-08-23**：反节流 flags + 数据重置重跑，**主口径 SR 52.2%（96/184）**（`results/shopping_admin_antithrottle.json`）
+>   ——证实 34.8% 里一批「表单失败」是 Chrome 后台节流伪影（P12 结案，`docs/p7/02` §4d：**自动化 Chrome 必须带反节流三 flags**）。
+>   88 失败轨迹收集；env_issue 21 任务深析（`docs/p7/env_issue/01`）；据此定三路线改进蓝图
+>   （工作空间 `docs/treewalker-optimization-blueprint.md`，数据支撑 `docs/skill-mechanism-cheating-analysis.md` / `docs/handoff-log-collection.md`：
+>   88 失败约四成 35 个卡工具层的墙、一到两成「路盲」、四分之一不稳定失败 27%）。
+>   首批工程反哺随 #167 / PR #168 交付
+> - **2026-08-28**：工具层（路线一）网格数据通道交付（read_grid / [Grid] 元信息 / kick，`docs/p7/tool_layer/01`）
+> - **2026-09-05**：路线二全量验证——TreeForge 蒸馏**站点级 skill** 加持 shopping_admin 184：
+>   **SR 65.2%（120/184）**（`results/shopping_admin_treeforge_skill.json`，网络受害已重跑修正），较主口径 +13pp，
+>   落在「预期 10-20pp」区间。按 intent_template_id 成败分布（57 模板）见 `docs/treeforge-round-by-template-20260905.md`
+>   ——剩余失败高度模板化：tpl 253（订单状态查询 0/5）/ 256（新建简单产品 0/5）/ 258（营销价格规则 0/5）/
+>   287（批量下架 1/5）/ 251（描述更新引好评 0/3+1/2）/ 268（报表生成 2/5）/ 284（物流单号 2/5）；
+>   另有 **778/782 TreeWalker 崩溃 bug**（`'str' object has no attribute 'get'`）待修——路线三的直接输入
 
 - [x] **smoke 链路打通**（10 任务子集，验证「链路通」而非跑分）
   - `CDPPageAdapter` + 同步/异步桥接（worker 线程跑 evaluator，`run_coroutine_threadsafe` + `wrap_future` 防死锁）
@@ -188,15 +203,31 @@ agent 探索时按 host 读 `domain-skills/<host>/` 注入上下文（默认关�
 - [x] **失败任务归因分析**（120 个，LLM 分类 + 关键词回落，`analyze_failures.py`）
   - 查询类死于**数据获取与解读**（66%）、操作类死于**表单交互**（26%+20%），两类都受步数预算挤压（各 20%）
   - 五个具体短板：①分页数据不完整就下结论 ②多轮聚合超步数预算 ③Magento 表单对 CDP 输入不友好且无提交兜底 ④异步渲染网格没等/没滚误判无数据 ⑤REST API 探测 401 浪费步数
-- [ ] **短板反哺改进**（本阶段的真正产出；按投入产出排序，来自失败归因）
-  - ✅ **首批已交付**（#167 / PR #168，2026-08-23 合并）：max_tokens 16384（猝死主因）+ 工程层三批次（R1 空响应重试 / R2 观测 / R3a 结果可见性 500→4000 · R4 重试上限 / R5 evaluate 转义 / P8 裸参数拦截 / R7-1 click 无效果检测 / R7-2 验证状态回读 · B3-1 页面 settle / B3-2 表单值指纹 / B3-3 judge 重试）+ **批量提取优先提示**（R6a）；验收记录 `docs/p7/02` §4a-§4d（task 1 史上首次成功；反节流下 task 107 六步全对）
-  - 步数预算感知升级（剩余步数紧张且任务未过半 → 明确切换批量策略而非只教体面收敛；避免 REST 探测烧步数）——首批未含，待做
-  - 数据完整性自检规则（汇报前核对 grid total vs 提取行数，prompt 层改动，预计影响 ~15% 失败）
-  - `submit_form` 原子动作（**降为备选**——输入层被 zcode 实验证实无问题、轻量反馈已就位，`docs/p7/02` R7 v4）
-  - 异步渲染等待策略（页面级 settle 已交付；行级「等行渲染」与网格数据通道并入 P9 路线一）
-- [ ] **扩展到全量 812 任务**
-  - 补齐 shopping / gitlab / reddit（+可选 map / wikipedia）Docker 镜像与 cookie，断点续跑
-  - 预计 ~1 周 + $300–500 LLM 费用；按站点 / eval_type 分组出 SR（`analyze_results.py` 已就绪）
+- [ ] **改进路线一（持续）：工具层能力——拆 form_interaction 与 data_truncated 的墙**
+  - 规模：88 失败中约四成（35 个）卡工具层的墙（form_interaction 18 + data_truncated 17，平均 28.7 步最烧预算）；轨迹证据——Knockout/MUI 网格渲染不出行（308 条订单只见空 `<tr>`）、筛选不生效、日期值被部件清空、提交无反馈、dialog 挂死（task 493 两次目击）
+  - ✅ **首批工程反哺**（#167 / PR #168，2026-08-23）：max_tokens 16384（猝死主因）+ 工程层三批次（R1 空响应重试 / R2 观测 / R3a 结果可见性 500→4000 · R4 重试上限 / R5 evaluate 转义 / P8 裸参数拦截 / R7-1 click 无效果检测 / R7-2 验证状态回读 · B3-1 页面 settle / B3-2 表单值指纹 / B3-3 judge 重试）+ **批量提取优先提示**（R6a）；验收记录 `docs/p7/02` §4a-§4d（task 1 史上首次成功；反节流下 task 107 六步全对）
+  - ✅ **网格数据通道**（2026-08-28，`docs/p7/tool_layer/01`）：`read_grid` 动作（uiRegistry → legacy AJAX → DOM 三级通道，排序/过滤/翻页/结构化行——「异步渲染网格」与「数据完整性自检」两短板的根治）；`[Grid]` 快照元信息（排序状态 + 总数 + 残留过滤警告，128 型「脑补已排序」解药）；保存成功信号 + 校验误报收窄；KO 行渲染冻结 kick（settle 后自动，`session._kick_frozen_data_grid`）。探针实证 mui 端点本环境不可用，通道序与蓝图原设想相反
+  - ⏳ 剩余：`Page.handleJavaScriptDialog` 自动 dismiss + 事件回灌 agent（493 挂死型）；步数预算感知升级（剩余步数紧张 → 切批量策略；REST 探测止损）；done 前数据对账 prompt 规则（[Grid] 已供数，规则待加）；`submit_form` 原子动作（**降为备选**——输入层被 zcode 实验证实无问题、轻量反馈已就位，`docs/p7/02` R7 v4）
+  - 口径：不改 setting，收益直接体现主口径 SR
+- [x] **改进路线二：站点级 skill——消导航不确定性（全量验证已交付，2026-09-05）**
+  - TreeForge 蒸馏站点级 skill（布局/菜单/功能地图/典型操作序列）注入上下文，shopping_admin 184 全量：**65.2%（120/184）**，+13pp，达「预期单独收益 10-20pp」区间
+  - 直接证据：data_truncated / form_interaction 大类模板大量转绿（tpl 270 月度订单统计 4/5、366 订单属性 6/7、247 单品改价 6/6）；剩余失败模板化收敛（见上时间线），是路线三的直接输入
+  - 边界：skill 只解决「路盲」，解决不了路线一的墙（地图告诉你表格在哪，表格照样渲染不出行）
+  - 口径：**"with site knowledge" 变体分列报告**——65.2% 属此列，不与无 skill 主口径、外部 leaderboard 直接对比
+- [ ] **改进路线三（🟢 当前优先，仅产品口径）：任务级 skill 优化**
+  - **下一步主攻**：按模板聚类蒸馏任务级 skill SOP——路线二已把失败收敛到少数模板（253/256/258/287/251/268/284 等 ~17 个失败集中模板），每个模板对应一条可复用人类轨迹（任务级 SOP），检索命中即走流程、未命中回落自主探索——产品能力（企业重复流程 RPA 化），命中高可靠、未命中测真实下限
+  - 优化重点（按失败量）：订单状态查询（UI 过滤留痕）、新建产品（多步表单）、营销价格规则（cart_fixed 值域等已知坑）、批量库存操作、描述更新、报表生成（终态字段格式）、物流单号
+  - 前置小项：修 **778/782 崩溃 bug**（`'str' object has no attribute 'get'`，TreeWalker 侧，非 skill 问题）
+  - **评测红线（不变）**：任务级 skill 对自主探索口径等价于泄露参考轨迹，其 SR **禁止与任何评测口径对比**——812 全量评测用无任务级 skill 的口径跑
+  - 前置：复用站点级 skill 的蒸馏/注入基建；检索精度决定价值（误命中比未命中更糟）
+- [ ] **完整 WebArena 环境 + 全量 812 任务评测（🟢 当前优先，与路线三并行）**
+  - **目标**：搭建完整 WebArena 环境（5 站点），全量 812 任务评测出分——812 口径的首个 TreeWalker 分数，也是外部可比性的基础
+  - 环境清单：shopping（7770，Magento 前台）/ shopping_admin（7780，已就绪）/ gitlab（8023，启动慢 + pg_resetwal 坑）/ reddit（9999）/ wikipedia（8888，kiwix + zim 文件）；map（3000）按需——**tpl 42 路线类任务（759/760）依赖 map 站**，无 map 则该类记为 N/A 或补建 OpenTripMap
+  - 流程：`auto_login.py --site_list` 补全 5 站 cookie → 站点级 skill 缺失的站点（gitlab/reddit 等）先跑无 skill 基线 → `run_full.ps1` 断点续跑（已支持）→ `analyze_results.py` 按站点/eval_type 分组出 SR
+  - **前置修复**：778/782 崩溃 bug；多站点下 30 步/600s 预算是否按站点分组校准（gitlab 类任务天然步数长）
+  - 口径：主口径 = 无 skill + 反节流 flags + 数据重置；with-site-skill 变体（shopping_admin 65.2%）分列
+  - 预计 ~1-2 周 + $500-800 LLM 费用
+- **验收口径（改进三路线通用）**：主口径 = 无 skill + 反节流 flags + 数据重置的全量 184（`run_full.ps1`，当前基线 **52.2%**）；with-site-skill 变体口径 **65.2%**（2026-09-05）分列；修复验证用 `run_category.ps1 -Category <类> -Force` 重收对照；稳定性指标 = 同任务 ≥3 跑的通过率方差
 - [ ] **模型交叉实验**（分离「架构差」与「模型差」）
   - 至少三组：TreeWalker+GLM / TreeWalker+Claude / browser-use+Claude
   - 只有同模型对比（TreeWalker vs browser-use，都接 Claude）才能把差距归因到 agent 架构本身
@@ -242,30 +273,6 @@ Chrome 扩展（自包含，Web Store 一键安装）
 - [ ] **Side Panel UI + 安全模型**：对话界面 + 任务展示 + 高危操作确认（参考 Anthropic 安全模型：站点级权限 / 分类屏蔽 / 敏感操作前确认——prompt injection 是浏览器 agent 核心威胁）
 - [ ] **Web Store 打包分发**（自包含零外部依赖；模型 key 走扩展内配置或用户自带）
 
-### P9 —— 工具层能力 + 站点/任务级 skill（💡 规划中：三路线蓝图已定，2026-08-23）
-
-**目标**：按反节流新基线（52.2%）88 个失败轨迹定出的优化蓝图推进，拆掉 SR 的两大主矛盾——工具层的墙（约四成失败）与导航不确定性（路盲）。
-
-> 蓝图全文（粗粒度方向 + 优先级）：评测工作空间 `D:\dev\git\z_jordon\evals\webarena\docs\treewalker-optimization-blueprint.md`；
-> 数据支撑：同空间 `docs/skill-mechanism-cheating-analysis.md` / `docs/handoff-log-collection.md`。
-> 现状一句话：88 失败中约四成（35 个）卡工具层的墙（form_interaction 18 + data_truncated 17，平均 28.7 步最烧预算），
-> 约一到两成「路盲」（找不到入口反复摸索），约四分之一是不稳定失败（重跑可翻转，27%）。
-
-- [ ] **路线一（最高优先）：工具层能力——拆 form_interaction 与 data_truncated 的墙**
-  - 规模：35/88 = 40%，SR 最大单一杠杆；轨迹证据——Knockout/MUI 网格渲染不出行（308 条订单只见空 `<tr>`）、筛选不生效、日期值被部件清空、提交无反馈、dialog 挂死（task 493 两次目击）
-  - 方向：DOM 级「等行渲染」等待；网格自有数据通道（XHR/API 直读，如 mui 端点需正确 form_key 姿势）；表单值快照复查（R7-1 已起步）；`Page.handleJavaScriptDialog` 自动 dismiss + 事件回灌 agent
-  - 口径：不改 setting，收益直接体现主口径 SR
-- [ ] **路线二（并行推进）：站点级 skill——消导航不确定性**
-  - 直接救 navigation / steps_exhausted 里的摸索部分（~10-15 任务）；更大价值在**确定性**——27% 翻转率约一半来自导航路径随机性，skill 收敛「同任务每次路径不同」并省步数
-  - 形态：人类手工操作代表性任务 → 蒸馏站点级 skill（布局/菜单/功能地图/典型操作序列）注入上下文（browser-bc 式）
-  - 边界：skill 只解决「路盲」，解决不了路线一的墙（地图告诉你表格在哪，表格照样渲染不出行）；预期单独收益 10-20pp，天花板明确
-  - 口径：标注 "with site knowledge" 变体**分列报告**，不与无 skill 主口径、外部 leaderboard 直接对比
-- [ ] **路线三（最后，仅产品口径）：任务级 skill SOP 库**
-  - 每个常见任务录一遍人类轨迹蒸馏一个 skill，探索时检索命中即走流程、未命中回落自主探索——产品能力（企业重复流程 RPA 化），命中高可靠、未命中测真实下限
-  - **评测红线**：任务级 skill 对自主探索口径等价于泄露参考轨迹，其 SR **禁止与任何评测口径对比**
-  - 前置：复用站点级 skill 的蒸馏/注入基建；检索精度决定价值（误命中比未命中更糟）
-- **验收口径（三路线通用）**：主口径 = 无 skill + 反节流 flags + 数据重置的全量 184（`run_full.ps1`，当前基线 **52.2%**）；变体口径分列；修复验证用 `run_category.ps1 -Category <类> -Force` 重收对照；稳定性指标 = 同任务 ≥3 跑的通过率方差
-
 ---
 
 ## 明确不做（战略转折后放弃）
@@ -290,9 +297,8 @@ Chrome 扩展（自包含，Web Store 一键安装）
 | P4 | 录制-重放体验打磨 | ✅ | #149/#150 可视化编辑 + #153 多 action 变量 + #155 CSV 批量 Web UI（步级实时+中止） |
 | P5 | 变量识别扩展到选择类动作 | ✅ | 原生 select #157/#159 + 自定义下拉 #160/PR#161（B站/抖音真机验证）|
 | P6 | TUI → 浏览器端 | ✅ | PR #166 全量交付（#162 关闭）：tw-web live 控制台 + 流程库 + 技能面 + 直播视口 + 设置面 + T2 批次；TUI 并存保留；e2e A–R 全绿 |
-| P7 | WebArena 基准评测与短板改进 | 🟡 | 两轮全量基线：无人值守 **SR=34.8%** → 反节流重跑 **SR=52.2%**（96/184，证实一批表单失败为节流伪影）+ 120 失败归因（5 短板）+ env_issue 21 任务深析；**首批短板反哺已交付**（#167/PR#168）；剩余：预算感知升级 / REST 止损 / 全量 812 / 模型交叉 |
+| P7 | WebArena 基准评测与改进闭环（含原 P9 三路线，2026-09-05 合并） | 🟡 | 评测口径演进：无人值守 **34.8%** → 反节流主口径 **52.2%** → TreeForge 站点级 skill 变体 **65.2%**（+13pp，2026-09-05）+ 120 失败归因 + env_issue 深析；改进三路线：路线一工具层首批已交付（#167/#168 + read_grid/[Grid]/kick），路线二站点级 skill 全量验证 ✅；**当前优先 = 路线三任务级 skill 优化 + 完整环境全量 812 评测**（前置：778/782 崩溃修复）；远期：模型交叉 / WebArena-Hard / 判分清理 |
 | P8 | 扩展化：浏览器扩展伴随形态 | 💡 | 调研完成（2026-08-12）；架构倾向**纯扩展**（agent 全做进扩展，C 端零额外安装——不要求装 Python，调研原推荐的 Python 桥模式降为备选），选型未最终定；最小验证 / TS 移植 / UI / 上架待做 |
-| P9 | 工具层能力 + 站点/任务级 skill | 💡 | 蓝图已定（2026-08-23，基于 52.2% 基线的 88 失败轨迹）：路线一工具层墙（40% 失败，最高优先）→ 路线二站点级 skill（并行，消导航不确定性）→ 路线三任务级 SOP（仅产品口径，评测红线） |
 
 ---
 
