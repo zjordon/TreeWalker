@@ -5,6 +5,48 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.17.0] - 2026-09-05
+
+### Added
+
+**WebArena P7 短板反哺：工程层三批次 + 工具层墙拆除（ROADMAP P7 / #167 / #169，PR #168 + #170）**
+
+- **`read_grid` 动作**（#169）：UI 网格结构化读取三级通道（uiRegistry data source →
+  legacy ExtJS AJAX → DOM 表格兜底）；排序/过滤/翻页/`fresh` 清残留（服务端书签跨会话
+  污染可见化）/字段裁剪；返回结构化行 + 元信息（total/applied/active_before/partial），
+  大结果自动落盘。探针实证 mui 端点本环境不可用，quirks.md 通道已修正
+- **`[Grid]` 快照元信息**（#169）：get_state 附带网格排序状态/总数/活动过滤残留 →
+  state 消息渲染 `[Grid]` 行（无排序时明示「do NOT assume any row order」），
+  `AGENT_ENABLE_GRID_META` 开关
+- **步数预算工程层三批次**（#167）：max_tokens 4096→16384（thinking 挤占动作输出→
+  零重试猝死主因）；R1 空响应先 nudge 重试；R3a 动作结果渲染上限 500→4000；
+  R7-1 click 无效果页面指纹检测；R7-2 input_text 回读页面验证标记；B3-1 requirejs
+  页面级 settle；B3-2 表单字段值指纹；B3-3 judge 空响应重试；大列表/网格页批量提取
+  优先提示（R6a）
+- **KO 网格行渲染冻结 kick**（#169）：settle 后自动检测空行网格并强制合成一帧解锁
+- **保存成功信号**（#169）：click 后读取 `.message-success/.message-error` 浮层并
+  ✅/⚠️ 分类回显
+- **`extract_host_with_port` + skill loader CWD 回退**（#169）：localhost:7780 的
+  skill 注入匹配；评测工作空间 CWD 下 domain-skills 回退命中仓库根
+- **Magento 站点手册**（#169）：`domain-skills/localhost_7780/` TreeForge 蒸馏三件套
+  （_sop 站点卡片 + quirks + selectors）——站点级 skill 轮 shopping_admin 184 =
+  65.2%（较无 skill 基线 52.2% +13pp）
+- `examples/p7_*`：网格通道探针 ×2 + read_grid 真机自测
+
+### Fixed
+
+- evaluate 正则字面量内裸控制字符（#167）；click/input_text 裸参数（index/element_id
+  二选一）步内校验拦截（#167）
+- input_text 页面校验误报收窄（#169）：报错文案仅当 `for=` 归属本字段或字段自身带
+  invalid 标记才计入（价格字段被无关 required 文案反复误报型）
+
+### Docs
+
+- `docs/p7/`：form_interaction 01/02 + data_truncated 01 失败分析报告、tool_layer 01
+  方案可行性与实施记录、02 优化方案与三批次验收、env_issue 21 任务归因
+- ROADMAP：评测时间线（34.8% → 反节流 52.2% → 站点 skill 变体 65.2%）；原 P7/P9
+  合并为「基准评测与改进闭环」；P8 架构倾向纯扩展（C 端零额外安装）
+
 ## [0.16.0] - 2026-08-15
 
 ### Added
