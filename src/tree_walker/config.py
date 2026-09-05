@@ -123,6 +123,12 @@ class AgentSettings:
     # 相对路径=相对 CWD(项目根)；可用绝对路径覆盖。默认 "domain-skills"。
     # 与 TreeForge adapters/treewalker_adapter.py 输出对齐。开关关时此字段不被读取。
     skills_dir: str = "domain-skills"
+    # P7 路线三（docs/p7/03）：任务级 skill——run() 初始导航后按当前 host_key 扫
+    # <skills_dir>/<host_key>/tasks/ 组 catalog，LLM 保守匹配命中才注入 [Task Skill]。
+    # 默认关（评测红线：对自主探索口径等价泄露参考轨迹）；独立于站点级开关。
+    enable_task_skill_injection: bool = False
+    # 任务级匹配器专用 LLM（None=复用主 llm；镜像 extract_llm 模式，docs/p7/03 §4.2）
+    task_skill_llm: LLMSettings | None = None
     # 用户操作录制：upload_file 的约定目录。空→运行时解析为 <rerun_history_dir>/uploads。
     # 扩展只能拿到文件名（浏览器安全限制），录制产物存文件名，重放前用户须把文件放进此目录。
     record_upload_dir: str = ""
@@ -417,6 +423,8 @@ def load_settings() -> Settings:
         upload_verify_interval_s=float(os.environ.get("AGENT_UPLOAD_VERIFY_INTERVAL_S", "0.25")),
         rerun_history_dir=os.environ.get("AGENT_RERUN_HISTORY_DIR", "rerun-history"),
         skills_dir=os.environ.get("AGENT_SKILLS_DIR", "domain-skills"),
+        # P7 路线三：任务级 skill 注入（默认关；AGENT_ENABLE_TASK_SKILL_INJECTION=true 开）
+        enable_task_skill_injection=os.environ.get("AGENT_ENABLE_TASK_SKILL_INJECTION", "false").lower() == "true",
         record_upload_dir=os.environ.get("AGENT_RECORD_UPLOAD_DIR", ""),
         save_conversation_path=os.environ.get("AGENT_SAVE_CONVERSATION_PATH", ""),
         # 重放时序（阶段 1）
@@ -471,6 +479,19 @@ def load_settings() -> Settings:
                 "https://open.bigmodel.cn/api/anthropic",
             ),
             max_tokens=int(os.environ.get("AGENT_EXTRACT_MAX_TOKENS", "4096")),
+        )
+
+    # 任务级 skill 匹配器专用 LLM（镜像 AGENT_EXTRACT_* 模式；None=复用主 llm）
+    task_skill_model = os.environ.get("AGENT_TASK_SKILL_MODEL", "")
+    if task_skill_model:
+        agent.task_skill_llm = LLMSettings(
+            model=task_skill_model,
+            api_key=os.environ.get("AGENT_TASK_SKILL_API_KEY") or api_key,
+            base_url=os.environ.get(
+                "AGENT_TASK_SKILL_BASE_URL",
+                "https://open.bigmodel.cn/api/anthropic",
+            ),
+            max_tokens=int(os.environ.get("AGENT_TASK_SKILL_MAX_TOKENS", "2048")),
         )
 
     # Fallback LLM configuration

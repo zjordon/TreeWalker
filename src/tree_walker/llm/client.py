@@ -493,6 +493,53 @@ class LLMClient:
         text_parts = [b.text for b in response.content if hasattr(b, "text")]
         return "\n".join(text_parts)
 
+    async def structured_call(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        output_schema: dict[str, Any],
+        *,
+        max_tokens: int = 512,
+        call_timeout: float | None = None,
+    ) -> dict[str, Any] | None:
+        """One-shot tool-forced structured output (docs/p7/03 §4.3).
+
+        任务级 skill 匹配等「一次轻量分类调用」的通用底座：Anthropic tool +
+        ``tool_choice`` 强制 schema（复用 extract 的 output_schema 机制），模型未用
+        工具时 text 兜底 ``_try_parse_json``。返回解析后的 dict；不可解析返回
+        None；API 失败先走 fallback 切换（``_try_switch_to_fallback``），仍失败
+        向上抛——调用方自行降级（matcher 的一次重试在那一层）。
+        """
+        tool = {
+            "name": "structured_result",
+            "description": "Structured result conforming to the given JSON Schema.",
+            "input_schema": output_schema,
+        }
+        try:
+            response = await self._extract_call(
+                call_timeout=call_timeout,
+                model=self.model,
+                max_tokens=max_tokens,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+                tools=[tool],
+                tool_choice={"type": "tool", "name": "structured_result"},
+            )
+        except (RateLimitError, APIError) as e:
+            if self._try_switch_to_fallback(e):
+                return await self.structured_call(
+                    system_prompt, user_prompt, output_schema,
+                    max_tokens=max_tokens, call_timeout=call_timeout,
+                )
+            raise
+        for block in response.content:
+            if getattr(block, "type", None) == "tool_use" and getattr(block, "name", None) == "structured_result":
+                if isinstance(block.input, dict):
+                    return block.input
+        logger.warning("LLM did not use structured_result tool; falling back to text parse")
+        text_parts = [b.text for b in response.content if hasattr(b, "text")]
+        return _try_parse_json("\n".join(text_parts))
+
 
 def _try_parse_json(text: str) -> dict[str, Any] | None:
     """Try to extract a JSON object from text that might contain markdown fences."""

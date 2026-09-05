@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import signal
 import sys
 import threading
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from tree_walker.agent.loop_detector import ActionLoopDetector
@@ -21,7 +23,8 @@ from tree_walker.browser.url_utils import extract_host_with_port
 from tree_walker.config import AgentSettings, LLMSettings
 from tree_walker.llm.client import LLMClient
 from tree_walker.prompts.system_prompt import build_system_prompt
-from tree_walker.skills import SkillLoader
+from tree_walker.skills import SkillLoader, TaskSkillLoader
+from tree_walker.skills.task_matcher import build_task_skill_text, match_task_skill
 from tree_walker.tools.actions import Tools
 
 from tree_walker.agent.judge import JudgeEvaluator
@@ -123,6 +126,16 @@ class Agent(StepPipeline, RerunMixin):
         # P1：skill 注入（默认关）。loader 无条件构建（构造零 IO），门控在调用点（step.py _prepare_context）。
         self.skills_dir = _settings.skills_dir
         self._skill_loader = SkillLoader(self.skills_dir)
+        # 任务级 skill（P7 路线三，docs/p7/03）：检索命中才注入，独立开关（默认关，
+        # 评测红线）。匹配器 LLM 镜像 extract 模式：专用配置缺省复用主 llm；
+        # _task_skill_text 由 run() 匹配一次后填充，step 每步带进 state message。
+        self._enable_task_skill_injection = _settings.enable_task_skill_injection
+        self._task_skill_loader = TaskSkillLoader(self._skill_loader)
+        self._task_skill_text: str | None = None
+        if _settings.task_skill_llm is not None:
+            self._task_skill_llm = LLMClient(_settings.task_skill_llm)
+        else:
+            self._task_skill_llm = self.llm
         self._max_history_items = _settings.max_history_items
         self._enable_recent_events = _settings.enable_recent_events
 
@@ -255,6 +268,15 @@ class Agent(StepPipeline, RerunMixin):
                 await self.browser.navigate(initial_url)
             except Exception as e:
                 logger.warning("Failed to navigate to initial URL: %s", e)
+
+        # 任务级 skill 匹配（docs/p7/03 §三）：初始导航之后做一次——导航前当前页是
+        # about:blank 或上一任务残页，host 不可信。全异常捕获：失败等价不注入，
+        # 不阻断 agent 启动。
+        if self._enable_task_skill_injection:
+            try:
+                await self._match_task_skill()
+            except Exception as e:
+                logger.warning("task-skill: match failed (%s) — no injection", e)
 
         self._setup_signal_handler()
         try:
@@ -452,6 +474,49 @@ class Agent(StepPipeline, RerunMixin):
             return None
         text = self._skill_loader.load_for_host(host)
         return text or None
+
+    async def _match_task_skill(self) -> None:
+        """任务级 skill 匹配 + 命中卡装载（docs/p7/03 §三/§四；每任务一次）。
+
+        host 取当前页 URL（与站点级 ``_build_skill_description`` 同一 keying）；
+        catalog 空 / 未命中 / low 降档 / 调用失败都不注入（安全降级 = 现状）。
+        命中后组装注入文本（头声明 + 三件套全文）存 ``_task_skill_text``，由
+        step 每步带进 state message 的 ``[Task Skill]`` 块。
+        """
+        url = await self.browser.get_current_url()
+        host_key = extract_host_with_port(url)
+        catalog = self._task_skill_loader.catalog(host_key)
+        if not host_key or not catalog:
+            return
+        match = await match_task_skill(self._safe_task, catalog, self._task_skill_llm)
+        # S4 匹配日志（docs/p7/03 §七）：单行 JSON——命中/未命中/降档都记，
+        # catalog_newest_distilled_at 是手工迁移（S0a/S0b 之间）的过期探针。
+        logger.info(
+            "task-skill-match: %s",
+            json.dumps(
+                {
+                    "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "host_key": host_key,
+                    "catalog_size": len(catalog),
+                    "catalog_newest_distilled_at": TaskSkillLoader.newest_distilled_at(catalog),
+                    "task": self._safe_task[:200],
+                    "match": match.slug,
+                    "confidence": match.confidence,
+                    "reason": match.reason,
+                    "downgraded": match.downgraded,
+                },
+                ensure_ascii=False,
+            ),
+        )
+        if not match.slug:
+            return
+        card = next((c for c in catalog if c.slug == match.slug), None)
+        if card is None:
+            return
+        self._task_skill_text = build_task_skill_text(
+            match.slug, self._task_skill_loader.card_text(card)
+        )
+        logger.info("task-skill hit: slug=%s chars=%d", match.slug, len(self._task_skill_text))
 
     # ── P1c：agent_history_description（统一历史格式 + 滑动窗口）─────────
 
