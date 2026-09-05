@@ -1,0 +1,16 @@
+{
+  "slug": "count-total-reviews",
+  "task_description": "How many reviews our shop received by far?",
+  "task_keywords": [
+    "reviews",
+    "total",
+    "count",
+    "all reviews",
+    "records found"
+  ],
+  "source_traces": [
+    "data\\captures\\2d186dd7\\trace.json",
+    "D:\\dev\\git\\z_jordon\\treeforge\\data\\captures\\2d186dd7\\trace.json"
+  ],
+  "distilled_at": "2026-08-31T12:11:57.338443+00:00"
+}

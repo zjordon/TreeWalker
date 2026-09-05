@@ -1,0 +1,15 @@
+{
+  "slug": "orders-report-custom-range",
+  "task_description": "Create an orders report from beginning of May 2021 to end of March 2022",
+  "task_keywords": [
+    "订单报表",
+    "报告",
+    "日期范围",
+    "Orders Report",
+    "From To"
+  ],
+  "source_traces": [
+    "data\\captures\\dd4cce6c\\trace.json"
+  ],
+  "distilled_at": "2026-09-01T23:42:12.128681+00:00"
+}

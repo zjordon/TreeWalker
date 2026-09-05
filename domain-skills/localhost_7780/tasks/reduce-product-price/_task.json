@@ -1,0 +1,16 @@
+{
+  "slug": "reduce-product-price",
+  "task_description": "Reduce the price of green Hollister backyard sweater in all size by $5",
+  "task_keywords": [
+    "降价",
+    "产品价格",
+    "Hollister",
+    "Sweatshirt",
+    "Green"
+  ],
+  "source_traces": [
+    "data\\captures\\e7c268bc\\trace.json",
+    "data\\captures\\139ee21b\\trace.json"
+  ],
+  "distilled_at": "2026-09-02T11:37:25.562543+00:00"
+}

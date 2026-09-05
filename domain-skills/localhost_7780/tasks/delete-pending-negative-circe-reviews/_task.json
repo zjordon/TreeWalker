@@ -1,0 +1,15 @@
+{
+  "slug": "delete-pending-negative-circe-reviews",
+  "task_description": "Delete all pending negative reviews for Circe fleece",
+  "task_keywords": [
+    "Circe",
+    "删除",
+    "评论",
+    "Pending",
+    "负面"
+  ],
+  "source_traces": [
+    "data\\captures\\dc19af3d\\trace.json"
+  ],
+  "distilled_at": "2026-09-02T23:41:45.812844+00:00"
+}

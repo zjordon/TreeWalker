@@ -1,0 +1,15 @@
+{
+  "slug": "approve-positive-reviews",
+  "task_description": "Approve the positive reviews to display in our store.",
+  "task_keywords": [
+    "approve",
+    "reviews",
+    "positive",
+    "pending",
+    "status"
+  ],
+  "source_traces": [
+    "data\\captures\\1e22d5f2\\trace.json"
+  ],
+  "distilled_at": "2026-09-02T23:32:22.669616+00:00"
+}

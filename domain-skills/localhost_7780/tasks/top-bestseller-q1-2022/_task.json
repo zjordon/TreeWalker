@@ -1,0 +1,15 @@
+{
+  "slug": "top-bestseller-q1-2022",
+  "task_description": "What is the top-1 best-selling brand in Quarter 1 2022",
+  "task_keywords": [
+    "热卖品牌",
+    "第一季度",
+    "2022",
+    "Bestsellers",
+    "报表"
+  ],
+  "source_traces": [
+    "data\\captures\\8933e418\\trace.json"
+  ],
+  "distilled_at": "2026-09-01T13:10:37.545967+00:00"
+}

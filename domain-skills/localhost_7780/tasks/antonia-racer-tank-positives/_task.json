@@ -1,0 +1,14 @@
+{
+  "slug": "antonia-racer-tank-positives",
+  "task_description": "Tell me the reasons why customers like Antonia Racer Tank",
+  "task_keywords": [
+    "Antonia Racer Tank",
+    "positive reviews",
+    "reasons customers like",
+    "product review detail"
+  ],
+  "source_traces": [
+    "data\\captures\\98be75b8\\trace.json"
+  ],
+  "distilled_at": "2026-08-31T23:02:20.693551+00:00"
+}

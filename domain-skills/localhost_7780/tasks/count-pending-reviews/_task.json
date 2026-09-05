@@ -1,0 +1,15 @@
+{
+  "slug": "count-pending-reviews",
+  "task_description": "What is the total count of Pending reviews amongst all the reviews?",
+  "task_keywords": [
+    "Pending",
+    "评价",
+    "待审核",
+    "数量",
+    "reviews"
+  ],
+  "source_traces": [
+    "data\\captures\\c2f9582c\\trace.json"
+  ],
+  "distilled_at": "2026-08-31T12:25:29.823513+00:00"
+}

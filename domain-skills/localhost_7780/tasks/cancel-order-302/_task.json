@@ -1,0 +1,15 @@
+{
+  "slug": "cancel-order-302",
+  "task_description": "Cancel order 302",
+  "task_keywords": [
+    "取消订单",
+    "订单302",
+    "cancel order",
+    "订单管理",
+    "确认弹窗"
+  ],
+  "source_traces": [
+    "data\\captures\\9970132f\\trace.json"
+  ],
+  "distilled_at": "2026-09-03T04:23:28.892889+00:00"
+}

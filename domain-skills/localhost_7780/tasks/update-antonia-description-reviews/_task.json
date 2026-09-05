@@ -1,0 +1,15 @@
+{
+  "slug": "update-antonia-description-reviews",
+  "task_description": "Update the product description of Antonia Racer Tank to highlight the real user positive reviews by quoting the comments",
+  "task_keywords": [
+    "Antonia Racer Tank",
+    "product description",
+    "reviews",
+    "short description",
+    "update"
+  ],
+  "source_traces": [
+    "data\\captures\\51bd3dc6\\trace.json"
+  ],
+  "distilled_at": "2026-09-02T13:00:17.296951+00:00"
+}

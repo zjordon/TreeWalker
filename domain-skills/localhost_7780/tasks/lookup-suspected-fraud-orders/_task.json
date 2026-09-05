@@ -1,0 +1,16 @@
+{
+  "slug": "lookup-suspected-fraud-orders",
+  "task_description": "Lookup orders that are suspected of being fraudulent",
+  "task_keywords": [
+    "orders",
+    "suspected fraud",
+    "filter",
+    "status",
+    "Magento"
+  ],
+  "source_traces": [
+    "data\\captures\\84445757\\trace.json",
+    "D:\\dev\\git\\z_jordon\\treeforge\\data\\captures\\84445757\\trace.json"
+  ],
+  "distilled_at": "2026-08-31T12:02:14.827105+00:00"
+}

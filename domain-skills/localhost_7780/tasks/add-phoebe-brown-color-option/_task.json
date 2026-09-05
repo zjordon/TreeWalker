@@ -1,0 +1,15 @@
+{
+  "slug": "add-phoebe-brown-color-option",
+  "task_description": "Add a new color option brown to the size S of Phoebe Zipper Sweatshirt",
+  "task_keywords": [
+    "Phoebe Zipper Sweatshirt",
+    "brown",
+    "颜色",
+    "配置",
+    "configurable"
+  ],
+  "source_traces": [
+    "data\\captures\\17ae9b1c\\trace.json"
+  ],
+  "distilled_at": "2026-09-02T13:11:26.547897+00:00"
+}

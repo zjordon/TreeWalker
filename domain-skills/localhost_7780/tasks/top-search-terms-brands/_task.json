@@ -1,0 +1,15 @@
+{
+  "slug": "top-search-terms-brands",
+  "task_description": "What brands appear most frequently among the top search terms?",
+  "task_keywords": [
+    "搜索词",
+    "品牌",
+    "Dashboard",
+    "Top Search Terms",
+    "高频"
+  ],
+  "source_traces": [
+    "data\\captures\\e5fdc3e9\\trace.json"
+  ],
+  "distilled_at": "2026-09-01T23:54:22.664234+00:00"
+}

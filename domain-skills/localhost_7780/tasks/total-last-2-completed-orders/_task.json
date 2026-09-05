@@ -1,0 +1,16 @@
+{
+  "slug": "total-last-2-completed-orders",
+  "task_description": "Get the total payment amount of the last 2 completed orders",
+  "task_keywords": [
+    "已完成订单",
+    "最近2笔",
+    "支付总额",
+    "订单筛选",
+    "订单列表"
+  ],
+  "source_traces": [
+    "data\\captures\\260fc3f0\\trace.json",
+    "D:\\dev\\git\\z_jordon\\treeforge\\data\\captures\\260fc3f0\\trace.json"
+  ],
+  "distilled_at": "2026-08-31T12:04:39.550429+00:00"
+}

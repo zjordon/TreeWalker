@@ -1,0 +1,16 @@
+{
+  "slug": "top-cancellations-customer",
+  "task_description": "Tell me the name of the customer who has the most cancellations in the history",
+  "task_keywords": [
+    "取消订单",
+    "最多取消",
+    "客户名",
+    "订单筛选",
+    "Magento"
+  ],
+  "source_traces": [
+    "data\\captures\\2d8582e1\\trace.json",
+    "D:\\dev\\git\\z_jordon\\treeforge\\data\\captures\\2d8582e1\\trace.json"
+  ],
+  "distilled_at": "2026-08-31T12:08:04.971563+00:00"
+}

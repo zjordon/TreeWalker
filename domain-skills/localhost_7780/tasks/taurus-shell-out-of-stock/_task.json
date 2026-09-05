@@ -1,0 +1,15 @@
+{
+  "slug": "taurus-shell-out-of-stock",
+  "task_description": "Make all Taurus Elements Shell as out of stock",
+  "task_keywords": [
+    "Taurus Elements Shell",
+    "out of stock",
+    "缺货",
+    "库存状态",
+    "商品编辑"
+  ],
+  "source_traces": [
+    "data\\captures\\4a48c919\\trace.json"
+  ],
+  "distilled_at": "2026-09-02T12:08:36.297397+00:00"
+}

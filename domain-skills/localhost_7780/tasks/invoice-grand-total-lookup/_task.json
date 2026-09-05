@@ -1,0 +1,16 @@
+{
+  "slug": "invoice-grand-total-lookup",
+  "task_description": "Telll me the grand total of invoice 000000001.",
+  "task_keywords": [
+    "invoice",
+    "grand total",
+    "000000001",
+    "invoices",
+    "sales"
+  ],
+  "source_traces": [
+    "data\\captures\\f1479b1d\\trace.json",
+    "D:\\dev\\git\\z_jordon\\treeforge\\data\\captures\\f1479b1d\\trace.json"
+  ],
+  "distilled_at": "2026-08-31T12:05:27.047724+00:00"
+}

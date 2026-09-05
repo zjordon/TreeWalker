@@ -1,0 +1,15 @@
+{
+  "slug": "top-bestseller-2022",
+  "task_description": "What is the top-1 best-selling product in 2022",
+  "task_keywords": [
+    "最畅销",
+    "Bestsellers",
+    "2022",
+    "报表",
+    "销量第一"
+  ],
+  "source_traces": [
+    "data\\captures\\14b46f50\\trace.json"
+  ],
+  "distilled_at": "2026-09-01T00:04:48.537939+00:00"
+}

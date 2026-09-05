@@ -1,0 +1,16 @@
+{
+  "slug": "worst-review-customer-email",
+  "task_description": "Show me the email address of the customer who is the most unhappy with Circe fleece",
+  "task_keywords": [
+    "最不满意",
+    "Circe",
+    "评论",
+    "客户邮箱",
+    "评分最低"
+  ],
+  "source_traces": [
+    "data\\captures\\5ab0f2ad\\trace.json",
+    "D:\\dev\\git\\z_jordon\\treeforge\\data\\captures\\5ab0f2ad\\trace.json"
+  ],
+  "distilled_at": "2026-08-31T12:09:01.867878+00:00"
+}

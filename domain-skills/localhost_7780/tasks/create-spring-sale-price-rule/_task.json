@@ -1,0 +1,15 @@
+{
+  "slug": "create-spring-sale-price-rule",
+  "task_description": "Draft a new marketing price rule for spring sale that offers a 20 percent discount site-wide for all customers",
+  "task_keywords": [
+    "cart price rule",
+    "spring sale",
+    "20 percent discount",
+    "marketing",
+    "promo quote"
+  ],
+  "source_traces": [
+    "data\\captures\\f9575c6c\\trace.json"
+  ],
+  "distilled_at": "2026-09-03T11:53:22.773798+00:00"
+}
