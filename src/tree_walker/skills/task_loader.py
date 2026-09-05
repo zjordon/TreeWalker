@@ -66,9 +66,18 @@ class TaskSkillLoader:
                 card = self._parse_card(meta_path)
                 if card is not None:
                     cards.append(card)
-        # 大声日志（docs/p7/03 §2.1 防再犯）：catalog 空是显式可见的状态，
-        # 不是埋在降级语义里的静默零命中。
-        logger.info("task-skill catalog: %d cards (host_key=%s)", len(cards), host_key)
+        # 大声日志（docs/p7/03 §2.1 防再犯）：catalog 空是显式可见的状态，不是埋在
+        # 降级语义里的静默零命中。目录存在却零卡 = 卡全坏（坏迁移/全不可解析），
+        # 比目录不存在严重——按方案钉死用 warning 级。
+        if cards:
+            logger.info("task-skill catalog: %d cards (host_key=%s)", len(cards), host_key)
+        elif tasks_dir.is_dir():
+            logger.warning(
+                "task-skill catalog: 0 cards under %s (all unparseable? bad migration?)",
+                tasks_dir,
+            )
+        else:
+            logger.info("task-skill catalog: 0 cards (no tasks/ dir, host_key=%s)", host_key)
         self._catalog_cache[host_key] = cards
         return cards
 
@@ -89,9 +98,15 @@ class TaskSkillLoader:
             # 无描述 = 无检索锚点，卡不可匹配——跳过（如 TreeForge 模板模式产物）。
             logger.warning("task-skill: skip card without description %s", meta_path)
             return None
-        keywords = tuple(
-            str(k) for k in (data.get("task_keywords") or []) if str(k).strip()
-        )
+        # keywords 类型守卫：契约是 str[]，但手改/异端导出可能给字符串——逐字符
+        # 迭代会产出垃圾单字并渲染进每次匹配 prompt，按单个关键词容错。
+        raw_keywords = data.get("task_keywords")
+        if isinstance(raw_keywords, str):
+            keywords = (raw_keywords,) if raw_keywords.strip() else ()
+        elif isinstance(raw_keywords, list):
+            keywords = tuple(str(k) for k in raw_keywords if str(k).strip())
+        else:
+            keywords = ()
         return TaskCardMeta(
             slug=slug,
             description=description,

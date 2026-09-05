@@ -132,6 +132,7 @@ class Agent(StepPipeline, RerunMixin):
         self._enable_task_skill_injection = _settings.enable_task_skill_injection
         self._task_skill_loader = TaskSkillLoader(self._skill_loader)
         self._task_skill_text: str | None = None
+        self._task_skill_slug: str | None = None  # 命中 slug（obs 事件用，见 step.py）
         if _settings.task_skill_llm is not None:
             self._task_skill_llm = LLMClient(_settings.task_skill_llm)
         else:
@@ -269,17 +270,19 @@ class Agent(StepPipeline, RerunMixin):
             except Exception as e:
                 logger.warning("Failed to navigate to initial URL: %s", e)
 
-        # 任务级 skill 匹配（docs/p7/03 §三）：初始导航之后做一次——导航前当前页是
-        # about:blank 或上一任务残页，host 不可信。全异常捕获：失败等价不注入，
-        # 不阻断 agent 启动。
-        if self._enable_task_skill_injection:
-            try:
-                await self._match_task_skill()
-            except Exception as e:
-                logger.warning("task-skill: match failed (%s) — no injection", e)
-
         self._setup_signal_handler()
         try:
+            # 任务级 skill 匹配（docs/p7/03 §三）：初始导航之后做一次——导航前当前页
+            # 是 about:blank 或上一任务残页，host 不可信。放 try 内、装好信号处理器
+            # 之后：匹配最长 ~30s（两次重试 × 15s 超时），期间 Ctrl+C 须走 pause 语义
+            # 且 finally 的浏览器/obs 清理必须生效。
+            # 全异常捕获：失败等价不注入，不阻断 agent 启动。
+            if self._enable_task_skill_injection:
+                try:
+                    await self._match_task_skill(preferred_url=initial_url)
+                except Exception as e:
+                    logger.warning("task-skill: match failed (%s) — no injection", e)
+
             while self.state.n_steps <= self.max_steps:
                 if self.state.stopped:
                     logger.info("Agent stopped by user")
@@ -475,15 +478,21 @@ class Agent(StepPipeline, RerunMixin):
         text = self._skill_loader.load_for_host(host)
         return text or None
 
-    async def _match_task_skill(self) -> None:
+    async def _match_task_skill(self, preferred_url: str | None = None) -> None:
         """任务级 skill 匹配 + 命中卡装载（docs/p7/03 §三/§四；每任务一次）。
 
-        host 取当前页 URL（与站点级 ``_build_skill_description`` 同一 keying）；
-        catalog 空 / 未命中 / low 降档 / 调用失败都不注入（安全降级 = 现状）。
-        命中后组装注入文本（头声明 + 三件套全文）存 ``_task_skill_text``，由
-        step 每步带进 state message 的 ``[Task Skill]`` 块。
+        host 来源优先 ``preferred_url``（run() 的初始导航目标）：CDP 的
+        ``Page.navigate`` 应答可能早于新文档 commit，紧随其后 ``get_current_url``
+        会读到旧页 host——用导航目标是从根上消竞态；无初始 URL（web 控制台等
+        产品场景）才读当前页。catalog 空 / 无任务文本 / 未命中 / low 降档 /
+        调用失败都不注入（安全降级 = 现状）。命中后组装注入文本（头声明 +
+        三件套全文）存 ``_task_skill_text``，由 step 每步带进 state message 的
+        ``[Task Skill]`` 块。
         """
-        url = await self.browser.get_current_url()
+        if not self._safe_task.strip():
+            # v2 §4.5 显式降级路径：无任务文本 = 无检索锚点，不做匹配调用。
+            return
+        url = preferred_url or await self.browser.get_current_url()
         host_key = extract_host_with_port(url)
         catalog = self._task_skill_loader.catalog(host_key)
         if not host_key or not catalog:
@@ -513,6 +522,7 @@ class Agent(StepPipeline, RerunMixin):
         card = next((c for c in catalog if c.slug == match.slug), None)
         if card is None:
             return
+        self._task_skill_slug = match.slug
         self._task_skill_text = build_task_skill_text(
             match.slug, self._task_skill_loader.card_text(card)
         )

@@ -93,3 +93,7 @@ class SkillActiveEvent(BaseEvent):
     host: str | None = None
     skill_loaded: bool = False
     char_count: int = 0
+    # P7 路线三：任务级 skill（与站点级分开标——skill_loaded=false + task_slug 非空
+    # 表示只有任务卡命中；code-review：chip 只看站点级会误报注入状态）
+    task_slug: str = ""
+    task_skill_chars: int = 0

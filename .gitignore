@@ -238,7 +238,8 @@ evaluate_output/
 examples/_model_page_view.txt
 # TreeForge 蒸馏直装（docs/p7/03 §2.5 形态 A）的运行态 registry——distill --output
 # 指向本仓库根时落在此，卡片（domain-skills/）进 git、registry 不进。
-registry/
+# 锚定仓库根（/registry/），不匹配任意深度的同名目录。
+/registry/
 
 # Frontend (web_ui React+Vite; npm 依赖与构建产物不进 git)
 web_ui/node_modules/

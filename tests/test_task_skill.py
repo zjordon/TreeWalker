@@ -141,6 +141,35 @@ class TestTaskSkillCatalog:
         catalog = _loader(tmp_path).catalog("h")
         assert catalog[0].slug == "dir-name"
 
+    def test_keywords_string_tolerated_as_single_keyword(self, tmp_path):
+        # 契约是 str[]，但手改/异端导出可能给字符串——按单个关键词容错，
+        # 不逐字符迭代产出垃圾单字
+        meta_text = json.dumps({"task_description": "d", "task_keywords": "count, quantity"})
+        _write_card(tmp_path, "h", "s", meta_text=meta_text)
+        catalog = _loader(tmp_path).catalog("h")
+        assert catalog[0].keywords == ("count, quantity",)
+        assert "count, quantity" in catalog[0].catalog_line()
+
+    def test_zero_cards_with_dir_logs_warning(self, tmp_path, caplog):
+        # 目录存在却零卡（全坏迁移）= 严重静默失效，按 docs/p7/03 §2.1 用 warning 级
+        import logging
+
+        _write_card(tmp_path, "h", "bad", meta_text="{broken")
+        with caplog.at_level(logging.WARNING):
+            _loader(tmp_path).catalog("h")
+        assert any(
+            "0 cards" in r.getMessage() and r.levelno == logging.WARNING
+            for r in caplog.records
+        )
+
+    def test_zero_cards_without_dir_stays_info(self, tmp_path, caplog):
+        # 无 tasks/ 目录 = 正常态（大多数 host 无任务卡），不告警
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            _loader(tmp_path).catalog("nowhere")
+        assert caplog.records == []
+
     def test_catalog_is_cached_per_host(self, tmp_path):
         _write_card(tmp_path, "h", "slug-a")
         loader = _loader(tmp_path)
@@ -216,6 +245,22 @@ class TestMatchTaskSkill:
     @pytest.mark.asyncio
     async def test_low_confidence_downgraded_to_null(self):
         llm = FakeMatchLLM([{"match": "slug-a", "confidence": "low", "reason": "unsure"}])
+        m = await match_task_skill("t", _catalog("slug-a"), llm)
+        assert m.slug is None
+        assert m.downgraded is True
+
+    @pytest.mark.asyncio
+    async def test_non_enum_confidence_downgraded_to_null(self):
+        # schema 外值（数字；structured_call 的 text 兜底路径不做 schema 校验）
+        # 不得绕过降档守卫——白名单只认 high/medium
+        llm = FakeMatchLLM([{"match": "slug-a", "confidence": 0.3, "reason": "r"}])
+        m = await match_task_skill("t", _catalog("slug-a"), llm)
+        assert m.slug is None
+        assert m.downgraded is True
+
+    @pytest.mark.asyncio
+    async def test_missing_confidence_downgraded_to_null(self):
+        llm = FakeMatchLLM([{"match": "slug-a", "reason": "r"}])
         m = await match_task_skill("t", _catalog("slug-a"), llm)
         assert m.slug is None
         assert m.downgraded is True
@@ -308,7 +353,13 @@ class TestTaskSkillRendering:
 # ── 4. Agent wiring ─────────────────────────────────────────────────────
 
 
-def _agent(tmp_path: Path, *, enable: bool = True, url: str = "http://localhost:7780/admin/"):
+def _agent(
+    tmp_path: Path,
+    *,
+    enable: bool = True,
+    url: str = "http://localhost:7780/admin/",
+    task: str = "the task",
+):
     from tree_walker.agent.agent import Agent
     from tree_walker.config import AgentSettings
 
@@ -316,7 +367,7 @@ def _agent(tmp_path: Path, *, enable: bool = True, url: str = "http://localhost:
     browser.get_current_url = AsyncMock(return_value=url)
     browser._settings = MagicMock(wait_between_actions=0.0)
     return Agent(
-        task="the task",
+        task=task,
         llm=MagicMock(),
         browser=browser,
         settings=AgentSettings(
@@ -340,6 +391,33 @@ class TestAgentTaskSkillWiring:
         assert agent._task_skill_text is not None
         assert "slug-a" in agent._task_skill_text
         assert "SOP BODY" in agent._task_skill_text
+        assert agent._task_skill_slug == "slug-a"  # obs 事件用（step.py SkillActiveEvent）
+
+    @pytest.mark.asyncio
+    async def test_blank_task_early_return(self, tmp_path, monkeypatch):
+        # v2 §4.5：无任务文本 = 显式降级路径，不发起匹配调用
+        _write_card(tmp_path, "localhost_7780", "slug-a")
+        agent = _agent(tmp_path, task="   ")
+        called = AsyncMock()
+        monkeypatch.setattr("tree_walker.agent.agent.match_task_skill", called)
+        await agent._match_task_skill()
+        called.assert_not_called()
+        assert agent._task_skill_text is None
+
+    @pytest.mark.asyncio
+    async def test_preferred_url_wins_over_stale_page(self, tmp_path, monkeypatch):
+        # Page.navigate 应答可早于新文档 commit——preferred_url（导航目标）必须
+        # 优先于当前页读数（残页），否则串行多 host 会话读错 host 的 catalog
+        _write_card(tmp_path, "right-host", "slug-a")
+        agent = _agent(tmp_path, url="http://stale-host/old")
+        mocked = AsyncMock(
+            return_value=TaskSkillMatch(slug="slug-a", confidence="high", reason="ok")
+        )
+        monkeypatch.setattr("tree_walker.agent.agent.match_task_skill", mocked)
+        await agent._match_task_skill(preferred_url="http://right-host/x")
+        mocked.assert_called_once()
+        catalog_arg = mocked.call_args.args[1]
+        assert [c.slug for c in catalog_arg] == ["slug-a"]
 
     @pytest.mark.asyncio
     async def test_no_match_leaves_text_none(self, tmp_path, monkeypatch):
@@ -382,26 +460,21 @@ class TestAgentTaskSkillWiring:
         with pytest.raises(RuntimeError):
             await agent._match_task_skill()
 
-    def test_call_site_gate_off(self, tmp_path):
-        # 复刻 step.py 调用点三元：开关关 → 即使文本在也不注入
+    def test_gate_method_off_blocks_injection(self, tmp_path):
+        # 门控在 _current_task_skill_text（step.py 每步调用）：开关关 → 文本在也不注入。
+        # 直接驱动生产方法，而非在测试里复刻三元（同义反复测不出回归）。
         agent = _agent(tmp_path, enable=False)
         agent._task_skill_text = "TEXT PRESENT"
-        task_skill_desc = (
-            agent._task_skill_text
-            if (agent._enable_task_skill_injection and agent._task_skill_text)
-            else None
-        )
-        assert task_skill_desc is None
+        assert agent._current_task_skill_text() is None
 
-    def test_call_site_gate_on_with_text(self, tmp_path):
+    def test_gate_method_on_with_text(self, tmp_path):
         agent = _agent(tmp_path, enable=True)
         agent._task_skill_text = "TEXT PRESENT"
-        task_skill_desc = (
-            agent._task_skill_text
-            if (agent._enable_task_skill_injection and agent._task_skill_text)
-            else None
-        )
-        assert task_skill_desc == "TEXT PRESENT"
+        assert agent._current_task_skill_text() == "TEXT PRESENT"
+
+    def test_gate_method_on_without_text(self, tmp_path):
+        agent = _agent(tmp_path, enable=True)
+        assert agent._current_task_skill_text() is None
 
     def test_end_to_end_rendering(self, tmp_path):
         agent = _agent(tmp_path)
@@ -491,6 +564,32 @@ class TestStructuredCall:
         kwargs = inner.messages.create.call_args.kwargs
         assert kwargs["tool_choice"] == {"type": "tool", "name": "structured_result"}
         assert kwargs["messages"][0]["content"] == "usr"
+
+    @pytest.mark.asyncio
+    async def test_max_tokens_defaults_to_client_setting(self):
+        # AGENT_TASK_SKILL_MAX_TOKENS 等专用配置落在 client.max_tokens——缺省必须
+        # 回落它（否则配置变死旋钮；thinking 模型思考 token 也计入 max_tokens）
+        client = _llm_client()
+        client.max_tokens = 7777
+        inner = MagicMock()
+        inner.messages.create = MagicMock(return_value=_tool_response({"x": 1}))
+        client.client = inner
+        await client.structured_call(
+            system_prompt="s", user_prompt="u", output_schema={"type": "object"}
+        )
+        assert inner.messages.create.call_args.kwargs["max_tokens"] == 7777
+
+    @pytest.mark.asyncio
+    async def test_explicit_max_tokens_wins(self):
+        client = _llm_client()
+        client.max_tokens = 7777
+        inner = MagicMock()
+        inner.messages.create = MagicMock(return_value=_tool_response({"x": 1}))
+        client.client = inner
+        await client.structured_call(
+            system_prompt="s", user_prompt="u", output_schema={"type": "object"}, max_tokens=99
+        )
+        assert inner.messages.create.call_args.kwargs["max_tokens"] == 99
 
     @pytest.mark.asyncio
     async def test_text_fallback_parses_fenced_json(self, monkeypatch):

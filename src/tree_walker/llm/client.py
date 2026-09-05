@@ -499,7 +499,7 @@ class LLMClient:
         user_prompt: str,
         output_schema: dict[str, Any],
         *,
-        max_tokens: int = 512,
+        max_tokens: int | None = None,
         call_timeout: float | None = None,
     ) -> dict[str, Any] | None:
         """One-shot tool-forced structured output (docs/p7/03 §4.3).
@@ -509,7 +509,10 @@ class LLMClient:
         工具时 text 兜底 ``_try_parse_json``。返回解析后的 dict；不可解析返回
         None；API 失败先走 fallback 切换（``_try_switch_to_fallback``），仍失败
         向上抛——调用方自行降级（matcher 的一次重试在那一层）。
+        ``max_tokens=None`` 回落 ``self.max_tokens``（专用配置如
+        AGENT_TASK_SKILL_MAX_TOKENS 生效于此；thinking 模型的思考 token 也计入）。
         """
+        effective_max_tokens = max_tokens if max_tokens is not None else self.max_tokens
         tool = {
             "name": "structured_result",
             "description": "Structured result conforming to the given JSON Schema.",
@@ -519,7 +522,7 @@ class LLMClient:
             response = await self._extract_call(
                 call_timeout=call_timeout,
                 model=self.model,
-                max_tokens=max_tokens,
+                max_tokens=effective_max_tokens,
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_prompt}],
                 tools=[tool],

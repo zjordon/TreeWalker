@@ -139,6 +139,8 @@ async def match_task_skill(
             "task-skill: matched slug %r not in catalog — treating as no match", slug
         )
         return TaskSkillMatch(slug=None, confidence=confidence, reason=f"unknown slug: {slug}")
-    if confidence == "low":
+    if confidence not in ("high", "medium"):
+        # 白名单而非黑名单：非 high/medium（含 "low"、缺失、数字等 schema 外值——
+        # text 兜底路径不做 schema 校验）一律降档为未命中，防绕过降档守卫。
         return TaskSkillMatch(slug=None, confidence=confidence, reason=reason, downgraded=True)
     return TaskSkillMatch(slug=slug, confidence=confidence, reason=reason)
