@@ -881,3 +881,55 @@ class TestRunEscalationOnFinalizeDegradation:
 		history = await agent.run()
 		assert steps["n"] == 3
 		assert history.finalize_degraded_steps == 3
+
+
+# ── 11. round8 微修收尾：restore 保型 / model_validate 不改写 / 死层删除 ──
+
+
+class TestRound8QuickClose:
+	@pytest.mark.asyncio
+	async def test_honest_done_survives_url_restore(self):
+		# review8 #1：restore 的 dict 重建曾剥掉 _HonestDone 带外标记——
+		# variant B + 含长 URL messages 场景诚实终止静默失效
+		from tree_walker.action_shape import is_honest_failure_action
+		from tree_walker.llm.client import LLMClient
+
+		client = LLMClient(LLMSettings(api_key="test-key"))
+		url_map = {"[u1]": "https://example.com/" + "x" * 120}
+		result = {
+			"action": honest_done_action(),
+			"actions": [honest_done_action()],
+		}
+		restored = client._restore_urls_in_output(result, url_map)
+		assert is_honest_failure_action(restored["action"])
+
+	@pytest.mark.asyncio
+	async def test_honest_done_survives_sensitive_restore(self):
+		from tree_walker.action_shape import is_honest_failure_action
+		from tree_walker.llm.client import LLMClient
+
+		client = LLMClient(LLMSettings(api_key="test-key"))
+		result = {"action": honest_done_action()}
+		restored = client._restore_sensitive_in_output(result, {"pwd": "sekrit"})
+		assert is_honest_failure_action(restored["action"])
+
+	def test_model_validate_failure_does_not_mutate_caller_dict(self):
+		# review8 #2：model_validate 路径 pydantic 把调用方原始 dict 交给
+		# validator——此前 data["model_output"]=mo_copy 仍改写调用方输入
+		import copy
+
+		mo = {"actions": [{"name": "click", "params": "561857"}]}
+		snapshot = copy.deepcopy(mo)
+		with pytest.raises(Exception):
+			AgentHistory.model_validate(
+				{"step_number": 1, "model_output": mo, "result": "not-a-list"}
+			)
+		assert mo == snapshot
+
+	def test_model_validate_success_does_not_mutate_caller_dict(self):
+		mo = {"actions": [{"name": "click", "params": "561857"}]}
+		h = AgentHistory.model_validate(
+			{"step_number": 1, "model_output": mo, "result": []}
+		)
+		assert h.model_output["actions"][0]["params"] == {}
+		assert mo["actions"][0]["params"] == "561857"  # 原始 dict 未被改写

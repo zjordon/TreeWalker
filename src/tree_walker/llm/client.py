@@ -123,7 +123,10 @@ class LLMClient:
                     obj = obj.replace(tag, original)
                 return obj
             if isinstance(obj, dict):
-                return {k: _restore(v) for k, v in obj.items()}
+                # 保留 dict 子类身份（_HonestDone 带外标记——review8 #1：
+                # dict 重建曾静默剥掉标记，variant B + URL 场景下诚实终止
+                # 退回烧重试）
+                return type(obj)({k: _restore(v) for k, v in obj.items()})
             if isinstance(obj, list):
                 return [_restore(item) for item in obj]
             return obj
@@ -164,7 +167,9 @@ class LLMClient:
                     obj = obj.replace(placeholder, real_value)
                 return obj
             if isinstance(obj, dict):
-                return {k: _restore(v) for k, v in obj.items()}
+                # 保留 dict 子类身份（_HonestDone——同 _restore_urls_in_output，
+                # review8 #1）
+                return type(obj)({k: _restore(v) for k, v in obj.items()})
             if isinstance(obj, list):
                 return [_restore(item) for item in obj]
             return obj

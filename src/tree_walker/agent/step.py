@@ -21,6 +21,8 @@ from tree_walker.action_shape import (
     normalize_model_output,
     params_of,
 )
+# noqa: F401 —— normalize_model_output 在 _get_next_action 内使用（review8 #8
+# 后 _step 不再直接调用）
 from tree_walker.agent.actionability import (
     ACTIONABILITY_ACTIONS,
     is_file_input,
@@ -184,10 +186,9 @@ class StepPipeline:
                 # P0-1：LLM 期间用户停止 → 输出已丢弃。不执行动作、不进 post_process，
                 # _finalize 的 `if model_output is not None` 守卫会跳过历史写入。
                 return False
-            # 归一化主入口在 _get_next_action 内（校验/truncate/emit 之前，
-            # review7 #6）；此处保留幂等兜底一层，覆盖直灌 model_output 的旁路
-            # 构造（内存历史改造路径等）。
-            normalize_model_output(model_output)
+            # 归一化在 _get_next_action 内完成（校验/truncate/emit 之前，
+            # review7 #6）——其每条返回路径（含 fallback done）都已归一化，
+            # 此处不再重复调用（review8 #8：三重归一化 + 同一 WARNING ×3/步）
             results = await self._execute_actions(model_output, browser_state)
             self._post_process(results, model_output)
 

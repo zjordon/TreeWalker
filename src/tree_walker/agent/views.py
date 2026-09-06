@@ -149,7 +149,11 @@ class AgentHistory(BaseModel):
         if not isinstance(mo, dict):
             return data
         # 深至动作条目一层的拷贝（normalize 会原地改 params/容器/镜像——
-        # 浅拷贝仍共享条目 dict，会写回调用方输入）
+        # 浅拷贝仍共享条目 dict，会写回调用方输入）。**data 本身也拷贝**
+        # （review8 #2）：model_validate 路径 pydantic 把调用方原始 dict 交给
+        # validator——写 ``data["model_output"] = mo_copy`` 仍改写调用方输入；
+        # 构造随后字段校验失败时（result 非法）不得腐蚀失败构造器从未拥有
+        # 的输入（load_from_dict / web /load 正走此路径）。
         mo_copy = dict(mo)
         actions = mo_copy.get("actions")
         if isinstance(actions, list):
@@ -158,6 +162,7 @@ class AgentHistory(BaseModel):
         if isinstance(act, dict):
             mo_copy["action"] = dict(act)
         normalize_model_output(mo_copy, context="history")
+        data = dict(data)
         data["model_output"] = mo_copy
         return data
 
