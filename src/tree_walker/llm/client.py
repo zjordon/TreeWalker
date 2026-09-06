@@ -335,13 +335,12 @@ class LLMClient:
             actions_list = raw_action
         elif isinstance(raw_action, dict):
             actions_list = [raw_action]
-        elif isinstance(raw_action, str) and raw_action.strip():
-            # 顶层裸字符串 action（issue #173 记录的畸形类别，PR #174 review2 #5）：
-            # 按动作名归一化进澄清-重试梯子（缺参校验会给 LLM 错误反馈重发），
-            # 不再合成 done(success=False) 零重试终止整个任务。
-            actions_list = [{"name": raw_action.strip(), "params": {}}]
         else:
-            actions_list = [{"name": "done", "params": {"text": "Invalid action shape", "success": False}}]
+            # 非列表非 dict（裸字符串 / null / 数字——issue #173 畸形类别，review3
+            # #3 语义统一）：一律按命名动作强转（未注册名得到「Unknown action」
+            # 反馈重发、缺参得到字段反馈重发），不再零重试硬终止任务——裸 "done"
+            # 的诚实失败特判在 _coerce_named_action 内（显式 success=False）。
+            actions_list = [_coerce_named_action(raw_action)]
 
         # Phase A diagnostic: log the actual shape LLM emitted so we can tell
         # whether multi-action is being used. Reads schema maxItems when present
@@ -547,6 +546,23 @@ class LLMClient:
         return _try_parse_json("\n".join(text_parts))
 
 
+def _coerce_named_action(raw: Any) -> dict:
+    """裸值 → 命名动作 dict（统一 strip 语义，PR #174 review3 #9）。
+
+    强转规则的三处入口（client 顶层 else / ``_normalize_actions_list`` 列表项 /
+    ``views.load_from_dict`` 老格式单 action）共用本函数——同一种 LLM 错误
+    （``' click '``）在任何入口得到同一结果，避免按位置不同结果不同。
+
+    裸 ``"done"`` 特判（review3 #3）：重试梯子对它只会反复要 text、耗尽后仍以
+    无 text 执行，撞上 ``_action_done`` 的默认 success=True（假成功终止）——
+    直接给显式 success=False 的诚实失败（对齐原 else 分支语义）。
+    """
+    coerced = {"name": str(raw).strip(), "params": {}}
+    if coerced["name"] == "done":
+        coerced["params"] = {"text": "Invalid action shape (bare 'done')", "success": False}
+    return coerced
+
+
 def _normalize_actions_list(actions_list: list[Any]) -> None:
     """畸形动作归一化（issue #173，PR #174 review #6 的 choke point）——原地修复。
 
@@ -566,7 +582,7 @@ def _normalize_actions_list(actions_list: list[Any]) -> None:
                 "action[%d] malformed (%s) — coerced to named action with empty params",
                 i, type(a).__name__,
             )
-            actions_list[i] = {"name": str(a), "params": {}}
+            actions_list[i] = _coerce_named_action(a)
         elif not isinstance(a.get("params"), dict):
             if a.get("params") is not None:
                 logger.warning(

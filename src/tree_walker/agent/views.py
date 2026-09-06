@@ -7,6 +7,11 @@ from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+# 历史加载入口的畸形动作归一化复用 client 的同一组函数（issue #173，review3
+# #9：无循环依赖——client 只 import config；anthropic 经 tree_walker/__init__
+# 本已加载），不为历史路径复制第二份强转规则。
+from tree_walker.llm.client import _coerce_named_action, _normalize_actions_list
+
 logger = logging.getLogger(__name__)
 
 
@@ -237,20 +242,23 @@ class AgentHistoryList(BaseModel):
         for h in data.get("history", []):
             if h and "interacted_element" not in h:
                 h["interacted_element"] = None
-            # 存量畸形动作归一化（issue #173，PR #174 review2 #3）——历史加载入口
-            # choke point：旧 JSONL 可能带畸形动作（裸字符串动作 / params 为字符串，
-            # 修复前被持久化），在此归一化一次覆盖全部 rerun 消费者（_skip_reason /
-            # _execute_history_step 的 dict(params) 等）。与 client.get_action 共用
-            # 同一函数（llm.client._normalize_actions_list），不为历史复制第二份。
+            # 存量畸形动作归一化（issue #173，PR #174 review2 #3 / review3 #1）——
+            # 历史加载入口 choke point：旧 JSONL 可能带畸形动作（裸字符串动作 /
+            # params 为字符串，修复前被持久化），在此归一化一次覆盖 rerun 消费者
+            # （_skip_reason / _execute_history_step 的 dict(params) 等）。与
+            # client.get_action 共用同一组函数，不为历史复制第二份。覆盖三种形态：
+            # actions 列表（含畸形条目）、老格式 dict action（params 畸形）、
+            # 老格式裸字符串 action。
             mo = h.get("model_output") if isinstance(h, dict) else None
             if isinstance(mo, dict):
                 actions = mo.get("actions")
                 if isinstance(actions, list) and actions:
-                    from tree_walker.llm.client import _normalize_actions_list
                     _normalize_actions_list(actions)
                     mo["action"] = actions[0]  # 镜像刷新（老文件可能是畸形原值）
+                elif isinstance(mo.get("action"), dict):
+                    _normalize_actions_list([mo["action"]])  # 原地补/修 params
                 elif isinstance(mo.get("action"), str) and mo["action"].strip():
-                    mo["action"] = {"name": mo["action"].strip(), "params": {}}
+                    mo["action"] = _coerce_named_action(mo["action"])
         return cls.model_validate(data)
 
     # —— P4 可视化编辑 mutation API ——

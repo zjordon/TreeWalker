@@ -178,7 +178,14 @@ class StepPipeline:
             if self.state.consecutive_failures >= self.max_failures:
                 return True
         except Exception as e:
-            await self._handle_step_error(e)
+            try:
+                await self._handle_step_error(e)
+            except Exception as he:
+                # review3 #4：错误处理器自身故障（如半死浏览器上 reconnect 再抛）
+                # 降级为日志——不得从 except 逃出杀死 run（finally 只兜 _finalize）。
+                logger.error(
+                    "step error handler itself failed: %s (original error: %s)", he, e,
+                )
             return False
         finally:
             # finally 边界（issue #173，PR #174 review #5）：finalize 含历史追加与
@@ -190,10 +197,11 @@ class StepPipeline:
                 await self._finalize(browser_state, model_output, results)
             except Exception as e:
                 logger.error("_finalize failed — history/obs degraded for this step: %s", e)
-                # 计数器边界（review2 #1）：n_steps += 1 是 _finalize 的最后一条
-                # 语句，吞异常不得跳过它——否则 run() 的 while 循环退化为无界
-                # livelock（动作照常执行、步数永不前进）。失败路径同样计入步数。
-                self.state.n_steps += 1
+            # 计数器边界（review2 #1 / review3 #8 单一所有者）：n_steps 递增只在此
+            # 处（_finalize 尾部副本已删）——吞异常不得跳过它（否则 run() 的
+            # while 循环退化为无界 livelock），正确性也不再依赖「递增恰是
+            # _finalize 最后一条语句」这条跨千行的顺序约定。
+            self.state.n_steps += 1
 
         return False
 
@@ -861,8 +869,12 @@ class StepPipeline:
 
         registered = self.tools.registry.actions.get(name)
         if registered is None:
-            # Unknown action — let execution surface it; nothing to validate.
-            return None
+            # review3 #3：未注册名也进澄清-重试梯子——畸形强转出来的名字（裸
+            # 字符串 action / null / 数字）由此得到「Unknown action」反馈重发，
+            # 而非落到执行失败计 failure。page 过滤只影响 schema 暴露、不影响
+            # 此处按名查找（apply_page_filters 只写 page_patterns），未注册 =
+            # 真未知名。
+            return f"Unknown action '{name}'"
 
         param_model = registered.param_model
         flat_params = self.tools._flatten_params(params, name)
@@ -1247,7 +1259,8 @@ class StepPipeline:
             ))
 
         self._log_step_completion_summary(results)
-        self.state.n_steps += 1
+        # n_steps 递增已上移至 _step 的 finally（review3 #8 单一所有者）——
+        # 此处不再持有副本。
 
     def _project_interacted_elements(
         self,
@@ -1282,6 +1295,11 @@ class StepPipeline:
                     projected.append({"_semantic_clue": True, "kind": "file_upload", **clue})
                     continue
             params = action.get("params", {}) if isinstance(action, dict) else {}
+            if not isinstance(params, dict):
+                # 逐条降级（review3 #7）：绕过 choke point 的畸形（内存构造历史 /
+                # 测试直调）只丢本条投影，维护 actions/interacted_element 等长
+                # 配对——catch-all（safe wrapper）留给真正的 DOM bug。
+                params = {}
             index = params.get("index")
             if index is None:
                 index = params.get("element_id")  # element_id 是 index 的别名

@@ -626,9 +626,13 @@ class RerunMixin:
         # （见 _execute_history_step 的 upload_file 兜底），故不在此跳过。
         first = next((a for a in actions if isinstance(a, dict) and a.get("name")), None)
         if first and first.get("name") in ("click", "input_text", "select_dropdown"):
-            # 畸形动作已在历史加载入口归一化（AgentHistoryList.load_from_dict，
-            # issue #173 / PR #174 review2 #3）——此处不再持有局部守卫副本
+            # 归一化主责在历史加载入口（load_from_dict，review2 #3）；但
+            # rerun_history() 也接受内存构造 / model_validate 加载的
+            # AgentHistoryList（未经该入口，review3 #5）——保留一行本地防御，
+            # 真值字符串会击穿 or {} 兜底。
             fp = first.get("params") or {}
+            if not isinstance(fp, dict):
+                fp = {}
             if fp.get("index") is None and fp.get("element_id") is None:
                 ie = item.interacted_element or []
                 if not ie or ie[0] is None:

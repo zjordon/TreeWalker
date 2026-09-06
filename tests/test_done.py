@@ -433,6 +433,10 @@ class TestDoneStructuredParamValidation:
 		assert err is not None
 		assert "text" in err
 
-	def test_unknown_action_returns_none(self):
+	def test_unknown_action_gets_retry_feedback(self):
+		# PR #174 review3 #3：未注册名进澄清-重试梯子（畸形强转名字得到
+		# 「Unknown action」反馈重发，而非落执行失败计 failure）——原行为返 None。
 		response = {"action": {"name": "bogus_action", "params": {}}}
-		assert StepPipeline._validate_action_params(_FakeStep(Tools()), response) is None
+		err = StepPipeline._validate_action_params(_FakeStep(Tools()), response)
+		assert err is not None
+		assert "Unknown action" in err
