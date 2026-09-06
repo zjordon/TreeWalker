@@ -111,9 +111,10 @@ Agent 实例上，每任务/每 run 重建）：
 - **形态 B——直读**：`AGENT_SKILLS_DIR` 指 treeforge `data/skills/domain-skills`。
   一行 env 零侵入，但 douyin/bilibili 卡需先并入、产物不进 git，评测可复现性弱一截。
 
-S0b 落地**前**，localhost 站点因 §2.1 的 key 分叉直读不到（无端口 host 不受影响，
-形态 B 今天对 bilibili/douyin 已可用）——这就是「S0b = 消灭手工拷贝前提」的准确
-含义：S0a 救本次评测的急，S0b + 直装让拷贝步骤从此不存在，而不是让手工拷更可靠。
+S0b 已交付（2026-09-06，treeforge issue #9 / commit `33bb9d2`）——key 分叉消除，
+**形态 A 蒸馏直装自此可用**：`distill --output <本仓库根>` 即蒸馏完成 = 安装完成，
+此后新蒸馏产物不再需要手工拷贝；存量 44 卡两侧已核实逐字节一致（此前「S0b 落地前
+localhost 直读不到」的警告随之作废）。
 
 ## 三、总体流程与匹配时机（P1-2 修订：hook 点钉死）
 
@@ -254,7 +255,13 @@ Anthropic tool + `tool_choice` 强制 + 模型未用工具时 text 兜底 + `_tr
   `domain-skills/localhost_7780/`。关键是 `tasks/` 子树；**三件套保持与 65.2% 基线
   一致的版本**（当前两侧逐字节一致，整目录拷贝等价；但别在任务级实验里同时引入
   新版站点卡——一次只动一个变量）。S1 按目录位置扫描，不关心文件怎么来的。
-- **S0b 契约修复（TreeForge 侧代码，半天，防复发——非当次评测前提）**：adapter 的
+- **S0b 契约修复（TreeForge 侧代码）——✅ 已交付 2026-09-06**（treeforge issue #9 /
+  commit `33bb9d2`）：新建 `harness/hostkey.py` 共享 key 函数（与本仓库
+  `extract_host_with_port` 逐字对齐）+ ADAPT 按事件 URL 对账升级存量裸 hostname
+  trace（不改 captures 数据）+ 易变值 prompt 规则 + 直装 runbook；数据侧
+  `localhost/`→`localhost_7780/`、registry 同步 rename，44 卡与本仓库逐字节一致
+  （MD5 全量校验，无需重拷）。**§2.5 形态 A 蒸馏直装自此可用。**
+  原计划（留档）：adapter 的
   host 目录名对齐 `extract_host_with_port` 语义；蒸馏 prompt 的易变值规则（§六遗留
   项，可同车）。不做 S0b 的后果**不是本次零命中**（S0a 已让 44 张卡可见），而是
   **复发**：adapter 仍写裸 `localhost/`，此后每次蒸馏（重录任务 / 站点改版后重蒸）
