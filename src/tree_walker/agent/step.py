@@ -930,8 +930,20 @@ class StepPipeline:
         results: list[ActionResult] = []
 
         for i, action in enumerate(actions):
+            # 畸形动作归一化（issue #173，778/782 崩溃根因）：LLM 偶发输出裸字符串
+            # 动作（"click"）或 params 为字符串（"params": "561857"）。归一化成
+            # dict 形态——动作以「缺必填参数」优雅失败（ActionResult.error 进
+            # failure 计数，LLM 重发即恢复），而不是 AttributeError 崩步/崩任务。
+            if not isinstance(action, dict):
+                action = {"name": str(action), "params": {}}
             action_name = action.get("name", "done")
             action_params = action.get("params", {})
+            if not isinstance(action_params, dict):
+                logger.warning(
+                    "malformed action params (name=%s, params=%r of %s) — coerced to {}",
+                    action_name, action_params, type(action_params).__name__,
+                )
+                action_params = {}
 
             # Guard #1: done is only allowed as a single action. Encountering
             # it after position 0 means the LLM mis-chained; we stop here so
@@ -1218,7 +1230,7 @@ class StepPipeline:
                 model_output=model_output,
                 result=results,
                 state_summary=state_summary,
-                interacted_element=self._project_interacted_elements(model_output, browser_state, results),
+                interacted_element=self._safe_project_interacted_elements(model_output, browser_state, results),
                 metadata=self._build_step_metadata(time.time()),
             ))
 
@@ -1268,6 +1280,8 @@ class StepPipeline:
                     projected.append({"_semantic_clue": True, "kind": "file_upload", **clue})
                     continue
             params = action.get("params", {}) if isinstance(action, dict) else {}
+            if not isinstance(params, dict):
+                params = {}  # params 为字符串等畸形形态（issue #173）→ 无 index 可投影
             index = params.get("index")
             if index is None:
                 index = params.get("element_id")  # element_id 是 index 的别名
@@ -1277,6 +1291,24 @@ class StepPipeline:
             else:
                 projected.append(None)
         return projected
+
+    def _safe_project_interacted_elements(
+        self,
+        model_output: dict[str, Any],
+        browser_state: BrowserStateSummary | None,
+        results: list[ActionResult] | None = None,
+    ) -> list[dict[str, Any] | None] | None:
+        """``_finalize`` 兜底（issue #173）：投影只是历史元数据（重放用），失败降级
+        None + warning——绝不让元数据 bug 杀死任务。778/782 教训：``_step`` 的
+        ``finally`` 里抛异常会越过单步错误处理（except 已执行完），直接终结整任务。
+        """
+        try:
+            return self._project_interacted_elements(model_output, browser_state, results)
+        except Exception as e:
+            logger.warning(
+                "interacted-element projection failed — history metadata degraded to None: %s", e,
+            )
+            return None
 
     def _build_step_metadata(self, step_end_time: float) -> StepMetadata:
         """构造单步计时。``step_interval`` = 上一步的耗时（首步为 None）。
