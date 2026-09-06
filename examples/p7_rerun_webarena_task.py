@@ -76,6 +76,8 @@ async def main() -> int:
 	ap.add_argument("--task-timeout", type=int, default=600, help="单任务总超时秒数")
 	ap.add_argument("--webarena-repo", type=Path, default=DEFAULT_WEBARENA_REPO)
 	ap.add_argument("--log-file", type=Path, default=None, help="轨迹日志落盘路径（可选）")
+	ap.add_argument("--no-cookie", action="store_true",
+		help="跳过 cookie 注入（Chrome 已手动登录时用——注入的评测 cookie 可能是过期的，反而顶掉手登会话）")
 	args = ap.parse_args()
 
 	# 日志：INFO 为主 + llm client DEBUG（响应块构成）；可选落盘
@@ -109,7 +111,7 @@ async def main() -> int:
 	browser = BrowserSession(settings.browser)
 	await browser.start()
 	try:
-		if task.get("require_login", True):
+		if task.get("require_login", True) and not args.no_cookie:
 			rel = task.get("storage_state", "")
 			while rel.startswith("./"):
 				rel = rel[2:]
