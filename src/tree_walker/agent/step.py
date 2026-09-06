@@ -15,6 +15,7 @@ from pydantic import ValidationError
 
 from tree_walker.action_shape import (
     actions_of,
+    honest_done_action,
     is_honest_failure_action,
     name_of,
     normalize_model_output,
@@ -60,12 +61,18 @@ TYPE_CONTEXT = "context"    # 注入提示（budget/last/failure/loop）：每�
 TYPE_USER = "user"          # 持久 user 消息（任务说明、conversation summary）
 TYPE_ASSISTANT = "assistant"
 
-_FALLBACK_DONE_OUTPUT: dict[str, Any] = {
-    "evaluation_previous_goal": "No action returned",
-    "memory": "",
-    "next_goal": "Ending task",
-    "action": {"name": "done", "params": {"text": "No action returned by LLM", "success": False}},
-}
+def _fallback_done_output() -> dict[str, Any]:
+    """review7 #5：合成 done 统一挂 _HonestDone 带外标记（校验放行；variant B
+    不烧重试）。每次调用返回新实例，text 沿用既有文案。"""
+    action = honest_done_action()
+    action["params"]["text"] = "No action returned by LLM"
+    return {
+        "evaluation_previous_goal": "No action returned",
+        "memory": "",
+        "next_goal": "Ending task",
+        "action": action,
+        "actions": [action],
+    }
 
 
 def _attach_downloads_to_done_results(
@@ -177,10 +184,9 @@ class StepPipeline:
                 # P0-1：LLM 期间用户停止 → 输出已丢弃。不执行动作、不进 post_process，
                 # _finalize 的 `if model_output is not None` 守卫会跳过历史写入。
                 return False
-            # 管线入口一次性归一化（review6 #9 主线）：client choke point 之后再
-            # 兜一层（幂等）——注入/自定义 LLM 绕过 client 时，整个 actions 列表
-            # （含 dict 条目的 name 修复、位置感知的标量策略）在此统一成型，
-            # 下游全部消费方（校验/执行/后处理/投影）不再各自为政。
+            # 归一化主入口在 _get_next_action 内（校验/truncate/emit 之前，
+            # review7 #6）；此处保留幂等兜底一层，覆盖直灌 model_output 的旁路
+            # 构造（内存历史改造路径等）。
             normalize_model_output(model_output)
             results = await self._execute_actions(model_output, browser_state)
             self._post_process(results, model_output)
@@ -652,6 +658,12 @@ class StepPipeline:
             )
             return None
 
+        # 管线入口归一化（review6 #9 / review7 #6）：必须在校验 / truncate /
+        # emit / assistant 消息构造**之前**——truncate 会把裸列表元素提升为
+        # 镜像，未归一化形态先到 emit/log 就崩（pydantic str 字段 / str.get）。
+        # client choke point 之后再兜一层（幂等），覆盖注入/自定义 LLM。
+        normalize_model_output(response)
+
         # Hard-cap actions to max_actions_per_step (browser-use service.py:1950-1951).
         # The system prompt and schema maxItems only *tell* the LLM the limit;
         # this is the runtime safety net for when small models ignore them and
@@ -666,8 +678,11 @@ class StepPipeline:
             self._obs_bus.emit(ModelResultEvent(
                 step=self.state.n_steps, session_id=self._obs_session_id,
                 model_call_id=model_call_id,
-                action_name=name_of(response.get("action")),
-                next_goal=response.get("next_goal", ""),
+                # review7 #8：emit 字段统一 str(x or "")——LLM 显式输出
+                # next_goal: null（key 存在）曾把 None 塞进 pydantic str 字段、
+                # ValidationError 丢弃整个有效步骤
+                action_name=str(name_of(response.get("action")) or ""),
+                next_goal=str(response.get("next_goal") or ""),
                 input_tokens=_usage.get("input_tokens"),
                 output_tokens=_usage.get("output_tokens"),
             ))
@@ -676,9 +691,11 @@ class StepPipeline:
         assistant_msg: dict[str, Any] = {
             "role": "assistant",
             "content": (
-                f"[{response.get('evaluation_previous_goal', '')}] "
-                f"Goal: {response.get('next_goal', '')} | "
-                f"Action: {response.get('action', {}).get('name', 'unknown')}"
+                f"[{response.get('evaluation_previous_goal') or ''}] "
+                f"Goal: {response.get('next_goal') or ''} | "
+                # review7 #6/#8：归一化后镜像可能仍是标量/无名字典（多元素
+                # 畸形头走澄清重试前）——name_of 兜底，不再裸 .get 崩
+                f"Action: {name_of(response.get('action')) or 'unknown'}"
             ),
         }
         if self._enable_message_typing:
@@ -697,7 +714,7 @@ class StepPipeline:
         self.messages.append(assistant_msg)
 
         # Log action decision (structured four-line block)
-        action_name = name_of(response.get("action"))
+        action_name = str(name_of(response.get("action")) or "unknown")
         action_params = params_of(response.get("action"))
         # P1-2：决策日志脱敏（修复 pre-existing 泄露——params 已被 client
         # ``_restore_sensitive_in_output`` 还原为真值，直接打印会泄密；与
@@ -820,7 +837,7 @@ class StepPipeline:
 
         # Fallback: insert safe done action
         logger.warning("LLM still returned empty action after retry, using fallback done")
-        return dict(_FALLBACK_DONE_OUTPUT)
+        return _fallback_done_output()
 
     async def _validate_params_or_retry(
         self,
@@ -853,7 +870,7 @@ class StepPipeline:
 
             if not self._is_valid_action(response):
                 logger.warning("LLM returned empty action during param validation retry")
-                return dict(_FALLBACK_DONE_OUTPUT)
+                return _fallback_done_output()
 
             param_error = self._validate_action_params(response)
             if param_error is None:

@@ -100,10 +100,7 @@ def _apply_manual_variable_at_location(
         if getattr(item, "step_number", None) != step_number:
             continue
         model_output = item.model_output or {}
-        actions = model_output.get("actions")
-        if not actions:
-            single = model_output.get("action")
-            actions = [single] if single else []
+        actions = actions_of(model_output)  # review7 #10：共享分发
         if not (0 <= action_index < len(actions)):
             return False
         action = actions[action_index]

@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field, model_validator
 # 历史加载入口的畸形动作归一化复用无依赖叶子模块 action_shape（review4 #7——
 # 不再把 LLM client 及其 anthropic import 拉进 agent 数据模型层/tools 的依赖图），
 # 不为历史路径复制第二份强转规则。
-from tree_walker.action_shape import coerce_named_action, normalize_actions_list
+from tree_walker.action_shape import actions_of, normalize_model_output, params_of
 
 logger = logging.getLogger(__name__)
 
@@ -132,33 +132,32 @@ class AgentHistory(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _normalize_malformed_actions(cls, data: Any) -> Any:
-        """畸形动作归一化的**构造收口**（issue #173，review5 #10 / review6 #8）。
+        """畸形动作归一化的**构造收口**（issue #173，review5 #10 / review6 #8 /
+        review7 #2/#3）。
 
-        对齐 ActionResult.validate_success_requires_done 的既有模式：把归一化
-        挂在模型上，使 load_from_file / load_from_dict / model_validate / 内存
-        构造**全部路径**统一。**拷贝归一化**：对 model_output 做浅拷贝（含逐条
-        动作 dict 一层拷贝）后改写——绝不就地改写调用方传入的 dict（构造随后
-        字段校验失败时，不得腐蚀一个失败的构造器从未拥有的输入；_finalize 与
-        state.last_model_output 共享同一 dict 对象）。
+        委托给 ``normalize_model_output(context="history")`` 的单一策略表——
+        历史上**下文不合成可执行动作**（master 时代录制的畸形条目在原 run 中
+        从未执行，重放不得替它执行；live 的 honest-done/澄清策略只属于实况
+        管线），只做无害化：非列表容器重置（防逐字符拆分）、dict 修 params、
+        畸形条目原样保留（消费方跳过）。**拷贝归一化**：绝不就地改写调用方
+        传入的 dict（构造随后字段校验失败时，不得腐蚀一个失败的构造器从未
+        拥有的输入；_finalize 与 state.last_model_output 共享同一 dict 对象）。
         """
         if not isinstance(data, dict):
             return data
         mo = data.get("model_output")
         if not isinstance(mo, dict):
             return data
+        # 深至动作条目一层的拷贝（normalize 会原地改 params/容器/镜像——
+        # 浅拷贝仍共享条目 dict，会写回调用方输入）
         mo_copy = dict(mo)
         actions = mo_copy.get("actions")
-        if isinstance(actions, list) and actions:
-            actions = [dict(a) if isinstance(a, dict) else a for a in actions]
-            normalize_actions_list(actions)
-            mo_copy["actions"] = actions
-            mo_copy["action"] = actions[0]  # 镜像刷新（老文件可能是畸形原值）
-        elif isinstance(mo_copy.get("action"), dict):
-            act = dict(mo_copy["action"])
-            normalize_actions_list([act])
-            mo_copy["action"] = act
-        elif isinstance(mo_copy.get("action"), str) and mo_copy["action"].strip():
-            mo_copy["action"] = coerce_named_action(mo_copy["action"])
+        if isinstance(actions, list):
+            mo_copy["actions"] = [dict(a) if isinstance(a, dict) else a for a in actions]
+        act = mo_copy.get("action")
+        if isinstance(act, dict):
+            mo_copy["action"] = dict(act)
+        normalize_model_output(mo_copy, context="history")
         data["model_output"] = mo_copy
         return data
 
@@ -199,13 +198,18 @@ def _redact_history_data(
         return
     for h in data.get("history", []):
         mo = h.get("model_output") or {}
-        actions = mo.get("actions") or ([mo["action"]] if mo.get("action") else [])
+        # review7 #10：共享分发。镜像与列表都要过——model_dump 序列化时共享
+        # 引用会被复制成两份，只脱敏 actions 列表会漏掉 action 镜像那份。
+        actions = actions_of(mo)
+        mirror = mo.get("action")
+        if isinstance(mirror, dict):
+            actions = actions + [mirror]
         for action in actions:
             if not isinstance(action, dict):
                 continue
             fields = _SENSITIVE_ACTION_FIELDS.get(action.get("name"))
-            params = action.get("params")
-            if not fields or not isinstance(params, dict):
+            params = params_of(action)
+            if not fields:
                 continue
             for f in fields:
                 if isinstance(params.get(f), str):

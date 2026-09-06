@@ -30,10 +30,12 @@ __all__ = [
     "params_of",
 ]
 
-# 诚实失败标记（review6 #3）：携带者跳过参数校验立即执行——variant B 的
-# StructuredDoneParams（extra="forbid"）会拒绝 honest_done 的 text 参数、
-# 烧掉 2 次全上下文重试，恰是该 helper 要消除的消耗。
-_HONEST_FAILURE_MARKER = "_honest_failure"
+# 诚实失败标记（review6 #3 / review7 #4 带外化）：``_HonestDone`` 是 dict 子类，
+# ``is_honest_failure_action`` 按 isinstance 判定——**不进动作数据载荷**：
+# - LLM 自己输出的 ``_honest_failure`` key 不再有任何特权（无法借它绕过校验）；
+# - json 持久化 / pydantic 校验 / web 编辑器往返天然是普通 dict（无私有 key 泄漏）。
+class _HonestDone(dict):
+    """诚实失败 done 的带外类型标记。序列化为普通 JSON 对象。"""
 
 
 def coerce_named_action(raw: Any) -> dict:
@@ -50,64 +52,101 @@ def coerce_named_action(raw: Any) -> dict:
 
 def honest_done_action() -> dict:
     """非字符串畸形值（null/数字/布尔）的统一去向（review4 #2 / review5 #2）：
-    诚实失败的 done——**一次调用**终止（``_HONEST_FAILURE_MARKER`` 使校验放行，
-    见 review6 #3），绝不强转成 'None'/'123' 这类模型从未输出过的名字进重试
-    梯子（2 次全上下文重试 × 每步，最终 max_failures 终止且无 done）。
+    诚实失败的 done——**一次调用**终止（``_HonestDone`` 带外标记使校验放行，
+    见 review6 #3 / review7 #4），绝不强转成 'None'/'123' 这类模型从未输出过
+    的名字进重试梯子。
     """
-    return {
+    return _HonestDone({
         "name": "done",
         "params": {"text": "Invalid action shape", "success": False},
-        _HONEST_FAILURE_MARKER: True,
-    }
+    })
 
 
 def is_honest_failure_action(action: Any) -> bool:
     """校验层放行判定（review6 #3）：诚实失败 done 不进参数校验/重试梯子。"""
-    return isinstance(action, dict) and bool(action.get(_HONEST_FAILURE_MARKER))
+    return isinstance(action, _HonestDone)
 
 
-def normalize_actions_list(actions_list: list[Any]) -> None:
+def _has_invalid_name(action: dict) -> bool:
+    """dict 动作的 name 键「存在但无效」（null/空串/非字符串）——与裸标量
+    同类的模型畸形（review7 #7：同一错误两种形态应同等待遇）。"""
+    if "name" not in action:
+        return False
+    name = action["name"]
+    return not (isinstance(name, str) and name)
+
+
+def normalize_actions_list(
+    actions_list: list[Any], *, context: str = "live"
+) -> None:
     """畸形动作归一化（issue #173 的 choke point 实现）——原地修复。
 
-    位置感知策略（review6 #1/#2）：
+    策略表（形状 × 位置 × 上下文，review7 主线收口——此前策略分散在
+    live 入口 / 历史加载 / truncate / client else 各应用不同子集）：
+
+    **live**（实况管线，可执行、可反馈模型）：
     - 裸字符串（像样的动作名）→ 命名动作（任意位置，进缺参重试梯子）；
-    - **index 0** 的其他标量（null/数字）→ 诚实失败 done——它是 actions[0]
-      镜像、会进参数校验，强转合成名会烧全上下文重试（review4 #2）；单元素
-      列表即「一次调用诚实终止」；
-    - **index > 0** 的其他标量 → ``str()`` 强转命名动作——中段条目不进校验，
-      执行时得到**可见的** Unknown action 错误（guard #3 截断且留 error 结果），
-      而非诚实 done 触发 guard #1 的静默截断（无反馈；持久化后重放还会执行
-      这个从未执行过的 done 造成分叉——review6 #2）；
-    - dict 的 name 键存在但为 null/空串/非字符串 → ``str(name)`` 强转（可见
-      错误，绝不伪造 done——review5 #1）；name 键缺失 → 不动（name_of 的
-      旧单动作 "done" 缺省语义）；
-    - dict 但 params 为字符串/null/数字 → 置空 ``{}``。
+    - **单元素列表**的其他畸形（标量或 name 无效的 dict）→ 诚实失败 done
+      （一次调用终止，不烧重试）；
+    - **多元素列表**：畸形条目**原样保留**——头部畸形使镜像过不了
+      ``_is_valid_action`` → 走 master 同款澄清重试（模型可重发整个列表，
+      review7 #1：不再硬终止丢弃有效尾部）；中段畸形在执行时得到可见的
+      Unknown action 错误（review6 #2：不合成 done 造成静默截断/重放分叉）；
+    - dict 但 params 为字符串/null/数字 → 置空 ``{}``（两种上下文共用的
+      无害化）。
+
+    **history**（历史加载，review7 #2/#3：**不合成可执行动作**——master 时代
+    录制的畸形条目在原 run 中从未执行，重放不得替它执行；只做无害化）：
+    - 非列表 truthy 的 actions 容器 → ``[action 或 {}]``（防逐字符拆分）；
+    - dict 条目修 params；标量/name 畸形条目原样保留（消费方
+      ``isinstance(action, dict)`` 跳过 / emit str() 包裹，均无害）。
     """
+    single = len(actions_list) == 1
     for i, a in enumerate(actions_list):
         if not isinstance(a, dict):
-            if isinstance(a, str) and a.strip():
+            if isinstance(a, str) and a.strip() and context == "live":
                 logger.warning(
                     "action[%d] malformed (%s) — coerced to named action",
                     i, type(a).__name__,
                 )
                 actions_list[i] = coerce_named_action(a)
-            elif i == 0:
+            elif context == "live" and single:
                 logger.warning(
                     "action[0] malformed (%s) — honest-failure done termination",
                     type(a).__name__,
                 )
                 actions_list[i] = honest_done_action()
             else:
+                # live 多元素：原样保留（镜像无效 → 澄清重试，review7 #1；中段
+                # 畸形执行时得可见错误，review6 #2）；history：不合成可执行
+                # 动作（review7 #2）——master 时代录制的裸字符串/标量在原 run
+                # 从未执行，重放不得替它执行，消费方 isinstance 跳过即可
                 logger.warning(
-                    "action[%d] malformed (%s) — coerced to named action "
-                    "(yields visible Unknown-action error on execute)",
-                    i, type(a).__name__,
+                    "action[%d] malformed (%s, %s) — left as-is (consumers skip "
+                    "or surface visible error)",
+                    i, type(a).__name__, context,
                 )
-                actions_list[i] = coerce_named_action(a)
         else:
-            name = a.get("name", "")
-            if "name" in a and not (isinstance(name, str) and name):
-                a["name"] = str(name) if name is not None else "None"
+            if _has_invalid_name(a):
+                if context == "live" and single:
+                    logger.warning(
+                        "action[0] has invalid name (%r) — honest-failure done",
+                        a.get("name"),
+                    )
+                    actions_list[i] = honest_done_action()
+                elif context == "live":
+                    # 多元素列表：无效 name 原样保留（review7 #7：不造 'None'
+                    # 合成名进重试梯——镜像过不了 _is_valid_action 走澄清）
+                    logger.warning(
+                        "action[%d] has invalid name (%r) — left as-is "
+                        "(invalid mirror → clarification retry)",
+                        i, a.get("name"),
+                    )
+                else:
+                    logger.warning(
+                        "history action[%d] has invalid name — left as-is",
+                        i,
+                    )
             if not isinstance(a.get("params"), dict):
                 if a.get("params") is not None:
                     logger.warning(
@@ -153,18 +192,24 @@ def actions_of(model_output: dict[str, Any] | None) -> list[Any]:
     return list(model_output.get("actions") or [model_output.get("action", {})])
 
 
-def normalize_model_output(model_output: dict[str, Any]) -> dict[str, Any]:
-    """管线入口一次性归一化整个 model_output（review6 主线，#9）。
+def normalize_model_output(
+    model_output: dict[str, Any], *, context: str = "live"
+) -> dict[str, Any]:
+    """管线入口一次性归一化整个 model_output（review6 #9 / review7 主线）。
 
-    在 ``_step`` 拿到 response 后（client 构造 result 之后/注入 LLM 绕过时）
-    调用：物化 actions 列表（单动作也物化，统一下游分发）→ 逐条归一化（位置
-    感知策略见 ``normalize_actions_list``）→ 刷新 ``action`` 镜像。幂等。
+    单一策略表（形状 × 位置 × 上下文，见 ``normalize_actions_list`` docstring）：
+    - **live**：在 ``_get_next_action`` 拿到 response 后、校验/truncate/emit
+      **之前**调用（review7 #6：归一化晚于 truncate 会让裸元素先崩 emit/log）；
+    - **history**：历史加载/构造路径（validator）调用——不合成可执行动作。
+
+    物化 actions 列表（非列表 truthy 容器按 ``[action 或 {}]`` 重置，防
+    ``actions_of`` 逐字符拆分——review7 #3）→ 逐条归一化 → 刷新镜像。幂等。
     """
     actions = model_output.get("actions")
     if not (isinstance(actions, list) and actions):
         act = model_output.get("action")
         actions = [act] if isinstance(act, (str, dict)) else [{}]
-    normalize_actions_list(actions)
+    normalize_actions_list(actions, context=context)
     model_output["actions"] = actions
     model_output["action"] = actions[0]
     return model_output

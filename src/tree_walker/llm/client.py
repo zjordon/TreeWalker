@@ -11,7 +11,6 @@ from typing import Any
 from anthropic import Anthropic, APIError, RateLimitError
 
 from tree_walker.action_shape import (
-    coerce_named_action,
     honest_done_action,
     normalize_actions_list,
 )
@@ -317,12 +316,16 @@ class LLMClient:
                     _text_retry_count=_text_retry_count,
                 )
             logger.warning("LLM still returned no parseable response after retry, using fallback done")
+            # review7 #5：合成 done 统一挂 _HonestDone 带外标记（校验放行，
+            # variant B 的 StructuredDoneParams 不再为它烧 2 次全上下文重试）
+            _fb = honest_done_action()
+            _fb["params"]["text"] = "No response from LLM"
             result = {
                 "evaluation_previous_goal": "No response from LLM",
                 "memory": "",
                 "next_goal": "Ending task due to empty response",
-                "action": {"name": "done", "params": {"text": "No response from LLM", "success": False}},
-                "actions": [{"name": "done", "params": {"text": "No response from LLM", "success": False}}],
+                "action": _fb,
+                "actions": [_fb],
                 "usage": _usage_dict,
             }
             if url_map:
@@ -335,20 +338,13 @@ class LLMClient:
         # Normalize action input: accept list (multi_act) or single dict (legacy).
         # Both `action` (first element, for backward compatibility) and `actions`
         # (full list, for the new multi-action loop) are exposed to downstream.
+        # review7 #9：标量头不再在 client 手工分流（与 normalize_actions_list
+        # 的 index-0 策略逐字节重复、可漂移）——统一 `[raw]` 后交给归一化。
         raw_action = tool_input.get("action", {})
         if isinstance(raw_action, list):
             actions_list = raw_action
-        elif isinstance(raw_action, dict):
-            actions_list = [raw_action]
         else:
-            if isinstance(raw_action, str) and raw_action.strip():
-                # 裸字符串：像样的动作名 → 命名动作进澄清-重试梯子（缺参得到
-                # 字段反馈、未注册名得到 Unknown action 反馈，模型可修）
-                actions_list = [coerce_named_action(raw_action)]
-            else:
-                # null/数字/布尔（review4 #2 / review5 #2）：无可修的名字——
-                # 诚实失败 done 一次调用终止，不合成 'None' 烧全上下文重试。
-                actions_list = [honest_done_action()]
+            actions_list = [raw_action]
 
         # Phase A diagnostic: log the actual shape LLM emitted so we can tell
         # whether multi-action is being used. Reads schema maxItems when present

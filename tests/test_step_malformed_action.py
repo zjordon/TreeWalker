@@ -33,7 +33,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from pydantic import BaseModel
 
-from tree_walker.action_shape import coerce_named_action, name_of, normalize_actions_list
+from tree_walker.action_shape import (
+    coerce_named_action,
+    honest_done_action,
+    name_of,
+    normalize_actions_list,
+)
 from tree_walker.agent.loop_detector import ActionLoopDetector
 from tree_walker.agent.rerun import RerunMixin
 from tree_walker.agent.step import StepPipeline
@@ -185,29 +190,58 @@ class TestNormalizeActionsList:
 		assert not any("<SECRET-TOKEN-1234>" in r.getMessage() for r in caplog.records)
 
 	def test_list_scalar_position_aware_policy(self):
-		# review6 #1/#2：位置感知——index 0 标量 = 镜像、进校验 → 诚实 done
-		# （带 _honest_failure 标记，校验放行一次调用终止）；index > 0 标量 →
-		# str() 强转命名动作（执行时可见 Unknown action 错误，而非触发 guard #1
-		# 的静默截断/重放分叉）
-		actions = [None, "click", 123]
+		# review7 #1：**单元素**列表畸形 → 诚实 done（_HonestDone 带外标记使
+		# 校验放行、一次调用终止）；**多元素**列表畸形头原样保留——镜像过不了
+		# _is_valid_action → master 同款澄清重试（不硬终止丢弃有效尾部）
+		actions = [None, {"name": "click", "params": {}}]
 		normalize_actions_list(actions)
-		assert actions[0]["name"] == "done"
-		assert actions[0]["params"]["success"] is False
-		assert actions[0].get("_honest_failure") is True  # 校验放行标记
+		assert actions[0] is None  # 多元素头：原样保留 → 澄清重试
 		assert actions[1] == {"name": "click", "params": {}}
-		assert actions[2] == {"name": "123", "params": {}}
 
-	def test_dict_with_invalid_name_gets_visible_string_name(self):
-		# review6 #1：null/非字符串 name → str() 强转（可见错误），绝不伪造 done
-		actions = [{"name": None, "params": {"index": 1}}, {"name": ["click"], "params": {}}]
-		normalize_actions_list(actions)
-		assert actions[0]["name"] == "None"
-		assert actions[0]["params"] == {"index": 1}  # params 保留
-		assert actions[1]["name"] == "['click']"
+		single = [None]
+		normalize_actions_list(single)
+		assert single[0]["name"] == "done"
+		assert single[0]["params"]["success"] is False
+
+	def test_dict_with_invalid_name_same_treatment_as_scalar(self):
+		# review7 #7：dict name=null 与标量 null 同等待遇——单元素 → 诚实 done；
+		# 多元素 → 原样保留（无效镜像 → 澄清重试），不造 'None' 合成名进重试梯
+		single = [{"name": None, "params": {"index": 1}}]
+		normalize_actions_list(single)
+		assert single[0]["name"] == "done"
+		assert single[0]["params"]["success"] is False
+
+		multi = [{"name": None, "params": {}}, {"name": "click", "params": {}}]
+		normalize_actions_list(multi)
+		assert multi[0]["name"] is None  # 原样保留，不合成 'None'
+
 		# name 键缺失 → 不动（name_of 的旧单动作 "done" 缺省语义）
 		actions2 = [{"params": {}}]
 		normalize_actions_list(actions2)
 		assert "name" not in actions2[0]
+
+	def test_history_context_never_synthesizes_executable_actions(self):
+		# review7 #2：history 上下文只做无害化——不合成可执行动作（master 时代
+		# 录制的中段标量/字符串在原 run 从未执行，重放不得替它执行）
+		actions = [None, "scroll", {"name": "click", "params": "561257"}]
+		normalize_actions_list(actions, context="history")
+		assert actions[0] is None  # 原样保留（消费方跳过）
+		assert actions[1] == "scroll"  # 不物化为可执行命名动作
+		assert actions[2]["params"] == {}  # dict 修 params（无害化共用）
+
+	def test_honest_done_marker_is_out_of_band(self):
+		# review7 #4：_HonestDone 带外标记——LLM 自己输出 _honest_failure key
+		# 无任何特权（不能借它绕过校验）；序列化为普通 dict（无私有 key 进载荷）
+		import json as _json
+
+		from tree_walker.action_shape import is_honest_failure_action
+
+		hd = honest_done_action()
+		assert is_honest_failure_action(hd)
+		assert "_honest_failure" not in _json.dumps(hd)  # 持久化无私有 key
+		assert not is_honest_failure_action(
+			{"name": "click", "params": {}, "_honest_failure": True}
+		)
 
 
 class TestNameOfSemantics:
@@ -238,10 +272,12 @@ class TestAgentHistoryConstructionNormalization:
 		return AgentHistory(step_number=1, model_output=model_output, result=[])
 
 	def test_in_memory_construction_normalizes(self):
+		# history 策略（review7 #2）：dict 修 params；裸字符串原样保留
+		# （不合成可执行动作）；镜像刷新为列表首元素
 		h = self._mk({"actions": [{"name": "click", "params": "561257"}, "wait"]})
 		assert h.model_output["actions"] == [
 			{"name": "click", "params": {}},
-			{"name": "wait", "params": {}},
+			"wait",
 		]
 		assert h.model_output["action"] == h.model_output["actions"][0]
 
@@ -273,13 +309,21 @@ class TestAgentHistoryConstructionNormalization:
 		assert mo == snapshot  # 失败构造不改写调用方输入
 
 	def test_normalize_model_output_materializes_and_fixes(self):
-		# review6 #9 主线：入口一次性归一化——单动作物化为列表、name 修复、镜像刷新
+		# review6 #9 主线：入口一次性归一化——单动作物化为列表、镜像刷新；
+		# review7 #3：非列表 truthy 容器重置（防 actions_of 逐字符拆分）；
+		# review7 #7：单元素 name=null → 诚实 done（与标量同待遇）
 		from tree_walker.action_shape import normalize_model_output
 
 		mo = {"action": {"name": None, "params": "561257"}}
 		normalize_model_output(mo)
-		assert mo["actions"] == [{"name": "None", "params": {}}]
-		assert mo["action"] == mo["actions"][0]
+		[action] = mo["actions"]
+		assert action["name"] == "done"  # 单元素无效 name → 诚实终止
+		assert action["params"]["success"] is False
+		assert mo["action"] == action
+
+		mo2 = {"actions": "click", "action": {"name": "click", "params": {}}}
+		normalize_model_output(mo2)
+		assert mo2["actions"] == [{"name": "click", "params": {}}]  # 容器重置
 
 
 # ── 2. 流水线端到端：归一化后走完 execute + post_process ────────────────
@@ -317,10 +361,10 @@ class TestPipelineStagesEndToEnd:
 		assert len(results) == 1
 
 	@pytest.mark.asyncio
-	async def test_mid_list_malformed_executes_visibly_not_silent_done(self):
-		# review6 #2：中段畸形标量强转为 'None' 名、作为动作执行（真实 Tools
-		# 会得到可见 Unknown action 错误并 guard #3 截断）——不再替换成
-		# honest-done 触发 guard #1 的静默截断（无反馈、重放分叉）
+	async def test_mid_list_malformed_left_as_is_visible_skip(self):
+		# review7 #1/#2 收口后的形态：多元素列表的畸形条目**原样保留**——
+		# 执行侧 name_of/params_of 解释（None 名 → 可见 Unknown action /
+		# 跳过），不再合成 done 或 'None' 名（重放分叉/合成名反馈双消除）
 		agent = _loop_agent()
 		model_output = {"actions": [
 			{"name": "click", "params": {}},
@@ -330,7 +374,8 @@ class TestPipelineStagesEndToEnd:
 		normalize_actions_list(model_output["actions"])
 		await StepPipeline._execute_actions(agent, model_output, _browser_state())
 		assert agent.tools.calls[0] == ("click", {})
-		assert agent.tools.calls[1] == ("None", {})  # 可见执行，非静默 done 截断
+		# None 名进入执行（fake 工具记录原样；真实 Tools → 可见 Unknown action）
+		assert agent.tools.calls[1] == (None, {})
 
 
 # ── 3. rerun：历史加载入口归一化（review2 #3 的根因修法）───────────────
@@ -352,25 +397,26 @@ class TestRerunHistoryLoadNormalization:
 		return fake
 
 	def test_load_from_dict_normalizes_malformed_actions(self):
+		# history 策略（review7 #2）：dict 修 params；裸字符串原样保留
 		hl = AgentHistoryList.load_from_dict(self._history_data(
 			[{"name": "input_text", "params": {"index": 1, "text": "x"}},
 			 {"name": "click", "params": "561857"}, "wait"],
 		))
 		actions = hl.history[0].model_output["actions"]
-		assert all(isinstance(a, dict) and isinstance(a["params"], dict) for a in actions)
-		assert actions[1] == {"name": "click", "params": {}}
-		assert actions[2] == {"name": "wait", "params": {}}
+		assert actions[1] == {"name": "click", "params": {}}  # params 无害化
+		assert actions[2] == "wait"  # 不合成可执行动作（消费方跳过）
 		assert hl.history[0].model_output["action"] == actions[0]  # 镜像刷新
 
-	def test_load_from_dict_normalizes_str_single_action(self):
-		# 老格式 {"action": "click"}（无 actions 列表）→ 命名动作 dict
+	def test_load_from_dict_str_single_action_left_as_is(self):
+		# 老格式 {"action": "click"}（无 actions 列表）：物化为列表（防逐字符
+		# 拆分，review7 #3）但字符串原样保留（review7 #2：不合成可执行动作）
 		data = {"history": [{
 			"step_number": 1,
 			"model_output": {"next_goal": "g", "action": "click"},
 			"result": [], "state_summary": {}, "interacted_element": None,
 		}]}
 		hl = AgentHistoryList.load_from_dict(data)
-		assert hl.history[0].model_output["action"] == {"name": "click", "params": {}}
+		assert hl.history[0].model_output["actions"] == ["click"]
 
 	def test_normalized_history_flows_through_skip_reason(self):
 		# 端到端：畸形历史经 load_from_dict 归一化后，_skip_reason 按「无 index」
@@ -717,13 +763,13 @@ class TestMalformedActionSemantics:
 
 	@pytest.mark.asyncio
 	async def test_null_action_honest_done_termination(self):
-		# review4 #2 / review6 #3：无可修的名字——诚实失败 done 一次调用终止
-		# （_honest_failure 标记使校验放行，variant B 也不烧重试）
+		# review4 #2 / review6 #3 / review7 #4：无可修的名字——诚实失败 done
+		# 一次调用终止（_HonestDone 带外标记使校验放行，variant B 也不烧重试）
 		result = await self._get_with_action(self._client(), None)
 		[action] = result["actions"]
 		assert action["name"] == "done"
 		assert action["params"]["success"] is False
-		assert action["_honest_failure"] is True
+		assert "_honest_failure" not in action  # 带外：无私有 key 入载荷
 
 	@pytest.mark.asyncio
 	async def test_numeric_action_honest_done_termination(self):
