@@ -1,16 +1,19 @@
-"""Tests for malformed-action handling (issue #173, PR #174 review 修订版).
+"""Tests for malformed-action handling (issue #173, PR #174 两轮 review 修订版).
 
 LLM 偶发输出畸形动作（params 为字符串 / 动作为裸字符串），65.2% 轮曾把 778/782
-从「可恢复的单步失败」放大成「整任务崩」。按 PR #174 code review 的裁决，防线
-收敛为（docs/p7/code-review/2026-09-06-pr174-malformed-action-params-crash.md）：
+从「可恢复的单步失败」放大成「整任务崩」。按两轮 code review 的裁决，防线收敛为
+（docs/p7/code-review/2026-09-06-pr174-malformed-action-params-crash*.md）：
 
   1. choke point：client._normalize_actions_list 在 get_action 构造 result 前
      原地归一化——一处修复执行 / 参数校验 / _post_process / loop_detector /
-     历史投影与持久化全部下游（review #1/#2/#6）
-  2. rerun._skip_reason 的存量数据守卫（review #3——归一化只保新历史，旧 JSONL
-     可能已有畸形数据）
-  3. _step 的 finally 对 _finalize 整体兜底（review #5——EventBus 订阅者无隔离）
-     + _safe_project_interacted_elements 元数据降级
+     历史投影与持久化全部下游（round1 #1/#2/#6）
+  2. rerun 的历史加载入口归一化（round2 #3）：AgentHistoryList.load_from_dict
+     复用同一函数修存量 JSONL，_skip_reason 不再持有局部守卫
+  3. EventBus.emit per-handler 隔离（round2 #1/#2 根因）+ _step 的 finally 对
+     _finalize 整体兜底且不跳过 n_steps 递增（计数器边界）+
+     _safe_project_interacted_elements 元数据降级
+  4. 顶层裸字符串 action 归一化为命名动作走重试梯子（round2 #5），不再合成
+     done(success=False) 零重试终止任务
 
 harness 复刻自 test_multi_act.py（registry/tools/agent）与 test_step_finalize.py
 （_FakeAgent 形态）。
@@ -31,8 +34,11 @@ from tree_walker.agent.rerun import RerunMixin
 from tree_walker.agent.step import StepPipeline
 from tree_walker.agent.views import ActionResult, AgentHistoryList, AgentState
 from tree_walker.browser.views import BrowserStateSummary, SerializedDOMState
-from tree_walker.config import TruncationSettings
-from tree_walker.llm.client import _normalize_actions_list
+from tree_walker.config import LLMSettings, TruncationSettings
+from tree_walker.llm.client import LLMClient, _normalize_actions_list
+from tree_walker.observability.event_bus import EventBus
+from tree_walker.observability.events import StepStartEvent
+from tree_walker.tools.actions import Tools
 from tree_walker.tools.registry import ActionRegistry, RegisteredAction
 
 
@@ -184,7 +190,7 @@ class TestPipelineStagesEndToEnd:
 		assert len(results) == 3
 		assert agent.tools.calls == [
 			("input_text", {"index": 1, "text": "x"}),
-			("click", {}),   # 缺参执行 → 优雅失败（非 AttributeError）
+			("click", {}),   # 缺参形态的「优雅失败」证据在 TestValidateParamsGracefulFailure
 			("wait", {}),
 		]
 		StepPipeline._post_process(agent, results, model_output)  # 不抛即过
@@ -202,39 +208,64 @@ class TestPipelineStagesEndToEnd:
 			await StepPipeline._execute_actions(agent, model_output, _browser_state())
 
 
-# ── 3. rerun 存量数据守卫 ───────────────────────────────────────────────
+# ── 3. rerun：历史加载入口归一化（review2 #3 的根因修法）───────────────
 
 
-class TestRerunSkipReasonGuard:
-	def _item(self, actions: list) -> SimpleNamespace:
-		return SimpleNamespace(
-			model_output={"actions": actions},
-			result=[ActionResult()],
-			interacted_element=None,
-			step_number=1,
-		)
+class TestRerunHistoryLoadNormalization:
+	def _history_data(self, actions) -> dict:
+		return {"history": [{
+			"step_number": 1,
+			"model_output": {"next_goal": "g", "actions": actions},
+			"result": [],
+			"state_summary": {},
+			"interacted_element": None,
+		}]}
 
 	def _mixin(self) -> RerunMixin:
 		fake = RerunMixin()
 		fake._is_redundant_retry_step = lambda *a, **k: False  # 与本测试无关的分支
 		return fake
 
-	def test_string_params_history_does_not_crash(self):
-		# review #3：truthy 字符串 "561857" 会击穿 `or {}` 兜底 → fp.get 崩掉
-		# 整个 replay；守卫后按「无 index」处理返回跳过原因
+	def test_load_from_dict_normalizes_malformed_actions(self):
+		hl = AgentHistoryList.load_from_dict(self._history_data(
+			[{"name": "input_text", "params": {"index": 1, "text": "x"}},
+			 {"name": "click", "params": "561857"}, "wait"],
+		))
+		actions = hl.history[0].model_output["actions"]
+		assert all(isinstance(a, dict) and isinstance(a["params"], dict) for a in actions)
+		assert actions[1] == {"name": "click", "params": {}}
+		assert actions[2] == {"name": "wait", "params": {}}
+		assert hl.history[0].model_output["action"] == actions[0]  # 镜像刷新
+
+	def test_load_from_dict_normalizes_str_single_action(self):
+		# 老格式 {"action": "click"}（无 actions 列表）→ 命名动作 dict
+		data = {"history": [{
+			"step_number": 1,
+			"model_output": {"next_goal": "g", "action": "click"},
+			"result": [], "state_summary": {}, "interacted_element": None,
+		}]}
+		hl = AgentHistoryList.load_from_dict(data)
+		assert hl.history[0].model_output["action"] == {"name": "click", "params": {}}
+
+	def test_normalized_history_flows_through_skip_reason(self):
+		# 端到端：畸形历史经 load_from_dict 归一化后，_skip_reason 按「无 index」
+		# 处理返回跳过原因（修复前 truthy 字符串击穿 or {} → fp.get 崩掉 replay）
+		hl = AgentHistoryList.load_from_dict(self._history_data(
+			[{"name": "click", "params": "561857"}],
+		))
 		reason = self._mixin()._skip_reason(
-			self._item([{"name": "click", "params": "561857"}]),
-			previous_item=None, previous_succeeded=True, skip_failures=False,
+			hl.history[0], previous_item=None, previous_succeeded=True, skip_failures=False,
 		)
 		assert reason is not None
 		assert "无 index" in reason
 
 	def test_valid_index_history_not_skipped(self):
-		reason = self._mixin()._skip_reason(
-			self._item([{"name": "click", "params": {"index": 5}}]),
-			previous_item=None, previous_succeeded=True, skip_failures=False,
-		)
-		assert reason is None
+		hl = AgentHistoryList.load_from_dict(self._history_data(
+			[{"name": "click", "params": {"index": 5}}],
+		))
+		assert self._mixin()._skip_reason(
+			hl.history[0], previous_item=None, previous_succeeded=True, skip_failures=False,
+		) is None
 
 
 # ── 4. _step 的 finally 兜底（review #5）───────────────────────────────
@@ -243,8 +274,8 @@ class TestRerunSkipReasonGuard:
 class TestStepFinallyGuard:
 	@pytest.mark.asyncio
 	async def test_finalize_exception_does_not_kill_step(self):
-		# EventBus 订阅者无异常隔离（JsonlRecorder 磁盘满/文件关闭）——_finalize
-		# 从 finally 抛出曾与 778/782 同型地杀死整个 run；兜底后 _step 正常返回。
+		# _finalize 从 finally 抛出曾与 778/782 同型地杀死整个 run；兜底后
+		# _step 正常返回。
 		agent = _loop_agent()
 		agent._prepare_context = AsyncMock(return_value=(_browser_state(), "state msg"))
 		agent._get_next_action = AsyncMock(return_value={"actions": [{"name": "click", "params": {}}]})
@@ -252,6 +283,9 @@ class TestStepFinallyGuard:
 		agent._finalize = AsyncMock(side_effect=RuntimeError("disk full in JsonlRecorder"))
 		done = await StepPipeline._step(agent)
 		assert done is False  # 不抛、正常返回（历史/obs 降级由 error 日志记录）
+		# 计数器边界（review2 #1）：吞异常不得跳过 n_steps 递增——否则 run() 的
+		# while 循环退化为无界 livelock（动作照常执行、步数永不前进）
+		assert agent.state.n_steps == 1
 
 	@pytest.mark.asyncio
 	async def test_finalize_still_runs_normally(self):
@@ -313,3 +347,135 @@ class TestSafeProjection:
 		)
 		assert len(agent.history.history) == 1
 		assert agent.history.history[-1].interacted_element is None
+
+
+# ── 6. get_action 生产接线（review2 #4：经真实 LLM 解析路径驱动 choke point）──
+
+
+def _make_tool_use_response(tool_input: dict) -> MagicMock:
+	"""伪 Anthropic tool_use 响应（复刻 test_multi_act.py）。"""
+	block = MagicMock()
+	block.type = "tool_use"
+	block.name = "agent_response"
+	block.input = tool_input
+	response = MagicMock()
+	response.content = [block]
+	return response
+
+
+class TestGetActionChokePoint:
+	"""畸形形态经 get_action 入、统一 dict 形态出——管线测试手工调
+	_normalize_actions_list 测不到的「生产接线」层（防有人加提前返回分支绕过
+	归一化时 CI 仍绿）。"""
+
+	def setup_method(self) -> None:
+		self.client = LLMClient(LLMSettings(api_key="test-key"))
+		self.client.client = MagicMock()
+
+	def _patch(self, tool_input: dict) -> None:
+		self.client.client.messages.create = MagicMock(
+			return_value=_make_tool_use_response(tool_input),
+		)
+
+	async def _get(self) -> dict:
+		return await self.client.get_action(
+			system_prompt="",
+			messages=[],
+			tool_schema={"name": "agent_response", "input_schema": {"type": "object"}},
+		)
+
+	@pytest.mark.asyncio
+	async def test_malformed_list_normalized_and_mirrored(self):
+		self._patch({
+			"evaluation_previous_goal": "", "memory": "", "next_goal": "g",
+			"action": [{"name": "click", "params": "561857"}, "wait"],
+		})
+		result = await self._get()
+		assert result["actions"] == [
+			{"name": "click", "params": {}},
+			{"name": "wait", "params": {}},
+		]
+		assert result["action"] == result["actions"][0]  # 镜像同为归一化后形态
+
+	@pytest.mark.asyncio
+	async def test_top_level_string_action_becomes_retryable_named_action(self):
+		# review2 #5：顶层裸字符串 action 不再合成 done(success=False) 零重试
+		# 终止任务——归一化为命名动作，走缺参校验的重试梯子
+		self._patch({
+			"evaluation_previous_goal": "", "memory": "", "next_goal": "g",
+			"action": "click",
+		})
+		result = await self._get()
+		assert result["actions"] == [{"name": "click", "params": {}}]
+		assert result["action"] == {"name": "click", "params": {}}
+
+	@pytest.mark.asyncio
+	async def test_text_json_path_string_action_normalized(self):
+		# review2 #5 的完整链路：模型输出 JSON 文本（非 tool_use）里的裸字符串
+		# action 同样被归一化
+		text_block = MagicMock()
+		text_block.type = "text"
+		text_block.text = '```json\n{"next_goal": "g", "action": "click"}\n```'
+		response = MagicMock()
+		response.content = [text_block]
+		self.client.client.messages.create = MagicMock(return_value=response)
+		result = await self._get()
+		assert result["actions"] == [{"name": "click", "params": {}}]
+		assert result["action"] == {"name": "click", "params": {}}
+
+
+# ── 7. EventBus 订阅者隔离（review2 #1/#2 根因修法）─────────────────────
+
+
+class TestEventBusSubscriberIsolation:
+	def test_bad_subscriber_does_not_break_emit_or_others(self):
+		bus = EventBus()
+		received: list[str] = []
+
+		def bad(event):
+			raise RuntimeError("disk full")
+
+		def good(event):
+			received.append(type(event).__name__)
+
+		bus.subscribe("*", bad)
+		bus.subscribe("*", good)
+		bus.emit(StepStartEvent(step=1, session_id="s"))  # 不抛
+		assert received == ["StepStartEvent"]
+
+	def test_typed_and_wildcard_both_reached(self):
+		bus = EventBus()
+		seen: list[str] = []
+
+		bus.subscribe("step_start", lambda e: seen.append("typed"))
+		bus.subscribe("*", lambda e: seen.append("wildcard"))
+		bus.emit(StepStartEvent(step=1, session_id="s"))
+		assert seen == ["typed", "wildcard"]
+
+
+# ── 8. 缺参优雅失败的真实证据（review2 #4 次级：真实 ClickParams）───────
+
+
+class TestValidateParamsGracefulFailure:
+	def test_normalized_click_empty_params_gets_retry_feedback(self):
+		# 「click 缺参 → 优雅失败」的真实证据链：归一化后的 {"params": {}} 进
+		# 参数校验，得到可反馈给 LLM 的缺字段错误（而非 AttributeError）——
+		# 这正是澄清-重试梯子的输入。
+		class _ClickParams(BaseModel):
+			index: int
+
+		registry = ActionRegistry()
+		registry.actions["click"] = RegisteredAction(
+			name="click", description="click", param_model=_ClickParams,
+			handler=MagicMock(), terminates_sequence=False,
+		)
+		agent = MagicMock()
+		agent.tools = MagicMock()
+		agent.tools.registry = registry
+		agent.tools._flatten_params = lambda params, name: Tools._flatten_params(
+			MagicMock(), params, name,
+		)
+		response = {"action": {"name": "click", "params": {}}}
+		err = StepPipeline._validate_action_params(agent, response)
+		assert err is not None
+		assert "index" in err  # 缺必填字段的反馈文案

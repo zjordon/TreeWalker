@@ -237,6 +237,20 @@ class AgentHistoryList(BaseModel):
         for h in data.get("history", []):
             if h and "interacted_element" not in h:
                 h["interacted_element"] = None
+            # 存量畸形动作归一化（issue #173，PR #174 review2 #3）——历史加载入口
+            # choke point：旧 JSONL 可能带畸形动作（裸字符串动作 / params 为字符串，
+            # 修复前被持久化），在此归一化一次覆盖全部 rerun 消费者（_skip_reason /
+            # _execute_history_step 的 dict(params) 等）。与 client.get_action 共用
+            # 同一函数（llm.client._normalize_actions_list），不为历史复制第二份。
+            mo = h.get("model_output") if isinstance(h, dict) else None
+            if isinstance(mo, dict):
+                actions = mo.get("actions")
+                if isinstance(actions, list) and actions:
+                    from tree_walker.llm.client import _normalize_actions_list
+                    _normalize_actions_list(actions)
+                    mo["action"] = actions[0]  # 镜像刷新（老文件可能是畸形原值）
+                elif isinstance(mo.get("action"), str) and mo["action"].strip():
+                    mo["action"] = {"name": mo["action"].strip(), "params": {}}
         return cls.model_validate(data)
 
     # —— P4 可视化编辑 mutation API ——

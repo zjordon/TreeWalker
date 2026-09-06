@@ -182,13 +182,18 @@ class StepPipeline:
             return False
         finally:
             # finally 边界（issue #173，PR #174 review #5）：finalize 含历史追加与
-            # obs emit（EventBus 订阅者无异常隔离——JsonlRecorder 磁盘满/文件关闭
-            # 会从这里炸出去）。finally 里抛异常会越过上方 except 杀死整个 run
-            # ——778/782 同类死法，必须整体兜住：历史/obs 降级也强过任务死亡。
+            # obs emit。finally 里抛异常会越过上方 except 杀死整个 run——778/782
+            # 同类死法，必须整体兜住：历史/obs 降级也强过任务死亡。
+            # （订阅者异常的根因已在 EventBus.emit 做 per-handler 隔离；这里兜
+            # _finalize 其余部分——历史追加/元数据等。）
             try:
                 await self._finalize(browser_state, model_output, results)
             except Exception as e:
                 logger.error("_finalize failed — history/obs degraded for this step: %s", e)
+                # 计数器边界（review2 #1）：n_steps += 1 是 _finalize 的最后一条
+                # 语句，吞异常不得跳过它——否则 run() 的 while 循环退化为无界
+                # livelock（动作照常执行、步数永不前进）。失败路径同样计入步数。
+                self.state.n_steps += 1
 
         return False
 

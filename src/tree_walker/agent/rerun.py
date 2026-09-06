@@ -626,11 +626,9 @@ class RerunMixin:
         # （见 _execute_history_step 的 upload_file 兜底），故不在此跳过。
         first = next((a for a in actions if isinstance(a, dict) and a.get("name")), None)
         if first and first.get("name") in ("click", "input_text", "select_dropdown"):
+            # 畸形动作已在历史加载入口归一化（AgentHistoryList.load_from_dict，
+            # issue #173 / PR #174 review2 #3）——此处不再持有局部守卫副本
             fp = first.get("params") or {}
-            if not isinstance(fp, dict):
-                # 存量历史里的畸形 params（issue #173 时代数据；真值字符串会击穿
-                # 上方 or {} 兜底）——无 index 可言，按缺 index 处理
-                fp = {}
             if fp.get("index") is None and fp.get("element_id") is None:
                 ie = item.interacted_element or []
                 if not ie or ie[0] is None:

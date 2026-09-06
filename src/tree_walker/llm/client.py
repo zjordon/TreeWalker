@@ -335,6 +335,11 @@ class LLMClient:
             actions_list = raw_action
         elif isinstance(raw_action, dict):
             actions_list = [raw_action]
+        elif isinstance(raw_action, str) and raw_action.strip():
+            # 顶层裸字符串 action（issue #173 记录的畸形类别，PR #174 review2 #5）：
+            # 按动作名归一化进澄清-重试梯子（缺参校验会给 LLM 错误反馈重发），
+            # 不再合成 done(success=False) 零重试终止整个任务。
+            actions_list = [{"name": raw_action.strip(), "params": {}}]
         else:
             actions_list = [{"name": "done", "params": {"text": "Invalid action shape", "success": False}}]
 
