@@ -1,4 +1,4 @@
-"""Step pipeline: 5-stage decomposition of the agent step."""
+﻿"""Step pipeline: 5-stage decomposition of the agent step."""
 
 from __future__ import annotations
 
@@ -13,7 +13,13 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
-from tree_walker.action_shape import name_of, params_of
+from tree_walker.action_shape import (
+    actions_of,
+    is_honest_failure_action,
+    name_of,
+    normalize_model_output,
+    params_of,
+)
 from tree_walker.agent.actionability import (
     ACTIONABILITY_ACTIONS,
     is_file_input,
@@ -171,6 +177,11 @@ class StepPipeline:
                 # P0-1：LLM 期间用户停止 → 输出已丢弃。不执行动作、不进 post_process，
                 # _finalize 的 `if model_output is not None` 守卫会跳过历史写入。
                 return False
+            # 管线入口一次性归一化（review6 #9 主线）：client choke point 之后再
+            # 兜一层（幂等）——注入/自定义 LLM 绕过 client 时，整个 actions 列表
+            # （含 dict 条目的 name 修复、位置感知的标量策略）在此统一成型，
+            # 下游全部消费方（校验/执行/后处理/投影）不再各自为政。
+            normalize_model_output(model_output)
             results = await self._execute_actions(model_output, browser_state)
             self._post_process(results, model_output)
 
@@ -196,17 +207,12 @@ class StepPipeline:
             # _finalize 其余部分——历史追加/元数据等。）
             try:
                 await self._finalize(browser_state, model_output, results)
-                # review5 #5：只在「真实 finalize」（model_output 非 None——本步
-                # 真正做了 LLM 决策并执行）成功时清零——pause/stop 提前返回的
-                # 空跑 finalize 平凡成功，不得把降级计数洗掉（交错 Ctrl+C 曾让
-                # 确定性 _finalize bug 永远低于升级线）。
-                if model_output is not None:
-                    self.state.finalize_degraded_steps = 0
             except Exception as e:
                 logger.error("_finalize failed — history/obs degraded for this step: %s", e)
-                # review4 #4：降级可观测——确定性 _finalize bug 会让 run 报成功但
-                # history 残缺（最坏是 done 步不进 history）；计数入 state，
-                # run() 连续达阈值时升级终止。
+                # 降级累计计数（review4 #4 / review6 #4/#5）：**只增不清零**——
+                # 任何「成功即清零」的连续计数器都会被交错的 pause/stop 空跑或
+                # 中途回复洗掉（缺步的 run 报 0，与干净 run 不可区分）；累计值
+                # 语义即「history 里缺失的步数」，run() 达阈值升级终止。
                 self.state.finalize_degraded_steps += 1
             # 计数器边界（review2 #1 / review3 #8 单一所有者）：n_steps 递增只在此
             # 处（_finalize 尾部副本已删）——吞异常不得跳过它（否则 run() 的
@@ -872,12 +878,16 @@ class StepPipeline:
 
         Returns None if valid, or an error detail string if invalid.
         """
-        action = response.get("action", {})
-        name = name_of(action) if isinstance(action, dict) else ""
-        # review5 #4：本 PR 最后一个裸读畸形 params 的点——注入/自定义 LLM 绕过
-        # client choke point 时（llm 参数只是未强制的注解），str params 会在
-        # _flatten_params 的 params.items() 崩；params_of 统一兜住。
-        params = params_of(action) if isinstance(action, dict) else {}
+        action = response.get("action") or {}
+        # review6 #3：诚实失败 done（畸形标量的归一化去向）跳过校验立即执行——
+        # variant B 的 StructuredDoneParams 会拒绝其 text 参数、烧 2 次全上下文
+        # 重试，违背「一次调用诚实终止」的设计。
+        if is_honest_failure_action(action):
+            return None
+        # review5 #4 / review6 #9：name/params 一律经共享访问器——注入 LLM 绕过
+        # client choke point 的畸形形态（str params / null name）不再崩校验层。
+        name = str(name_of(action) or "")
+        params = params_of(action)
 
         registered = self.tools.registry.actions.get(name)
         if registered is None:
@@ -961,7 +971,7 @@ class StepPipeline:
         if self.state.stopped or self.state.paused:
             return [ActionResult(error="Agent stopped or paused")]
 
-        actions = model_output.get("actions") or [model_output.get("action", {})]
+        actions = actions_of(model_output)
         total = len(actions)
         results: list[ActionResult] = []
 
@@ -1025,7 +1035,10 @@ class StepPipeline:
                 self._obs_bus.emit(ToolCallEvent(
                     step=self.state.n_steps, session_id=self._obs_session_id,
                     model_call_id=getattr(self, "_current_model_call_id", ""),
-                    tool_call_id=tool_call_id, action_name=action_name,
+                    tool_call_id=tool_call_id,
+                    # review6 #1：pydantic str 字段不接受 None——str() 包裹防旁路
+                    # 形态在事件构造处 ValidationError 杀死整步
+                    action_name=str(action_name or ""),
                     params=action_params,
                     action_index=i, total_actions=total,
                     element_index=_eidx, element_bbox=_ebbox, element_xpath=_expath,
@@ -1166,7 +1179,7 @@ class StepPipeline:
         # Record each action to loop detector with exemption filtering.
         # Multi-action steps record each action individually so the detector
         # sees the full sequence.
-        actions = model_output.get("actions") or [model_output.get("action", {})]
+        actions = actions_of(model_output)
         for action in actions:
             action_name = name_of(action)
             action_params = params_of(action)
@@ -1300,7 +1313,7 @@ class StepPipeline:
         if not selector_map:
             return None
 
-        actions = model_output.get("actions") or [model_output.get("action", {})]
+        actions = actions_of(model_output)
         projected: list[dict[str, Any] | None] = []
         for i, action in enumerate(actions):
             # upload_file：agent 采集的语义线索优先于原始 DOM 节点投影（#151）

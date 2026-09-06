@@ -184,16 +184,30 @@ class TestNormalizeActionsList:
 		assert any("params malformed (str)" in r.getMessage() for r in caplog.records)
 		assert not any("<SECRET-TOKEN-1234>" in r.getMessage() for r in caplog.records)
 
-	def test_list_scalar_non_string_replaced_by_honest_done(self):
-		# review5 #2：列表内标量与顶层同策略——null/数字不再强转 'None'/'123'
-		# 烧全上下文重试，诚实失败 done 原地替换（保持与 interacted 等长）
+	def test_list_scalar_position_aware_policy(self):
+		# review6 #1/#2：位置感知——index 0 标量 = 镜像、进校验 → 诚实 done
+		# （带 _honest_failure 标记，校验放行一次调用终止）；index > 0 标量 →
+		# str() 强转命名动作（执行时可见 Unknown action 错误，而非触发 guard #1
+		# 的静默截断/重放分叉）
 		actions = [None, "click", 123]
 		normalize_actions_list(actions)
 		assert actions[0]["name"] == "done"
 		assert actions[0]["params"]["success"] is False
+		assert actions[0].get("_honest_failure") is True  # 校验放行标记
 		assert actions[1] == {"name": "click", "params": {}}
-		assert actions[2]["name"] == "done"
-		assert actions[2]["params"]["success"] is False
+		assert actions[2] == {"name": "123", "params": {}}
+
+	def test_dict_with_invalid_name_gets_visible_string_name(self):
+		# review6 #1：null/非字符串 name → str() 强转（可见错误），绝不伪造 done
+		actions = [{"name": None, "params": {"index": 1}}, {"name": ["click"], "params": {}}]
+		normalize_actions_list(actions)
+		assert actions[0]["name"] == "None"
+		assert actions[0]["params"] == {"index": 1}  # params 保留
+		assert actions[1]["name"] == "['click']"
+		# name 键缺失 → 不动（name_of 的旧单动作 "done" 缺省语义）
+		actions2 = [{"params": {}}]
+		normalize_actions_list(actions2)
+		assert "name" not in actions2[0]
 
 
 class TestNameOfSemantics:
@@ -246,6 +260,27 @@ class TestAgentHistoryConstructionNormalization:
 		hl.update_action_params(step_number=1, action_index=0, field="text", value="v")
 		assert hl.history[0].model_output["actions"][0]["params"]["text"] == "v"
 
+	def test_failed_construction_does_not_mutate_caller_dict(self):
+		# review6 #8：mode='before' validator 曾就地改写调用方 dict——构造随后
+		# 字段校验失败（result 非法）时腐蚀了失败构造器从未拥有的输入。
+		# 拷贝归一化后：无论构造成败，调用方 dict 逐字节不变。
+		import copy
+
+		mo = {"actions": [{"name": "click", "params": "561257"}]}
+		snapshot = copy.deepcopy(mo)
+		with pytest.raises(Exception):
+			AgentHistory(step_number=1, model_output=mo, result="not-a-list")
+		assert mo == snapshot  # 失败构造不改写调用方输入
+
+	def test_normalize_model_output_materializes_and_fixes(self):
+		# review6 #9 主线：入口一次性归一化——单动作物化为列表、name 修复、镜像刷新
+		from tree_walker.action_shape import normalize_model_output
+
+		mo = {"action": {"name": None, "params": "561257"}}
+		normalize_model_output(mo)
+		assert mo["actions"] == [{"name": "None", "params": {}}]
+		assert mo["action"] == mo["actions"][0]
+
 
 # ── 2. 流水线端到端：归一化后走完 execute + post_process ────────────────
 
@@ -280,6 +315,22 @@ class TestPipelineStagesEndToEnd:
 		results = await StepPipeline._execute_actions(agent, model_output, _browser_state())
 		assert agent.tools.calls == [("click", {})]
 		assert len(results) == 1
+
+	@pytest.mark.asyncio
+	async def test_mid_list_malformed_executes_visibly_not_silent_done(self):
+		# review6 #2：中段畸形标量强转为 'None' 名、作为动作执行（真实 Tools
+		# 会得到可见 Unknown action 错误并 guard #3 截断）——不再替换成
+		# honest-done 触发 guard #1 的静默截断（无反馈、重放分叉）
+		agent = _loop_agent()
+		model_output = {"actions": [
+			{"name": "click", "params": {}},
+			None,
+			{"name": "input_text", "params": {"index": 1, "text": "x"}},
+		]}
+		normalize_actions_list(model_output["actions"])
+		await StepPipeline._execute_actions(agent, model_output, _browser_state())
+		assert agent.tools.calls[0] == ("click", {})
+		assert agent.tools.calls[1] == ("None", {})  # 可见执行，非静默 done 截断
 
 
 # ── 3. rerun：历史加载入口归一化（review2 #3 的根因修法）───────────────
@@ -364,8 +415,9 @@ class TestStepFinallyGuard:
 		assert agent.state.finalize_degraded_steps == 1
 
 	@pytest.mark.asyncio
-	async def test_finalize_success_resets_degradation_counter(self):
-		# review4 #4 连续语义：成功一步即清零——偶发降级不累积到升级阈值
+	async def test_finalize_degradation_counter_is_cumulative(self):
+		# review6 #4/#5：累计制（只增不清零）——中途回复的降级不再被成功/空跑
+		# 洗成 0（缺步的 run 与干净 run 不可区分）；快照语义 = history 缺失步数
 		agent = _loop_agent()
 		agent._prepare_context = AsyncMock(return_value=(_browser_state(), "state msg"))
 		agent._get_next_action = AsyncMock(return_value={"actions": [{"name": "click", "params": {}}]})
@@ -373,14 +425,12 @@ class TestStepFinallyGuard:
 		agent._finalize = AsyncMock(side_effect=[RuntimeError("boom"), None])
 		await StepPipeline._step(agent)
 		assert agent.state.finalize_degraded_steps == 1
-		await StepPipeline._step(agent)
-		assert agent.state.finalize_degraded_steps == 0
+		await StepPipeline._step(agent)  # 成功一步——累计值保持（不被洗掉）
+		assert agent.state.finalize_degraded_steps == 1
 
 	@pytest.mark.asyncio
 	async def test_empty_finalize_run_does_not_reset_counter(self):
-		# review5 #5：pause/stop 提前返回的「空跑」finalize（model_output=None，
-		# history 块跳过、平凡成功）不得清零降级计数——交错的 Ctrl+C 曾让
-		# 确定性 _finalize bug 永远低于升级线
+		# review5 #5 / review6 #5：pause/stop 提前返回的「空跑」finalize 不动计数
 		agent = _loop_agent()
 		agent._prepare_context = AsyncMock(return_value=(_browser_state(), "state msg"))
 		agent._get_next_action = AsyncMock(return_value={"actions": [{"name": "click", "params": {}}]})
@@ -389,9 +439,7 @@ class TestStepFinallyGuard:
 		await StepPipeline._step(agent)
 		await StepPipeline._step(agent)
 		assert agent.state.finalize_degraded_steps == 2
-		# 第三步：stopped → prepare_context 后提前返回（model_output=None），
-		# _finalize 这次成功——计数必须保持 2
-		agent._finalize = AsyncMock()
+		agent._finalize = AsyncMock()  # 第三步 stopped 空跑——计数保持
 		agent.state.stopped = True
 		await StepPipeline._step(agent)
 		assert agent.state.finalize_degraded_steps == 2
@@ -669,18 +717,20 @@ class TestMalformedActionSemantics:
 
 	@pytest.mark.asyncio
 	async def test_null_action_honest_done_termination(self):
-		# review4 #2：无可修的名字——不合成 'None' 进重试梯子烧全上下文调用，
-		# 直接诚实失败终止（一次调用，恢复本 PR 之前的旧 else 语义）
+		# review4 #2 / review6 #3：无可修的名字——诚实失败 done 一次调用终止
+		# （_honest_failure 标记使校验放行，variant B 也不烧重试）
 		result = await self._get_with_action(self._client(), None)
-		assert result["actions"] == [
-			{"name": "done", "params": {"text": "Invalid action shape", "success": False}},
-		]
+		[action] = result["actions"]
+		assert action["name"] == "done"
+		assert action["params"]["success"] is False
+		assert action["_honest_failure"] is True
 
 	@pytest.mark.asyncio
 	async def test_numeric_action_honest_done_termination(self):
 		result = await self._get_with_action(self._client(), 123)
-		assert result["actions"][0]["name"] == "done"
-		assert result["actions"][0]["params"]["success"] is False
+		[action] = result["actions"]
+		assert action["name"] == "done"
+		assert action["params"]["success"] is False
 
 	@pytest.mark.asyncio
 	async def test_bare_done_goes_through_retry_ladder(self):

@@ -304,15 +304,17 @@ class Agent(StepPipeline, RerunMixin):
 
                 try:
                     done = await self._step()
-                    # review5 #3：升级检查必须在 done-break **之前**——降级步恰是
-                    # done 步时（其 history 正是残缺的那个），先 break 会让检查
-                    # 永不触发，正是该守卫声称覆盖的最坏情形。
+                    # review5 #3 / review6 #7：升级检查在 done-break **之前**，且
+                    # 升级分支内先跑 judge——降级步恰是 done 步时（其 history 正是
+                    # 残缺的那个）检查仍触发，且最需要独立验证的 run 不丢 verdict。
                     if self.state.finalize_degraded_steps >= 3:
                         logger.error(
-                            "_finalize degraded on %d consecutive steps — aborting run "
+                            "_finalize degraded on %d steps — aborting run "
                             "(history is incomplete; see prior error logs)",
                             self.state.finalize_degraded_steps,
                         )
+                        if done and self._judge:
+                            await self._run_judge()
                         break
                     if done:
                         if self._judge:

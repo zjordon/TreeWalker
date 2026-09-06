@@ -132,29 +132,34 @@ class AgentHistory(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _normalize_malformed_actions(cls, data: Any) -> Any:
-        """畸形动作归一化的**构造收口**（issue #173，review5 #10 主线）。
+        """畸形动作归一化的**构造收口**（issue #173，review5 #10 / review6 #8）。
 
-        对齐 ActionResult.validate_success_requires_done 的既有模式：把
-        ``normalize_actions_list`` 挂在模型上，使 load_from_file / load_from_dict /
-        model_validate / 内存构造**全部路径**统一归一化——此前散点防御
-        （client choke point + load_from_dict 预校验 + 逐点访问器）每层都有
-        绕过（update_action_params 在畸形形态上 TypeError、自定义 LLM 注入
-        绕过 client）。覆盖三种形态：actions 列表（含畸形条目）、老格式
-        dict action、老格式裸字符串 action。
+        对齐 ActionResult.validate_success_requires_done 的既有模式：把归一化
+        挂在模型上，使 load_from_file / load_from_dict / model_validate / 内存
+        构造**全部路径**统一。**拷贝归一化**：对 model_output 做浅拷贝（含逐条
+        动作 dict 一层拷贝）后改写——绝不就地改写调用方传入的 dict（构造随后
+        字段校验失败时，不得腐蚀一个失败的构造器从未拥有的输入；_finalize 与
+        state.last_model_output 共享同一 dict 对象）。
         """
         if not isinstance(data, dict):
             return data
         mo = data.get("model_output")
         if not isinstance(mo, dict):
             return data
-        actions = mo.get("actions")
+        mo_copy = dict(mo)
+        actions = mo_copy.get("actions")
         if isinstance(actions, list) and actions:
+            actions = [dict(a) if isinstance(a, dict) else a for a in actions]
             normalize_actions_list(actions)
-            mo["action"] = actions[0]  # 镜像刷新（老文件可能是畸形原值）
-        elif isinstance(mo.get("action"), dict):
-            normalize_actions_list([mo["action"]])  # 原地补/修 params
-        elif isinstance(mo.get("action"), str) and mo["action"].strip():
-            mo["action"] = coerce_named_action(mo["action"])
+            mo_copy["actions"] = actions
+            mo_copy["action"] = actions[0]  # 镜像刷新（老文件可能是畸形原值）
+        elif isinstance(mo_copy.get("action"), dict):
+            act = dict(mo_copy["action"])
+            normalize_actions_list([act])
+            mo_copy["action"] = act
+        elif isinstance(mo_copy.get("action"), str) and mo_copy["action"].strip():
+            mo_copy["action"] = coerce_named_action(mo_copy["action"])
+        data["model_output"] = mo_copy
         return data
 
 
