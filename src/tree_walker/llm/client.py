@@ -10,6 +10,10 @@ from typing import Any
 
 from anthropic import Anthropic, APIError, RateLimitError
 
+from tree_walker.action_shape import (
+    honest_done_action,
+    normalize_actions_list,
+)
 from tree_walker.config import LLMSettings
 
 logger = logging.getLogger(__name__)
@@ -119,7 +123,10 @@ class LLMClient:
                     obj = obj.replace(tag, original)
                 return obj
             if isinstance(obj, dict):
-                return {k: _restore(v) for k, v in obj.items()}
+                # 保留 dict 子类身份（_HonestDone 带外标记——review8 #1：
+                # dict 重建曾静默剥掉标记，variant B + URL 场景下诚实终止
+                # 退回烧重试）
+                return type(obj)({k: _restore(v) for k, v in obj.items()})
             if isinstance(obj, list):
                 return [_restore(item) for item in obj]
             return obj
@@ -160,7 +167,9 @@ class LLMClient:
                     obj = obj.replace(placeholder, real_value)
                 return obj
             if isinstance(obj, dict):
-                return {k: _restore(v) for k, v in obj.items()}
+                # 保留 dict 子类身份（_HonestDone——同 _restore_urls_in_output，
+                # review8 #1）
+                return type(obj)({k: _restore(v) for k, v in obj.items()})
             if isinstance(obj, list):
                 return [_restore(item) for item in obj]
             return obj
@@ -312,12 +321,16 @@ class LLMClient:
                     _text_retry_count=_text_retry_count,
                 )
             logger.warning("LLM still returned no parseable response after retry, using fallback done")
+            # review7 #5：合成 done 统一挂 _HonestDone 带外标记（校验放行，
+            # variant B 的 StructuredDoneParams 不再为它烧 2 次全上下文重试）
+            _fb = honest_done_action()
+            _fb["params"]["text"] = "No response from LLM"
             result = {
                 "evaluation_previous_goal": "No response from LLM",
                 "memory": "",
                 "next_goal": "Ending task due to empty response",
-                "action": {"name": "done", "params": {"text": "No response from LLM", "success": False}},
-                "actions": [{"name": "done", "params": {"text": "No response from LLM", "success": False}}],
+                "action": _fb,
+                "actions": [_fb],
                 "usage": _usage_dict,
             }
             if url_map:
@@ -330,13 +343,13 @@ class LLMClient:
         # Normalize action input: accept list (multi_act) or single dict (legacy).
         # Both `action` (first element, for backward compatibility) and `actions`
         # (full list, for the new multi-action loop) are exposed to downstream.
+        # review7 #9：标量头不再在 client 手工分流（与 normalize_actions_list
+        # 的 index-0 策略逐字节重复、可漂移）——统一 `[raw]` 后交给归一化。
         raw_action = tool_input.get("action", {})
         if isinstance(raw_action, list):
             actions_list = raw_action
-        elif isinstance(raw_action, dict):
-            actions_list = [raw_action]
         else:
-            actions_list = [{"name": "done", "params": {"text": "Invalid action shape", "success": False}}]
+            actions_list = [raw_action]
 
         # Phase A diagnostic: log the actual shape LLM emitted so we can tell
         # whether multi-action is being used. Reads schema maxItems when present
@@ -359,9 +372,9 @@ class LLMClient:
                 schema_max if schema_max else "1",
             )
 
-        for a in actions_list:
-            if isinstance(a, dict):
-                a.setdefault("params", {})
+        # 归一化实现已移至无依赖叶子模块 action_shape（review4 #7——views.py 也
+        # 要用，不再让 agent 数据模型层 import llm.client 的私有函数）
+        normalize_actions_list(actions_list)
 
         result = {
             "evaluation_previous_goal": tool_input.get("evaluation_previous_goal", ""),

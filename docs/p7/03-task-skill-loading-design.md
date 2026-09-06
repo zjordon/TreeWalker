@@ -1,6 +1,7 @@
 # 任务级 skill 加载技术方案 v2（评审修订定稿）
 
-> 状态：设计定稿 v2（2026-09-05 v1 评审后修订，待实施）。
+> 状态：**已实施**（S0a/S0b/S1-S4 交付，2026-09-05/06，issue #171 / PR #172 + treeforge #9；
+> 2026-09-06 真机冒烟通过。S5 评测脚本分口径随口径 C 批量评测时做，见 §八）。
 > 前版：`treeforge/docs/task-skill-loading-design.md`（v1，存档保留；评审意见已全部吸收进本版，对照见附录 C）。
 > 关联：ROADMAP P7 改进路线三（任务级 skill 优化，仅产品口径）、TreeForge P4 双产物
 >（`treeforge/docs/p4/p4-implement-plan.md` S6 读取契约）、`src/tree_walker/skills/loader.py`（站点级注入现状）。
@@ -56,10 +57,9 @@ domain-skills/<host_key>/
 
 1. TreeForge adapter 复制该 key 函数（纯 stdlib urlparse，零依赖），蒸馏产物写
    `domain-skills/<host_key>/`。站点级三件套同样受益（消灭手工改名步骤）。
-2. 存量迁移（**可手工，立即可做**——S0a）：把 treeforge
-   `data/skills/domain-skills/localhost/` 复制进本仓库 `domain-skills/localhost_7780/`
-   （关键是 `tasks/` 子树；三件套与现存版本逐字节一致，已核实——2026-09-05 早晨的
-   一次手工复制正是本仓库现三件套的来源）。`tasks/` 子目录不污染站点级注入——
+2. 存量迁移（S0a，**已完成 2026-09-05，MD5 全量校验一致**）：treeforge 产物已
+   复制进本仓库 `domain-skills/localhost_7780/`（S0b 落地后 treeforge 侧目录同名，
+   两侧逐字节一致）。`tasks/` 子目录不污染站点级注入——
    loader 按固定文件名直读、不递归（P4 现状盘点已论证）。
 3. 否决的备选：TreeWalker 侧双 key 回退（`localhost_7780` → `localhost`）。端口限定
    key 是 P7 form_interaction 补丁特意引入的（本机 7780 Magento / 5173 tw-web 各挂
@@ -111,9 +111,10 @@ Agent 实例上，每任务/每 run 重建）：
 - **形态 B——直读**：`AGENT_SKILLS_DIR` 指 treeforge `data/skills/domain-skills`。
   一行 env 零侵入，但 douyin/bilibili 卡需先并入、产物不进 git，评测可复现性弱一截。
 
-S0b 落地**前**，localhost 站点因 §2.1 的 key 分叉直读不到（无端口 host 不受影响，
-形态 B 今天对 bilibili/douyin 已可用）——这就是「S0b = 消灭手工拷贝前提」的准确
-含义：S0a 救本次评测的急，S0b + 直装让拷贝步骤从此不存在，而不是让手工拷更可靠。
+S0b 已交付（2026-09-06，treeforge issue #9 / commit `33bb9d2`）——key 分叉消除，
+**形态 A 蒸馏直装自此可用**：`distill --output <本仓库根>` 即蒸馏完成 = 安装完成，
+此后新蒸馏产物不再需要手工拷贝；存量 44 卡两侧已核实逐字节一致（此前「S0b 落地前
+localhost 直读不到」的警告随之作废）。
 
 ## 三、总体流程与匹配时机（P1-2 修订：hook 点钉死）
 
@@ -244,17 +245,25 @@ Anthropic tool + `tool_choice` 强制 + 模型未用工具时 text 兜底 + `_tr
     sanity 数字失真（见 §八 caveat）。
   - v1 内缓解（TreeWalker 侧）：注入头声明加一句「卡中具体数值是录制时快照，一律以
     页面当前读数为准」（附录 B 已更新）。
-  - 遗留（TreeForge 侧，不阻塞本方案）：蒸馏 prompt 加「易变结果值（计数/金额/日期
-    结果）不写死、或显式标注为录制时示例」——列入 TreeForge 待办，两端文档同步。
+  - ~~遗留（TreeForge 侧，不阻塞本方案）~~：**已随 S0b 交付**（treeforge #9，
+    2026-09-06）——蒸馏 prompt 已加「易变结果值不写死、或显式标注为录制时示例」
+    规则；存量 44 卡是该规则之前蒸馏的（注入头声明仍兜底），重蒸后新卡生效。
 
 ## 七、实施步骤
 
-- **S0a 存量迁移（手工，约五分钟，立即可做——口径 C 的唯一前提就是这个）**：把
-  treeforge `data/skills/domain-skills/localhost/` 复制进本仓库
-  `domain-skills/localhost_7780/`。关键是 `tasks/` 子树；**三件套保持与 65.2% 基线
+- **S0a 存量迁移（✅ 已完成 2026-09-05，MD5 全量校验一致；当时源为 treeforge
+  `localhost/`，S0b 落地后已改名 `localhost_7780/`，后续以直装为准）**：把
+  treeforge `data/skills/domain-skills/localhost_7780/` 同步进本仓库同名目录。
+  关键是 `tasks/` 子树；**三件套保持与 65.2% 基线
   一致的版本**（当前两侧逐字节一致，整目录拷贝等价；但别在任务级实验里同时引入
   新版站点卡——一次只动一个变量）。S1 按目录位置扫描，不关心文件怎么来的。
-- **S0b 契约修复（TreeForge 侧代码，半天，防复发——非当次评测前提）**：adapter 的
+- **S0b 契约修复（TreeForge 侧代码）——✅ 已交付 2026-09-06**（treeforge issue #9 /
+  commit `33bb9d2`）：新建 `harness/hostkey.py` 共享 key 函数（与本仓库
+  `extract_host_with_port` 逐字对齐）+ ADAPT 按事件 URL 对账升级存量裸 hostname
+  trace（不改 captures 数据）+ 易变值 prompt 规则 + 直装 runbook；数据侧
+  `localhost/`→`localhost_7780/`、registry 同步 rename，44 卡与本仓库逐字节一致
+  （MD5 全量校验，无需重拷）。**§2.5 形态 A 蒸馏直装自此可用。**
+  原计划（留档）：adapter 的
   host 目录名对齐 `extract_host_with_port` 语义；蒸馏 prompt 的易变值规则（§六遗留
   项，可同车）。不做 S0b 的后果**不是本次零命中**（S0a 已让 44 张卡可见），而是
   **复发**：adapter 仍写裸 `localhost/`，此后每次蒸馏（重录任务 / 站点改版后重蒸）
@@ -279,13 +288,15 @@ Anthropic tool + `tool_choice` 强制 + 模型未用工具时 text 兜底 + `_tr
   ts / host_key / catalog_size / catalog_newest_distilled_at / task(截断 200 chars) /
   match / confidence / reason / downgraded），命中、未命中、降档都记；**catalog 大声
   日志**（found: N cards，N=0 且目录存在 → warning）。`catalog_newest_distilled_at`
-  是手工迁移的过期探针——S0b 落地前，它与 treeforge 侧产物时间差一眼可查（S0b 的
-  落地判据之一）。不建新文件——评测后从既有 agent 日志 grep 统计。
+  是手工迁移时代的过期探针——S0b 落地后新蒸馏走直装，本值退化为跨仓一致性观察项
+  （与 treeforge 侧产物时间差仍一眼可查）。不建新文件——评测后从既有 agent 日志
+  grep 统计。
 - **S5 评测脚本分口径**：见 §八 env 矩阵；变体只显式设置注入 flag 与输出文件名，
   其余参数与 `run_full.ps1` 完全一致。
 
-工作量重估：S0a 约五分钟（手工，可先做）；S0b 半天（TreeForge，可后补）；S1-S3
-一天到一天半（改动面小、先例齐全）；S4-S5 半天。
+工作量重估（实际执行后回填）：S0a 手工五分钟（✅ 2026-09-05 完成）；S0b 半天
+（✅ 2026-09-06 完成，treeforge #9）；S1-S4 一天半（含两轮 code-review 修复）；
+S5 半天（evals 工作空间，跑口径 C 批量时做）。
 
 ## 八、评测口径（红线落地 + env 卫生）
 
@@ -317,7 +328,7 @@ Anthropic tool + `tool_choice` 强制 + 模型未用工具时 text 兜底 + `_tr
 1. **同任务回放**（RPA sanity）：蒸馏任务 = 测试任务。预期很高（本来就该高），只验证
    「录过的任务能稳跑」，数字不对外。**caveat（v2）**：受答案固化影响（§六），读型
    任务可能 parrot 卡内答案——此测法只做「录过能跑」的下限 sanity，数字不作为能力
-   证明；彻底修掉要靠 TreeForge 蒸馏侧的易变值规则。
+   证明；彻底修掉靠 TreeForge 蒸馏侧的易变值规则（已随 S0b 交付，存量卡重蒸后生效）。
 2. **不相交泛化**（有信息量的数字）：蒸馏任务集 A 与测试任务集 B **不相交**（同站的
    变体任务，如蒸馏「按数量筛商品/按状态筛订单」，测「按价格筛商品/按日期筛订单」）。
    衡量任务知识的近邻泛化——若这个数字也好，说明任务级 skill 不止 RPA。**注意**：
@@ -333,8 +344,8 @@ Anthropic tool + `tool_choice` 强制 + 模型未用工具时 text 兜底 + `_tr
 |---|---|
 | 误命中带偏流程 | 保守 prompt + null 自由度 + low 降档 + host_key 域 + 日志复盘（§四） |
 | host key 再分叉（两端命名漂移） | 统一 key 语义写进契约（§2.1）+ S0 迁移 + catalog 大声日志 + §8.1 sanity 断言 |
-| 手工迁移漏拷 / 过期卡仍被注入（S0b 落地前常驻） | catalog N 大声日志（不及预期即显形）+ `catalog_newest_distilled_at` 过期探针（S4）+ S0b 落地根治 |
-| 读型任务答案固化 | 注入头易变值声明（v2）+ TreeForge 蒸馏 prompt 待办；同任务回放只做下限 sanity |
+| 手工迁移漏拷 / 过期卡仍被注入 | S0b 已落地根治（蒸馏直装，无拷贝步骤）；`catalog_newest_distilled_at`（S4）留作跨仓一致性观察 |
+| 读型任务答案固化 | 注入头易变值声明（v2）+ TreeForge 蒸馏 prompt 易变值规则（已随 S0b 交付；存量卡重蒸后生效）；同任务回放只做下限 sanity |
 | 匹配调用阻断 agent 启动 | 全异常捕获 + 15s 超时 + API 失败一次重试后降级 null（§4.3/4.5） |
 | 上下文膨胀 | catalog 6k/44 任务一次调用；命中卡 ≤3k chars/步（vs 站点卡 12.3k 已在跑）；总量远小于 DOM 预算 |
 | 卡片过期（站点改版） | v1 靠「指引非脚本」自适应 + 重新蒸馏；不做自动失效 |

@@ -91,7 +91,11 @@ class TestFinalizeDomExcerpt:
         assert last.state_summary["title"] == "Example"
 
     @pytest.mark.asyncio
-    async def test_advances_step_counter(self):
+    async def test_finalize_no_longer_advances_step_counter(self):
+        # review3 #8（PR #174）：n_steps 递增的唯一所有者是 _step 的 finally
+        # （紧跟被守卫的 _finalize 调用之后）——_finalize 自身不再递增。
+        # 计数器边界行为（_finalize 抛异常仍递增）由
+        # test_step_malformed_action.py::TestStepFinallyGuard 锚定。
         agent = _FakeAgent()
         await self._run(agent, "content", done=True)
-        assert agent.state.n_steps == 1
+        assert agent.state.n_steps == 0

@@ -7,6 +7,11 @@ from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+# 历史加载入口的畸形动作归一化复用无依赖叶子模块 action_shape（review4 #7——
+# 不再把 LLM client 及其 anthropic import 拉进 agent 数据模型层/tools 的依赖图），
+# 不为历史路径复制第二份强转规则。
+from tree_walker.action_shape import actions_of, normalize_model_output, params_of
+
 logger = logging.getLogger(__name__)
 
 
@@ -76,6 +81,10 @@ class AgentState(BaseModel):
     plan: list[PlanItem] | None = None
     current_plan_item_index: int = 0
     plan_generation_step: int = 0
+    # _finalize 降级计数（PR #174 review4 #4）：finally 兜底吞掉 _finalize 异常的
+    # 次数——确定性 _finalize bug 会让 run 报成功但 history 残缺（最坏是 done 步
+    # 不进 history），此计数让降级可观测，run() 连续达阈值时升级终止。
+    finalize_degraded_steps: int = 0
 
     class Config:
         arbitrary_types_allowed = True
@@ -120,6 +129,43 @@ class AgentHistory(BaseModel):
     class Config:
         arbitrary_types_allowed = True
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_malformed_actions(cls, data: Any) -> Any:
+        """畸形动作归一化的**构造收口**（issue #173，review5 #10 / review6 #8 /
+        review7 #2/#3）。
+
+        委托给 ``normalize_model_output(context="history")`` 的单一策略表——
+        历史上**下文不合成可执行动作**（master 时代录制的畸形条目在原 run 中
+        从未执行，重放不得替它执行；live 的 honest-done/澄清策略只属于实况
+        管线），只做无害化：非列表容器重置（防逐字符拆分）、dict 修 params、
+        畸形条目原样保留（消费方跳过）。**拷贝归一化**：绝不就地改写调用方
+        传入的 dict（构造随后字段校验失败时，不得腐蚀一个失败的构造器从未
+        拥有的输入；_finalize 与 state.last_model_output 共享同一 dict 对象）。
+        """
+        if not isinstance(data, dict):
+            return data
+        mo = data.get("model_output")
+        if not isinstance(mo, dict):
+            return data
+        # 深至动作条目一层的拷贝（normalize 会原地改 params/容器/镜像——
+        # 浅拷贝仍共享条目 dict，会写回调用方输入）。**data 本身也拷贝**
+        # （review8 #2）：model_validate 路径 pydantic 把调用方原始 dict 交给
+        # validator——写 ``data["model_output"] = mo_copy`` 仍改写调用方输入；
+        # 构造随后字段校验失败时（result 非法）不得腐蚀失败构造器从未拥有
+        # 的输入（load_from_dict / web /load 正走此路径）。
+        mo_copy = dict(mo)
+        actions = mo_copy.get("actions")
+        if isinstance(actions, list):
+            mo_copy["actions"] = [dict(a) if isinstance(a, dict) else a for a in actions]
+        act = mo_copy.get("action")
+        if isinstance(act, dict):
+            mo_copy["action"] = dict(act)
+        normalize_model_output(mo_copy, context="history")
+        data = dict(data)
+        data["model_output"] = mo_copy
+        return data
+
 
 # 仅这些「用户填值类」动作的参数需要敏感数据脱敏（动作名 → 待脱敏的参数字段）。
 _SENSITIVE_ACTION_FIELDS: dict[str, tuple[str, ...]] = {
@@ -157,13 +203,18 @@ def _redact_history_data(
         return
     for h in data.get("history", []):
         mo = h.get("model_output") or {}
-        actions = mo.get("actions") or ([mo["action"]] if mo.get("action") else [])
+        # review7 #10：共享分发。镜像与列表都要过——model_dump 序列化时共享
+        # 引用会被复制成两份，只脱敏 actions 列表会漏掉 action 镜像那份。
+        actions = actions_of(mo)
+        mirror = mo.get("action")
+        if isinstance(mirror, dict):
+            actions = actions + [mirror]
         for action in actions:
             if not isinstance(action, dict):
                 continue
             fields = _SENSITIVE_ACTION_FIELDS.get(action.get("name"))
-            params = action.get("params")
-            if not fields or not isinstance(params, dict):
+            params = params_of(action)
+            if not fields:
                 continue
             for f in fields:
                 if isinstance(params.get(f), str):
@@ -191,6 +242,10 @@ class AgentHistoryList(BaseModel):
     action_registry_version: str | None = None
     # P4 可视化编辑：编辑器手动标注的变量绑定。老 JSON 无此键 → pydantic 默认 []，自动兼容。
     manual_variables: list[ManualVariableBinding] = Field(default_factory=list)
+    # _finalize 降级步数（review5 #3）：run() 收尾把 AgentState 的计数落到返回的
+    # history 上——调用方（web/评测）可区分「正常完成」与「history 残缺的完成」
+    # （最坏情形：done 步不进 history）。0 = 无降级。
+    finalize_degraded_steps: int = 0
 
     def final_result(self) -> str | None:
         for item in reversed(self.history):
@@ -233,7 +288,12 @@ class AgentHistoryList(BaseModel):
 
     @classmethod
     def load_from_dict(cls, data: dict[str, Any]) -> "AgentHistoryList":
-        """从 dict 重建历史。老格式兼容：缺 interacted_element 补 None。"""
+        """从 dict 重建历史。老格式兼容：缺 interacted_element 补 None。
+
+        畸形动作归一化已上收到 ``AgentHistory._normalize_malformed_actions``
+        的 model_validator（review5 #10 主线——覆盖 load/validate/内存全部构造
+        路径），此处不再持有手工副本。
+        """
         for h in data.get("history", []):
             if h and "interacted_element" not in h:
                 h["interacted_element"] = None

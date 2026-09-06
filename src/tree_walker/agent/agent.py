@@ -22,6 +22,7 @@ from tree_walker.browser.session import BrowserSession
 from tree_walker.browser.url_utils import extract_host_with_port
 from tree_walker.config import AgentSettings, LLMSettings
 from tree_walker.llm.client import LLMClient
+from tree_walker.action_shape import actions_of, name_of, params_of
 from tree_walker.prompts.system_prompt import build_system_prompt
 from tree_walker.skills import SkillLoader, TaskSkillLoader
 from tree_walker.skills.task_matcher import build_task_skill_text, match_task_skill
@@ -304,6 +305,18 @@ class Agent(StepPipeline, RerunMixin):
 
                 try:
                     done = await self._step()
+                    # review5 #3 / review6 #7：升级检查在 done-break **之前**，且
+                    # 升级分支内先跑 judge——降级步恰是 done 步时（其 history 正是
+                    # 残缺的那个）检查仍触发，且最需要独立验证的 run 不丢 verdict。
+                    if self.state.finalize_degraded_steps >= 3:
+                        logger.error(
+                            "_finalize degraded on %d steps — aborting run "
+                            "(history is incomplete; see prior error logs)",
+                            self.state.finalize_degraded_steps,
+                        )
+                        if done and self._judge:
+                            await self._run_judge()
+                        break
                     if done:
                         if self._judge:
                             await self._run_judge()
@@ -312,6 +325,9 @@ class Agent(StepPipeline, RerunMixin):
                     logger.info("Interrupted by user")
                     break
         finally:
+            # review5 #3：降级信息落到返回的 history——调用方可区分「正常完成」
+            # 与「history 残缺的完成」（AgentHistoryList.finalize_degraded_steps）。
+            self.history.finalize_degraded_steps = self.state.finalize_degraded_steps
             self._finalize_session()
             self._restore_signal_handler()
             if not keep_alive:
@@ -567,9 +583,9 @@ class Agent(StepPipeline, RerunMixin):
             goal = mo.get("next_goal", "")
             eval_ = mo.get("evaluation_previous_goal", "")
             memory = mo.get("memory", "")
-            actions = mo.get("actions") or ([mo.get("action")] if mo.get("action") else [])
+            actions = actions_of(mo)  # review7 #10：与执行器/re共分发（不再各说各话）
             action_parts = [
-                f"{a.get('name', '?')}({a.get('params', {})})"
+                f"{name_of(a) or '?'}({params_of(a)})"
                 for a in actions
                 if isinstance(a, dict)
             ]

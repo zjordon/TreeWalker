@@ -1,4 +1,4 @@
-"""变量检测（纯规则，不调 LLM）—— 识别历史中可替换的值。
+﻿"""变量检测（纯规则，不调 LLM）—— 识别历史中可替换的值。
 
 移植自 browser-use ``variable_detector.py`` 并精简。仅检查动作参数的 ``text``/``query``
 字段（即 ``input_text`` 填的值、``search``/``extract`` 的查询）。两条策略：元素属性优先，
@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 
+from tree_walker.action_shape import actions_of, params_of
 from tree_walker.agent.views import AgentHistoryList, DetectedVariable, ManualVariableBinding
 
 # 仅这些字段是「用户填入的完整值」，可安全作为变量替换目标。
@@ -31,12 +32,12 @@ def detect_variables_in_history(
     detected: dict[str, DetectedVariable] = {}
     seen_values: set[str] = set()
     for item in history.history:
-        actions = item.model_output.get("actions") or [item.model_output.get("action", {})]
+        actions = actions_of(item.model_output)
         interacted = item.interacted_element or []
         for i, action in enumerate(actions):
             if not isinstance(action, dict):
                 continue
-            params = action.get("params") if isinstance(action.get("params"), dict) else {}
+            params = params_of(action)
             elem = interacted[i] if i < len(interacted) else None
             for field in _FIELDS:
                 value = params.get(field)

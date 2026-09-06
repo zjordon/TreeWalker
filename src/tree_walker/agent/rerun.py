@@ -1,4 +1,4 @@
-"""历史重放（rerun_history）—— 把录制的动作序列在新浏览器里重跑。
+﻿"""历史重放（rerun_history）—— 把录制的动作序列在新浏览器里重跑。
 
 设计详见 ``docs/rerun_history/``。本模块是 ``RerunMixin``，由 ``Agent`` 继承，提供：
 - ``save_history`` / ``detect_variables`` / ``load_and_rerun`` / ``rerun_history`` 公共 API；
@@ -21,6 +21,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
+from tree_walker.action_shape import actions_of, params_of
 from tree_walker.agent.actionability import (
     ACTIONABILITY_ACTIONS as _ACTIONABILITY_ACTIONS,
     is_actionable as _is_actionable,
@@ -99,17 +100,15 @@ def _apply_manual_variable_at_location(
         if getattr(item, "step_number", None) != step_number:
             continue
         model_output = item.model_output or {}
-        actions = model_output.get("actions")
-        if not actions:
-            single = model_output.get("action")
-            actions = [single] if single else []
+        actions = actions_of(model_output)  # review7 #10：共享分发
         if not (0 <= action_index < len(actions)):
             return False
         action = actions[action_index]
         if not isinstance(action, dict):
             return False
-        params = action.get("params")
-        if isinstance(params, dict) and field in params:
+        # review6 #9 残留守卫：params_of 统一「非 dict → {}」
+        params = params_of(action)
+        if field in params:
             params[field] = new_value
             return True
         return False
@@ -609,7 +608,7 @@ class RerunMixin:
         skip_failures: bool,
     ) -> str | None:
         """返回跳过原因字符串；不跳过则返回 None（由调用方统一打日志）。"""
-        actions = item.model_output.get("actions") or [item.model_output.get("action", {})]
+        actions = actions_of(item.model_output)
         # 无动作
         if not actions or all(not (a and a.get("name")) for a in actions if isinstance(a, dict)):
             return "无动作"
@@ -626,7 +625,11 @@ class RerunMixin:
         # （见 _execute_history_step 的 upload_file 兜底），故不在此跳过。
         first = next((a for a in actions if isinstance(a, dict) and a.get("name")), None)
         if first and first.get("name") in ("click", "input_text", "select_dropdown"):
-            fp = first.get("params") or {}
+            # 归一化主责在历史加载入口（load_from_dict，review2 #3）；但
+            # rerun_history() 也接受内存构造 / model_validate 加载的
+            # AgentHistoryList（未经该入口，review3 #5）——params_of 共享访问器
+            # 兜住（review4 #8：不再手写本地拼法）。
+            fp = params_of(first)
             if fp.get("index") is None and fp.get("element_id") is None:
                 ie = item.interacted_element or []
                 if not ie or ie[0] is None:
@@ -660,7 +663,7 @@ class RerunMixin:
             state = await self._wait_for_target_elements(state, item, timeout=15.0)
 
         selector_map = state.dom_state.selector_map if state and state.dom_state else {}
-        actions = item.model_output.get("actions") or [item.model_output.get("action", {})]
+        actions = actions_of(item.model_output)
         interacted = item.interacted_element or []
 
         results: list[ActionResult] = []
@@ -672,10 +675,10 @@ class RerunMixin:
 
             if name == "extract":
                 # extract 自带 LLM 且读当前页（tools/_action_extract）→ 直接 re-execute 即在当前页重算
-                params = dict(action.get("params", {}))
+                params = dict(params_of(action))  # review4 #3：内存历史旁路形态不崩
             else:
                 hist_elem = interacted[i] if i < len(interacted) else None
-                raw_params = action.get("params") if isinstance(action.get("params"), dict) else {}
+                raw_params = params_of(action)
                 has_index = raw_params.get("index") is not None or raw_params.get("element_id") is not None
                 if hist_elem and hist_elem.get("_semantic_clue"):
                     # 语义线索路径：录制时 locate 失败（get_state 抓变化后页），存了 e.target 的
@@ -715,7 +718,7 @@ class RerunMixin:
                         name = updated.get("name", name)
                         params = dict(updated.get("params", {}))
                 else:
-                    params = dict(action.get("params", {}))
+                    params = dict(params_of(action))  # review4 #3：内存历史旁路形态不崩
                     if (
                         name == "upload_file"
                         and params.get("index") is None
@@ -836,7 +839,10 @@ class RerunMixin:
                     session_id=self._obs_session_id,
                     model_call_id="",
                     tool_call_id=tool_call_id,
-                    action_name=action_name,
+                    # review6 #6：历史含 null/非 str name（旁路构造未经归一化）时
+                    # pydantic str 字段在事件构造处 ValidationError、烧掉整个
+                    # 重试梯——str() 包裹，emit 移入 try 由下方执行错误优雅呈现
+                    action_name=str(action_name or ""),
                     params=params,
                     action_index=0,
                     total_actions=1,
@@ -1170,7 +1176,7 @@ class RerunMixin:
             return None
         new_index, level = match
         new_action = copy.deepcopy(action)
-        params = new_action.get("params") if isinstance(new_action.get("params"), dict) else {}
+        params = params_of(new_action)
         new_action["params"] = params
         old = params.get("index", params.get("element_id"))
         # 统一写回 index（element_id 是别名；tools._flatten_params 处理 index）
@@ -1236,7 +1242,7 @@ class RerunMixin:
 
     @staticmethod
     def _first_action_name(item: AgentHistory) -> str | None:
-        actions = item.model_output.get("actions") or [item.model_output.get("action", {})]
+        actions = actions_of(item.model_output)
         if actions and isinstance(actions[0], dict):
             return actions[0].get("name")
         return None
@@ -1330,12 +1336,12 @@ class RerunMixin:
             return False
 
     def _count_expected_elements(self, item: AgentHistory) -> int:
-        actions = item.model_output.get("actions") or [item.model_output.get("action", {})]
+        actions = actions_of(item.model_output)
         max_index = -1
         for action in actions:
             if not isinstance(action, dict):
                 continue
-            params = action.get("params") if isinstance(action.get("params"), dict) else {}
+            params = params_of(action)
             idx = params.get("index")
             if idx is None:
                 idx = params.get("element_id")
@@ -1398,7 +1404,7 @@ class RerunMixin:
 
     def _collect_target_hists(self, item: AgentHistory) -> list[dict[str, Any]]:
         """枚举本步所有需定位 action 的 hist_elem（剔除 upload_file / 无指纹 action）。"""
-        actions = item.model_output.get("actions") or [item.model_output.get("action", {})]
+        actions = actions_of(item.model_output)
         interacted = item.interacted_element or []
         out: list[dict[str, Any]] = []
         for i, action in enumerate(actions):
@@ -1566,12 +1572,10 @@ class RerunMixin:
 
         if value_replacements:
             for item in modified.history:
-                actions = item.model_output.get("actions") or [item.model_output.get("action", {})]
+                actions = actions_of(item.model_output)
                 for action in actions:
                     if isinstance(action, dict):
-                        params = action.get("params")
-                        if isinstance(params, dict):
-                            _substitute_in_dict(params, value_replacements)
+                        _substitute_in_dict(params_of(action), value_replacements)
             n_applied += len(value_replacements)
         if n_applied:
             logger.info("🔁 已替换 %d 个变量值", n_applied)

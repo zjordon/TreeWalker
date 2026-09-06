@@ -137,6 +137,15 @@ class TestDoneEmptyText:
 		assert r.is_done is True
 
 	@pytest.mark.asyncio
+	async def test_missing_text_defaults_to_honest_failure(self):
+		# review5 #6：text/data 均缺失的 done（畸形归一化擦成 {} 的路径）默认
+		# success=False——第四轮 #1 假成功修复的锚点（此前回退该修复零测试失败）。
+		# 对照：显式空文本（下一测试）与变体 B 有 data（test_structured_
+		# serializes_data 断言 success True）均维持 True。
+		r = await _run({})
+		assert r.success is False
+
+	@pytest.mark.asyncio
 	async def test_empty_text_warns(self, caplog):
 		with caplog.at_level("WARNING", logger="tree_walker.tools.actions"):
 			await _run({"text": ""})
@@ -433,6 +442,10 @@ class TestDoneStructuredParamValidation:
 		assert err is not None
 		assert "text" in err
 
-	def test_unknown_action_returns_none(self):
+	def test_unknown_action_gets_retry_feedback(self):
+		# PR #174 review3 #3：未注册名进澄清-重试梯子（畸形强转名字得到
+		# 「Unknown action」反馈重发，而非落执行失败计 failure）——原行为返 None。
 		response = {"action": {"name": "bogus_action", "params": {}}}
-		assert StepPipeline._validate_action_params(_FakeStep(Tools()), response) is None
+		err = StepPipeline._validate_action_params(_FakeStep(Tools()), response)
+		assert err is not None
+		assert "Unknown action" in err

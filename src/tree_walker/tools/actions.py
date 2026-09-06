@@ -2742,7 +2742,15 @@ class Tools:
         return ActionResult(extracted_content=visible, long_term_memory=memory)
 
     async def _action_done(self, params: dict, browser: BrowserSession) -> ActionResult:
-        success = params.get("success", True)
+        # success 默认值（PR #174 review4 #1）：text/data 任一「存在」才默认 True——
+        # 覆盖全部畸形形态的诚实失败（dict 形态畸形 done 的 params 被 choke point
+        # 擦成 {} 后，此前会以 success=True + "(no summary provided)" 假成功终止，
+        # 比修复前的 AttributeError 崩溃更糟）。注意「存在」而非「非空」：显式
+        # 空文本（""）是合法的有意终止（runtime guard 仅 warning，维持 True）；
+        # variant B 结构化 done 无 text 但有 data，同样维持 True。
+        success = params.get(
+            "success", params.get("text") is not None or params.get("data") is not None
+        )
 
         # 二.B 共享：解析 files_to_display → attachments（白名单 + 存在性）。
         # done 必须终止，故任何失败只 warn + 跳过，绝不 error / 绝不 is_done=False。

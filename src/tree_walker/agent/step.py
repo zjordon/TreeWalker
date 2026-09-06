@@ -1,4 +1,4 @@
-"""Step pipeline: 5-stage decomposition of the agent step."""
+﻿"""Step pipeline: 5-stage decomposition of the agent step."""
 
 from __future__ import annotations
 
@@ -13,6 +13,16 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
+from tree_walker.action_shape import (
+    actions_of,
+    honest_done_action,
+    is_honest_failure_action,
+    name_of,
+    normalize_model_output,
+    params_of,
+)
+# noqa: F401 —— normalize_model_output 在 _get_next_action 内使用（review8 #8
+# 后 _step 不再直接调用）
 from tree_walker.agent.actionability import (
     ACTIONABILITY_ACTIONS,
     is_file_input,
@@ -53,12 +63,18 @@ TYPE_CONTEXT = "context"    # 注入提示（budget/last/failure/loop）：每�
 TYPE_USER = "user"          # 持久 user 消息（任务说明、conversation summary）
 TYPE_ASSISTANT = "assistant"
 
-_FALLBACK_DONE_OUTPUT: dict[str, Any] = {
-    "evaluation_previous_goal": "No action returned",
-    "memory": "",
-    "next_goal": "Ending task",
-    "action": {"name": "done", "params": {"text": "No action returned by LLM", "success": False}},
-}
+def _fallback_done_output() -> dict[str, Any]:
+    """review7 #5：合成 done 统一挂 _HonestDone 带外标记（校验放行；variant B
+    不烧重试）。每次调用返回新实例，text 沿用既有文案。"""
+    action = honest_done_action()
+    action["params"]["text"] = "No action returned by LLM"
+    return {
+        "evaluation_previous_goal": "No action returned",
+        "memory": "",
+        "next_goal": "Ending task",
+        "action": action,
+        "actions": [action],
+    }
 
 
 def _attach_downloads_to_done_results(
@@ -170,6 +186,9 @@ class StepPipeline:
                 # P0-1：LLM 期间用户停止 → 输出已丢弃。不执行动作、不进 post_process，
                 # _finalize 的 `if model_output is not None` 守卫会跳过历史写入。
                 return False
+            # 归一化在 _get_next_action 内完成（校验/truncate/emit 之前，
+            # review7 #6）——其每条返回路径（含 fallback done）都已归一化，
+            # 此处不再重复调用（review8 #8：三重归一化 + 同一 WARNING ×3/步）
             results = await self._execute_actions(model_output, browser_state)
             self._post_process(results, model_output)
 
@@ -178,10 +197,35 @@ class StepPipeline:
             if self.state.consecutive_failures >= self.max_failures:
                 return True
         except Exception as e:
-            await self._handle_step_error(e)
+            try:
+                await self._handle_step_error(e)
+            except Exception as he:
+                # review3 #4：错误处理器自身故障（如半死浏览器上 reconnect 再抛）
+                # 降级为日志——不得从 except 逃出杀死 run（finally 只兜 _finalize）。
+                logger.error(
+                    "step error handler itself failed: %s (original error: %s)", he, e,
+                )
             return False
         finally:
-            await self._finalize(browser_state, model_output, results)
+            # finally 边界（issue #173，PR #174 review #5）：finalize 含历史追加与
+            # obs emit。finally 里抛异常会越过上方 except 杀死整个 run——778/782
+            # 同类死法，必须整体兜住：历史/obs 降级也强过任务死亡。
+            # （订阅者异常的根因已在 EventBus.emit 做 per-handler 隔离；这里兜
+            # _finalize 其余部分——历史追加/元数据等。）
+            try:
+                await self._finalize(browser_state, model_output, results)
+            except Exception as e:
+                logger.error("_finalize failed — history/obs degraded for this step: %s", e)
+                # 降级累计计数（review4 #4 / review6 #4/#5）：**只增不清零**——
+                # 任何「成功即清零」的连续计数器都会被交错的 pause/stop 空跑或
+                # 中途回复洗掉（缺步的 run 报 0，与干净 run 不可区分）；累计值
+                # 语义即「history 里缺失的步数」，run() 达阈值升级终止。
+                self.state.finalize_degraded_steps += 1
+            # 计数器边界（review2 #1 / review3 #8 单一所有者）：n_steps 递增只在此
+            # 处（_finalize 尾部副本已删）——吞异常不得跳过它（否则 run() 的
+            # while 循环退化为无界 livelock），正确性也不再依赖「递增恰是
+            # _finalize 最后一条语句」这条跨千行的顺序约定。
+            self.state.n_steps += 1
 
         return False
 
@@ -615,6 +659,12 @@ class StepPipeline:
             )
             return None
 
+        # 管线入口归一化（review6 #9 / review7 #6）：必须在校验 / truncate /
+        # emit / assistant 消息构造**之前**——truncate 会把裸列表元素提升为
+        # 镜像，未归一化形态先到 emit/log 就崩（pydantic str 字段 / str.get）。
+        # client choke point 之后再兜一层（幂等），覆盖注入/自定义 LLM。
+        normalize_model_output(response)
+
         # Hard-cap actions to max_actions_per_step (browser-use service.py:1950-1951).
         # The system prompt and schema maxItems only *tell* the LLM the limit;
         # this is the runtime safety net for when small models ignore them and
@@ -625,13 +675,15 @@ class StepPipeline:
 
         if self._obs_bus:
             from tree_walker.observability.events import ModelResultEvent
-            action = response.get("action", {})
             _usage = response.get("usage") or {}  # P6 后续 I2：LLMClient 透传的 token usage
             self._obs_bus.emit(ModelResultEvent(
                 step=self.state.n_steps, session_id=self._obs_session_id,
                 model_call_id=model_call_id,
-                action_name=action.get("name", "done"),
-                next_goal=response.get("next_goal", ""),
+                # review7 #8：emit 字段统一 str(x or "")——LLM 显式输出
+                # next_goal: null（key 存在）曾把 None 塞进 pydantic str 字段、
+                # ValidationError 丢弃整个有效步骤
+                action_name=str(name_of(response.get("action")) or ""),
+                next_goal=str(response.get("next_goal") or ""),
                 input_tokens=_usage.get("input_tokens"),
                 output_tokens=_usage.get("output_tokens"),
             ))
@@ -640,9 +692,11 @@ class StepPipeline:
         assistant_msg: dict[str, Any] = {
             "role": "assistant",
             "content": (
-                f"[{response.get('evaluation_previous_goal', '')}] "
-                f"Goal: {response.get('next_goal', '')} | "
-                f"Action: {response.get('action', {}).get('name', 'unknown')}"
+                f"[{response.get('evaluation_previous_goal') or ''}] "
+                f"Goal: {response.get('next_goal') or ''} | "
+                # review7 #6/#8：归一化后镜像可能仍是标量/无名字典（多元素
+                # 畸形头走澄清重试前）——name_of 兜底，不再裸 .get 崩
+                f"Action: {name_of(response.get('action')) or 'unknown'}"
             ),
         }
         if self._enable_message_typing:
@@ -661,9 +715,8 @@ class StepPipeline:
         self.messages.append(assistant_msg)
 
         # Log action decision (structured four-line block)
-        action = response.get("action", {})
-        action_name = action.get("name", "done")
-        action_params = action.get("params", {})
+        action_name = str(name_of(response.get("action")) or "unknown")
+        action_params = params_of(response.get("action"))
         # P1-2：决策日志脱敏（修复 pre-existing 泄露——params 已被 client
         # ``_restore_sensitive_in_output`` 还原为真值，直接打印会泄密；与
         # ``_execute_actions`` 的 per-action 日志共用同一辅助）。
@@ -785,7 +838,7 @@ class StepPipeline:
 
         # Fallback: insert safe done action
         logger.warning("LLM still returned empty action after retry, using fallback done")
-        return dict(_FALLBACK_DONE_OUTPUT)
+        return _fallback_done_output()
 
     async def _validate_params_or_retry(
         self,
@@ -818,7 +871,7 @@ class StepPipeline:
 
             if not self._is_valid_action(response):
                 logger.warning("LLM returned empty action during param validation retry")
-                return dict(_FALLBACK_DONE_OUTPUT)
+                return _fallback_done_output()
 
             param_error = self._validate_action_params(response)
             if param_error is None:
@@ -843,14 +896,25 @@ class StepPipeline:
 
         Returns None if valid, or an error detail string if invalid.
         """
-        action = response.get("action", {})
-        name = action.get("name", "")
-        params = action.get("params", {})
+        action = response.get("action") or {}
+        # review6 #3：诚实失败 done（畸形标量的归一化去向）跳过校验立即执行——
+        # variant B 的 StructuredDoneParams 会拒绝其 text 参数、烧 2 次全上下文
+        # 重试，违背「一次调用诚实终止」的设计。
+        if is_honest_failure_action(action):
+            return None
+        # review5 #4 / review6 #9：name/params 一律经共享访问器——注入 LLM 绕过
+        # client choke point 的畸形形态（str params / null name）不再崩校验层。
+        name = str(name_of(action) or "")
+        params = params_of(action)
 
         registered = self.tools.registry.actions.get(name)
         if registered is None:
-            # Unknown action — let execution surface it; nothing to validate.
-            return None
+            # review3 #3：未注册名也进澄清-重试梯子——畸形强转出来的名字（裸
+            # 字符串 action / null / 数字）由此得到「Unknown action」反馈重发，
+            # 而非落到执行失败计 failure。page 过滤只影响 schema 暴露、不影响
+            # 此处按名查找（apply_page_filters 只写 page_patterns），未注册 =
+            # 真未知名。
+            return f"Unknown action '{name}'"
 
         param_model = registered.param_model
         flat_params = self.tools._flatten_params(params, name)
@@ -925,13 +989,16 @@ class StepPipeline:
         if self.state.stopped or self.state.paused:
             return [ActionResult(error="Agent stopped or paused")]
 
-        actions = model_output.get("actions") or [model_output.get("action", {})]
+        actions = actions_of(model_output)
         total = len(actions)
         results: list[ActionResult] = []
 
         for i, action in enumerate(actions):
-            action_name = action.get("name", "done")
-            action_params = action.get("params", {})
+            # 形态访问器统一自 action_shape（review4 #8：共享实现替换散落的
+            # isinstance 拼法）。正常路径的 actions 已在 client choke point 归一化，
+            # 此处访问器兜旁路形态（内存构造数据/测试直调）。
+            action_name = name_of(action)
+            action_params = params_of(action)
 
             # Guard #1: done is only allowed as a single action. Encountering
             # it after position 0 means the LLM mis-chained; we stop here so
@@ -986,7 +1053,10 @@ class StepPipeline:
                 self._obs_bus.emit(ToolCallEvent(
                     step=self.state.n_steps, session_id=self._obs_session_id,
                     model_call_id=getattr(self, "_current_model_call_id", ""),
-                    tool_call_id=tool_call_id, action_name=action_name,
+                    tool_call_id=tool_call_id,
+                    # review6 #1：pydantic str 字段不接受 None——str() 包裹防旁路
+                    # 形态在事件构造处 ValidationError 杀死整步
+                    action_name=str(action_name or ""),
                     params=action_params,
                     action_index=i, total_actions=total,
                     element_index=_eidx, element_bbox=_ebbox, element_xpath=_expath,
@@ -1127,10 +1197,10 @@ class StepPipeline:
         # Record each action to loop detector with exemption filtering.
         # Multi-action steps record each action individually so the detector
         # sees the full sequence.
-        actions = model_output.get("actions") or [model_output.get("action", {})]
+        actions = actions_of(model_output)
         for action in actions:
-            action_name = action.get("name", "done")
-            action_params = action.get("params", {})
+            action_name = name_of(action)
+            action_params = params_of(action)
             if action_name not in _LOOP_EXEMPT_ACTIONS:
                 self.loop_detector.record_action(action_name, action_params)
 
@@ -1187,10 +1257,13 @@ class StepPipeline:
         model_output: dict[str, Any] | None,
         results: list[ActionResult],
     ) -> None:
-        """Record history, log summary, and advance step counter.
+        """Record history and log the step summary.
 
-        Called from finally block — runs regardless of success or exception.
-        n_steps is incremented last so all consumers see the current value.
+        Called from the ``_step`` finally block — runs regardless of success or
+        exception（自身异常由 finally 的守卫兜住并计数 ``finalize_degraded_steps``）。
+        **n_steps 递增不在此处**（PR #174 review3 #8 单一所有者）：由 ``_step``
+        的 finally 在本方法之后统一执行——请勿在本方法尾部追加可能抛异常的
+        语句后假设步数语义不变，递增的正确性已与语句顺序解耦。
 
         Async in preparation for screenshot persistence (phase 5 P1); no await
         sites yet — screenshot storage lands with screenshot.md stage 2.
@@ -1218,7 +1291,7 @@ class StepPipeline:
                 model_output=model_output,
                 result=results,
                 state_summary=state_summary,
-                interacted_element=self._project_interacted_elements(model_output, browser_state, results),
+                interacted_element=self._safe_project_interacted_elements(model_output, browser_state, results),
                 metadata=self._build_step_metadata(time.time()),
             ))
 
@@ -1233,7 +1306,8 @@ class StepPipeline:
             ))
 
         self._log_step_completion_summary(results)
-        self.state.n_steps += 1
+        # n_steps 递增已上移至 _step 的 finally（review3 #8 单一所有者）——
+        # 此处不再持有副本。
 
     def _project_interacted_elements(
         self,
@@ -1257,7 +1331,7 @@ class StepPipeline:
         if not selector_map:
             return None
 
-        actions = model_output.get("actions") or [model_output.get("action", {})]
+        actions = actions_of(model_output)
         projected: list[dict[str, Any] | None] = []
         for i, action in enumerate(actions):
             # upload_file：agent 采集的语义线索优先于原始 DOM 节点投影（#151）
@@ -1267,7 +1341,10 @@ class StepPipeline:
                 if isinstance(clue, dict) and clue:
                     projected.append({"_semantic_clue": True, "kind": "file_upload", **clue})
                     continue
-            params = action.get("params", {}) if isinstance(action, dict) else {}
+            # 逐条降级（review3 #7 / review4 #8）：params_of 统一实现「非 dict →
+            # {}」，绕过 choke point 的畸形只丢本条投影，维护
+            # actions/interacted_element 等长配对——catch-all 留给 DOM bug。
+            params = params_of(action)
             index = params.get("index")
             if index is None:
                 index = params.get("element_id")  # element_id 是 index 的别名
@@ -1277,6 +1354,24 @@ class StepPipeline:
             else:
                 projected.append(None)
         return projected
+
+    def _safe_project_interacted_elements(
+        self,
+        model_output: dict[str, Any],
+        browser_state: BrowserStateSummary | None,
+        results: list[ActionResult] | None = None,
+    ) -> list[dict[str, Any] | None] | None:
+        """``_finalize`` 兜底（issue #173）：投影只是历史元数据（重放用），失败降级
+        None + warning——绝不让元数据 bug 杀死任务。778/782 教训：``_step`` 的
+        ``finally`` 里抛异常会越过单步错误处理（except 已执行完），直接终结整任务。
+        """
+        try:
+            return self._project_interacted_elements(model_output, browser_state, results)
+        except Exception as e:
+            logger.warning(
+                "interacted-element projection failed — history metadata degraded to None: %s", e,
+            )
+            return None
 
     def _build_step_metadata(self, step_end_time: float) -> StepMetadata:
         """构造单步计时。``step_interval`` = 上一步的耗时（首步为 None）。
