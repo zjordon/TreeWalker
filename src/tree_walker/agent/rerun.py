@@ -1175,7 +1175,7 @@ class RerunMixin:
             return None
         new_index, level = match
         new_action = copy.deepcopy(action)
-        params = new_action.get("params") if isinstance(new_action.get("params"), dict) else {}
+        params = params_of(new_action)
         new_action["params"] = params
         old = params.get("index", params.get("element_id"))
         # 统一写回 index（element_id 是别名；tools._flatten_params 处理 index）
@@ -1340,7 +1340,7 @@ class RerunMixin:
         for action in actions:
             if not isinstance(action, dict):
                 continue
-            params = action.get("params") if isinstance(action.get("params"), dict) else {}
+            params = params_of(action)
             idx = params.get("index")
             if idx is None:
                 idx = params.get("element_id")
@@ -1574,9 +1574,7 @@ class RerunMixin:
                 actions = item.model_output.get("actions") or [item.model_output.get("action", {})]
                 for action in actions:
                     if isinstance(action, dict):
-                        params = action.get("params")
-                        if isinstance(params, dict):
-                            _substitute_in_dict(params, value_replacements)
+                        _substitute_in_dict(params_of(action), value_replacements)
             n_applied += len(value_replacements)
         if n_applied:
             logger.info("🔁 已替换 %d 个变量值", n_applied)

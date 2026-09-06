@@ -196,7 +196,12 @@ class StepPipeline:
             # _finalize 其余部分——历史追加/元数据等。）
             try:
                 await self._finalize(browser_state, model_output, results)
-                self.state.finalize_degraded_steps = 0  # 成功即清零（连续语义）
+                # review5 #5：只在「真实 finalize」（model_output 非 None——本步
+                # 真正做了 LLM 决策并执行）成功时清零——pause/stop 提前返回的
+                # 空跑 finalize 平凡成功，不得把降级计数洗掉（交错 Ctrl+C 曾让
+                # 确定性 _finalize bug 永远低于升级线）。
+                if model_output is not None:
+                    self.state.finalize_degraded_steps = 0
             except Exception as e:
                 logger.error("_finalize failed — history/obs degraded for this step: %s", e)
                 # review4 #4：降级可观测——确定性 _finalize bug 会让 run 报成功但
@@ -651,12 +656,11 @@ class StepPipeline:
 
         if self._obs_bus:
             from tree_walker.observability.events import ModelResultEvent
-            action = response.get("action", {})
             _usage = response.get("usage") or {}  # P6 后续 I2：LLMClient 透传的 token usage
             self._obs_bus.emit(ModelResultEvent(
                 step=self.state.n_steps, session_id=self._obs_session_id,
                 model_call_id=model_call_id,
-                action_name=action.get("name", "done"),
+                action_name=name_of(response.get("action")),
                 next_goal=response.get("next_goal", ""),
                 input_tokens=_usage.get("input_tokens"),
                 output_tokens=_usage.get("output_tokens"),
@@ -687,9 +691,8 @@ class StepPipeline:
         self.messages.append(assistant_msg)
 
         # Log action decision (structured four-line block)
-        action = response.get("action", {})
-        action_name = action.get("name", "done")
-        action_params = action.get("params", {})
+        action_name = name_of(response.get("action"))
+        action_params = params_of(response.get("action"))
         # P1-2：决策日志脱敏（修复 pre-existing 泄露——params 已被 client
         # ``_restore_sensitive_in_output`` 还原为真值，直接打印会泄密；与
         # ``_execute_actions`` 的 per-action 日志共用同一辅助）。
@@ -870,8 +873,11 @@ class StepPipeline:
         Returns None if valid, or an error detail string if invalid.
         """
         action = response.get("action", {})
-        name = action.get("name", "")
-        params = action.get("params", {})
+        name = name_of(action) if isinstance(action, dict) else ""
+        # review5 #4：本 PR 最后一个裸读畸形 params 的点——注入/自定义 LLM 绕过
+        # client choke point 时（llm 参数只是未强制的注解），str params 会在
+        # _flatten_params 的 params.items() 崩；params_of 统一兜住。
+        params = params_of(action) if isinstance(action, dict) else {}
 
         registered = self.tools.registry.actions.get(name)
         if registered is None:

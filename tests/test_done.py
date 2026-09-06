@@ -137,6 +137,15 @@ class TestDoneEmptyText:
 		assert r.is_done is True
 
 	@pytest.mark.asyncio
+	async def test_missing_text_defaults_to_honest_failure(self):
+		# review5 #6：text/data 均缺失的 done（畸形归一化擦成 {} 的路径）默认
+		# success=False——第四轮 #1 假成功修复的锚点（此前回退该修复零测试失败）。
+		# 对照：显式空文本（下一测试）与变体 B 有 data（test_structured_
+		# serializes_data 断言 success True）均维持 True。
+		r = await _run({})
+		assert r.success is False
+
+	@pytest.mark.asyncio
 	async def test_empty_text_warns(self, caplog):
 		with caplog.at_level("WARNING", logger="tree_walker.tools.actions"):
 			await _run({"text": ""})

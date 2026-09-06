@@ -105,12 +105,15 @@ class EventBus:
                 )
         all_subs = [s for subs in self._subscribers.values() for s in subs]
         disabled = [s for s in all_subs if s.disabled]
-        failing = {s.name for s in all_subs if s.failures > 0}
+        # review5 #9：failing 排除已 disabled 的订阅（其 failures 停在上限、从不
+        # 重置）——否则同一 handler 被双重报告（"1 disabled, 1 failing" 读起来像
+        # 两个独立问题）；两个计数统一单位为「订阅路径」。
+        failing = [s for s in all_subs if s.failures > 0 and not s.disabled]
         if disabled or failing:
             names = sorted({s.name for s in disabled})
             logger.warning(
-                "event bus close: %d subscription(s) disabled [%s], %d handler(s) with "
-                "recent failures — session observation data may be truncated/incomplete",
+                "event bus close: %d subscription(s) disabled [%s], %d subscription(s) "
+                "with recent failures — session observation data may be truncated/incomplete",
                 len(disabled), ", ".join(names), len(failing),
             )
         self._close_callbacks.clear()

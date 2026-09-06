@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 
+from tree_walker.action_shape import params_of
 from tree_walker.agent.views import AgentHistoryList, DetectedVariable, ManualVariableBinding
 
 # 仅这些字段是「用户填入的完整值」，可安全作为变量替换目标。
@@ -36,7 +37,7 @@ def detect_variables_in_history(
         for i, action in enumerate(actions):
             if not isinstance(action, dict):
                 continue
-            params = action.get("params") if isinstance(action.get("params"), dict) else {}
+            params = params_of(action)
             elem = interacted[i] if i < len(interacted) else None
             for field in _FIELDS:
                 value = params.get(field)

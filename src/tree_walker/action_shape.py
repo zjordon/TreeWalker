@@ -20,7 +20,21 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["coerce_named_action", "name_of", "normalize_actions_list", "params_of"]
+__all__ = [
+    "coerce_named_action",
+    "honest_done_action",
+    "name_of",
+    "normalize_actions_list",
+    "params_of",
+]
+
+
+def honest_done_action() -> dict:
+    """非字符串畸形值（null/数字/布尔）的统一去向（review4 #2 / review5 #2）：
+    诚实失败的 done——一次调用终止，绝不强转成 'None'/'123' 这类模型从未输出过
+    的名字进重试梯子（2 次全上下文重试 × 每步，最终 max_failures 终止且无 done）。
+    """
+    return {"name": "done", "params": {"text": "Invalid action shape", "success": False}}
 
 
 def coerce_named_action(raw: Any) -> dict:
@@ -49,7 +63,13 @@ def normalize_actions_list(actions_list: list[Any]) -> None:
                 "action[%d] malformed (%s) — coerced to named action with empty params",
                 i, type(a).__name__,
             )
-            actions_list[i] = coerce_named_action(a)
+            # review5 #2：列表内标量与顶层同策略——裸字符串是像样的动作名 →
+            # 命名动作；null/数字/布尔 → 诚实失败 done 原地替换（保持与
+            # interacted_element 的等长对应），不合成 'None' 烧重试。
+            if isinstance(a, str) and a.strip():
+                actions_list[i] = coerce_named_action(a)
+            else:
+                actions_list[i] = honest_done_action()
         elif not isinstance(a.get("params"), dict):
             if a.get("params") is not None:
                 logger.warning(
@@ -59,17 +79,22 @@ def normalize_actions_list(actions_list: list[Any]) -> None:
             a["params"] = {}
 
 
-def name_of(action: Any, default: str = "done") -> str:
-    """动作名的安全访问（旁路形态兜底）：dict 取 name（非字符串/缺失回默认），
-    裸字符串动作取其 strip 值，其余回默认。"""
+def name_of(action: Any) -> Any:
+    """动作名访问（master 语义，review5 #1：绝不伪造 done）。
+
+    - dict 缺 ``name`` 键 → ``"done"``（旧单动作形态的既有缺省）；
+    - dict 的 name 为显式 null / 空串 / 非字符串 → **原样返回**——下游
+      registry 未命中产生可见的 Unknown action 错误（进 failure 计数、
+      LLM 可见），而非静默伪造终止动作或借 guard #1 截断剩余动作；
+    - 裸字符串动作 → strip 后的名字；其余（null/数字直接作动作）→ None。
+    """
     if isinstance(action, dict):
-        name = action.get("name")
-        if isinstance(name, str) and name:
-            return name
-        return default
+        if "name" not in action:
+            return "done"
+        return action["name"]
     if isinstance(action, str) and action.strip():
         return action.strip()
-    return default
+    return None
 
 
 def params_of(action: Any) -> dict:

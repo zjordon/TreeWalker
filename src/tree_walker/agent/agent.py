@@ -304,13 +304,9 @@ class Agent(StepPipeline, RerunMixin):
 
                 try:
                     done = await self._step()
-                    if done:
-                        if self._judge:
-                            await self._run_judge()
-                        break
-                    # review4 #4：_finalize 持续降级升级终止——确定性 _finalize bug
-                    # 会让 run 报成功但 history 残缺（最坏是 done 步不进 history），
-                    # 连续 3 步降级即中止并显形，而非静默跑完。
+                    # review5 #3：升级检查必须在 done-break **之前**——降级步恰是
+                    # done 步时（其 history 正是残缺的那个），先 break 会让检查
+                    # 永不触发，正是该守卫声称覆盖的最坏情形。
                     if self.state.finalize_degraded_steps >= 3:
                         logger.error(
                             "_finalize degraded on %d consecutive steps — aborting run "
@@ -318,10 +314,17 @@ class Agent(StepPipeline, RerunMixin):
                             self.state.finalize_degraded_steps,
                         )
                         break
+                    if done:
+                        if self._judge:
+                            await self._run_judge()
+                        break
                 except KeyboardInterrupt:
                     logger.info("Interrupted by user")
                     break
         finally:
+            # review5 #3：降级信息落到返回的 history——调用方可区分「正常完成」
+            # 与「history 残缺的完成」（AgentHistoryList.finalize_degraded_steps）。
+            self.history.finalize_degraded_steps = self.state.finalize_degraded_steps
             self._finalize_session()
             self._restore_signal_handler()
             if not keep_alive:

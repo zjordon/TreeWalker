@@ -169,7 +169,27 @@ class TestCloseIsolation:
         summary = [r.getMessage() for r in caplog.records if "event bus close" in r.getMessage()]
         assert summary
         assert "0 subscription(s) disabled" in summary[0]
-        assert "1 handler(s) with recent failures" in summary[0]
+        assert "1 subscription(s) " in summary[0]  # 单位统一为订阅路径
+
+    def test_close_summary_does_not_double_count_disabled(self, caplog):
+        # review5 #9：熔断订阅的 failures 停在上限且从不重置——汇总的 failing
+        # 集合排除已 disabled 的订阅，同一 handler 不被报成两个问题
+        bus = EventBus()
+
+        def dead(event):
+            raise RuntimeError("permanent")
+
+        bus.subscribe("*", dead)
+        with caplog.at_level(logging.ERROR):
+            for _ in range(bus._MAX_SUBSCRIPTION_FAILURES):
+                bus.emit(_event())
+        with caplog.at_level(logging.WARNING):
+            bus.close()
+        summary = [r.getMessage() for r in caplog.records if "event bus close" in r.getMessage()]
+        assert summary
+        assert "1 subscription(s) disabled" in summary[0]
+        assert "0 subscription(s) \nwith recent failures" not in summary[0]
+        assert ", 0 subscription(s)" in summary[0]  # disabled 的不再进 failing 计数
 
     def test_close_summary_silent_when_healthy(self, caplog):
         bus = EventBus()

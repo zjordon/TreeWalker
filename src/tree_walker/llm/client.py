@@ -10,7 +10,11 @@ from typing import Any
 
 from anthropic import Anthropic, APIError, RateLimitError
 
-from tree_walker.action_shape import coerce_named_action, normalize_actions_list
+from tree_walker.action_shape import (
+    coerce_named_action,
+    honest_done_action,
+    normalize_actions_list,
+)
 from tree_walker.config import LLMSettings
 
 logger = logging.getLogger(__name__)
@@ -342,11 +346,9 @@ class LLMClient:
                 # 字段反馈、未注册名得到 Unknown action 反馈，模型可修）
                 actions_list = [coerce_named_action(raw_action)]
             else:
-                # null/数字/布尔（review4 #2）：无可修的名字——强转成 'None'/'123'
-                # 进重试梯子会带着「模型从未输出过的名字」反馈烧全上下文调用
-                # （2 次重试 × 每步，最终 max_failures 终止且 history 无 done）。
-                # 直接诚实失败终止（一次调用，恢复本 PR 之前的旧 else 语义）。
-                actions_list = [{"name": "done", "params": {"text": "Invalid action shape", "success": False}}]
+                # null/数字/布尔（review4 #2 / review5 #2）：无可修的名字——
+                # 诚实失败 done 一次调用终止，不合成 'None' 烧全上下文重试。
+                actions_list = [honest_done_action()]
 
         # Phase A diagnostic: log the actual shape LLM emitted so we can tell
         # whether multi-action is being used. Reads schema maxItems when present

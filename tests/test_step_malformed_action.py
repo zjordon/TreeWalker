@@ -33,16 +33,25 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from pydantic import BaseModel
 
-from tree_walker.action_shape import coerce_named_action, normalize_actions_list
+from tree_walker.action_shape import coerce_named_action, name_of, normalize_actions_list
 from tree_walker.agent.loop_detector import ActionLoopDetector
 from tree_walker.agent.rerun import RerunMixin
 from tree_walker.agent.step import StepPipeline
-from tree_walker.agent.views import ActionResult, AgentHistoryList, AgentState
+from tree_walker.agent.views import ActionResult, AgentHistory, AgentHistoryList, AgentState
 from tree_walker.browser.views import BrowserStateSummary, SerializedDOMState
 from tree_walker.config import LLMSettings, TruncationSettings
 from tree_walker.llm.client import LLMClient
 from tree_walker.tools.actions import Tools
 from tree_walker.tools.registry import ActionRegistry, RegisteredAction
+
+
+@pytest.fixture(autouse=True)
+def _mock_anthropic_sdk(monkeypatch):
+	# review5 #7：LLMClient() 在 setup 阶段急切构造真实 Anthropic SDK client——
+	# 设了 socks:// 代理变量的机器上（httpx 只认 http/https/socks5[h]）直接
+	# ValueError。测试反正立刻 MagicMock 覆盖 client，这里提前 mock 掉符号，
+	# 使整套测试环境无关。
+	monkeypatch.setattr("tree_walker.llm.client.Anthropic", MagicMock())
 
 
 # ── helpers（复刻 test_multi_act.py）────────────────────────────────────
@@ -175,6 +184,68 @@ class TestNormalizeActionsList:
 		assert any("params malformed (str)" in r.getMessage() for r in caplog.records)
 		assert not any("<SECRET-TOKEN-1234>" in r.getMessage() for r in caplog.records)
 
+	def test_list_scalar_non_string_replaced_by_honest_done(self):
+		# review5 #2：列表内标量与顶层同策略——null/数字不再强转 'None'/'123'
+		# 烧全上下文重试，诚实失败 done 原地替换（保持与 interacted 等长）
+		actions = [None, "click", 123]
+		normalize_actions_list(actions)
+		assert actions[0]["name"] == "done"
+		assert actions[0]["params"]["success"] is False
+		assert actions[1] == {"name": "click", "params": {}}
+		assert actions[2]["name"] == "done"
+		assert actions[2]["params"]["success"] is False
+
+
+class TestNameOfSemantics:
+	"""review5 #1：name_of 绝不把畸形 name 伪造为 done。"""
+
+	def test_missing_name_key_defaults_done(self):
+		# 旧单动作形态的既有缺省（master 的 .get("name", "done") 语义）
+		assert name_of({"params": {}}) == "done"
+
+	def test_null_name_passthrough_visible_error(self):
+		# 显式 null/空串/非字符串 name 原样返回——下游 registry 未命中产生
+		# 可见的 Unknown action 错误（master 行为），绝不静默伪造终止动作
+		assert name_of({"name": None}) is None
+		assert name_of({"name": ""}) == ""
+		assert name_of({"name": 123}) == 123
+
+	def test_bare_string_action_name(self):
+		assert name_of("click") == "click"
+		assert name_of("  click  ") == "click"
+		assert name_of(None) is None
+
+
+class TestAgentHistoryConstructionNormalization:
+	"""review5 #10 主线：AgentHistory model_validator 构造收口——内存构造 /
+	model_validate 不再绕过归一化（update_action_params 等消费方无需自带守卫）。"""
+
+	def _mk(self, model_output: dict) -> AgentHistory:
+		return AgentHistory(step_number=1, model_output=model_output, result=[])
+
+	def test_in_memory_construction_normalizes(self):
+		h = self._mk({"actions": [{"name": "click", "params": "561257"}, "wait"]})
+		assert h.model_output["actions"] == [
+			{"name": "click", "params": {}},
+			{"name": "wait", "params": {}},
+		]
+		assert h.model_output["action"] == h.model_output["actions"][0]
+
+	def test_in_memory_old_format_dict_action_normalized(self):
+		h = self._mk({"action": {"name": "click", "params": "561257"}})
+		assert h.model_output["action"] == {"name": "click", "params": {}}
+
+	def test_update_action_params_on_malformed_history_no_crash(self):
+		# review5 #10 的崩溃实例：此前 update_action_params 对 str params
+		# setdefault 后赋值 → TypeError；构造收口后 model_output 已是干净形态
+		hl = AgentHistoryList(history=[AgentHistory(
+			step_number=1,
+			model_output={"actions": [{"name": "click", "params": "561257"}]},
+			result=[],
+		)])
+		hl.update_action_params(step_number=1, action_index=0, field="text", value="v")
+		assert hl.history[0].model_output["actions"][0]["params"]["text"] == "v"
+
 
 # ── 2. 流水线端到端：归一化后走完 execute + post_process ────────────────
 
@@ -304,6 +375,26 @@ class TestStepFinallyGuard:
 		assert agent.state.finalize_degraded_steps == 1
 		await StepPipeline._step(agent)
 		assert agent.state.finalize_degraded_steps == 0
+
+	@pytest.mark.asyncio
+	async def test_empty_finalize_run_does_not_reset_counter(self):
+		# review5 #5：pause/stop 提前返回的「空跑」finalize（model_output=None，
+		# history 块跳过、平凡成功）不得清零降级计数——交错的 Ctrl+C 曾让
+		# 确定性 _finalize bug 永远低于升级线
+		agent = _loop_agent()
+		agent._prepare_context = AsyncMock(return_value=(_browser_state(), "state msg"))
+		agent._get_next_action = AsyncMock(return_value={"actions": [{"name": "click", "params": {}}]})
+		agent._execute_actions = AsyncMock(return_value=[ActionResult()])
+		agent._finalize = AsyncMock(side_effect=RuntimeError("bug"))
+		await StepPipeline._step(agent)
+		await StepPipeline._step(agent)
+		assert agent.state.finalize_degraded_steps == 2
+		# 第三步：stopped → prepare_context 后提前返回（model_output=None），
+		# _finalize 这次成功——计数必须保持 2
+		agent._finalize = AsyncMock()
+		agent.state.stopped = True
+		await StepPipeline._step(agent)
+		assert agent.state.finalize_degraded_steps == 2
 
 	@pytest.mark.asyncio
 	async def test_finalize_still_runs_normally(self):
@@ -472,6 +563,29 @@ class TestValidateParamsGracefulFailure:
 		assert err is not None
 		assert "index" in err  # 缺必填字段的反馈文案
 
+	def test_custom_llm_str_params_survives_validation_layer(self):
+		# review5 #4：注入/自定义 LLM 绕过 client choke point 时（llm 参数只是
+		# 未强制的注解），str params 曾在 _flatten_params 的 params.items() 崩
+		# ——校验层换 params_of 后优雅给缺参反馈。
+		class _ClickParams(BaseModel):
+			index: int
+
+		registry = ActionRegistry()
+		registry.actions["click"] = RegisteredAction(
+			name="click", description="click", param_model=_ClickParams,
+			handler=MagicMock(), terminates_sequence=False,
+		)
+		agent = MagicMock()
+		agent.tools = MagicMock()
+		agent.tools.registry = registry
+		agent.tools._flatten_params = lambda params, name: Tools._flatten_params(
+			MagicMock(), params, name,
+		)
+		response = {"action": {"name": "click", "params": "561257"}}  # 未经归一化
+		err = StepPipeline._validate_action_params(agent, response)
+		assert err is not None
+		assert "index" in err
+
 
 # ── 9. round3 补口：旧格式形态 / 内存构造历史 / 错误处理器自防护 / 语义统一 ──
 
@@ -639,3 +753,35 @@ class TestRunEscalationOnFinalizeDegradation:
 		agent._step = degraded_step
 		await agent.run()
 		assert steps["n"] == 3  # 第 3 次降级后升级终止，而非跑满 max_steps
+
+	@pytest.mark.asyncio
+	async def test_done_step_degradation_still_escalates_and_is_visible(self):
+		# review5 #3：升级检查在 done-break **之前**——降级步恰是 done 步时
+		# （其 history 正是残缺的那个）同样触发；降级计数落到返回的 history
+		# 上（AgentHistoryList.finalize_degraded_steps），调用方可区分。
+		from tree_walker.agent.agent import Agent
+		from tree_walker.config import AgentSettings
+
+		browser = MagicMock()
+		browser.start = AsyncMock()
+		browser.stop = AsyncMock()
+		browser._settings = MagicMock(wait_between_actions=0.0)
+		agent = Agent(
+			task="t", llm=MagicMock(), browser=browser,
+			settings=AgentSettings(max_steps=10, enable_planning=False),
+		)
+
+		steps = {"n": 0}
+
+		async def degraded_done_step():
+			steps["n"] += 1
+			agent.state.n_steps += 1
+			agent.state.finalize_degraded_steps += 1
+			# 第 3 步是 done——恰在升级线上的「降级 done 步」：若升级检查在
+			# done-break 之后（review5 #3 的旧顺序），此处直接 break、永不触发
+			return steps["n"] >= 3
+
+		agent._step = degraded_done_step
+		history = await agent.run()
+		assert steps["n"] == 3
+		assert history.finalize_degraded_steps == 3

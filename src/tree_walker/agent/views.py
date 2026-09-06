@@ -129,6 +129,34 @@ class AgentHistory(BaseModel):
     class Config:
         arbitrary_types_allowed = True
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_malformed_actions(cls, data: Any) -> Any:
+        """畸形动作归一化的**构造收口**（issue #173，review5 #10 主线）。
+
+        对齐 ActionResult.validate_success_requires_done 的既有模式：把
+        ``normalize_actions_list`` 挂在模型上，使 load_from_file / load_from_dict /
+        model_validate / 内存构造**全部路径**统一归一化——此前散点防御
+        （client choke point + load_from_dict 预校验 + 逐点访问器）每层都有
+        绕过（update_action_params 在畸形形态上 TypeError、自定义 LLM 注入
+        绕过 client）。覆盖三种形态：actions 列表（含畸形条目）、老格式
+        dict action、老格式裸字符串 action。
+        """
+        if not isinstance(data, dict):
+            return data
+        mo = data.get("model_output")
+        if not isinstance(mo, dict):
+            return data
+        actions = mo.get("actions")
+        if isinstance(actions, list) and actions:
+            normalize_actions_list(actions)
+            mo["action"] = actions[0]  # 镜像刷新（老文件可能是畸形原值）
+        elif isinstance(mo.get("action"), dict):
+            normalize_actions_list([mo["action"]])  # 原地补/修 params
+        elif isinstance(mo.get("action"), str) and mo["action"].strip():
+            mo["action"] = coerce_named_action(mo["action"])
+        return data
+
 
 # 仅这些「用户填值类」动作的参数需要敏感数据脱敏（动作名 → 待脱敏的参数字段）。
 _SENSITIVE_ACTION_FIELDS: dict[str, tuple[str, ...]] = {
@@ -200,6 +228,10 @@ class AgentHistoryList(BaseModel):
     action_registry_version: str | None = None
     # P4 可视化编辑：编辑器手动标注的变量绑定。老 JSON 无此键 → pydantic 默认 []，自动兼容。
     manual_variables: list[ManualVariableBinding] = Field(default_factory=list)
+    # _finalize 降级步数（review5 #3）：run() 收尾把 AgentState 的计数落到返回的
+    # history 上——调用方（web/评测）可区分「正常完成」与「history 残缺的完成」
+    # （最坏情形：done 步不进 history）。0 = 无降级。
+    finalize_degraded_steps: int = 0
 
     def final_result(self) -> str | None:
         for item in reversed(self.history):
@@ -242,27 +274,15 @@ class AgentHistoryList(BaseModel):
 
     @classmethod
     def load_from_dict(cls, data: dict[str, Any]) -> "AgentHistoryList":
-        """从 dict 重建历史。老格式兼容：缺 interacted_element 补 None。"""
+        """从 dict 重建历史。老格式兼容：缺 interacted_element 补 None。
+
+        畸形动作归一化已上收到 ``AgentHistory._normalize_malformed_actions``
+        的 model_validator（review5 #10 主线——覆盖 load/validate/内存全部构造
+        路径），此处不再持有手工副本。
+        """
         for h in data.get("history", []):
             if h and "interacted_element" not in h:
                 h["interacted_element"] = None
-            # 存量畸形动作归一化（issue #173，PR #174 review2 #3 / review3 #1）——
-            # 历史加载入口 choke point：旧 JSONL 可能带畸形动作（裸字符串动作 /
-            # params 为字符串，修复前被持久化），在此归一化一次覆盖 rerun 消费者
-            # （_skip_reason / _execute_history_step 的 dict(params) 等）。与
-            # client.get_action 共用同一组函数，不为历史复制第二份。覆盖三种形态：
-            # actions 列表（含畸形条目）、老格式 dict action（params 畸形）、
-            # 老格式裸字符串 action。
-            mo = h.get("model_output") if isinstance(h, dict) else None
-            if isinstance(mo, dict):
-                actions = mo.get("actions")
-                if isinstance(actions, list) and actions:
-                    normalize_actions_list(actions)
-                    mo["action"] = actions[0]  # 镜像刷新（老文件可能是畸形原值）
-                elif isinstance(mo.get("action"), dict):
-                    normalize_actions_list([mo["action"]])  # 原地补/修 params
-                elif isinstance(mo.get("action"), str) and mo["action"].strip():
-                    mo["action"] = coerce_named_action(mo["action"])
         return cls.model_validate(data)
 
     # —— P4 可视化编辑 mutation API ——
