@@ -627,6 +627,10 @@ class RerunMixin:
         first = next((a for a in actions if isinstance(a, dict) and a.get("name")), None)
         if first and first.get("name") in ("click", "input_text", "select_dropdown"):
             fp = first.get("params") or {}
+            if not isinstance(fp, dict):
+                # 存量历史里的畸形 params（issue #173 时代数据；真值字符串会击穿
+                # 上方 or {} 兜底）——无 index 可言，按缺 index 处理
+                fp = {}
             if fp.get("index") is None and fp.get("element_id") is None:
                 ie = item.interacted_element or []
                 if not ie or ie[0] is None:

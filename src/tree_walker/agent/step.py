@@ -181,7 +181,14 @@ class StepPipeline:
             await self._handle_step_error(e)
             return False
         finally:
-            await self._finalize(browser_state, model_output, results)
+            # finally 边界（issue #173，PR #174 review #5）：finalize 含历史追加与
+            # obs emit（EventBus 订阅者无异常隔离——JsonlRecorder 磁盘满/文件关闭
+            # 会从这里炸出去）。finally 里抛异常会越过上方 except 杀死整个 run
+            # ——778/782 同类死法，必须整体兜住：历史/obs 降级也强过任务死亡。
+            try:
+                await self._finalize(browser_state, model_output, results)
+            except Exception as e:
+                logger.error("_finalize failed — history/obs degraded for this step: %s", e)
 
         return False
 
@@ -930,20 +937,10 @@ class StepPipeline:
         results: list[ActionResult] = []
 
         for i, action in enumerate(actions):
-            # 畸形动作归一化（issue #173，778/782 崩溃根因）：LLM 偶发输出裸字符串
-            # 动作（"click"）或 params 为字符串（"params": "561857"）。归一化成
-            # dict 形态——动作以「缺必填参数」优雅失败（ActionResult.error 进
-            # failure 计数，LLM 重发即恢复），而不是 AttributeError 崩步/崩任务。
-            if not isinstance(action, dict):
-                action = {"name": str(action), "params": {}}
+            # 畸形动作归一化在 client.get_action 的 choke point 完成（issue #173，
+            # PR #174 review #6）——此处收到的 actions 已是 dict 形态，不再散落副本。
             action_name = action.get("name", "done")
             action_params = action.get("params", {})
-            if not isinstance(action_params, dict):
-                logger.warning(
-                    "malformed action params (name=%s, params=%r of %s) — coerced to {}",
-                    action_name, action_params, type(action_params).__name__,
-                )
-                action_params = {}
 
             # Guard #1: done is only allowed as a single action. Encountering
             # it after position 0 means the LLM mis-chained; we stop here so
@@ -1280,8 +1277,6 @@ class StepPipeline:
                     projected.append({"_semantic_clue": True, "kind": "file_upload", **clue})
                     continue
             params = action.get("params", {}) if isinstance(action, dict) else {}
-            if not isinstance(params, dict):
-                params = {}  # params 为字符串等畸形形态（issue #173）→ 无 index 可投影
             index = params.get("index")
             if index is None:
                 index = params.get("element_id")  # element_id 是 index 的别名

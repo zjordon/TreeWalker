@@ -359,9 +359,7 @@ class LLMClient:
                 schema_max if schema_max else "1",
             )
 
-        for a in actions_list:
-            if isinstance(a, dict):
-                a.setdefault("params", {})
+        _normalize_actions_list(actions_list)
 
         result = {
             "evaluation_previous_goal": tool_input.get("evaluation_previous_goal", ""),
@@ -542,6 +540,35 @@ class LLMClient:
         logger.warning("LLM did not use structured_result tool; falling back to text parse")
         text_parts = [b.text for b in response.content if hasattr(b, "text")]
         return _try_parse_json("\n".join(text_parts))
+
+
+def _normalize_actions_list(actions_list: list[Any]) -> None:
+    """畸形动作归一化（issue #173，PR #174 review #6 的 choke point）——原地修复。
+
+    LLM 偶发输出畸形动作（issue #173 / task 778-782 实锤）：裸字符串动作
+    （``"click"``）或 dict 但 params 为字符串（``"params": "561857"``）。在
+    ``get_action`` 构造 ``result`` 之前归一化，一处修复所有下游（执行循环 /
+    参数校验 / ``_post_process`` / loop_detector / 历史投影与持久化 / rerun），
+    避免散落各处的 isinstance 副本漂移。归一化后的条目以「缺必填参数」优雅
+    失败（进 params 校验重试 / failure 计数），不抛 AttributeError。
+
+    日志只记类型不记值：client 在此之前已把占位符还原为真值，原值可能含
+    密钥（review #4 的脱敏不变量）。
+    """
+    for i, a in enumerate(actions_list):
+        if not isinstance(a, dict):
+            logger.warning(
+                "action[%d] malformed (%s) — coerced to named action with empty params",
+                i, type(a).__name__,
+            )
+            actions_list[i] = {"name": str(a), "params": {}}
+        elif not isinstance(a.get("params"), dict):
+            if a.get("params") is not None:
+                logger.warning(
+                    "action[%d] (%r) params malformed (%s) — coerced to {}",
+                    i, a.get("name"), type(a.get("params")).__name__,
+                )
+            a["params"] = {}
 
 
 def _try_parse_json(text: str) -> dict[str, Any] | None:
