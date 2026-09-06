@@ -1,0 +1,15 @@
+{
+  "slug": "top-3-bestsellers-jan-2023",
+  "task_description": "What are the top-3 best-selling product in Jan 2023",
+  "task_keywords": [
+    "bestsellers",
+    "top-3",
+    "January",
+    "2023",
+    "热销产品"
+  ],
+  "source_traces": [
+    "data\\captures\\d13fb843\\trace.json"
+  ],
+  "distilled_at": "2026-09-01T23:09:02.961530+00:00"
+}

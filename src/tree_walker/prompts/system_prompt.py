@@ -153,6 +153,7 @@ def build_state_message(
     grid_meta: dict[str, Any] | None = None,
     sensitive_description: str | None = None,
     skill_description: str | None = None,
+    task_skill_description: str | None = None,
 ) -> str:
     """Build the user message describing the current browser state."""
     parts: list[str] = []
@@ -160,6 +161,14 @@ def build_state_message(
     # Task reminder
     if task:
         parts.append(f"[Task] {task}")
+
+    # P7 路线三（docs/p7/03 §五）：任务级 skill——命中卡的流程叙事，位置在 [Task]
+    # 后、[Domain Skill] 前：任务流程比站点共性更贴当前目标，放前面让 LLM 优先按
+    # 流程走。每步随 state message 重建（与 [Domain Skill] 同构）。
+    if task_skill_description:
+        parts.append("[Task Skill]")
+        parts.append(task_skill_description)
+        parts.append("")
 
     # P1：domain-skill 注入（按 host 读 domain-skills/<host>/，给 LLM 的领域知识）。
     # 多行渲染（skill 常是大段文本）；放在 [Task] 后、[Available Secrets] 前，

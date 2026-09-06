@@ -1,0 +1,16 @@
+{
+  "slug": "latest-cancelled-order-customer",
+  "task_description": "Get the customer name of the most recent cancelled order",
+  "task_keywords": [
+    "cancelled",
+    "canceled",
+    "order",
+    "customer name",
+    "most recent"
+  ],
+  "source_traces": [
+    "data\\captures\\5b362f32\\trace.json",
+    "D:\\dev\\git\\z_jordon\\treeforge\\data\\captures\\5b362f32\\trace.json"
+  ],
+  "distilled_at": "2026-08-31T12:03:19.374380+00:00"
+}

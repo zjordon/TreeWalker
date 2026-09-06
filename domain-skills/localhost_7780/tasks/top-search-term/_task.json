@@ -1,0 +1,15 @@
+{
+  "slug": "top-search-term",
+  "task_description": "List the top 1 search terms in my store",
+  "task_keywords": [
+    "search terms",
+    "top search",
+    "dashboard",
+    "搜索词",
+    "热门搜索"
+  ],
+  "source_traces": [
+    "data\\captures\\4f064956\\trace.json"
+  ],
+  "distilled_at": "2026-09-01T23:50:59.659187+00:00"
+}

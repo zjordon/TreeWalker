@@ -1,0 +1,15 @@
+{
+  "slug": "refund-report-q1",
+  "task_description": "Today is 3/15/2023, generate a refund report for Q1",
+  "task_keywords": [
+    "refund",
+    "report",
+    "Q1",
+    "refunds",
+    "quarter"
+  ],
+  "source_traces": [
+    "data\\captures\\21b19eaa\\trace.json"
+  ],
+  "distilled_at": "2026-09-01T23:33:22.305782+00:00"
+}

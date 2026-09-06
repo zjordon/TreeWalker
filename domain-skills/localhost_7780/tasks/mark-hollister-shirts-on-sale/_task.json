@@ -1,0 +1,15 @@
+{
+  "slug": "mark-hollister-shirts-on-sale",
+  "task_description": "Mark all Hollister shirts on sale",
+  "task_keywords": [
+    "Hollister",
+    "shirt",
+    "sale",
+    "促销",
+    "标记"
+  ],
+  "source_traces": [
+    "data\\captures\\23633a98\\trace.json"
+  ],
+  "distilled_at": "2026-09-02T12:24:58.143153+00:00"
+}

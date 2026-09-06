@@ -1,0 +1,16 @@
+{
+  "slug": "find-products-by-quantity-name",
+  "task_description": "Give me the name of the products that have 0 units left",
+  "task_keywords": [
+    "products",
+    "quantity",
+    "0 units",
+    "out of stock",
+    "filter"
+  ],
+  "source_traces": [
+    "data\\captures\\3e803a1c\\trace.json",
+    "D:\\dev\\git\\z_jordon\\treeforge\\data\\captures\\3e803a1c\\trace.json"
+  ],
+  "distilled_at": "2026-08-31T12:01:42.404544+00:00"
+}

@@ -1,0 +1,16 @@
+{
+  "slug": "update-product-stock",
+  "task_description": "We've received 378 brown Aero daily fitness tee in every size, please update the inventory.",
+  "task_keywords": [
+    "stock",
+    "inventory",
+    "quantity",
+    "product",
+    "Aero Daily Fitness Tee"
+  ],
+  "source_traces": [
+    "data\\captures\\402e3110\\trace.json",
+    "data\\captures\\a27c416d\\trace.json"
+  ],
+  "distilled_at": "2026-09-02T11:59:54.343892+00:00"
+}

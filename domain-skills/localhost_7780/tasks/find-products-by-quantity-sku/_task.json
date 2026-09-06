@@ -1,0 +1,16 @@
+{
+  "slug": "find-products-by-quantity-sku",
+  "task_description": "Give me the SKU of the products that have 10 units left",
+  "task_keywords": [
+    "SKU",
+    "产品",
+    "数量",
+    "筛选",
+    "Catalog"
+  ],
+  "source_traces": [
+    "data\\captures\\d81eea6f\\trace.json",
+    "D:\\dev\\git\\z_jordon\\treeforge\\data\\captures\\d81eea6f\\trace.json"
+  ],
+  "distilled_at": "2026-08-31T12:01:02.614803+00:00"
+}

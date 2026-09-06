@@ -1,0 +1,15 @@
+{
+  "slug": "preview-blank-theme",
+  "task_description": "Preview the Magento Blank theme for my shop",
+  "task_keywords": [
+    "主题",
+    "Magento Blank",
+    "预览",
+    "Content",
+    "Themes"
+  ],
+  "source_traces": [
+    "data\\captures\\efd4bba6\\trace.json"
+  ],
+  "distilled_at": "2026-09-03T12:05:01.447754+00:00"
+}

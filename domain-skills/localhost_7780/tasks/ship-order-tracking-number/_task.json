@@ -1,0 +1,15 @@
+{
+  "slug": "ship-order-tracking-number",
+  "task_description": "Update order #299 with the Federal Express tracking number 8974568499",
+  "task_keywords": [
+    "订单",
+    "发货",
+    "跟踪号",
+    "Federal Express",
+    "shipment"
+  ],
+  "source_traces": [
+    "data\\captures\\11eab229\\trace.json"
+  ],
+  "distilled_at": "2026-09-03T04:29:15.352468+00:00"
+}

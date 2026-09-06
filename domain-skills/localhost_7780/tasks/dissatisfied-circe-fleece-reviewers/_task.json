@@ -1,0 +1,16 @@
+{
+  "slug": "dissatisfied-circe-fleece-reviewers",
+  "task_description": "Show me the customers who have expressed dissatisfaction with Circe fleece?",
+  "task_keywords": [
+    "Circe",
+    "fleece",
+    "dissatisfied",
+    "reviews",
+    "customers"
+  ],
+  "source_traces": [
+    "data\\captures\\45978f64\\trace.json",
+    "D:\\dev\\git\\z_jordon\\treeforge\\data\\captures\\45978f64\\trace.json"
+  ],
+  "distilled_at": "2026-08-31T12:09:48.991131+00:00"
+}

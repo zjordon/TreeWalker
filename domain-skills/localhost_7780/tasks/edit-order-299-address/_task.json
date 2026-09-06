@@ -1,0 +1,15 @@
+{
+  "slug": "edit-order-299-address",
+  "task_description": "Modify the address of order #299 to 456 Oak Avenue, Apartment 5B, New York, NY, 10001",
+  "task_keywords": [
+    "订单",
+    "修改地址",
+    "地址",
+    "299",
+    "shipping address"
+  ],
+  "source_traces": [
+    "data\\captures\\cefd08a4\\trace.json"
+  ],
+  "distilled_at": "2026-09-03T04:19:15.014636+00:00"
+}

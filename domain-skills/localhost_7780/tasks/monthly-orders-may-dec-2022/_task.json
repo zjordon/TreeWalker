@@ -1,0 +1,15 @@
+{
+  "slug": "monthly-orders-may-dec-2022",
+  "task_description": "Presents the monthly count of successful orders from May to December 2022 in MM:COUNT format",
+  "task_keywords": [
+    "月度订单数",
+    "报表",
+    "订单报告",
+    "2022",
+    "完成订单"
+  ],
+  "source_traces": [
+    "data\\captures\\2ecdef36\\trace.json"
+  ],
+  "distilled_at": "2026-09-01T23:24:11.468328+00:00"
+}

@@ -1,0 +1,15 @@
+{
+  "slug": "bestsellers-report-custom-range",
+  "task_description": "Create a best sellers report from 05/01/2022 to 05/31/2023",
+  "task_keywords": [
+    "bestsellers",
+    "report",
+    "date range",
+    "sales report",
+    "Show Report"
+  ],
+  "source_traces": [
+    "data\\captures\\7a4b7e41\\trace.json"
+  ],
+  "distilled_at": "2026-09-01T23:43:49.655003+00:00"
+}

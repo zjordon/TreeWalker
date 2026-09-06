@@ -1,0 +1,16 @@
+{
+  "slug": "top-completed-orders-customer",
+  "task_description": "Which customer has completed the most number of orders in the entire history?",
+  "task_keywords": [
+    "最多完成订单",
+    "客户",
+    "完成订单数",
+    "订单筛选",
+    "Magento 后台"
+  ],
+  "source_traces": [
+    "data\\captures\\bf62e5e7\\trace.json",
+    "D:\\dev\\git\\z_jordon\\treeforge\\data\\captures\\bf62e5e7\\trace.json"
+  ],
+  "distilled_at": "2026-08-31T12:10:52.897371+00:00"
+}

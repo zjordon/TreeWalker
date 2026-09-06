@@ -1,0 +1,15 @@
+{
+  "slug": "change-404-page-title",
+  "task_description": "Change the page title of \"404 Not Found\" page on my site to \"Bruh bro you clicked the wrong page\".",
+  "task_keywords": [
+    "404 Not Found",
+    "CMS",
+    "Page Title",
+    "页面标题",
+    "no-route"
+  ],
+  "source_traces": [
+    "data\\captures\\4a61a5d7\\trace.json"
+  ],
+  "distilled_at": "2026-09-03T12:01:03.611916+00:00"
+}

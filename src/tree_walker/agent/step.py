@@ -104,6 +104,9 @@ class StepPipeline:
     _enable_grid_meta: bool  # P7 tool_layer B2：[Grid] 元信息渲染开关（session 侧照常采集）
     _enable_sensitive_description: bool
     _enable_skill_injection: bool
+    _enable_task_skill_injection: bool  # P7 路线三：[Task Skill] 注入开关（默认关）
+    _task_skill_text: str | None  # run() 匹配一次后的命中文本（每步注入）
+    _task_skill_slug: str | None  # 命中 slug（obs 事件用）
     _max_history_items: int
     _system_prompt: str
     _tool_schema: dict[str, Any]
@@ -193,6 +196,16 @@ class StepPipeline:
     #   6. Force done on last step
     #   7. Force done after consecutive failures
 
+    def _current_task_skill_text(self) -> str | None:
+        """每步取任务级 skill 文本（P7 路线三，docs/p7/03 §五）。
+
+        开关门控集中在此（而非调用点三元）：门控是评测红线的执行点，独立成方法
+        才能被测试直接驱动——调用点三元会退化成与测试各写一份的同义反复。
+        """
+        if self._enable_task_skill_injection and self._task_skill_text:
+            return self._task_skill_text
+        return None
+
     async def _prepare_context(self) -> tuple[BrowserStateSummary, str]:
         """Gather browser state and build the state message for the LLM."""
         # 0. P0：每步入口清理上一步的注入提示（budget/last/failure/loop），
@@ -275,9 +288,14 @@ class StepPipeline:
             if self._enable_skill_injection
             else None
         )
+        # P7 路线三（docs/p7/03 §五）：任务级 skill——run() 匹配一次的文本每步注入，
+        # 与 [Domain Skill] 同构（state message 每步重建，compaction 无需特殊处理）。
+        task_skill_desc = self._current_task_skill_text()
 
         # P6 后续 I1：把「本步活动 skill」事件化（web 前端 RunView chip 用）。
         # 仅 host/命中/字数，不传全文；emit 同步、与 agent 同线程，安全。
+        # P7 路线三：任务级分开标（task_slug/task_skill_chars）——站点级 off 或
+        # 无站点卡时 chip 只看 skill_loaded 会误报「未注入」。
         if self._obs_bus:
             from tree_walker.observability.events import SkillActiveEvent
             _skill_host = extract_host_with_port(browser_state.url)
@@ -286,6 +304,8 @@ class StepPipeline:
                 host=_skill_host,
                 skill_loaded=bool(skill_desc),
                 char_count=len(skill_desc or ""),
+                task_slug=self._task_skill_slug or "",
+                task_skill_chars=len(task_skill_desc or ""),
             ))
 
         state_msg = build_state_message(
@@ -303,6 +323,7 @@ class StepPipeline:
             page_stats=page_stats,
             sensitive_description=sensitive_desc,
             skill_description=skill_desc,
+            task_skill_description=task_skill_desc,
             grid_meta=grid_meta,
         )
         self._set_state_message(state_msg)  # P0：替换唯一 state 消息（避免完整 DOM 随步数累积）

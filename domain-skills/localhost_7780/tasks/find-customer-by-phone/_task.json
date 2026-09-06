@@ -1,0 +1,16 @@
+{
+  "slug": "find-customer-by-phone",
+  "task_description": "Find the customer name and email with phone number +1 2058812302",
+  "task_keywords": [
+    "customer",
+    "phone",
+    "filter",
+    "email",
+    "name"
+  ],
+  "source_traces": [
+    "data\\captures\\4675a501\\trace.json",
+    "D:\\dev\\git\\z_jordon\\treeforge\\data\\captures\\4675a501\\trace.json"
+  ],
+  "distilled_at": "2026-08-31T12:07:22.866148+00:00"
+}

@@ -1,0 +1,16 @@
+{
+  "slug": "total-items-last-2-orders",
+  "task_description": "What's the total number of items sold in the most recent 2 orders?",
+  "task_keywords": [
+    "订单",
+    "销量",
+    "最近两笔订单",
+    "件数",
+    "后台"
+  ],
+  "source_traces": [
+    "data\\captures\\d66b1380\\trace.json",
+    "D:\\dev\\git\\z_jordon\\treeforge\\data\\captures\\d66b1380\\trace.json"
+  ],
+  "distilled_at": "2026-08-31T12:06:18.804654+00:00"
+}
