@@ -29,7 +29,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from tree_walker import Agent, AgentSettings, BrowserSession, LLMClient, load_settings
+from tree_walker import Agent, BrowserSession, LLMClient, load_settings
 
 DEFAULT_WEBARENA_REPO = Path(r"D:\dev\git\z_jordon\evals\webarena\webarena_repo")
 
@@ -117,11 +117,16 @@ async def main() -> int:
 				await inject_cookies(browser, args.webarena_repo / rel)
 
 		task_text = f"{intent}\n\n起始页: {start_url}" if start_url else intent
+		# 用 load_settings() 的 agent 设置、只覆盖 max_steps——原先直接
+		# AgentSettings(max_steps=...) 会把 env 接线整个丢掉（如
+		# AGENT_ENABLE_TASK_SKILL_INJECTION / AGENT_SKILLS_DIR，2026-09-06 踩坑）。
+		agent_settings = settings.agent
+		agent_settings.max_steps = args.max_steps
 		agent = Agent(
 			task=task_text,
 			llm=LLMClient(settings.llm),
 			browser=browser,
-			settings=AgentSettings(max_steps=args.max_steps),
+			settings=agent_settings,
 		)
 		try:
 			history = await asyncio.wait_for(
