@@ -3,7 +3,9 @@ r"""P7 轨迹重跑：直接用 TreeWalker Agent 重跑单个 WebArena 任务（
 用途：P7 失败归因的下一步验证——按 task_id 原样重跑，观察轨迹漂移/摩擦复现/
 死因复现（如 thinking-only 猝死，见 docs/p7/01-task1-trajectory-anatomy.md 附三）。
 与评测工作空间（D:\dev\git\z_jordon\evals\webarena）的关系：**只读**其
-config_files/<id>.json 与 .auth cookie，不改那边任何程序；官方判分（WebArena
+config_files/<id>.json，不改那边任何程序；登录 cookie 由使用者在浏览器侧自行
+保证（本脚本不做注入——2026-09-06 移除，注入评测侧过期 cookie 反而会顶掉手登
+会话）；官方判分（WebArena
 evaluator）仍归那边管——本示例产出轨迹 + agent 自评 + judge 判词 + 参考答案对照，
 足够做轨迹分析。
 
@@ -34,40 +36,6 @@ from tree_walker import Agent, BrowserSession, LLMClient, load_settings
 DEFAULT_WEBARENA_REPO = Path(r"D:\dev\git\z_jordon\evals\webarena\webarena_repo")
 
 
-async def inject_cookies(browser: BrowserSession, cookie_file: Path) -> int:
-	"""Playwright storage-state → CDP Network.setCookie（url 参数绑定作用域）。
-
-	⚠️ localhost 的 domain cookie 假成功坑：必须用 url 参数，
-	domain="localhost" 会返回 success:true 但 cookie 不进 jar。
-	"""
-	if not cookie_file.exists():
-		raise FileNotFoundError(f"cookie 文件不存在: {cookie_file}")
-	cookies = json.loads(cookie_file.read_text(encoding="utf-8")).get("cookies", [])
-	if browser.client is None or browser.current_session_id is None:
-		raise RuntimeError("BrowserSession 未连接（先 await browser.start()）")
-	sid = browser.current_session_id
-	n_ok = 0
-	for c in cookies:
-		scheme = "https" if c.get("secure") else "http"
-		domain = c.get("domain", "") or ""
-		path = c.get("path", "/") or "/"
-		params = {
-			"name": c["name"], "value": c["value"], "path": path,
-			"secure": c.get("secure", False), "httpOnly": c.get("httpOnly", False),
-			"sameSite": {"Strict": "Strict", "Lax": "Lax", "None": "None"}.get(
-				c.get("sameSite", "Lax"), "Lax"),
-			"url": c.get("url") or f"{scheme}://{domain or 'localhost'}{path}",
-		}
-		expires = c.get("expires", -1)
-		if isinstance(expires, (int, float)) and expires > 0:
-			params["expires"] = expires
-		result = await browser.client.send.Network.setCookie(params, session_id=sid)
-		if result.get("success", True):
-			n_ok += 1
-	print(f"cookie 注入 {n_ok}/{len(cookies)}（{cookie_file.name}）")
-	return n_ok
-
-
 async def main() -> int:
 	ap = argparse.ArgumentParser(description="重跑单个 WebArena 任务（轨迹分析用）")
 	ap.add_argument("--task-id", type=int, default=1)
@@ -76,8 +44,6 @@ async def main() -> int:
 	ap.add_argument("--task-timeout", type=int, default=600, help="单任务总超时秒数")
 	ap.add_argument("--webarena-repo", type=Path, default=DEFAULT_WEBARENA_REPO)
 	ap.add_argument("--log-file", type=Path, default=None, help="轨迹日志落盘路径（可选）")
-	ap.add_argument("--no-cookie", action="store_true",
-		help="跳过 cookie 注入（Chrome 已手动登录时用——注入的评测 cookie 可能是过期的，反而顶掉手登会话）")
 	args = ap.parse_args()
 
 	# 日志：INFO 为主 + llm client DEBUG（响应块构成）；可选落盘
@@ -111,13 +77,7 @@ async def main() -> int:
 	browser = BrowserSession(settings.browser)
 	await browser.start()
 	try:
-		if task.get("require_login", True) and not args.no_cookie:
-			rel = task.get("storage_state", "")
-			while rel.startswith("./"):
-				rel = rel[2:]
-			if rel:
-				await inject_cookies(browser, args.webarena_repo / rel)
-
+		# 登录由使用者手动完成（cookie 注入已移除，2026-09-06）——跑前先在浏览器里登录目标站
 		task_text = f"{intent}\n\n起始页: {start_url}" if start_url else intent
 		# 用 load_settings() 的 agent 设置、只覆盖 max_steps——原先直接
 		# AgentSettings(max_steps=...) 会把 env 接线整个丢掉（如

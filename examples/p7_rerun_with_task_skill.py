@@ -1,11 +1,9 @@
 r"""P7 轨迹重跑·任务级 skill 注入版（口径 C 冒烟，docs/p7/03）。
 
-在 ``p7_rerun_webarena_task.py`` 之上做两件事：
-1. 进程内预设 ``AGENT_ENABLE_TASK_SKILL_INJECTION=true`` 再跑原脚本——免得每次
-   测试手设 env；
-2. 自动追加 ``--no-cookie`` 跳过 cookie 注入——手工测试前已在 Chrome 登录，注入
-   评测侧（可能过期的）storage_state 反而会顶掉手登会话。
-其余参数 / 行为与原脚本完全一致（argv 透传给原脚本的 argparse）。
+在 ``p7_rerun_webarena_task.py`` 之上只做一件事：进程内预设
+``AGENT_ENABLE_TASK_SKILL_INJECTION=true`` 再跑原脚本——免得每次测试手设 env。
+其余参数 / 行为与原脚本完全一致（argv 透传给原脚本的 argparse；cookie 注入已从
+base 移除，登录由使用者在浏览器侧手动完成）。
 
 ⚠️ 口径提醒（docs/p7/03 §八红线）：本脚本跑出的是**口径 C（with task knowledge）**
 的数字——任务级 skill 对自主探索口径等价泄露参考轨迹，其 SR 禁止与主口径（A）/
@@ -35,13 +33,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import p7_rerun_webarena_task as base  # noqa: E402
 
-# 跳过 cookie 注入（store_true 重复传无害）；需保证测试前 Chrome 已手动登录。
-sys.argv.append("--no-cookie")
-
 
 async def main() -> int:
 	print("[口径 C] AGENT_ENABLE_TASK_SKILL_INJECTION=true——任务级 skill 注入已开")
-	print("[口径 C] 已跳过 cookie 注入——请确保 Chrome 已手动登录目标站")
+	print("[注意] 不注入 cookie——请确保 Chrome 已手动登录目标站")
 	print("[口径 C] ⚠️ 本运行的 SR 属产品口径，禁止与主口径/站点口径/外部榜对比（docs/p7/03 §八）")
 	return await base.main()
 
