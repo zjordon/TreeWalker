@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
+from tree_walker.action_shape import name_of, params_of
 from tree_walker.agent.actionability import (
     ACTIONABILITY_ACTIONS,
     is_file_input,
@@ -195,8 +196,13 @@ class StepPipeline:
             # _finalize 其余部分——历史追加/元数据等。）
             try:
                 await self._finalize(browser_state, model_output, results)
+                self.state.finalize_degraded_steps = 0  # 成功即清零（连续语义）
             except Exception as e:
                 logger.error("_finalize failed — history/obs degraded for this step: %s", e)
+                # review4 #4：降级可观测——确定性 _finalize bug 会让 run 报成功但
+                # history 残缺（最坏是 done 步不进 history）；计数入 state，
+                # run() 连续达阈值时升级终止。
+                self.state.finalize_degraded_steps += 1
             # 计数器边界（review2 #1 / review3 #8 单一所有者）：n_steps 递增只在此
             # 处（_finalize 尾部副本已删）——吞异常不得跳过它（否则 run() 的
             # while 循环退化为无界 livelock），正确性也不再依赖「递增恰是
@@ -954,10 +960,11 @@ class StepPipeline:
         results: list[ActionResult] = []
 
         for i, action in enumerate(actions):
-            # 畸形动作归一化在 client.get_action 的 choke point 完成（issue #173，
-            # PR #174 review #6）——此处收到的 actions 已是 dict 形态，不再散落副本。
-            action_name = action.get("name", "done")
-            action_params = action.get("params", {})
+            # 形态访问器统一自 action_shape（review4 #8：共享实现替换散落的
+            # isinstance 拼法）。正常路径的 actions 已在 client choke point 归一化，
+            # 此处访问器兜旁路形态（内存构造数据/测试直调）。
+            action_name = name_of(action)
+            action_params = params_of(action)
 
             # Guard #1: done is only allowed as a single action. Encountering
             # it after position 0 means the LLM mis-chained; we stop here so
@@ -1155,8 +1162,8 @@ class StepPipeline:
         # sees the full sequence.
         actions = model_output.get("actions") or [model_output.get("action", {})]
         for action in actions:
-            action_name = action.get("name", "done")
-            action_params = action.get("params", {})
+            action_name = name_of(action)
+            action_params = params_of(action)
             if action_name not in _LOOP_EXEMPT_ACTIONS:
                 self.loop_detector.record_action(action_name, action_params)
 
@@ -1213,10 +1220,13 @@ class StepPipeline:
         model_output: dict[str, Any] | None,
         results: list[ActionResult],
     ) -> None:
-        """Record history, log summary, and advance step counter.
+        """Record history and log the step summary.
 
-        Called from finally block — runs regardless of success or exception.
-        n_steps is incremented last so all consumers see the current value.
+        Called from the ``_step`` finally block — runs regardless of success or
+        exception（自身异常由 finally 的守卫兜住并计数 ``finalize_degraded_steps``）。
+        **n_steps 递增不在此处**（PR #174 review3 #8 单一所有者）：由 ``_step``
+        的 finally 在本方法之后统一执行——请勿在本方法尾部追加可能抛异常的
+        语句后假设步数语义不变，递增的正确性已与语句顺序解耦。
 
         Async in preparation for screenshot persistence (phase 5 P1); no await
         sites yet — screenshot storage lands with screenshot.md stage 2.
@@ -1294,12 +1304,10 @@ class StepPipeline:
                 if isinstance(clue, dict) and clue:
                     projected.append({"_semantic_clue": True, "kind": "file_upload", **clue})
                     continue
-            params = action.get("params", {}) if isinstance(action, dict) else {}
-            if not isinstance(params, dict):
-                # 逐条降级（review3 #7）：绕过 choke point 的畸形（内存构造历史 /
-                # 测试直调）只丢本条投影，维护 actions/interacted_element 等长
-                # 配对——catch-all（safe wrapper）留给真正的 DOM bug。
-                params = {}
+            # 逐条降级（review3 #7 / review4 #8）：params_of 统一实现「非 dict →
+            # {}」，绕过 choke point 的畸形只丢本条投影，维护
+            # actions/interacted_element 等长配对——catch-all 留给 DOM bug。
+            params = params_of(action)
             index = params.get("index")
             if index is None:
                 index = params.get("element_id")  # element_id 是 index 的别名

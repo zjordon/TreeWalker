@@ -7,10 +7,10 @@ from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-# 历史加载入口的畸形动作归一化复用 client 的同一组函数（issue #173，review3
-# #9：无循环依赖——client 只 import config；anthropic 经 tree_walker/__init__
-# 本已加载），不为历史路径复制第二份强转规则。
-from tree_walker.llm.client import _coerce_named_action, _normalize_actions_list
+# 历史加载入口的畸形动作归一化复用无依赖叶子模块 action_shape（review4 #7——
+# 不再把 LLM client 及其 anthropic import 拉进 agent 数据模型层/tools 的依赖图），
+# 不为历史路径复制第二份强转规则。
+from tree_walker.action_shape import coerce_named_action, normalize_actions_list
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +81,10 @@ class AgentState(BaseModel):
     plan: list[PlanItem] | None = None
     current_plan_item_index: int = 0
     plan_generation_step: int = 0
+    # _finalize 降级计数（PR #174 review4 #4）：finally 兜底吞掉 _finalize 异常的
+    # 次数——确定性 _finalize bug 会让 run 报成功但 history 残缺（最坏是 done 步
+    # 不进 history），此计数让降级可观测，run() 连续达阈值时升级终止。
+    finalize_degraded_steps: int = 0
 
     class Config:
         arbitrary_types_allowed = True
@@ -253,12 +257,12 @@ class AgentHistoryList(BaseModel):
             if isinstance(mo, dict):
                 actions = mo.get("actions")
                 if isinstance(actions, list) and actions:
-                    _normalize_actions_list(actions)
+                    normalize_actions_list(actions)
                     mo["action"] = actions[0]  # 镜像刷新（老文件可能是畸形原值）
                 elif isinstance(mo.get("action"), dict):
-                    _normalize_actions_list([mo["action"]])  # 原地补/修 params
+                    normalize_actions_list([mo["action"]])  # 原地补/修 params
                 elif isinstance(mo.get("action"), str) and mo["action"].strip():
-                    mo["action"] = _coerce_named_action(mo["action"])
+                    mo["action"] = coerce_named_action(mo["action"])
         return cls.model_validate(data)
 
     # —— P4 可视化编辑 mutation API ——

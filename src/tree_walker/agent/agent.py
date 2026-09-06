@@ -308,6 +308,16 @@ class Agent(StepPipeline, RerunMixin):
                         if self._judge:
                             await self._run_judge()
                         break
+                    # review4 #4：_finalize 持续降级升级终止——确定性 _finalize bug
+                    # 会让 run 报成功但 history 残缺（最坏是 done 步不进 history），
+                    # 连续 3 步降级即中止并显形，而非静默跑完。
+                    if self.state.finalize_degraded_steps >= 3:
+                        logger.error(
+                            "_finalize degraded on %d consecutive steps — aborting run "
+                            "(history is incomplete; see prior error logs)",
+                            self.state.finalize_degraded_steps,
+                        )
+                        break
                 except KeyboardInterrupt:
                     logger.info("Interrupted by user")
                     break

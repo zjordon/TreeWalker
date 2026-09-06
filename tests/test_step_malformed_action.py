@@ -1,4 +1,4 @@
-"""Tests for malformed-action handling (issue #173, PR #174 三轮 review 修订版).
+﻿"""Tests for malformed-action handling (issue #173, PR #174 四轮 review 修订版).
 
 LLM 偶发输出畸形动作（params 为字符串 / 动作为裸字符串），65.2% 轮曾把 778/782
 从「可恢复的单步失败」放大成「整任务崩」。按三轮 code review 的裁决，防线按
@@ -33,15 +33,14 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from pydantic import BaseModel
 
+from tree_walker.action_shape import coerce_named_action, normalize_actions_list
 from tree_walker.agent.loop_detector import ActionLoopDetector
 from tree_walker.agent.rerun import RerunMixin
 from tree_walker.agent.step import StepPipeline
 from tree_walker.agent.views import ActionResult, AgentHistoryList, AgentState
 from tree_walker.browser.views import BrowserStateSummary, SerializedDOMState
 from tree_walker.config import LLMSettings, TruncationSettings
-from tree_walker.llm.client import LLMClient, _normalize_actions_list
-from tree_walker.observability.event_bus import EventBus
-from tree_walker.observability.events import StepStartEvent
+from tree_walker.llm.client import LLMClient
 from tree_walker.tools.actions import Tools
 from tree_walker.tools.registry import ActionRegistry, RegisteredAction
 
@@ -134,12 +133,12 @@ def _malformed_model_output() -> dict:
 class TestNormalizeActionsList:
 	def test_string_params_coerced_to_empty_dict(self):
 		actions = [{"name": "click", "params": "561857"}]
-		_normalize_actions_list(actions)
+		normalize_actions_list(actions)
 		assert actions == [{"name": "click", "params": {}}]
 
 	def test_bare_string_action_coerced_to_named_action(self):
 		actions = ["wait"]
-		_normalize_actions_list(actions)
+		normalize_actions_list(actions)
 		assert actions == [{"name": "wait", "params": {}}]
 
 	def test_none_params_filled_without_warning(self, caplog):
@@ -148,20 +147,20 @@ class TestNormalizeActionsList:
 
 		actions = [{"name": "click"}]
 		with caplog.at_level(logging.WARNING):
-			_normalize_actions_list(actions)
+			normalize_actions_list(actions)
 		assert actions == [{"name": "click", "params": {}}]
 		assert caplog.records == []
 
 	def test_clean_actions_untouched(self):
 		actions = [{"name": "click", "params": {"index": 5}}]
-		_normalize_actions_list(actions)
+		normalize_actions_list(actions)
 		assert actions == [{"name": "click", "params": {"index": 5}}]
 
 	def test_in_place_mutation_covers_full_list(self):
 		# get_action 随后取 actions_list[0] 作镜像——归一化必须发生在镜像之前且
 		# 覆盖每个条目（review #1：下游逐条目重读原始数据）
 		actions = [{"name": "input_text", "params": "x"}, "click"]
-		_normalize_actions_list(actions)
+		normalize_actions_list(actions)
 		assert all(isinstance(a, dict) and isinstance(a["params"], dict) for a in actions)
 		assert actions[1]["name"] == "click"
 
@@ -171,8 +170,8 @@ class TestNormalizeActionsList:
 		import logging
 
 		actions = [{"name": "input_text", "params": "<SECRET-TOKEN-1234>"}]
-		with caplog.at_level(logging.WARNING, logger="tree_walker.llm.client"):
-			_normalize_actions_list(actions)
+		with caplog.at_level(logging.WARNING, logger="tree_walker.action_shape"):
+			normalize_actions_list(actions)
 		assert any("params malformed (str)" in r.getMessage() for r in caplog.records)
 		assert not any("<SECRET-TOKEN-1234>" in r.getMessage() for r in caplog.records)
 
@@ -189,7 +188,7 @@ class TestPipelineStagesEndToEnd:
 	async def test_malformed_output_flows_through_execute_and_post_process(self):
 		agent = _loop_agent()
 		model_output = _malformed_model_output()
-		_normalize_actions_list(model_output["actions"])  # get_action 的 choke point
+		normalize_actions_list(model_output["actions"])  # get_action 的 choke point
 		results = await StepPipeline._execute_actions(agent, model_output, _browser_state())
 		assert len(results) == 3
 		assert agent.tools.calls == [
@@ -201,15 +200,15 @@ class TestPipelineStagesEndToEnd:
 		assert agent.state.consecutive_failures == 0  # 多动作失败不计数（既有语义）
 
 	@pytest.mark.asyncio
-	async def test_raw_malformed_output_never_reaches_stages(self):
-		# 契约锚点：未经 client 归一化的裸字符串动作直灌 step 层会在循环头
-		# `action.get` 崩——这正是归一化必须在 choke point 完成的原因
-		# （step 层不再持有本地副本）。用纯裸字符串形态保证确定性（str params
-		# 形态会被 guard #3 提前截断，走不到该断言）。
+	async def test_raw_bypass_form_handled_by_shared_accessors(self):
+		# review4 #8：契约从「step 层崩（证明归一化归 client）」翻转为「共享
+		# 访问器兜住旁路形态」——未经 choke point 的裸字符串动作以
+		# name_of/params_of 解释（click + 空 params），不再 AttributeError。
 		agent = _loop_agent()
 		model_output = {"actions": ["click"]}
-		with pytest.raises(AttributeError):
-			await StepPipeline._execute_actions(agent, model_output, _browser_state())
+		results = await StepPipeline._execute_actions(agent, model_output, _browser_state())
+		assert agent.tools.calls == [("click", {})]
+		assert len(results) == 1
 
 
 # ── 3. rerun：历史加载入口归一化（review2 #3 的根因修法）───────────────
@@ -290,6 +289,21 @@ class TestStepFinallyGuard:
 		# 计数器边界（review2 #1）：吞异常不得跳过 n_steps 递增——否则 run() 的
 		# while 循环退化为无界 livelock（动作照常执行、步数永不前进）
 		assert agent.state.n_steps == 1
+		# review4 #4：降级可观测——计数入 state（run() 连续达阈值升级终止）
+		assert agent.state.finalize_degraded_steps == 1
+
+	@pytest.mark.asyncio
+	async def test_finalize_success_resets_degradation_counter(self):
+		# review4 #4 连续语义：成功一步即清零——偶发降级不累积到升级阈值
+		agent = _loop_agent()
+		agent._prepare_context = AsyncMock(return_value=(_browser_state(), "state msg"))
+		agent._get_next_action = AsyncMock(return_value={"actions": [{"name": "click", "params": {}}]})
+		agent._execute_actions = AsyncMock(return_value=[ActionResult()])
+		agent._finalize = AsyncMock(side_effect=[RuntimeError("boom"), None])
+		await StepPipeline._step(agent)
+		assert agent.state.finalize_degraded_steps == 1
+		await StepPipeline._step(agent)
+		assert agent.state.finalize_degraded_steps == 0
 
 	@pytest.mark.asyncio
 	async def test_finalize_still_runs_normally(self):
@@ -428,94 +442,7 @@ class TestGetActionChokePoint:
 		assert result["action"] == {"name": "click", "params": {}}
 
 
-# ── 7. EventBus 订阅者隔离（review2 #1/#2 根因修法）─────────────────────
-
-
-class TestEventBusSubscriberIsolation:
-	def test_bad_subscriber_does_not_break_emit_or_others(self):
-		bus = EventBus()
-		received: list[str] = []
-
-		def bad(event):
-			raise RuntimeError("disk full")
-
-		def good(event):
-			received.append(type(event).__name__)
-
-		bus.subscribe("*", bad)
-		bus.subscribe("*", good)
-		bus.emit(StepStartEvent(step=1, session_id="s"))  # 不抛
-		assert received == ["StepStartEvent"]
-
-	def test_typed_and_wildcard_both_reached(self):
-		bus = EventBus()
-		seen: list[str] = []
-
-		bus.subscribe("step_start", lambda e: seen.append("typed"))
-		bus.subscribe("*", lambda e: seen.append("wildcard"))
-		bus.emit(StepStartEvent(step=1, session_id="s"))
-		assert seen == ["typed", "wildcard"]
-
-	def test_disable_after_n_failures(self, caplog):
-		# review3 #6：死订阅者连续失败达上限后熔断——不再被调用（不刷屏），
-		# 其他订阅者不受影响
-		import logging
-
-		bus = EventBus()
-		calls = {"bad": 0, "good": 0}
-
-		def bad(event):
-			calls["bad"] += 1
-			raise RuntimeError("disk full")
-
-		def good(event):
-			calls["good"] += 1
-
-		bus.subscribe("*", bad)
-		bus.subscribe("*", good)
-		with caplog.at_level(logging.ERROR):
-			for _ in range(10):
-				bus.emit(StepStartEvent(step=1, session_id="s"))
-		assert calls["bad"] == bus._MAX_HANDLER_FAILURES  # 熔断后不再调用
-		assert calls["good"] == 10
-		assert any("DISABLED" in r.getMessage() for r in caplog.records)
-
-	def test_close_callback_failure_does_not_propagate(self):
-		# review3 #2：close 回调（JsonlRecorder flush/close）失败不得穿出
-		# run() finally 的 _finalize_session 替换掉 return self.history
-		bus = EventBus()
-
-		def bad_close():
-			raise OSError("disk full during flush")
-
-		closed = []
-		bus.on_close(bad_close)
-		bus.on_close(lambda: closed.append(1))
-		bus.close()  # 不抛
-		assert closed == [1]  # 后续回调照常执行
-
-	def test_handler_recovery_resets_failure_count(self):
-		# 失败后恢复 → 连续计数清零（不因历史偶发失败被熔断）
-		bus = EventBus()
-		state = {"fail": True}
-		calls = []
-
-		def flaky(event):
-			calls.append(1)
-			if state["fail"]:
-				raise RuntimeError("transient")
-			return None
-
-		bus.subscribe("*", flaky)
-		for _ in range(2):
-			bus.emit(StepStartEvent(step=1, session_id="s"))  # 2 次失败（未达上限）
-		state["fail"] = False
-		for _ in range(5):
-			bus.emit(StepStartEvent(step=1, session_id="s"))  # 恢复
-		state["fail"] = True
-		for _ in range(bus._MAX_HANDLER_FAILURES + 2):
-			bus.emit(StepStartEvent(step=1, session_id="s"))  # 重新连续失败才熔断
-		assert len(calls) == 2 + 5 + bus._MAX_HANDLER_FAILURES
+# ── 7.（已迁出）EventBus 隔离/熔断/close 测试见 tests/test_event_bus.py（review4 #9）──
 
 
 # ── 8. 缺参优雅失败的真实证据（review2 #4 次级：真实 ClickParams）───────
@@ -604,7 +531,12 @@ class TestRound3EdgeShapes:
 
 
 class TestMalformedActionSemantics:
-	"""review3 #3：畸形 action 的终止/重试语义统一。"""
+	"""review3 #3 + review4 #1/#2/#5：畸形 action 的终止/重试语义。
+
+	分流规则：裸字符串（像样的动作名）→ 命名动作进重试梯子；null/数字/布尔
+	（无可修的名字）→ 诚实失败 done 直接终止（一次调用）；裸 "done" → 命名动作
+	进重试梯子（要 text），重试耗尽后 _action_done 的 success 默认值兜底诚实失败。
+	"""
 
 	def _client(self) -> LLMClient:
 		client = LLMClient(LLMSettings(api_key="test-key"))
@@ -622,16 +554,26 @@ class TestMalformedActionSemantics:
 		)
 
 	@pytest.mark.asyncio
-	async def test_null_action_coerced_not_hard_done(self):
-		# {"action": null} 与字符串同等对待——强转命名动作进重试梯子，
-		# 不再零重试合成 done(success=False) 终止任务
+	async def test_null_action_honest_done_termination(self):
+		# review4 #2：无可修的名字——不合成 'None' 进重试梯子烧全上下文调用，
+		# 直接诚实失败终止（一次调用，恢复本 PR 之前的旧 else 语义）
 		result = await self._get_with_action(self._client(), None)
-		assert result["actions"] == [{"name": "None", "params": {}}]
+		assert result["actions"] == [
+			{"name": "done", "params": {"text": "Invalid action shape", "success": False}},
+		]
 
 	@pytest.mark.asyncio
-	async def test_numeric_action_coerced(self):
+	async def test_numeric_action_honest_done_termination(self):
 		result = await self._get_with_action(self._client(), 123)
-		assert result["actions"] == [{"name": "123", "params": {}}]
+		assert result["actions"][0]["name"] == "done"
+		assert result["actions"][0]["params"]["success"] is False
+
+	@pytest.mark.asyncio
+	async def test_bare_done_goes_through_retry_ladder(self):
+		# review4 #1/#5：裸 "done"（真动作名）进重试梯子要 text——模型可修；
+		# 耗尽后 _action_done 的 success 默认值（text/data 任一存在才 True）兜底
+		result = await self._get_with_action(self._client(), "done")
+		assert result["actions"] == [{"name": "done", "params": {}}]
 
 	def test_unregistered_name_gets_retry_feedback(self):
 		# 未注册名进澄清-重试梯子（此前 validation 返 None → 执行失败计 failure）
@@ -644,17 +586,10 @@ class TestMalformedActionSemantics:
 		assert err is not None
 		assert "Unknown action" in err
 
-	def test_bare_done_coerces_to_honest_failure(self):
-		# review3 #3：裸 "done" 特判——重试梯子对它只会反复要 text、耗尽后仍以
-		# 无 text 执行撞上 _action_done 默认 success=True（假成功终止）；强转时
-		# 直接给显式 success=False 的诚实失败（text 占位使校验通过、立即终止）
-		from tree_walker.llm.client import _coerce_named_action
+	def test_bare_done_missing_text_gets_retry_feedback(self):
+		# 裸 "done" → {"params":{}} → 真实 DoneParams 校验给出「text 缺字段」
+		# 反馈（重试梯子输入；模型补 text 后正常终止）
 		from tree_walker.tools.models import DoneParams
-
-		coerced = _coerce_named_action("done")
-		assert coerced["name"] == "done"
-		assert coerced["params"]["success"] is False
-		assert coerced["params"]["text"]  # 占位 text → DoneParams 校验通过
 
 		agent = MagicMock()
 		agent.tools = MagicMock()
@@ -666,5 +601,41 @@ class TestMalformedActionSemantics:
 			name="done", description="done", param_model=DoneParams,
 			handler=MagicMock(), terminates_sequence=False,
 		)
-		err = StepPipeline._validate_action_params(agent, {"action": coerced})
-		assert err is None  # 校验通过 → 执行 → is_done=True / success=False 诚实终止
+		err = StepPipeline._validate_action_params(
+			agent, {"action": {"name": "done", "params": {}}},
+		)
+		assert err is not None
+		assert "text" in err
+
+
+# ── 10. review4：run() 对 _finalize 持续降级的升级终止（#4）──────────────
+
+
+class TestRunEscalationOnFinalizeDegradation:
+	@pytest.mark.asyncio
+	async def test_run_aborts_after_three_consecutive_degraded_steps(self):
+		# 确定性 _finalize bug 会让 run 报成功但 history 残缺（最坏是 done 步
+		# 不进 history）——连续 3 步降级即中止并显形，而非静默跑完
+		from tree_walker.agent.agent import Agent
+		from tree_walker.config import AgentSettings
+
+		browser = MagicMock()
+		browser.start = AsyncMock()
+		browser.stop = AsyncMock()
+		browser._settings = MagicMock(wait_between_actions=0.0)
+		agent = Agent(
+			task="t", llm=MagicMock(), browser=browser,
+			settings=AgentSettings(max_steps=10, enable_planning=False),
+		)
+
+		steps = {"n": 0}
+
+		async def degraded_step():
+			steps["n"] += 1
+			agent.state.n_steps += 1  # 模拟 finally 的递增
+			agent.state.finalize_degraded_steps += 1
+			return False
+
+		agent._step = degraded_step
+		await agent.run()
+		assert steps["n"] == 3  # 第 3 次降级后升级终止，而非跑满 max_steps

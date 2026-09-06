@@ -21,6 +21,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
+from tree_walker.action_shape import params_of
 from tree_walker.agent.actionability import (
     ACTIONABILITY_ACTIONS as _ACTIONABILITY_ACTIONS,
     is_actionable as _is_actionable,
@@ -628,11 +629,9 @@ class RerunMixin:
         if first and first.get("name") in ("click", "input_text", "select_dropdown"):
             # 归一化主责在历史加载入口（load_from_dict，review2 #3）；但
             # rerun_history() 也接受内存构造 / model_validate 加载的
-            # AgentHistoryList（未经该入口，review3 #5）——保留一行本地防御，
-            # 真值字符串会击穿 or {} 兜底。
-            fp = first.get("params") or {}
-            if not isinstance(fp, dict):
-                fp = {}
+            # AgentHistoryList（未经该入口，review3 #5）——params_of 共享访问器
+            # 兜住（review4 #8：不再手写本地拼法）。
+            fp = params_of(first)
             if fp.get("index") is None and fp.get("element_id") is None:
                 ie = item.interacted_element or []
                 if not ie or ie[0] is None:
@@ -678,10 +677,10 @@ class RerunMixin:
 
             if name == "extract":
                 # extract 自带 LLM 且读当前页（tools/_action_extract）→ 直接 re-execute 即在当前页重算
-                params = dict(action.get("params", {}))
+                params = dict(params_of(action))  # review4 #3：内存历史旁路形态不崩
             else:
                 hist_elem = interacted[i] if i < len(interacted) else None
-                raw_params = action.get("params") if isinstance(action.get("params"), dict) else {}
+                raw_params = params_of(action)
                 has_index = raw_params.get("index") is not None or raw_params.get("element_id") is not None
                 if hist_elem and hist_elem.get("_semantic_clue"):
                     # 语义线索路径：录制时 locate 失败（get_state 抓变化后页），存了 e.target 的
@@ -721,7 +720,7 @@ class RerunMixin:
                         name = updated.get("name", name)
                         params = dict(updated.get("params", {}))
                 else:
-                    params = dict(action.get("params", {}))
+                    params = dict(params_of(action))  # review4 #3：内存历史旁路形态不崩
                     if (
                         name == "upload_file"
                         and params.get("index") is None
