@@ -11,6 +11,10 @@
 > P7「WebArena 基准评测与改进闭环」（P9 编号撤销）。TreeForge 站点级 skill 全量验证
 > **SR 65.2%（120/184）**，较反节流基线 52.2% **+13pp**；工具层首批（read_grid 网格通道等）
 > 已交付。下一优先：**任务级 skill 优化** 与 **完整环境 + 全量 812 评测**。
+>
+> **更新（2026-09-07）**：智谱上线 **GLM-5.3-Flash**（GLM-5 系列首个原生多模态模型），解锁被
+> 「默认模型纯文本」阻塞已久的 LLM 视觉通道（screenshot.md 阶段二）。P0 前置验证已过
+> （issue #175）：Anthropic 兼容端点 + 标准 image block 直通。新增 **P10（LLM 视觉通道接入）**。
 
 ---
 
@@ -81,7 +85,8 @@ agent 探索时按 host 读 `domain-skills/<host>/` 注入上下文（默认关�
 > P1、P4、P5、P6 已完成；下一阶段主要方向 = **P7（WebArena 基准评测与改进闭环，2026-09-05 吸收原 P9）**，
 > 当前两条并行主线：**① 改进路线三——任务级 skill 优化**（失败已按模板收敛，投入产出最高的下一步）、
 > **② 完整 WebArena 环境 + 全量 812 任务评测**（首个 812 口径分数）。
-> 远期布局 **P8（扩展化）**；P2（进行中）、P3（备选）为既有项；P6 后续远期项见 `docs/p6/05` §3。
+> 远期布局 **P8（扩展化）**；P2（进行中）、P3（备选）为既有项；P6 后续远期项见 `docs/p6/05` §3；
+> **P10（LLM 视觉通道，2026-09-07 新增）**并行推进。
 
 ### P2 —— agent 自动探索可靠性提升（🟡 进行中：P0 已交付，P1-P3 暂缓）
 
@@ -273,6 +278,22 @@ Chrome 扩展（自包含，Web Store 一键安装）
 - [ ] **Side Panel UI + 安全模型**：对话界面 + 任务展示 + 高危操作确认（参考 Anthropic 安全模型：站点级权限 / 分类屏蔽 / 敏感操作前确认——prompt injection 是浏览器 agent 核心威胁）
 - [ ] **Web Store 打包分发**（自包含零外部依赖；模型 key 走扩展内配置或用户自带）
 
+### P10 —— LLM 视觉通道接入：GLM-5.3-Flash（🟡 进行中：P0 验证已过，代码实施未开始）
+
+**目标**：agent 每步决策从「纯 DOM 文本」升级为「DOM 文本 + 页面截图」，补 DOM 通道的三大盲区——**渲染层事实**（KO 网格冻结 / 异步翻页缺数据）、**视觉内容**（canvas / 图片 / toast）、**DOM 转述失真**（自定义下拉 / 虚拟化列表）。对齐 browser-use 的每步截图输入形态。
+
+> 背景：`docs/tools-optimize/screenshot.md` 阶段一（工具参数化 + 降采样 + 断路止血）已交付；阶段二（LLM 视觉通道）方案定稿已久但被「默认模型 glm-5.1 纯文本」阻塞。2026-08-26 智谱上线 **GLM-5.3-Flash**（GLM-5 系列首个原生多模态模型，320B/A18B，定价 GLM-5.3 的 1/10，thinking 不可关闭），阻塞解除。跟踪：**issue #175**，分支 `feat/175-llm-vision`。
+>
+> **P0 前置验证 ✅（2026-09-07）**：智谱 Anthropic 兼容端点直接跑通 glm-5.3-flash + 标准 Anthropic image block（`source.type=base64`，视觉答案正确）——**无需切原生 API**；thinking 简单题不挤占输出（max_tokens 16384 维持）。探针 `examples/smoke_vision_glm53.py`，书面记录见 screenshot.md「P0 验证记录」节。**两个计划外发现**：① 文本模型收图不报错（静默致盲）→ §2.5 fallback 滤图升级为必须项；② `glm-5.1` 被端点静默改道 `glm-5.3`（现行评测实际模型，口径需知悉）。
+>
+> **评测红线（同任务级 skill 原则）**：`use_vision` 默认 off——开启视觉属能力增强口径，其 SR 不与主口径 / 无 skill 口径直接对比。
+
+- [x] **P0 前置验证**：端点可用性 / image block 接受度 / thinking 对 max_tokens 影响
+- [x] **阶段二代码实施**（2026-09-07，screenshot.md §2.2-2.7）：`use_vision`/`llm_screenshot_size` 配置（`model_supports_vision` 名单门控）→ `build_state_blocks` → `step.py` 门控接线（step0 新标签页跳过 + 串行采集）→ `client.py` 两过滤器 block list 适配 + **fallback 滤图**（P0 静默致盲防线）→ `_set_state_message` 单图在飞（旧 state 丢图留文）→ 压缩器/对话 dump list content 兼容 → `_finalize` 截图落盘（`screenshot_path` 兑现，存原图）→ `tests/test_vision_channel.py` 58 例；全量 2568 过，改动模块覆盖率 89%
+- [ ] **采集编排**（§2.2.1 决策已定，2026-09-07）：串行先行（复用 get_state 现状编排）；任务级累计 >20-30s 或出现 DOM/像素错位再 gather 化（browser-use 式两任务并发 + highlight 后补 + 截图 6s 独立超时）
+- [x] **真机验收**（2026-09-07，`examples/e2e_vision_channel.py`）：回流契约 3/3 调用带图 ✅ / 随机底色答对 + 文本对照组**无法作答** ✅ / 截图落盘 ✅ / 门控零泄漏 ✅。三个生产级发现已随验收修复/记录：① `captureScreenshot` 无单请求超时会挂死（最小化窗口等不到帧）→ `screenshot_timeout`=10s 降级已修；② **带 evaluate 的文本 agent 能用 drawImage+getImageData 读同源图片像素**——「页面颜色」不是视觉专属任务，视觉增益的真实边界=跨域/CORS 保护内容+零步感知（评测任务设计红线）；③ 视觉模式 LLM 偶发超 120s（thinking+图），建议视觉跑评测时调大 `AGENT_LLM_TIMEOUT`。记录：screenshot.md「阶段二真机验收记录」
+- [ ] （后置）**视觉变体对照评测**：shopping_admin 184 开视觉跑分，量化对渲染冻结 / 数据截断类失败的增益（分列报告，不动主口径）
+
 ---
 
 ## 明确不做（战略转折后放弃）
@@ -299,6 +320,7 @@ Chrome 扩展（自包含，Web Store 一键安装）
 | P6 | TUI → 浏览器端 | ✅ | PR #166 全量交付（#162 关闭）：tw-web live 控制台 + 流程库 + 技能面 + 直播视口 + 设置面 + T2 批次；TUI 并存保留；e2e A–R 全绿 |
 | P7 | WebArena 基准评测与改进闭环（含原 P9 三路线，2026-09-05 合并） | 🟡 | 评测口径演进：无人值守 **34.8%** → 反节流主口径 **52.2%** → TreeForge 站点级 skill 变体 **65.2%**（+13pp，2026-09-05）+ 120 失败归因 + env_issue 深析；改进三路线：路线一工具层首批已交付（#167/#168 + read_grid/[Grid]/kick），路线二站点级 skill 全量验证 ✅；**当前优先 = 路线三任务级 skill 优化 + 完整环境全量 812 评测**（前置：778/782 崩溃修复）；远期：模型交叉 / WebArena-Hard / 判分清理 |
 | P8 | 扩展化：浏览器扩展伴随形态 | 💡 | 调研完成（2026-08-12）；架构倾向**纯扩展**（agent 全做进扩展，C 端零额外安装——不要求装 Python，调研原推荐的 Python 桥模式降为备选），选型未最终定；最小验证 / TS 移植 / UI / 上架待做 |
+| P10 | LLM 视觉通道接入（GLM-5.3-Flash） | 🟡 | issue #175 / 分支 `feat/175-llm-vision`；P0 ✅ + 阶段二代码 ✅ + **真机验收 ✅**（2026-09-07，e2e 全绿 + 文本对照组隔离证明）；余视觉变体评测（后置）；`use_vision` 默认 off = 评测红线 |
 
 ---
 

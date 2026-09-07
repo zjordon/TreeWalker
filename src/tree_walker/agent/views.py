@@ -121,9 +121,10 @@ class AgentHistory(BaseModel):
     # 与 model_output 的 actions 列表【等长、按位对应】；无 index 的动作为 None。
     interacted_element: list[dict[str, Any] | None] | None = None
     metadata: StepMetadata | None = None
-    # 当步页面截图的存盘路径（phase 5 P1 集成点）。当前恒为 None —— 截图采集依赖
-    # screenshot.md 阶段二（LLM 视觉通道），未打通前 _finalize 不写入；字段先就位，
-    # 避免 _finalize async 化时再动模型层。
+    # 当步页面截图的存盘路径（phase 5 P1 / screenshot.md 阶段二已兑现，issue #175）：
+    # 视觉开（use_vision）时 _finalize 把原图存 <rerun_history_dir>/screenshots/
+    # step_NNN.png 并记录路径；视觉关（默认）恒 None。旧历史 JSON 无此字段 →
+    # pydantic 默认 None，向后兼容。
     screenshot_path: str | None = None
 
     class Config:

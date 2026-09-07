@@ -317,7 +317,7 @@ if include_screenshot:
 
 > **⚠ 关键现实（已复核 `config.py:92-94`）：默认模型是 `glm-5.1`（智谱，`base_url=https://open.bigmodel.cn/api/anthropic`），是文本模型，不支持视觉输入。** 因此：
 > - `use_vision` 默认 **False**；用户需显式配置支持多模态的模型（如 `glm-4v` / `glm-4.6`，或将 `LLM_MODEL` 切到 `claude-*` + 真 Anthropic base_url）。
-> - 智谱 anthropic 兼容接口对标准 Anthropic image block（`source.type=base64`）的接受度需**端到端验证**（列入阶段二验证项与风险）。若不兼容，阶段二需调整格式或走智谱原生多模态接口。
+> - 智谱 anthropic 兼容接口对标准 Anthropic image block（`source.type=base64`）的接受度：**已验证通过**（2026-09-07 P0，见文末「P0 验证记录」），无需调整格式或走智谱原生多模态接口。
 > - 按模型自适应尺寸：仅对已知视觉模型家族给默认值，其余 None。
 
 ### 2.2 `build_state_blocks` 新增（`prompts/system_prompt.py:113-201` 后，4 空格）
@@ -342,6 +342,23 @@ def build_state_blocks(
 ```
 
 `step.py:171-184` 改为调 `build_state_blocks`，content 从 `str` 变 `list[dict]`；前置：切回 `include_screenshot=True`，按 `self._use_vision and browser_state.screenshot and not _is_new_tab_step_zero(...)` 决定是否降采样并转 b64。
+
+### 2.2.1 采集编排：DOM 与截图**串行先行**，gather 化留作实测驱动的后续优化（2026-09-07 决策）
+
+**browser-use 对照（源码已核实，`browser_use/browser/watchdogs/dom_watchdog.py:356-418`）**：`dom_task`（`_build_dom_tree_without_highlights`）与 `screenshot_task`（`_capture_clean_screenshot`，`:681`，经 ScreenshotEvent、6s 超时）先 `create_task` 并发、再分别 await，各自独立兜错（`suppress_exceptions=True`；DOM 失败→最小 state、截图失败→None）；**highlight 在两任务都完成后才追加**（`:410`，既不进截图也不进 DOM 树，"clean" 靠顺序而非括号）。它能并行的前提：DOM build = **一次注入 JS eval（BuildDOMTree）**，与 `Page.captureScreenshot` 是两条互不依赖的 CDP 命令。
+
+**本项目现状**：`get_state`（`session.py:1828-1930`，2026-09 现行行号）严格串行：url/title → tabs → `build_dom_state`（多源批次，内部已 asyncio 并行 + 两阶段重试 + 熔断）→ debug highlight 括号（`:1896-1916`）→ 截图（`:1904-1909`）→ grid_meta。**阶段二第一刀不改变该编排**，仅切回 `include_screenshot=True`。
+
+**不照搬 gather 的理由**：
+
+1. `build_dom_state` 是多源批次，renderer 主线程是共享瓶颈，`captureScreenshot` 还要向合成器请求新帧——并行收益打折且可能互拖（renderer 敏感前科：scroll 大 deltaY 打死渲染线程）；browser-use 是"单 eval + 单截图"两路，结构不同。
+2. debug highlight 括号需重排成 browser-use 的"两任务后补"式才可并行，动的是已验证编排。
+3. DOM 熔断器语义只覆盖 `build_dom_state`；并行需新增截图路独立超时 + 兜错。
+4. 收益占比小：P0 实测 glm-5.3-flash 每步 LLM 往返 2-4s（thinking 强制），截图串行 0.1-0.5s，占步时 <15%。
+
+**诚实的反向论点**：串行下 DOM 与截图隔着整个 DOM 采集时长（重页 1s+），SPA 窗口内变化会造成"DOM 与像素错位"，并行反而更同瞬。缓解：step 流程 get_state 前已有 settle 门（exploration_page_settle B3-1 / networkidle），browser-use 并行前同样做 page stability wait（`:282`）——双方前提一致，风险低。
+
+**gather 化的触发条件与形态（不预先实施）**：串行上线后度量每步截图净增延迟（`build_dom_state` metrics 已有，新增截图计时日志）；若任务级累计显著（参考阈值 >20-30s/任务）或出现 DOM/像素错位实例，再实施——形态：`take_screenshot` 提前 `create_task` 与 `build_dom_state` 并发；debug highlight 括号重排为两任务完成后追加；截图路 6s 独立超时 + 失败→None（不挂步）；上线前后对比 `build_dom_state` metrics 防互拖。
 
 ### 2.3 `LLMClient` 过滤器适配（`client.py:71-103` / `:124-141`，4 空格）
 
@@ -391,8 +408,60 @@ llm_screenshot_size: tuple[int, int] | None = None   # None = no resize
 | 缩进一致性（文件混合） | 代码片段已按目标文件缩进给出；实施时 IDE 显示空白复核 |
 | Pillow 引入体积 | 可选依赖，缺失降级 no-op |
 | 阶段一切 `include_screenshot=False` | 实施前 `Grep` 全量确认无其它读取方（已确认） |
-| **智谱兼容接口 image block 格式**（阶段二） | 默认 `use_vision=False`；阶段二端到端验证格式接受度，不兼容则调整 |
+| **智谱兼容接口 image block 格式**（阶段二） | P0 已验证兼容（见「P0 验证记录」）；`use_vision` 仍默认 False |
+| 每步串行截图净增延迟（~0.1-0.5s/步） | 接受（§2.2.1 决策：串行先行）；任务级累计 >20-30s 触发 gather 化 |
 | `_shorten_urls` 闭包 `nonlocal` 陷阱 | 抽 `_make_replacer` 独立函数 |
+
+---
+
+## P0 验证记录（2026-09-07，issue #175）
+
+> 探针脚本：`examples/smoke_vision_glm53.py`（走生产同款路径：Anthropic SDK + `https://open.bigmodel.cn/api/anthropic`，裸 `messages.create`，不带 temperature/thinking 参数，与 `llm/client.py` get_action 一致）。测试图：纯红 200×120 PNG，问「这张图片的主要颜色是什么」。
+
+| # | 验证项 | 结果 | 证据 |
+|---|---|---|---|
+| A | `glm-5.3-flash` 在 Anthropic 兼容端点可用性 | ✅ PASS | 纯文本往返 2.8s，响应 `model=glm-5.3-flash`，thinking 368 字符 + 文本「OK」 |
+| B | 标准 Anthropic image block（`source.type=base64`）接受度 + 视觉正确性 | ✅ PASS | 回答「红色」，3.8s；input 65 tokens（同题纯文本 23 → 小图约 +42 tokens；真实截图更大，降采样仍必要） |
+| C | thinking 不可关闭对 max_tokens 的影响 | ✅ PASS（维持 16384） | max_tokens=4096 同题仍出文本（thinking 137 字符，`stop_reason=end_turn`）；简单题不挤占。难推理步思考更长——config.py LLMSettings「4096 被思考写满 → 空响应猝死」的历史教训仍适用，16384 不动 |
+
+**结论：阶段二可行——智谱 Anthropic 兼容端点 + 标准 image block 直接走通，无需切智谱原生多模态 API（§2.1 预案不启用）。**
+
+### 计划外发现 1：文本模型对 image block 不报错，静默「致盲」回答
+
+- `glm-5.1` + 图、`glm-5.3`（旗舰）+ 图：API 层**均不报错**（正常 200），模型回答「抱歉，我无法查看或加载这张图片…」。
+- 实现影响：§2.5 的「fallback 切到无视觉模型时滤掉 image block」从防御性升级为**必须**——不滤不会触发可重试的 APIError，而是「我看不见图」的困惑回答照常走 agent 决策，浪费步数且难归因。模型视觉能力判定必须客户端做（已知视觉模型名单），不能依赖端点报错。
+
+### 计划外发现 2：`glm-5.1` 被端点静默改道为 `glm-5.3`
+
+- 请求 `model=glm-5.1`，响应 `model=glm-5.3`（D / D1 两次复现）。
+- 项目默认 `LLM_MODEL=glm-5.1`（config.py LLMSettings）**当前实际由 glm-5.3 服务**。评测口径影响超出本 issue 范围，需单独知悉；对阶段二无阻塞。
+
+---
+
+## 阶段二真机验收记录（2026-09-07，issue #175）
+
+> e2e 脚本：`examples/e2e_vision_channel.py`（`--control` 带文本对照）。三轮迭代后全绿。
+
+**最终结果**：
+
+| 验收项 | 结果 |
+|---|---|
+| 回流契约：每次 LLM 调用（送 SDK 前）带 image block | ✅ 3/3 调用 `image_in_request=True` |
+| 视觉有效性：随机底色五选一答对 | ✅ `orange`（真值 orange）；对照组同题**无法作答** |
+| 截图入历史 | ✅ 3 张 `step_NNN.png` 合法落盘 |
+| 门控正确性：use_vision=False 零图零截图 | ✅ 对照组 0 image block、0 截图 |
+
+**验收页面的隔离演进**（对照组三次答对驱动，对话 dump 破案）：
+
+1. v1 canvas + `<script>` hex → 文本通道可读源码；
+2. v2 同源 PNG + 逐像素抖动 → **agent 用 evaluate `drawImage`+`getImageData` 直接读像素**——canvas API 就是像素读取器，同源像素对带 evaluate 的文本 agent 零隔离；
+3. v3（终版）swatch 放**跨域端口** + Sec-Fetch 门禁（无 Origin 且 Dest=image 才放行，fetch/XHR/导航全 403）→ 对照组实测 fetch 被 CORS 拦死、`getImageData` 被 canvas 污染拦死，两步长思考后放弃（无动作）——像素只剩渲染器（截图/视觉）可达。
+
+**验收过程中的三个生产级发现**：
+
+1. **`Page.captureScreenshot` 无单请求超时会挂死**（窗口最小化/遮挡时等不到合成器新帧，§1.7 预言的场景实测命中）→ 已修：`BrowserSettings.screenshot_timeout`（默认 10s）+ `take_screenshot` 包 `asyncio.wait_for`，超时降级（get_state→None 只发文本不挂步；0=关闭防护）。单测两例。
+2. **带 evaluate 的文本 agent 能读同源图片像素**（drawImage+getImageData）——「页面颜色」类问题不是视觉专属任务；视觉的真实增益在跨域内容/canvas 渲染/CORS 保护资源 + 零步感知（不用烧 evaluate 步数）。**评测任务设计需知悉**：想测视觉增益，答案所在资源必须跨域保护。
+3. **视觉模式 LLM 调用偶发超 120s**（`AGENT_LLM_TIMEOUT` 触发一次后重试自愈；thinking 强制 + 图片 token 使 P50 延迟上升）——视觉模式建议调大 `AGENT_LLM_TIMEOUT`（如 240s）。延迟分布：视觉调用 7-18s 常态，thinking 主导、图片占比小（§2.2.1 串行决策的延迟风险实测无忧）。
 
 ---
 

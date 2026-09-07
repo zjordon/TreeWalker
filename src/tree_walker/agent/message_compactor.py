@@ -19,6 +19,24 @@ _COMPACTION_SYSTEM_PROMPT = (
 )
 
 
+def _content_text(content: Any) -> str:
+    """Extract a message content's text: str 直通；block list 取 text block 拼接。
+
+    阶段二（issue #175）：视觉开时 state 消息 content 为 ``[text, image]``
+    blocks。图片无文本语义且 b64 巨大——压缩输入**丢图留文**（§2.5 边界 5 的
+    落点：图片只活在最近 keep_last 条原文里，进入摘要即丢）。
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            b.get("text", "")
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+    return ""
+
+
 class MessageCompactor:
     """Compresses old conversation messages into a summary using a separate LLM."""
 
@@ -52,7 +70,7 @@ class MessageCompactor:
             return
 
         # Gate 2: character count
-        full_text = "\n".join(m.get("content", "") for m in messages)
+        full_text = "\n".join(_content_text(m.get("content", "")) for m in messages)
         if len(full_text) < settings.trigger_char_count:
             return
 

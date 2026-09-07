@@ -304,3 +304,34 @@ def build_state_message(
         parts.append(f"[Planning Suggestion] {planning_nudge}")
 
     return "\n".join(parts)
+
+
+def build_state_blocks(
+    browser_state: BrowserStateSummary,
+    screenshot_b64: str | None = None,
+    **kwargs: Any,
+) -> list[dict[str, Any]]:
+    """User content as Anthropic content blocks: text + optional image.
+
+    screenshot.md 阶段二（issue #175）：``build_state_message`` 的 block 版。
+    文本部分完全复用（kwargs 原样透传，不重复维护）；``screenshot_b64`` 非空时
+    追加标准 Anthropic image block（``source.type=base64``——P0 已验证智谱
+    anthropic 兼容端点接受此格式，见 screenshot.md「P0 验证记录」）。注意
+    **不要**用 OpenAI 风格的 ``image_url`` block（那是智谱原生 API 的格式）。
+
+    ``screenshot_b64=None`` → 单 text block，语义与纯文本 ``str`` 等价——
+    调用方（step.py）仅在确认要带图时才走本函数，视觉关/无图保持 ``str``
+    路径零行为变化。
+    """
+    text = build_state_message(browser_state=browser_state, **kwargs)
+    blocks: list[dict[str, Any]] = [{"type": "text", "text": text}]
+    if screenshot_b64:
+        blocks.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": screenshot_b64,
+            },
+        })
+    return blocks

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import time
@@ -37,9 +38,11 @@ from tree_walker.agent.views import (
     _SENSITIVE_ACTION_FIELDS,
     redact_sensitive_string,
 )
+from tree_walker.browser.image_utils import resize_screenshot_bytes
 from tree_walker.browser.views import BrowserStateSummary, DOMInteractedElement
 from tree_walker.browser.url_utils import extract_host_with_port
-from tree_walker.prompts.system_prompt import build_state_message, build_system_prompt
+from tree_walker.config import model_supports_vision
+from tree_walker.prompts.system_prompt import build_state_blocks, build_state_message, build_system_prompt
 
 if TYPE_CHECKING:
     from tree_walker.config import TruncationSettings
@@ -124,6 +127,9 @@ class StepPipeline:
     _task_skill_text: str | None  # run() 匹配一次后的命中文本（每步注入）
     _task_skill_slug: str | None  # 命中 slug（obs 事件用）
     _max_history_items: int
+    # LLM 视觉通道（阶段二，issue #175）：配置门 + 降采样目标尺寸
+    _use_vision: bool
+    _llm_screenshot_size: tuple[int, int] | None
     _system_prompt: str
     _tool_schema: dict[str, Any]
     loop_detector: ActionLoopDetector
@@ -257,8 +263,13 @@ class StepPipeline:
         self._clear_context_messages()
 
         # 1. Get browser state
-        # 断路止血：每步截图暂不取（LLM 视觉通道尚未打通，见 docs/tools-optimize/screenshot.md 阶段二）
-        browser_state = await self.browser.get_state(include_screenshot=False)
+        # LLM 视觉通道（screenshot.md 阶段二，issue #175）：视觉门开时恢复每步截图
+        # 采集；默认 use_vision=False → include_screenshot=False，与阶段一断路止血
+        # 行为完全一致。采集编排维持 get_state 现状串行（§2.2.1 决策：gather 化
+        # 留作实测驱动的后续优化，勿在此并发）。
+        browser_state = await self.browser.get_state(
+            include_screenshot=self._vision_gate_open(),
+        )
         # 临时调试：env AGENT_DEBUG_DUMP_DIR 设定时，每步 dump element_tree_text（issue #157）
         await self._maybe_dump_step_dom(browser_state)
 
@@ -352,8 +363,7 @@ class StepPipeline:
                 task_skill_chars=len(task_skill_desc or ""),
             ))
 
-        state_msg = build_state_message(
-            browser_state=browser_state,
+        state_kwargs = dict(
             task=self._safe_task,
             previous_result=self.state.last_result,
             previous_evaluation=self._last("evaluation_previous_goal"),
@@ -370,6 +380,16 @@ class StepPipeline:
             task_skill_description=task_skill_desc,
             grid_meta=grid_meta,
         )
+        # 阶段二：截图就位时 state 消息升级为 [text, image] blocks（Anthropic
+        # 格式）；否则保持纯文本 str——视觉关（默认）与视觉开但无图（step 0
+        # 新标签页/截图失败）都走 str，与既有行为零差异。
+        screenshot_b64 = self._prepare_state_screenshot_b64(browser_state)
+        if screenshot_b64 is not None:
+            state_msg: str | list[dict[str, Any]] = build_state_blocks(
+                browser_state, screenshot_b64, **state_kwargs,
+            )
+        else:
+            state_msg = build_state_message(browser_state, **state_kwargs)
         self._set_state_message(state_msg)  # P0：替换唯一 state 消息（避免完整 DOM 随步数累积）
 
         # P1c：注入 <agent_history>（滑动窗口，每步替换 TYPE_USER 消息）。
@@ -386,6 +406,52 @@ class StepPipeline:
         self._force_done_after_failure()
 
         return browser_state, state_msg
+
+    # ── LLM 视觉通道（screenshot.md 阶段二，issue #175）─────────────────
+
+    def _vision_gate_open(self) -> bool:
+        """视觉门：配置门（use_vision）+ 模型门（已知视觉名单）。
+
+        **逐步评估**而非 run 开始锁存——client 侧 fallback 切换会改 ``llm.model``，
+        切到文本模型后本门自动关（后续步不再采图/带图，配合 client 滤图双保险）。
+        模型判定见 ``config.model_supports_vision``（P0 发现：端点对文本模型+
+        图不报错只静默致盲，判定只能客户端做）。
+        """
+        return self._use_vision and model_supports_vision(getattr(self.llm, "model", None))
+
+    def _prepare_state_screenshot_b64(self, browser_state: BrowserStateSummary) -> str | None:
+        """当步截图 → 降采样 → Anthropic image block 的 b64 payload。
+
+        §2.5 边界（返回 None = 只发文本，绝不因图挂步）：
+          - 视觉门关（use_vision off / 模型非视觉）；
+          - 新标签页 step 0（空白页无信息量）；
+          - 截图为 None（get_state 内截图失败已 warning 降级）；
+          - b64 编码异常（极端防御）。
+        降采样失败 / 无 Pillow：``resize_screenshot_bytes`` 原样返回原图
+        （可能很大但可用，warning 已在 helper 内记录）。
+        """
+        if not self._vision_gate_open():
+            return None
+        if self._is_new_tab_step_zero(browser_state):
+            return None
+        shot = browser_state.screenshot
+        if not shot:
+            return None
+        resized = resize_screenshot_bytes(shot, self._llm_screenshot_size)
+        try:
+            return base64.b64encode(resized).decode("ascii")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("screenshot b64 encode failed, sending text-only: %s", e)
+            return None
+
+    def _is_new_tab_step_zero(self, browser_state: BrowserStateSummary) -> bool:
+        """新标签页 step 0 判定（§2.5 边界 1）：url 空/about:blank 且 DOM 空。"""
+        if self.state.n_steps != 0:
+            return False
+        url = (browser_state.url or "").strip().lower()
+        dom = browser_state.dom_state
+        dom_empty = not dom or not (dom.element_tree_text or "").strip()
+        return url in ("", "about:blank") and dom_empty
 
     async def _maybe_dump_step_dom(self, browser_state: BrowserStateSummary) -> None:
         """临时调试：env AGENT_DEBUG_DUMP_DIR 设定时，每步把 element_tree_text + JS 直查实际 DOM 落盘。
@@ -463,7 +529,7 @@ class StepPipeline:
             return msg
         return {k: v for k, v in msg.items() if k != _MSG_TYPE}
 
-    def _set_state_message(self, content: str) -> None:
+    def _set_state_message(self, content: str | list[dict[str, Any]]) -> None:
         """设置当前步状态消息，并保留上一份 state 供 LLM 前后对比。
 
         ``enable_message_typing=True`` 时保留**最近 2 份** state（previous + current），
@@ -472,6 +538,11 @@ class StepPipeline:
         空画布对比才能确认成功；只剩当前 state 时，模型被其他空槽位残留的"点击上传"
         占位文 + 变化的 input 索引误导，误判"上传没生效"而反复重试。保留 2 份既恢复对比
         能力，又有界（远小于 P0 前无界累积的 token 成本）。False 时回退原始 append。
+
+        阶段二（issue #175）：``content`` 可为 Anthropic block list（视觉开时
+        ``[text, image]``）。保留的旧 state **丢图留文**——before/after 对比的价值
+        在文本 DOM（索引/结构），旧截图只是徒增 token；恒定单图在飞让图片 token
+        成本可预算（与消息压缩"丢图留文"同思路，落在 state 槽位上）。
         """
         if not self._enable_message_typing:
             self.messages.append({"role": "user", "content": content})
@@ -481,6 +552,13 @@ class StepPipeline:
         state_idxs = [i for i, m in enumerate(self.messages) if m.get(_MSG_TYPE) == TYPE_STATE]
         drop = set(state_idxs[:-1])
         self.messages = [m for i, m in enumerate(self.messages) if i not in drop]
+        if isinstance(content, list):
+            for m in self.messages:
+                if m.get(_MSG_TYPE) == TYPE_STATE and isinstance(m.get("content"), list):
+                    m["content"] = [
+                        b for b in m["content"]
+                        if not (isinstance(b, dict) and b.get("type") == "image")
+                    ]
         self.messages.append({"role": "user", "content": content, _MSG_TYPE: TYPE_STATE})
 
     def _clear_context_messages(self) -> None:
@@ -617,7 +695,7 @@ class StepPipeline:
     async def _get_next_action(
         self,
         browser_state: BrowserStateSummary,
-        state_message: str,
+        state_message: str | list[dict[str, Any]],
     ) -> dict[str, Any] | None:
         """Call the LLM with timeout and retry, return parsed output."""
         trimmed = self._trim_messages()
@@ -787,6 +865,19 @@ class StepPipeline:
             for m in messages:
                 role = m.get("role", "?")
                 content = m.get("content", "")
+                # 阶段二：content 可为 block list——text block 取全文，image block
+                # 摘要为大小标记（dump 人类可读审计件，不落几 MB 的 b64）。
+                if isinstance(content, list):
+                    parts = []
+                    for b in content:
+                        if not isinstance(b, dict):
+                            continue
+                        if b.get("type") == "text":
+                            parts.append(b.get("text", ""))
+                        elif b.get("type") == "image":
+                            kb = len((b.get("source") or {}).get("data", "")) // 1024
+                            parts.append(f"[screenshot: {kb} KiB base64 omitted]")
+                    content = "\n".join(p for p in parts if p)
                 lines.append(f"\n--- {role} ---\n{content}")
             lines.append(f"\n--- model_output ---\n{json.dumps(model_output, ensure_ascii=False, indent=2)}")
             target.write_text("\n".join(lines), encoding="utf-8")
@@ -1286,6 +1377,15 @@ class StepPipeline:
                     state_summary["dom_excerpt"] = (
                         dom_state.element_tree_text if dom_state else ""
                     )[: self._truncation.dom_excerpt_max_chars]
+            # 阶段二（issue #175）：当步截图落盘兑现 screenshot_path 占位字段
+            # （agent-loop-optimize/05 的 P1 截图入历史缺口）。存**原图**（LLM
+            # 收的是降采样版，历史要档案级保真）；视觉关时 screenshot 恒 None
+            # （_prepare_context 门控），此处自然零写入。
+            screenshot_path = (
+                self._save_step_screenshot(browser_state.screenshot)
+                if browser_state is not None and browser_state.screenshot
+                else None
+            )
             self.history.history.append(AgentHistory(
                 step_number=self.state.n_steps,
                 model_output=model_output,
@@ -1293,6 +1393,7 @@ class StepPipeline:
                 state_summary=state_summary,
                 interacted_element=self._safe_project_interacted_elements(model_output, browser_state, results),
                 metadata=self._build_step_metadata(time.time()),
+                screenshot_path=screenshot_path,
             ))
 
         if self._obs_bus:
@@ -1308,6 +1409,24 @@ class StepPipeline:
         self._log_step_completion_summary(results)
         # n_steps 递增已上移至 _step 的 finally（review3 #8 单一所有者）——
         # 此处不再持有副本。
+
+    def _save_step_screenshot(self, png: bytes) -> str | None:
+        """当步截图落盘（阶段二 P1 截图入历史），返回写入路径。
+
+        目录 ``<rerun_history_dir>/screenshots/``、文件名 ``step_NNN.png``
+        （与 history JSON 同根，重放/审计一起找）。**失败只 warning 返回
+        None**——截图是增强产物，任何 IO 问题不得挂 _finalize（PR #174 的
+        finalize 降级红线：历史写入比截图存档重要）。
+        """
+        try:
+            base = Path(self.rerun_history_dir) / "screenshots"
+            base.mkdir(parents=True, exist_ok=True)
+            target = base / f"step_{self.state.n_steps:03d}.png"
+            target.write_bytes(png)
+            return str(target)
+        except OSError as e:
+            logger.warning("step screenshot save failed: %s", e)
+            return None
 
     def _project_interacted_elements(
         self,

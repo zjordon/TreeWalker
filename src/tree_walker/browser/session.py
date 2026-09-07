@@ -2031,10 +2031,21 @@ class BrowserSession:
             }
 
         try:
-            result = await self.client.send.Page.captureScreenshot(
+            coro = self.client.send.Page.captureScreenshot(
                 params,
                 session_id=self.current_session_id,
             )
+            # 单请求超时（screenshot.md §1.7 预案，阶段二实测命中）：cdp-use
+            # send_raw 无单请求超时，captureScreenshot 等不到合成器新帧会无限
+            # 挂（最小化/遮挡窗口等不来帧，P6 screencast 零帧同因）。超时抛
+            # asyncio.TimeoutError——get_state 兜 warning+None（只发文本不挂步），
+            # screenshot action 兜 ActionResult(error)。双层 getattr：kick 测试
+            # 的鸭子类型桩不走 __init__（无 _settings 属性），得容缺省。
+            timeout = getattr(getattr(self, "_settings", None), "screenshot_timeout", 10.0)
+            if timeout and timeout > 0:
+                result = await asyncio.wait_for(coro, timeout=timeout)
+            else:
+                result = await coro
         except Exception as e:
             logger.warning("Page.captureScreenshot failed: %s", e)
             raise

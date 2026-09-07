@@ -14,12 +14,33 @@ from tree_walker.action_shape import (
     honest_done_action,
     normalize_actions_list,
 )
-from tree_walker.config import LLMSettings
+from tree_walker.config import LLMSettings, model_supports_vision
 
 logger = logging.getLogger(__name__)
 
 # URL shortening threshold
 _URL_MIN_LENGTH = 100
+
+
+def _strip_image_blocks(messages: list[dict[str, Any]]) -> None:
+    """Remove image blocks from message contents, in place (阶段二，§2.5 边界 2).
+
+    P0 实测发现（screenshot.md「P0 验证记录」）：智谱端点对「文本模型 + image
+    block」**不报错**——模型自述「无法查看图片」照常回答（静默致盲）。因此
+    fallback 切到无视觉模型后，历史消息里的 image block 必须丢弃，否则每次
+    重试都白带图、且得到困惑回答浪费步数难归因。content 为 ``str`` 时不动；
+    block list 滤图后若空（理论不发生——state 消息恒有 text block 在前）退化为
+    空串，仍是对 SDK 合法的 content。
+    """
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            kept = [
+                b for b in content
+                if not (isinstance(b, dict) and b.get("type") == "image")
+            ]
+            if len(kept) != len(content):
+                msg["content"] = kept if kept else ""
 
 # R4（P7 02 方案）：text-not-tool_use 重试上限——旧实现无限递归
 _TEXT_RETRY_MAX = 2
@@ -81,33 +102,43 @@ class LLMClient:
         """Replace URLs >=100 chars in messages with short [uN] markers.
 
         Identical URLs share the same marker to save tokens.
+
+        阶段二（issue #175）：content 兼容 Anthropic block list——仅对
+        ``type=text`` block 做替换，image block 透传（b64 中不可能出现合法
+        URL，也无替换意义）。替换闭包定义在循环外（counter 的 nonlocal 绑定
+        到本函数作用域，避免循环内重复定义的误导性）。
         """
         url_map: dict[str, str] = {}
         url_to_tag: dict[str, str] = {}
         counter = 0
         url_pattern = re.compile(r'https?://\S+')
 
+        def _replace(match: re.Match) -> str:
+            nonlocal counter
+            url = match.group(0)
+            if len(url) < _URL_MIN_LENGTH:
+                return url
+            if url in url_to_tag:
+                return url_to_tag[url]
+            tag = f"[u{counter}]"
+            url_map[tag] = url
+            url_to_tag[url] = tag
+            counter += 1
+            return tag
+
+        def _shorten(text: str) -> str:
+            return url_pattern.sub(_replace, text)
+
         for msg in messages:
             content = msg.get("content")
-            if not isinstance(content, str):
-                continue
-
-            def _replace(match: re.Match) -> str:
-                nonlocal counter
-                url = match.group(0)
-                if len(url) < _URL_MIN_LENGTH:
-                    return url
-                if url in url_to_tag:
-                    return url_to_tag[url]
-                tag = f"[u{counter}]"
-                url_map[tag] = url
-                url_to_tag[url] = tag
-                counter += 1
-                return tag
-
-            new_content = url_pattern.sub(_replace, content)
-            if new_content != content:
-                msg["content"] = new_content
+            if isinstance(content, str):
+                new_content = _shorten(content)
+                if new_content != content:
+                    msg["content"] = new_content
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        block["text"] = _shorten(block.get("text", ""))
 
         return url_map
 
@@ -138,17 +169,25 @@ class LLMClient:
         messages: list[dict[str, Any]],
         sensitive_map: dict[str, str] | None,
     ) -> dict[str, str] | None:
-        """Replace sensitive values in messages with their placeholders."""
+        """Replace sensitive values in messages with their placeholders.
+
+        阶段二（issue #175）：content 兼容 Anthropic block list——仅对
+        ``type=text`` block 做替换，image block 透传（二进制像素无敏感串语义）。
+        """
         if not sensitive_map:
             return sensitive_map
 
         for msg in messages:
             content = msg.get("content")
-            if not isinstance(content, str):
-                continue
-            for real_value, placeholder in sensitive_map.items():
-                content = content.replace(real_value, placeholder)
-            msg["content"] = content
+            if isinstance(content, str):
+                for real_value, placeholder in sensitive_map.items():
+                    content = content.replace(real_value, placeholder)
+                msg["content"] = content
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        for real_value, placeholder in sensitive_map.items():
+                            block["text"] = block.get("text", "").replace(real_value, placeholder)
 
         return sensitive_map
 
@@ -223,6 +262,12 @@ class LLMClient:
             # (5xx, 402, ...) are all subclasses of APIError, so this single
             # except is behaviorally equivalent to browser-use's explicit set.
             if self._try_switch_to_fallback(e):
+                # 阶段二（§2.5 边界 2 + P0 发现）：fallback 模型无视觉时滤掉
+                # 历史 image block——端点对文本模型+图不报错（静默致盲），不滤
+                # 不会触发可重试错误，只会得到「我看不见图」的困惑回答照常走
+                # 决策。滤图降级为纯文本重试，不引入新失败。
+                if not model_supports_vision(self.model):
+                    _strip_image_blocks(messages)
                 return await self.get_action(
                     system_prompt, messages, tool_schema,
                     _no_action_retry_used=_no_action_retry_used,
