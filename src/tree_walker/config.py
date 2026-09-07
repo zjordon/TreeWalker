@@ -5,12 +5,61 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+# 视觉门开且未显式配置尺寸时的默认降采样目标（对齐 browser-use）。
+# load_settings 与 step.py 门控使用处共享——后者兜底是修复
+# PR #177 review round2 CONFIRMED：load 时按 LLM_MODEL env 快照的 size 与
+# 每步按活模型判定的视觉门失配（fallback 切到视觉模型后门开而 size=None，
+# 每步回流全分辨率原图）。
+_DEFAULT_LLM_SCREENSHOT_SIZE: tuple[int, int] = (1400, 850)
+
+
+def model_supports_vision(model: str | None) -> bool:
+    """已知视觉模型家族判定（screenshot.md 阶段二，issue #175）。
+
+    P0 实测发现：智谱端点对「文本模型 + image block」**不报错**——模型自述
+    「无法查看图片」照常回答（静默致盲）。因此视觉能力判定必须在客户端做
+    名单，不能依赖 API 报错兜底。名单覆盖：
+      - ``claude-*``（Anthropic 全系支持视觉输入）
+      - ``glm-<n>[.n]*v*`` 家族（glm-4v / 4.1v / 4.5v / 4.6v / 5v…）
+      - ``glm-5.3-flash``（GLM-5 系列首个原生多模态，2026-08-26）
+    名单外（glm-5.1 / 5.2 / 5.3、glm-4.x 无 v 等）一律 False。
+    """
+    m = (model or "").strip().lower()
+    if not m:
+        return False
+    if m.startswith("claude-"):
+        return True
+    if re.match(r"^glm-\d+(\.\d+)*v", m):
+        return True
+    return m.startswith("glm-5.3-flash")
+
+
+def _parse_screenshot_size(raw: str) -> tuple[int, int] | None:
+    """``AGENT_LLM_SCREENSHOT_SIZE="1400x850"`` → ``(1400, 850)``。
+
+    空/空白 → None（未显式配置）；格式非法 → warning + None（不炸 load_settings）。
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    m = re.fullmatch(r"(\d+)[x×](\d+)", raw)
+    if not m:
+        logger.warning("Invalid AGENT_LLM_SCREENSHOT_SIZE %r (expect '1400x850'), ignoring", raw)
+        return None
+    size = (int(m.group(1)), int(m.group(2)))
+    if size[0] < 100 or size[1] < 100:
+        logger.warning("AGENT_LLM_SCREENSHOT_SIZE %s below 100px floor, ignoring", size)
+        return None
+    return size
 
 
 def _load_dotenv() -> None:
@@ -93,6 +142,15 @@ class AgentSettings:
     enable_skill_injection: bool = True
     max_history_items: int = 10  # P1c：<agent_history> 滑动窗口大小（compactor 启用时自动降到 5）
     enable_recent_events: bool = False  # P1b：state 消息渲染 [Recent Events]（首期仅 dialog；CDP 回调风险，默认关）
+    # ── LLM 视觉通道（screenshot.md 阶段二，issue #175）──
+    # use_vision 开启时每步 state 消息附降采样截图（Anthropic image block，
+    # source.type=base64——P0 已验证智谱兼容端点接受）。默认 False = 零行为变化
+    # （评测红线：视觉口径分列报告，不与主口径并比）。仅模型在已知视觉名单
+    # （model_supports_vision）时生效——文本模型收图不报错只静默致盲（P0 发现）。
+    use_vision: bool = False
+    # 截图降采样目标 (w, h)。None = 模型自适应（视觉模型默认 (1400, 850)，
+    # 其余 None=不缩放）；env AGENT_LLM_SCREENSHOT_SIZE="1400x850" 显式覆盖。
+    llm_screenshot_size: tuple[int, int] | None = None
     truncation: TruncationSettings = field(default_factory=TruncationSettings)
     enable_planning: bool = False
     exploration_threshold: int = 5
@@ -262,6 +320,11 @@ class BrowserSettings:
     # agent 循环挂死到任务超时。beforeunload→accept（放行导航），其余→dismiss（不替
     # 用户确认危险操作）；每次处理记入 [Recent Events] 告知 LLM。
     auto_handle_js_dialog: bool = True
+    # 单次 Page.captureScreenshot 超时（秒）。cdp-use send_raw 无单请求超时，
+    # 等不到合成器新帧（窗口最小化/遮挡）会无限挂（screenshot.md §1.7 预案，
+    # 阶段二 e2e 实测命中）；超时由调用方降级（get_state→None 只发文本）。
+    # 0 = 不设防（旧行为）。
+    screenshot_timeout: float = 10.0
 
 
 @dataclass
@@ -374,6 +437,17 @@ def load_settings() -> Settings:
             ),
         )
 
+    # LLM 视觉通道（阶段二）：AGENT_USE_VISION 默认 false（评测红线）；尺寸
+    # 显式 env 优先，未配置时按模型自适应（视觉模型 → (1400, 850)，对齐
+    # browser-use 默认；文本模型 None=不缩放，反正门关着也不采图）。
+    use_vision = os.environ.get("AGENT_USE_VISION", "false").lower() == "true"
+    llm_screenshot_size = _parse_screenshot_size(
+        os.environ.get("AGENT_LLM_SCREENSHOT_SIZE", "")
+    )
+    if llm_screenshot_size is None and use_vision:
+        if model_supports_vision(os.environ.get("LLM_MODEL", "glm-5.1")):
+            llm_screenshot_size = _DEFAULT_LLM_SCREENSHOT_SIZE
+
     agent = AgentSettings(
         max_steps=int(os.environ.get("AGENT_MAX_STEPS", "100")),
         max_failures=int(os.environ.get("AGENT_MAX_FAILURES", "5")),
@@ -390,6 +464,8 @@ def load_settings() -> Settings:
         enable_skill_injection=os.environ.get("AGENT_ENABLE_SKILL_INJECTION", "true").lower() == "true",
         max_history_items=int(os.environ.get("AGENT_MAX_HISTORY_ITEMS", "10")),
         enable_recent_events=os.environ.get("AGENT_ENABLE_RECENT_EVENTS", "false").lower() == "true",
+        use_vision=use_vision,
+        llm_screenshot_size=llm_screenshot_size,
         truncation=TruncationSettings(
             extract_page_max_chars=int(os.environ.get("AGENT_TRUNCATE_EXTRACT_PAGE", "8000")),
             extract_fallback_max_chars=int(os.environ.get("AGENT_TRUNCATE_EXTRACT_FALLBACK", "2000")),

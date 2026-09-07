@@ -140,6 +140,10 @@ class Agent(StepPipeline, RerunMixin):
             self._task_skill_llm = self.llm
         self._max_history_items = _settings.max_history_items
         self._enable_recent_events = _settings.enable_recent_events
+        # LLM 视觉通道（screenshot.md 阶段二，issue #175）：门控与降采样尺寸
+        # 从 AgentSettings 拷贝；模型门在 step.py _vision_gate_open 逐步评估。
+        self._use_vision = _settings.use_vision
+        self._llm_screenshot_size = _settings.llm_screenshot_size
 
         # Sensitive data filtering（P1d：归一化为 _sensitive_data_raw，兼容旧/新格式）
         _sd = sensitive_data or _settings.sensitive_data

@@ -109,6 +109,32 @@ class TestTakeScreenshotParams:
 		assert clip["width"] == 3
 
 	@pytest.mark.asyncio
+	async def test_hanging_capture_times_out(self):
+		"""§1.7 预案（阶段二 e2e 实测命中）：captureScreenshot 等不到帧无限挂 →
+		screenshot_timeout 单请求超时抛 TimeoutError（get_state 兜 None 不挂步）。"""
+		import asyncio as _asyncio
+
+		async def hang(*args, **kwargs):
+			await _asyncio.sleep(999)
+
+		client = _make_mock_cdp_client(capture_side_effect=hang)
+		session = await _start_session(client)
+		session._settings.screenshot_timeout = 0.05
+		with pytest.raises(_asyncio.TimeoutError):
+			await session.take_screenshot()
+
+	@pytest.mark.asyncio
+	async def test_timeout_zero_disables_guard(self):
+		"""screenshot_timeout=0 = 不设防（旧行为，显式 opt-out）。"""
+		import base64 as _base64
+
+		client = _make_mock_cdp_client()
+		session = await _start_session(client)
+		session._settings.screenshot_timeout = 0
+		data = await session.take_screenshot()
+		assert data == _base64.b64decode("iVBORw0KGgo=")
+
+	@pytest.mark.asyncio
 	async def test_missing_data_raises_runtime_error(self):
 		client = _make_mock_cdp_client(capture_return={})
 		session = await _start_session(client)
