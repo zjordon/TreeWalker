@@ -41,7 +41,7 @@ from tree_walker.agent.views import (
 from tree_walker.browser.image_utils import resize_screenshot_bytes
 from tree_walker.browser.views import BrowserStateSummary, DOMInteractedElement
 from tree_walker.browser.url_utils import extract_host_with_port
-from tree_walker.config import model_supports_vision
+from tree_walker.config import _DEFAULT_LLM_SCREENSHOT_SIZE, model_supports_vision
 from tree_walker.prompts.system_prompt import build_state_blocks, build_state_message, build_system_prompt
 
 if TYPE_CHECKING:
@@ -437,7 +437,12 @@ class StepPipeline:
         shot = browser_state.screenshot
         if not shot:
             return None
-        resized = resize_screenshot_bytes(shot, self._llm_screenshot_size)
+        # size 兜底（PR #177 review round2 CONFIRMED 修复）：AgentSettings 的
+        # size 是 load 时按 LLM_MODEL env 快照的（文本主模型 → None=不预置），
+        # 而本门每步按**活模型**判定——fallback 切到视觉模型后门开但 size 仍
+        # None 会回流全分辨率原图。门开即模型是视觉的，未显式配置就走默认。
+        target = self._llm_screenshot_size or _DEFAULT_LLM_SCREENSHOT_SIZE
+        resized = resize_screenshot_bytes(shot, target)
         try:
             return base64.b64encode(resized).decode("ascii")
         except Exception as e:  # noqa: BLE001

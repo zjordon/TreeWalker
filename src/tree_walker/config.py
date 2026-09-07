@@ -14,6 +14,14 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
+# 视觉门开且未显式配置尺寸时的默认降采样目标（对齐 browser-use）。
+# load_settings 与 step.py 门控使用处共享——后者兜底是修复
+# PR #177 review round2 CONFIRMED：load 时按 LLM_MODEL env 快照的 size 与
+# 每步按活模型判定的视觉门失配（fallback 切到视觉模型后门开而 size=None，
+# 每步回流全分辨率原图）。
+_DEFAULT_LLM_SCREENSHOT_SIZE: tuple[int, int] = (1400, 850)
+
+
 def model_supports_vision(model: str | None) -> bool:
     """已知视觉模型家族判定（screenshot.md 阶段二，issue #175）。
 
@@ -438,7 +446,7 @@ def load_settings() -> Settings:
     )
     if llm_screenshot_size is None and use_vision:
         if model_supports_vision(os.environ.get("LLM_MODEL", "glm-5.1")):
-            llm_screenshot_size = (1400, 850)
+            llm_screenshot_size = _DEFAULT_LLM_SCREENSHOT_SIZE
 
     agent = AgentSettings(
         max_steps=int(os.environ.get("AGENT_MAX_STEPS", "100")),

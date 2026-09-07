@@ -400,6 +400,21 @@ class TestPrepareScreenshotB64:
 		assert base64.b64decode(b64) == self._shot()
 		assert calls == [(self._shot(), (1400, 850))]
 
+	def test_size_none_falls_back_to_default(self, monkeypatch):
+		"""PR #177 review round2 CONFIRMED 修复：load 时按主模型快照的 size=None
+		（文本主模型）+ fallback 切到视觉模型后门开——使用处必须兜底默认尺寸，
+		不得回流全分辨率原图。"""
+		stub = _GateStub(True, "glm-5.3-flash", size=None)
+		calls = []
+		def fake_resize(data, target):
+			calls.append((data, target))
+			return data
+		monkeypatch.setattr("tree_walker.agent.step.resize_screenshot_bytes", fake_resize)
+
+		b64 = stub._prepare_state_screenshot_b64(_png_state(self._shot()))
+		assert base64.b64decode(b64) == self._shot()
+		assert calls == [(self._shot(), (1400, 850))]
+
 
 class TestSetStateMessageImageCap:
 	def test_older_state_keeps_text_drops_image(self):
