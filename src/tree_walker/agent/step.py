@@ -1079,6 +1079,10 @@ class StepPipeline:
     @staticmethod
     def _is_valid_action(response: dict[str, Any]) -> bool:
         """Check whether the LLM response contains a usable action."""
+        # 非 dict（注入/旁路 LLM 的契约违反）判假进澄清梯——兑现
+        # _normalize_llm_response docstring 的透传承诺，而非 AttributeError
+        if not isinstance(response, dict):
+            return False
         action = response.get("action")
         if not action or not isinstance(action, dict):
             return False

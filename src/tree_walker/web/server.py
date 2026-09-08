@@ -42,6 +42,7 @@ from tree_walker.agent.variable_detector import (
 	merge_variable_sources,
 )
 from tree_walker.agent.views import AgentHistoryList
+from tree_walker.config import _parse_screenshot_size
 
 logger = logging.getLogger(__name__)
 
@@ -292,7 +293,7 @@ class SettingField:
 
 	key: str                     # 展示名（前端 id）
 	env: str                     # 环境变量名（白名单键）
-	type: str                    # str | int | float | bool | enum
+	type: str                    # str | int | float | bool | enum | size（WxH 截图尺寸，空 = 模型自适应）
 	default: str                 # 默认值（字符串形式）
 	section: str                 # llm | agent | browser | advanced
 	choices: tuple[str, ...] = ()  # enum 候选
@@ -317,12 +318,19 @@ _SETTINGS_FIELDS: tuple[SettingField, ...] = (
 	SettingField("计划模式", "AGENT_ENABLE_PLANNING", "bool", "true", "agent"),
 	# 注：默认 false = env 层默认（config.py）；web live 任务由 _build_agent 强制开
 	SettingField("Skill 注入", "AGENT_ENABLE_SKILL_INJECTION", "bool", "false", "agent"),
+	# P7 路线三（PR #172）：任务级 skill 注入——默认关 = 评测红线（对自主探索口径等价
+	# 泄露参考轨迹）；独立于上方站点级 Skill 注入开关
+	SettingField("任务级 Skill 注入", "AGENT_ENABLE_TASK_SKILL_INJECTION", "bool", "false", "agent"),
+	# P10 视觉通道（issue #179）：默认 false = 评测红线（视觉口径分列报告，不与主口径并比）
+	SettingField("视觉通道", "AGENT_USE_VISION", "bool", "false", "agent"),
 	# Browser（cdp_port 由 tw-web CLI 决定，不在此暴露）
 	SettingField("高亮反馈", "BROWSER_HIGHLIGHT_INTERACTION", "bool", "true", "browser"),
 	# 高级
 	SettingField("重放步间延迟(秒)", "AGENT_RERUN_DELAY_BETWEEN_ACTIONS", "float", "1.0", "advanced"),
 	SettingField("步间隔封顶(秒)", "AGENT_RERUN_MAX_STEP_INTERVAL", "float", "5.0", "advanced"),
 	SettingField("重放等元素", "AGENT_RERUN_WAIT_FOR_ELEMENTS", "bool", "false", "advanced"),
+	# P10 截图降采样（issue #179）：空 = 模型自适应（视觉模型 (1400,850)，文本模型不缩放）
+	SettingField("截图降采样", "AGENT_LLM_SCREENSHOT_SIZE", "size", "", "advanced"),
 )
 
 
@@ -335,6 +343,12 @@ def _validate_setting_value(field: SettingField, raw: str) -> str:
 	if field.type == "enum":
 		if raw not in field.choices:
 			raise ValueError(f"{field.env} 须为 {list(field.choices)} 之一: {raw!r}")
+		return raw
+	if field.type == "size":
+		# P10 截图降采样（issue #179）：空 = 模型自适应；非空须 WxH（≥100px）。复用 config
+		# 解析器做单一事实源——load_settings 侧非法值是 warning + 静默忽略，必须在此拦下报 400。
+		if raw and _parse_screenshot_size(raw) is None:
+			raise ValueError(f"{field.env} 须为 WxH（如 1400x850，宽高 ≥100px）或留空: {raw!r}")
 		return raw
 	if field.type == "int":
 		int(raw)  # 仅校验可解析（防 "abc"/"1.5"）

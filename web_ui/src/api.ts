@@ -225,7 +225,7 @@ export interface SettingFieldDTO {
 	key: string;
 	env: string;
 	section: string;
-	type: "str" | "int" | "float" | "bool" | "enum";
+	type: "str" | "int" | "float" | "bool" | "enum" | "size";
 	choices: string[];
 	default: string;
 	sensitive: boolean; // 敏感字段（placeholder 提示，不动不提交）
