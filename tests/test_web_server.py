@@ -340,7 +340,8 @@ async def test_batch_cancel_unknown_task(client):
 async def test_settings_get_defaults_and_masking(client, monkeypatch):
     # 清掉本机可能存在的同名 env，验证注册表默认值 + API key 脱敏
     for env in ("LLM_MODEL", "ZHIPU_API_KEY", "AGENT_MAX_STEPS", "LLM_OUTPUT_MODE",
-                "AGENT_ENABLE_SKILL_INJECTION"):
+                "AGENT_ENABLE_SKILL_INJECTION", "AGENT_USE_VISION", "AGENT_LLM_SCREENSHOT_SIZE",
+                "AGENT_ENABLE_TASK_SKILL_INJECTION"):
         monkeypatch.delenv(env, raising=False)
     resp = await client.get("/settings/get")
     assert resp.status == 200
@@ -354,6 +355,17 @@ async def test_settings_get_defaults_and_masking(client, monkeypatch):
     assert fields["LLM_OUTPUT_MODE"]["choices"] == ["standard", "flash", "thinking"]
     # skill 注入默认 false = env 层默认（config.py），web live 由 _build_agent 强制开
     assert fields["AGENT_ENABLE_SKILL_INJECTION"]["value"] == "false"
+    # 任务级 skill（P7 路线三，PR #172）：默认 false = 评测红线（独立于站点级开关）
+    assert fields["AGENT_ENABLE_TASK_SKILL_INJECTION"]["value"] == "false"
+    assert fields["AGENT_ENABLE_TASK_SKILL_INJECTION"]["type"] == "bool"
+    assert fields["AGENT_ENABLE_TASK_SKILL_INJECTION"]["section"] == "agent"
+    # P10 视觉通道（issue #179）：注册表默认值须与 config fallback 一致（false / 空 = 模型自适应）
+    assert fields["AGENT_USE_VISION"]["value"] == "false"
+    assert fields["AGENT_USE_VISION"]["type"] == "bool"
+    assert fields["AGENT_USE_VISION"]["section"] == "agent"
+    assert fields["AGENT_LLM_SCREENSHOT_SIZE"]["value"] == ""
+    assert fields["AGENT_LLM_SCREENSHOT_SIZE"]["type"] == "size"
+    assert fields["AGENT_LLM_SCREENSHOT_SIZE"]["section"] == "advanced"
     # 敏感：未设 → 空值不掩码；设了 → **** + 尾 4 位；sensitive 标志供前端区分「敏感未设置」
     assert fields["ZHIPU_API_KEY"]["masked"] is False
     assert fields["ZHIPU_API_KEY"]["sensitive"] is True
@@ -436,6 +448,68 @@ async def test_settings_set_affects_new_agent(client, monkeypatch):
     resp = await client.post("/task/start", json={"task": "x"})
     assert resp.status == 200
     assert built["settings"].agent.max_steps == 3
+
+
+@pytest.mark.asyncio
+async def test_settings_set_vision_fields(client, monkeypatch):
+    """P10 视觉通道两字段（issue #179）：合法写入 / bool 字面量规范化 / 空串清空 / 非法尺寸 400。"""
+    monkeypatch.delenv("AGENT_USE_VISION", raising=False)
+    monkeypatch.delenv("AGENT_LLM_SCREENSHOT_SIZE", raising=False)
+    resp = await client.post("/settings/set", json={
+        "AGENT_USE_VISION": "true", "AGENT_LLM_SCREENSHOT_SIZE": "1400x850"})
+    assert resp.status == 200
+    assert os.environ["AGENT_USE_VISION"] == "true"
+    assert os.environ["AGENT_LLM_SCREENSHOT_SIZE"] == "1400x850"
+    # bool JSON 字面量规范化（既有行为在新字段上同样成立）
+    resp = await client.post("/settings/set", json={"AGENT_USE_VISION": False})
+    assert resp.status == 200
+    assert os.environ["AGENT_USE_VISION"] == "false"
+    # 空串 = 清空回模型自适应（非敏感字段照写 os.environ）
+    resp = await client.post("/settings/set", json={"AGENT_LLM_SCREENSHOT_SIZE": ""})
+    assert resp.status == 200
+    assert os.environ["AGENT_LLM_SCREENSHOT_SIZE"] == ""
+    # 非法尺寸 → 400：格式（对齐 config._parse_screenshot_size 的正则）+ <100px 地板
+    for bad in ("abc", "1400", "1400x", "50x50", "0x0"):
+        assert (await client.post("/settings/set", json={"AGENT_LLM_SCREENSHOT_SIZE": bad})).status == 400
+
+
+@pytest.mark.asyncio
+async def test_settings_vision_affects_load_settings(client, monkeypatch):
+    """set 视觉字段后 load_settings 语义正确（issue #179 §4.4）。
+
+    模型自适应默认（视觉模型 → (1400,850)）→ 显式覆盖 → 清空回自适应。
+    """
+    from tree_walker.config import load_settings
+    monkeypatch.delenv("AGENT_USE_VISION", raising=False)
+    monkeypatch.delenv("AGENT_LLM_SCREENSHOT_SIZE", raising=False)
+    monkeypatch.setenv("LLM_MODEL", "glm-5.3-flash")  # 视觉名单内（config.model_supports_vision）
+    resp = await client.post("/settings/set", json={"AGENT_USE_VISION": "true"})
+    assert resp.status == 200
+    s = load_settings()
+    assert s.agent.use_vision is True
+    assert s.agent.llm_screenshot_size == (1400, 850)  # 未显式配置 → 模型自适应默认
+    resp = await client.post("/settings/set", json={"AGENT_LLM_SCREENSHOT_SIZE": "1200x700"})
+    assert resp.status == 200
+    assert load_settings().agent.llm_screenshot_size == (1200, 700)  # 显式覆盖优先
+    resp = await client.post("/settings/set", json={"AGENT_LLM_SCREENSHOT_SIZE": ""})
+    assert resp.status == 200
+    assert load_settings().agent.llm_screenshot_size == (1400, 850)  # 清空 → 回自适应
+
+
+@pytest.mark.asyncio
+async def test_settings_set_task_skill_injection(client, monkeypatch):
+    """任务级 skill 开关（P7 路线三，PR #172）：bool 校验 + 白名单写入；默认 false = 评测红线。"""
+    monkeypatch.delenv("AGENT_ENABLE_TASK_SKILL_INJECTION", raising=False)
+    resp = await client.post("/settings/set", json={"AGENT_ENABLE_TASK_SKILL_INJECTION": "true"})
+    assert resp.status == 200
+    assert os.environ["AGENT_ENABLE_TASK_SKILL_INJECTION"] == "true"
+    # 非法 bool → 400（bool 分支既有行为在新字段上同样成立）
+    assert (await client.post("/settings/set",
+            json={"AGENT_ENABLE_TASK_SKILL_INJECTION": "yes"})).status == 400
+    # bool JSON 字面量规范化 + 关回默认
+    resp = await client.post("/settings/set", json={"AGENT_ENABLE_TASK_SKILL_INJECTION": False})
+    assert resp.status == 200
+    assert os.environ["AGENT_ENABLE_TASK_SKILL_INJECTION"] == "false"
 
 
 # ── Live agent 探索任务（P6 M1）─────────────────────────────────────────────
