@@ -494,6 +494,10 @@ async def test_settings_vision_affects_load_settings(client, monkeypatch):
     resp = await client.post("/settings/set", json={"AGENT_LLM_SCREENSHOT_SIZE": ""})
     assert resp.status == 200
     assert load_settings().agent.llm_screenshot_size == (1400, 850)  # 清空 → 回自适应
+    # endpoint 直接写 os.environ，monkeypatch 只回收自己 set/delenv 的键——
+    # 显式清理防 AGENT_USE_VISION=true 泄漏给同会话后续测试（评测红线 flag）
+    os.environ.pop("AGENT_USE_VISION", None)
+    os.environ.pop("AGENT_LLM_SCREENSHOT_SIZE", None)
 
 
 @pytest.mark.asyncio

@@ -9,7 +9,7 @@
 三层修复（docs/bug-fix/176-unknown-action-name-collateral.md）：
   P0-A  action_shape：known_names 注入——live 批次丢「shape 合法但未注册」
         名 + 镜像刷新；响应字段名（plan_update/current_plan_item/thinking）
-        降 INFO；丢光保留原列表（落外梯澄清，不合成不空批）
+        降 INFO；丢光保留原列表（落内梯「Unknown action」反馈重试，不合成不空批）
   P0-B  step：参数校验内梯对无效动作与外梯对称——澄清重试（共用
         _PARAM_VALIDATION_MAX_RETRIES 预算），仍无效才 fallback done
   P1-C  registry/plan_manager：响应字段不是动作的澄清文案
@@ -206,8 +206,8 @@ class TestNormalizeKnownNames:
 		assert actions == [{"name": "click", "params": {}}]
 
 	def test_all_unknown_batch_restored_as_is(self, caplog):
-		# 丢光兜底：全部未注册 → 列表原样保留（镜像照旧指向头部 → 外梯
-		# 「Unknown action」澄清重试，模型可重发），不合成动作、不空批
+		# 丢光兜底：全部未注册 → 列表原样保留（镜像照旧指向头部 → 内梯
+		# 「Unknown action」参数反馈重试，模型可重发），不合成动作、不空批
 		original = [
 			{"name": "plan_update", "params": {}},
 			{"name": "scroll_to_moon", "params": {}},
@@ -333,7 +333,7 @@ class TestInnerLadderClarification:
 	@pytest.mark.asyncio
 	async def test_budget_bound_worst_case(self):
 		# 最坏路径（每次内梯重试都无效）：内梯调用次数恰为预算值，不超
-		# _PARAM_VALIDATION_MAX_RETRIES（更不超 +1）
+		# _PARAM_VALIDATION_MAX_RETRIES
 		agent = _LadderAgent([
 			{"action": {"name": "click", "params": {}}},
 			{"action": {"params": {}}},
@@ -342,7 +342,6 @@ class TestInnerLadderClarification:
 		await agent._get_action_with_retry([])
 		inner_calls = agent.llm.get_action.await_count - 1
 		assert inner_calls <= _PARAM_VALIDATION_MAX_RETRIES
-		assert inner_calls <= _PARAM_VALIDATION_MAX_RETRIES + 1
 
 
 class TestOuterLadderRegression:
@@ -364,6 +363,21 @@ class TestOuterLadderRegression:
 		assert agent.llm.get_action.await_count == 2
 		assert result["action"]["name"] == "done"
 		assert result["action"]["params"]["success"] is False
+
+	@pytest.mark.asyncio
+	async def test_nondict_response_clarified_not_crash(self):
+		# _normalize_llm_response 对非 dict 原样透传 → _is_valid_action 判假
+		# （isinstance 守卫）进外梯澄清——注入/旁路 LLM 的契约违反不再
+		# AttributeError 崩断（兑现透传 docstring 承诺）
+		agent = _LadderAgent([
+			"not-a-dict",
+			{"action": {"name": "click", "params": {"index": 1}}},
+		])
+		result = await agent._get_action_with_retry([])
+		assert agent.llm.get_action.await_count == 2
+		first_retry = agent.llm.get_action.await_args_list[1].kwargs["messages"]
+		assert "forgot to return an action" in first_retry[-1]["content"]
+		assert result["action"]["name"] == "click"
 
 	@pytest.mark.asyncio
 	async def test_all_unknown_batch_kept_for_clarification_retry(self):
