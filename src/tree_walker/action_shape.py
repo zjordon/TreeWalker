@@ -15,6 +15,7 @@ client / agent.views / step / rerun 共同 import：
 from __future__ import annotations
 
 import logging
+from collections.abc import Collection
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -76,8 +77,64 @@ def _has_invalid_name(action: dict) -> bool:
 	return not (isinstance(name, str) and name)
 
 
+# issue #176：agent_response 的响应字段名（registry.py 注入 schema、
+# plan_manager 消费响应体）——模型偶发把它们当动作名塞进 actions[]。良性混淆：
+# 其语义本就在响应体字段里（plan_update/current_plan_item 照常被
+# update_from_model_output 消费、thinking 只是思考文本），丢弃时降为 INFO。
+_RESPONSE_FIELD_ACTION_NAMES = frozenset({"plan_update", "current_plan_item", "thinking"})
+
+
+def _drop_unregistered_actions(
+	actions_list: list[Any], known_names: Collection[str]
+) -> None:
+	"""issue #176 P0-A：live 批次里 shape 合法但名字未注册的条目移除。
+
+	与 #173 的 shape 畸形策略正交：本函数只看「有合法名字但不在注册表」
+	（模型幻觉名 / 响应字段名误发为动作）——这类条目在执行路径的归宿本就是
+	``Unknown action`` 失败（step.py 既有语义），提前丢弃只是免掉头部未知名
+	把整批拖进重试梯的连坐。丢光兜底：全部条目被丢时**原样保留列表**（不合成
+	动作、不返回空批）——落回外梯澄清重试，与 review7 #1「模型可重发」语义
+	一致。shape 畸形条目（标量 / 无效 name）与诚实失败 done 不在处置范围。
+	"""
+	kept: list[Any] = []
+	for i, a in enumerate(actions_list):
+		if (
+			isinstance(a, dict)
+			and not is_honest_failure_action(a)
+			and isinstance(a.get("name"), str)
+			and a["name"]
+			and a["name"] not in known_names
+		):
+			name = a["name"]
+			if name in _RESPONSE_FIELD_ACTION_NAMES:
+				logger.info(
+					"action[%d] (%r) is a response field, not an action — "
+					"dropped (semantics live in the response body fields)",
+					i, name,
+				)
+			else:
+				logger.warning(
+					"action[%d] (%r) is not a registered action — dropped "
+					"from batch",
+					i, name,
+				)
+			continue
+		kept.append(a)
+	if len(kept) == len(actions_list):
+		return
+	if not kept:
+		logger.warning(
+			"all %d action(s) unregistered — batch kept as-is for "
+			"clarification retry (no synthesis, no empty batch)",
+			len(actions_list),
+		)
+		return
+	actions_list[:] = kept
+
+
 def normalize_actions_list(
-	actions_list: list[Any], *, context: str = "live"
+	actions_list: list[Any], *, context: str = "live",
+	known_names: Collection[str] | None = None,
 ) -> None:
 	"""畸形动作归一化（issue #173 的 choke point 实现）——原地修复。
 
@@ -94,6 +151,11 @@ def normalize_actions_list(
 	  Unknown action 错误（review6 #2：不合成 done 造成静默截断/重放分叉）；
 	- dict 但 params 为字符串/null/数字 → 置空 ``{}``（两种上下文共用的
 	  无害化）。
+
+	**known_names**（issue #176 P0-A，仅 live）：非 None 时，shape 合法但
+	名字未注册的条目在形状修复后从列表移除（详见
+	``_drop_unregistered_actions``——响应字段名降 INFO、丢光保留原列表）。
+	None = 行为与 #173 完全一致（client choke point 无 registry，照旧不传）。
 
 	**history**（历史加载，review7 #2/#3：**不合成可执行动作**——master 时代
 	录制的畸形条目在原 run 中从未执行，重放不得替它执行；只做无害化）：
@@ -155,6 +217,9 @@ def normalize_actions_list(
 					)
 				a["params"] = {}
 
+	if known_names is not None and context == "live":
+		_drop_unregistered_actions(actions_list, known_names)
+
 
 def name_of(action: Any) -> Any:
 	"""动作名访问（master 语义，review5 #1：绝不伪造 done）。
@@ -193,7 +258,8 @@ def actions_of(model_output: dict[str, Any] | None) -> list[Any]:
 
 
 def normalize_model_output(
-	model_output: dict[str, Any], *, context: str = "live"
+	model_output: dict[str, Any], *, context: str = "live",
+	known_names: Collection[str] | None = None,
 ) -> dict[str, Any]:
 	"""管线入口一次性归一化整个 model_output（review6 #9 / review7 主线）。
 
@@ -202,14 +268,19 @@ def normalize_model_output(
 	  **之前**调用（review7 #6：归一化晚于 truncate 会让裸元素先崩 emit/log）；
 	- **history**：历史加载/构造路径（validator）调用——不合成可执行动作。
 
+	``known_names``（issue #176 P0-A）：非 None 时 live 批次里未注册名的条目
+	被移除——镜像刷新（``action = actions[0]``）自然指向第一个幸存动作，
+	头部未知名不再连坐整批。
+
 	物化 actions 列表（非列表 truthy 容器按 ``[action 或 {}]`` 重置，防
-	``actions_of`` 逐字符拆分——review7 #3）→ 逐条归一化 → 刷新镜像。幂等。
+	``actions_of`` 逐字符拆分——review7 #3）→ 逐条归一化 → 刷新镜像。幂等
+	（known_names 传入时同样幂等：幸存者名字全在注册表，二次归一化 no-op）。
 	"""
 	actions = model_output.get("actions")
 	if not (isinstance(actions, list) and actions):
 		act = model_output.get("action")
 		actions = [act] if isinstance(act, (str, dict)) else [{}]
-	normalize_actions_list(actions, context=context)
+	normalize_actions_list(actions, context=context, known_names=known_names)
 	model_output["actions"] = actions
 	model_output["action"] = actions[0]
 	return model_output

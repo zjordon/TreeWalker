@@ -201,11 +201,20 @@ class ActionRegistry:
             properties["plan_update"] = {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Replace the entire plan with these steps. Use when creating a new plan or revising the current plan.",
+                "description": (
+                    "Replace the entire plan with these steps. Use when creating "
+                    "a new plan or revising the current plan. This is a RESPONSE "
+                    "FIELD — never use it as an action name in action/actions."
+                ),
             }
             properties["current_plan_item"] = {
                 "type": "integer",
-                "description": "Index of the current plan step to advance to. Steps between current and this index will be marked as done.",
+                "description": (
+                    "Index of the current plan step to advance to. Steps between "
+                    "current and this index will be marked as done. This is a "
+                    "RESPONSE FIELD — never use it as an action name in "
+                    "action/actions."
+                ),
             }
 
         description = (

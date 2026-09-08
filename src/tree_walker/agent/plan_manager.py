@@ -27,7 +27,7 @@ class PlanManager:
         """Update plan state from LLM output.
 
         Two mutually exclusive paths:
-          A) plan_update: replace the entire plan
+          A) plan_update: replace the entire plan (response field, not an action)
           B) current_plan_item: advance the current step index
         """
         # Path A: full plan replacement
@@ -71,7 +71,8 @@ class PlanManager:
             return None
         return (
             "You have failed multiple consecutive times. The current plan may not be working. "
-            "Consider revising the plan by providing a new plan_update with adjusted steps."
+            "Consider revising the plan by providing a new plan_update with adjusted steps "
+            "(plan_update is a response field, not an action)."
         )
 
     def build_exploration_nudge(
@@ -85,5 +86,6 @@ class PlanManager:
             return None
         return (
             "You have been exploring for several steps without a structured plan. "
-            "Consider breaking down the task into clear steps by providing a plan_update."
+            "Consider breaking down the task into clear steps by providing a plan_update "
+            "(a response field, not an action)."
         )
