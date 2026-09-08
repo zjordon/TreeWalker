@@ -22,8 +22,8 @@ from tree_walker.action_shape import (
     normalize_model_output,
     params_of,
 )
-# noqa: F401 —— normalize_model_output 在 _get_next_action 内使用（review8 #8
-# 后 _step 不再直接调用）
+# normalize_model_output 在 _normalize_llm_response 内使用（#176 P0-A 起
+# 传 known_names；_get_next_action 经该 helper 间接调用）
 from tree_walker.agent.actionability import (
     ACTIONABILITY_ACTIONS,
     is_file_input,
@@ -57,6 +57,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _PARAM_VALIDATION_MAX_RETRIES = 2
+
+# 无效动作（无名字/空 action）的澄清消息——外梯（_get_action_with_retry）与
+# 参数校验内梯共用同一措辞（issue #176 P0-B：内梯对无效动作与外梯对称，先
+# 澄清重试而非一次 fallback 死刑）。
+_INVALID_ACTION_CLARIFICATION = (
+    "You forgot to return an action. Please respond with a valid "
+    "action using the agent_response tool, including your evaluation, "
+    "memory, next goal, and action."
+)
 
 # P0 消息分类管理：内部 _type 键标记消息类别（不送 SDK，_trim_messages 边界剥除）。
 # 对齐 browser-use MessageManager 的 state/context/agent_history 分类。
@@ -745,8 +754,9 @@ class StepPipeline:
         # 管线入口归一化（review6 #9 / review7 #6）：必须在校验 / truncate /
         # emit / assistant 消息构造**之前**——truncate 会把裸列表元素提升为
         # 镜像，未归一化形态先到 emit/log 就崩（pydantic str 字段 / str.get）。
-        # client choke point 之后再兜一层（幂等），覆盖注入/自定义 LLM。
-        normalize_model_output(response)
+        # client choke point 之后再兜一层（幂等），覆盖注入/自定义 LLM；
+        # #176 P0-A 起带 known_names（梯子内已归一化，此处二次幂等 no-op）。
+        self._normalize_llm_response(response)
 
         # Hard-cap actions to max_actions_per_step (browser-use service.py:1950-1951).
         # The system prompt and schema maxItems only *tell* the LLM the limit;
@@ -889,6 +899,26 @@ class StepPipeline:
         except Exception as e:
             logger.warning("Failed to save conversation for step %d: %s", self.state.n_steps, e)
 
+    def _normalize_llm_response(self, response: dict[str, Any]) -> dict[str, Any]:
+        """issue #176 P0-A：live 管线对每个 LLM 响应的 registry 感知归一化。
+
+        在 client choke point 归一化（无 registry 依赖，照旧不传 known_names）
+        之上补一层：shape 合法但名字未注册的动作（模型把 agent_response 的
+        响应字段 ``plan_update``/``current_plan_item`` 误发为动作名等）从批次
+        移除并刷新镜像——头部未知名不再把整批拖进「Unknown action」重试梯
+        （兄弟动作陪葬，issue #176 死亡链第 2 环）。``registry.actions`` 恒为
+        全量注册表：page 过滤只影响 schema 暴露、不影响按名查找
+        （``_validate_action_params`` 同源语义，后者保留作背带——注入/旁路
+        LLM 绕过此处时兜底）。非 dict 响应原样透传（交 ``_is_valid_action``
+        判假进澄清梯）。
+        """
+        if not isinstance(response, dict):
+            return response
+        return normalize_model_output(
+            response,
+            known_names=frozenset(self.tools.registry.actions),
+        )
+
     async def _get_action_with_retry(
         self,
         messages: list[dict[str, Any]],
@@ -904,11 +934,13 @@ class StepPipeline:
         logger.debug("Available actions for this step: %s", action_enum)
         logger.debug("Tool schema: %s", json.dumps(self._tool_schema, ensure_ascii=False, indent=2))
 
-        response = await self.llm.get_action(
+        # #176 P0-A：校验前归一化（含 known_names 丢弃 + 镜像刷新）——否则
+        # 头部未注册名的连坐在进 _is_valid_action 之前就已注定
+        response = self._normalize_llm_response(await self.llm.get_action(
             system_prompt=self._system_prompt,
             messages=messages,
             tool_schema=self._tool_schema,
-        )
+        ))
 
         if self._is_valid_action(response):
             return await self._validate_params_or_retry(response, messages)
@@ -917,17 +949,13 @@ class StepPipeline:
         logger.warning("LLM returned empty action, retrying with clarification...")
         retry_messages = list(messages) + [{
             "role": "user",
-            "content": (
-                "You forgot to return an action. Please respond with a valid "
-                "action using the agent_response tool, including your evaluation, "
-                "memory, next goal, and action."
-            ),
+            "content": _INVALID_ACTION_CLARIFICATION,
         }]
-        response = await self.llm.get_action(
+        response = self._normalize_llm_response(await self.llm.get_action(
             system_prompt=self._system_prompt,
             messages=retry_messages,
             tool_schema=self._tool_schema,
-        )
+        ))
 
         if self._is_valid_action(response):
             return await self._validate_params_or_retry(response, messages)
@@ -941,37 +969,61 @@ class StepPipeline:
         response: dict[str, Any],
         original_messages: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        """Validate action params against Pydantic model; retry with error details."""
+        """Validate action params against Pydantic model; retry with error details.
+
+        issue #176 P0-B：重试响应本身无效（无名字动作——死亡链第 3 环）不再
+        一次 fallback 死刑，与外梯对称地附澄清消息再试；澄清与参数重试共用
+        ``_PARAM_VALIDATION_MAX_RETRIES`` 预算（一次 Invalid-params + 一次
+        Invalid-action 封顶），总 LLM 调用次数有界（外梯 2 + 内梯 2）。
+        """
         param_error = self._validate_action_params(response)
         if param_error is None:
             return response
 
         for attempt in range(_PARAM_VALIDATION_MAX_RETRIES):
-            logger.warning(
-                "Invalid params for '%s': %s — retrying (%d/%d)",
-                response["action"]["name"], param_error,
-                attempt + 1, _PARAM_VALIDATION_MAX_RETRIES,
-            )
-            retry_messages = list(original_messages) + [{
-                "role": "user",
-                "content": (
+            if self._is_valid_action(response):
+                logger.warning(
+                    "Invalid params for '%s': %s — retrying (%d/%d)",
+                    name_of(response.get("action")), param_error,
+                    attempt + 1, _PARAM_VALIDATION_MAX_RETRIES,
+                )
+                feedback: str = (
                     f"Your action parameters are invalid: {param_error}. "
                     "Please fix the parameters and respond again with a valid action."
-                ),
+                )
+            else:
+                # P0-B：重试退化成无名字动作——外梯同款澄清（共用 attempt
+                # 预算），而非立即 fallback done
+                logger.warning(
+                    "LLM returned invalid action during param validation retry "
+                    "— clarifying (%d/%d)",
+                    attempt + 1, _PARAM_VALIDATION_MAX_RETRIES,
+                )
+                feedback = _INVALID_ACTION_CLARIFICATION
+            retry_messages = list(original_messages) + [{
+                "role": "user",
+                "content": feedback,
             }]
-            response = await self.llm.get_action(
+            response = self._normalize_llm_response(await self.llm.get_action(
                 system_prompt=self._system_prompt,
                 messages=retry_messages,
                 tool_schema=self._tool_schema,
+            ))
+
+            if self._is_valid_action(response):
+                param_error = self._validate_action_params(response)
+                if param_error is None:
+                    return response
+
+        if not self._is_valid_action(response):
+            # 预算耗尽时最后响应仍是无效动作——此前在循环内一次死刑的位置，
+            # 现在只在澄清重试也失败后才 fallback
+            logger.warning(
+                "LLM still returned invalid action after %d param-validation "
+                "retries — fallback done",
+                _PARAM_VALIDATION_MAX_RETRIES,
             )
-
-            if not self._is_valid_action(response):
-                logger.warning("LLM returned empty action during param validation retry")
-                return _fallback_done_output()
-
-            param_error = self._validate_action_params(response)
-            if param_error is None:
-                return response
+            return _fallback_done_output()
 
         logger.warning(
             "Params still invalid after %d retries: %s — proceeding anyway",
