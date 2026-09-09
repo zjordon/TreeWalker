@@ -2,7 +2,8 @@
 
 Five groups:
   1. TaskSkillLoader — catalog scan / bad-card skip / cache / card_text order
-  2. match_task_skill — null 一等答案 / low 降档 / 未知 slug / 调用失败重试
+  2. match_task_skill — null 一等答案 / low 降档 / 未知 slug / 调用失败重试 /
+     match_kind/task_kind 分级字段归一化（docs/p7/04 §4.2）
   3. build_state_message — [Task Skill] 渲染与位置（[Task] 后、[Domain Skill] 前）
   4. Agent 接线 — _match_task_skill / 默认关 / env 开关
   5. LLMClient.structured_call — tool 强制路径 / text 兜底
@@ -11,6 +12,7 @@ Five groups:
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -295,13 +297,67 @@ class TestMatchTaskSkill:
         assert len(llm.calls) == 2
 
     @pytest.mark.asyncio
+    async def test_match_kind_and_task_kind_parsed(self):
+        # docs/p7/04 §4.2：合法分级字段透传（模板命中 + 读型）
+        llm = FakeMatchLLM(
+            [{"match": "slug-a", "match_kind": "same_template", "task_kind": "read",
+              "confidence": "high", "reason": "same template, other product"}]
+        )
+        m = await match_task_skill("t", _catalog("slug-a"), llm)
+        assert m.slug == "slug-a"
+        assert m.match_kind == "same_template"
+        assert m.task_kind == "read"
+
+    @pytest.mark.asyncio
+    async def test_match_kind_missing_defaults_to_same_task(self):
+        # 缺省 = v2 单档行为（分级是增强不是门控，回放路径零扰动）
+        llm = FakeMatchLLM([{"match": "slug-a", "confidence": "high", "reason": "r"}])
+        m = await match_task_skill("t", _catalog("slug-a"), llm)
+        assert m.match_kind == "same_task"
+        assert m.task_kind is None
+
+    @pytest.mark.asyncio
+    async def test_match_kind_invalid_values_normalized(self):
+        # schema 外值（text 兜底路径不做 schema 校验）→ 白名单归一化回保守缺省
+        llm = FakeMatchLLM(
+            [{"match": "slug-a", "match_kind": "SIMILAR", "task_kind": "query",
+              "confidence": "high", "reason": "r"}]
+        )
+        m = await match_task_skill("t", _catalog("slug-a"), llm)
+        assert m.match_kind == "same_task"
+        assert m.task_kind is None
+
+    @pytest.mark.asyncio
+    async def test_match_kind_case_folded(self):
+        llm = FakeMatchLLM(
+            [{"match": "slug-a", "match_kind": "Same_Template", "task_kind": "READ",
+              "confidence": "medium", "reason": "r"}]
+        )
+        m = await match_task_skill("t", _catalog("slug-a"), llm)
+        assert m.match_kind == "same_template"
+        assert m.task_kind == "read"
+
+    @pytest.mark.asyncio
+    async def test_low_confidence_with_tier_fields_still_downgrades(self):
+        # 新字段不得绕过降档守卫
+        llm = FakeMatchLLM(
+            [{"match": "slug-a", "match_kind": "same_template", "task_kind": "read",
+              "confidence": "low", "reason": "unsure"}]
+        )
+        m = await match_task_skill("t", _catalog("slug-a"), llm)
+        assert m.slug is None
+        assert m.downgraded is True
+
+    @pytest.mark.asyncio
     async def test_prompt_contains_task_and_catalog(self):
         llm = FakeMatchLLM([{"match": None, "confidence": "high", "reason": "r"}])
         await match_task_skill("THE TASK TEXT", _catalog("slug-a"), llm)
         prompt = llm.calls[0]["user_prompt"]
         assert "THE TASK TEXT" in prompt
         assert "`slug-a`" in prompt
-        assert "ESSENTIALLY THE SAME" in prompt
+        # docs/p7/04 §4.1 模板判据锚点：两轴指令 + 实体无关声明
+        assert "SAME OPERATION TEMPLATE" in prompt
+        assert "ENTITY values are parameters" in prompt
         assert "worse than no match" in llm.calls[0]["system_prompt"]
 
 
@@ -317,6 +373,26 @@ class TestBuildTaskSkillText:
         text = build_task_skill_text("my-slug", "")
         assert "PROVEN flow" in text
         assert text.strip() != ""
+
+    def test_same_template_header_swapped(self):
+        # docs/p7/04 §4.3 第二档：实体替换警示头替代 v2 本尊头
+        text = build_task_skill_text("my-slug", "CARD BODY", match_kind="same_template")
+        assert "SAME operation template" in text
+        assert "DIFFERENT instance" in text
+        assert "substituting your task's own entities" in text
+        assert "PROVEN flow" not in text  # v2 本尊头整段换掉
+        assert "CARD BODY" in text
+
+    def test_read_appendix_added_regardless_of_match_kind(self):
+        # 第三档：读型加严段无论本尊/变体都追加（答案固化对回放 parrot 风险最大）
+        for kind in ("same_task", "same_template"):
+            text = build_task_skill_text("my-slug", "", match_kind=kind, task_kind="read")
+            assert "shows the PATH to that" in text, f"match_kind={kind}"
+            assert "Do not report any value" in text, f"match_kind={kind}"
+
+    def test_operate_task_kind_no_appendix(self):
+        text = build_task_skill_text("my-slug", "", task_kind="operate")
+        assert "Do not report any value" not in text
 
 
 # ── 3. build_state_message rendering ────────────────────────────────────
@@ -392,6 +468,47 @@ class TestAgentTaskSkillWiring:
         assert "slug-a" in agent._task_skill_text
         assert "SOP BODY" in agent._task_skill_text
         assert agent._task_skill_slug == "slug-a"  # obs 事件用（step.py SkillActiveEvent）
+
+    @pytest.mark.asyncio
+    async def test_variant_match_uses_tiered_header(self, tmp_path, monkeypatch):
+        # docs/p7/04 §4.4：分级字段透传 build_task_skill_text——模板命中变体
+        # 文本含实体替换警示头 + 读型加严段
+        _write_card(tmp_path, "localhost_7780", "slug-a", sop="SOP BODY")
+        agent = _agent(tmp_path)
+        monkeypatch.setattr(
+            "tree_walker.agent.agent.match_task_skill",
+            AsyncMock(return_value=TaskSkillMatch(
+                slug="slug-a", confidence="high", reason="same template",
+                match_kind="same_template", task_kind="read",
+            )),
+        )
+        await agent._match_task_skill()
+        assert agent._task_skill_text is not None
+        assert "DIFFERENT instance" in agent._task_skill_text  # 模板命中头
+        assert "Do not report any value" in agent._task_skill_text  # 读型加严段
+        assert "SOP BODY" in agent._task_skill_text
+
+    @pytest.mark.asyncio
+    async def test_match_log_carries_tier_fields(self, tmp_path, monkeypatch, caplog):
+        # docs/p7/04 §4.4：S4 日志带 match_kind/task_kind；无命中时 match_kind
+        # 不适用记 null，task_kind（用户任务属性）无论命中与否照记
+        _write_card(tmp_path, "localhost_7780", "slug-a")
+        agent = _agent(tmp_path)
+        monkeypatch.setattr(
+            "tree_walker.agent.agent.match_task_skill",
+            AsyncMock(return_value=TaskSkillMatch(
+                slug=None, confidence="high", reason="no template match", task_kind="read",
+            )),
+        )
+        with caplog.at_level(logging.INFO, logger="tree_walker.agent.agent"):
+            await agent._match_task_skill()
+        record = next(
+            r for r in caplog.records if r.getMessage().startswith("task-skill-match:")
+        )
+        payload = json.loads(record.getMessage().split("task-skill-match: ", 1)[1])
+        assert payload["match"] is None
+        assert payload["match_kind"] is None
+        assert payload["task_kind"] == "read"
 
     @pytest.mark.asyncio
     async def test_blank_task_early_return(self, tmp_path, monkeypatch):
