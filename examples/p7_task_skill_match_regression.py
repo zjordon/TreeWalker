@@ -15,8 +15,9 @@ r"""P7 任务级 skill 匹配离线回归（docs/p7/04 §七 S3，issue #182）�
      （docs/p7/04 §4.5：42 模板 44 卡，命中同模板另一张卡算正确命中）。
 
 调用失败（``TaskSkillMatch.call_failed``——API 异常/超时重试后仍失败）在 harness
-层重试至 3 次——基础设施故障不是匹配语义，不得计入未命中（match_task_skill
-内部只重试一次）。
+层重试至 3 次（match_task_skill 内部只重试一次）；重试穷尽仍失败的**持续失败**
+从命中率统计剔除（分母不含）、metrics 单列 ``call_failed_persistent``、门槛
+不判 PASS——基础设施故障不是匹配语义，不得计入未命中。
 
 用法（TreeWalker 仓库根）：
   uv run python examples/p7_task_skill_match_regression.py --eval-root <evals/webarena>
@@ -139,6 +140,14 @@ async def main() -> int:
 			f"catalog 卡缺 replay 映射: {sorted(unmapped)}——card_template 会 KeyError，"
 			f"先补 config/replay_map.json 再跑"
 		)
+	# 反向校验（review-20260910-3）：replay_map 里的陈旧 slug（不在当前 catalog）会
+	# 抬高 replay total（≠44），门槛永久 FAIL 且难归因
+	stale = set(replay) - {c.slug for c in catalog}
+	if stale:
+		raise SystemExit(
+			f"replay_map 有 catalog 外的陈旧 slug: {sorted(stale)}——replay total 会被抬高，"
+			f"门槛永久 FAIL，先清理 config/replay_map.json 再跑"
+		)
 	replay_ids = set(replay.values())
 	# 卡的模板 = 本尊任务的 intent_template_id（模板等价类，docs/p7/04 §4.5）
 	card_template = {slug: tasks_by_id[tid]["intent_template_id"] for slug, tid in replay.items()}
@@ -178,13 +187,19 @@ async def main() -> int:
 			"match_kind": m.match_kind if m.slug else None,
 			"task_kind": m.task_kind,
 			"downgraded": m.downgraded,
+			"call_failed": m.call_failed,
 			"reason": m.reason,
 			"intent": t["intent"],
 		}
 		rows.append(row)
 
-	replay_rows = [r for r in rows if r["is_replay"]]
-	variant_rows = [r for r in rows if not r["is_replay"]]
+	# 持续调用失败（3 次重试后仍 call_failed）= 基础设施故障，不是匹配语义——
+	# 从命中率统计剔除（分母不含），门槛存在即不判 PASS，metrics 单列显式标注
+	# （review-20260910-3：此前以 slug=None 混入 missed/correct，配额耗尽这类持续
+	# 故障会被误报成全量漏命中，门槛 FAIL 时无法区分归因）
+	failed_rows = [r for r in rows if r["call_failed"]]
+	replay_rows = [r for r in rows if r["is_replay"] and not r["call_failed"]]
+	variant_rows = [r for r in rows if not r["is_replay"] and not r["call_failed"]]
 
 	def _hit(rs):
 		return sum(1 for r in rs if r["matched_slug"])
@@ -207,14 +222,22 @@ async def main() -> int:
 			"cross_template": [
 				r["task_id"] for r in variant_rows if r["matched_slug"] and not r["correct_template"]
 			],
-			"missed": sum(1 for r in variant_rows if not r["matched_slug"]),
+			# 与 replay.missed 同型（task_id 列表）——review-20260910-3：此前 int 计数，
+			# 同名异型坑下游逐例复核脚本
+			"missed": [r["task_id"] for r in variant_rows if not r["matched_slug"]],
+		},
+		"call_failed_persistent": {
+			"count": len(failed_rows),
+			"task_ids": [r["task_id"] for r in failed_rows],
 		},
 		"downgraded": sum(1 for r in rows if r["downgraded"]),
 		# 分级字段分布（docs/p7/04 §4.2 的实证核对）：本尊命中应 mostly same_task，
-		# 变体命中应 mostly same_template——倒挂说明模型没理解分级指令
+		# 变体命中应 mostly same_template——倒挂说明模型没理解分级指令。
+		# 只统计命中行（review-20260910-3：未命中行 match_kind=None，混入会造出
+		# 无法与「模型对命中行返回 null」区分的 None 桶）
 		"match_kind_of_hits": {
-			"replay": _dist(replay_rows, "match_kind"),
-			"variants": _dist(variant_rows, "match_kind"),
+			"replay": _dist([r for r in replay_rows if r["matched_slug"]], "match_kind"),
+			"variants": _dist([r for r in variant_rows if r["matched_slug"]], "match_kind"),
 		},
 		"task_kind": _dist(rows, "task_kind"),
 	}
@@ -245,8 +268,11 @@ async def main() -> int:
 	print(f"泛化集:  命中 {vp['hit']}/{vp['total']}"
 	      f" | 正确模板 {vp['correct']}/{vp['total']}"
 	      f"（{variant_rate:.1%}）"
-	      f" | 跨模板误命中 {len(vp['cross_template'])} | 未命中 {vp['missed']}")
+	      f" | 跨模板误命中 {len(vp['cross_template'])} | 未命中 {len(vp['missed'])}")
 	print(f"降档: {metrics['downgraded']}；命中分级分布: {metrics['match_kind_of_hits']}")
+	if failed_rows:
+		print(f"⚠ 持续调用失败 {len(failed_rows)} 个——基础设施故障已从命中率统计剔除，"
+		      f"门槛不判 PASS: {metrics['call_failed_persistent']['task_ids']}")
 	print(f"零命中模板（有卡且 correct=0）: {len(zero_hit_templates)} 个 -> {zero_hit_templates}")
 	if no_card_templates:
 		print(f"（另有无卡模板 {len(no_card_templates)} 个: {no_card_templates}——变体无从正确命中，不计零命中）")
@@ -273,7 +299,10 @@ async def main() -> int:
 
 	if args.gate:
 		ok = (
-			rp["correct"] == GATE_REPLAY_TOTAL == rp["total"]
+			# 持续失败存在即不判 PASS：变体被剔除会缩小分母 artificially 抬高命中
+			# 率，数据不完整不能过关（review-20260910-3）
+			not failed_rows
+			and rp["correct"] == GATE_REPLAY_TOTAL == rp["total"]
 			and variant_rate >= GATE_VARIANT_RATE
 		)
 		print(f"\n门槛判定: {'PASS' if ok else 'FAIL'}"
