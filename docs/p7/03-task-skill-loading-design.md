@@ -2,6 +2,10 @@
 
 > 状态：**已实施**（S0a/S0b/S1-S4 交付，2026-09-05/06，issue #171 / PR #172 + treeforge #9；
 > 2026-09-06 真机冒烟通过。S5 评测脚本分口径随口径 C 批量评测时做，见 §八）。
+> **修订**：§4.4/§8.2/§九/附录 B 的匹配判据已按两轴模型（实体=参数忽略 / 模板=判据）
+> 升级——见 `docs/p7/04-task-skill-template-matching-plan.md`（issue #182：口径 C 实测
+> 泛化命中率仅 30%，v2 单轴保守判据把模板泛化整个保守掉了）。本节措辞已同步，方案
+> 细节以 04 为准。
 > 前版：`treeforge/docs/task-skill-loading-design.md`（v1，存档保留；评审意见已全部吸收进本版，对照见附录 C）。
 > 关联：ROADMAP P7 改进路线三（任务级 skill 优化，仅产品口径）、TreeForge P4 双产物
 >（`treeforge/docs/p4/p4-implement-plan.md` S6 读取契约）、`src/tree_walker/skills/loader.py`（站点级注入现状）。
@@ -193,14 +197,17 @@ Anthropic tool + `tool_choice` 强制 + 模型未用工具时 text 兜底 + `_tr
   （null），日志照记（含 downgraded 标记）——把「拿不准返回 null」从 prompt 自觉
   变成解析器强制。
 
-### 4.4 误命中防护（误命中比未命中更糟——蓝图原话）
+### 4.4 误命中防护（误命中比未命中更糟——蓝图原话；判据按 docs/p7/04 两轴模型修订）
 
-1. **保守匹配 prompt**（草案全文见附录 B）：只有「本质同一操作」才命中；近邻变体
-   （如「数全部评论」vs「数待审评论」、「按 SKU 查」vs「按名称查」）默认**不命中**；
-   拿不准返回 null。
+1. **模板语义匹配 prompt**（全文见附录 B / docs/p7/04 §4.1）：匹配单元 = 操作模板。
+   **实体差异**（商品名/日期/年份/名次/数值——「把 A 商品下架」vs「把 B 商品下架」）
+   是参数，**命中**；**模板差异**（动作动词 / 对象类型 / 过滤维度 / 输出形态——
+   「按 SKU 查」vs「按名称查」）**不命中**；拿不准返回 null。
+   v2 原版把两类差异笼统塞进「近邻变体不命中」，实测（issue #182）把模板泛化整个
+   保守掉了——泛化命中率仅 30%，13/37 模板变体零命中。
 2. **null 是一等答案**：未命中的代价只是回落探索（现状能力），误命中会带偏流程。
-3. **匹配日志**：每次匹配（命中/未命中/降档都）记结构化日志（S4），评测后复盘误
-   命中率——这是调 prompt 的唯一依据。
+3. **匹配日志**：每次匹配（命中/未命中/降档都）记结构化日志（S4，含 docs/p7/04 的
+   match_kind/task_kind 分级字段），评测后复盘误命中率——这是调 prompt 的唯一依据。
 
 ### 4.5 降级路径（全部等价于「不注入」）
 
@@ -244,7 +251,8 @@ Anthropic tool + `tool_choice` 强制 + 模型未用工具时 text 兜底 + `_tr
   - 评测：口径 C 同任务回放可能测成「阅读理解」——agent 直接 parrot 卡内答案，RPA
     sanity 数字失真（见 §八 caveat）。
   - v1 内缓解（TreeWalker 侧）：注入头声明加一句「卡中具体数值是录制时快照，一律以
-    页面当前读数为准」（附录 B 已更新）。
+    页面当前读数为准」（附录 B 已更新）；docs/p7/04 追加**读型加严段**（task_kind=read
+    时无论本尊/变体：「卡给的是通往答案的路径而非答案本身，禁止报告卡内值」）。
   - ~~遗留（TreeForge 侧，不阻塞本方案）~~：**已随 S0b 交付**（treeforge #9，
     2026-09-06）——蒸馏 prompt 已加「易变结果值不写死、或显式标注为录制时示例」
     规则；存量 44 卡是该规则之前蒸馏的（注入头声明仍兜底），重蒸后新卡生效。
@@ -329,11 +337,13 @@ S5 半天（evals 工作空间，跑口径 C 批量时做）。
    「录过的任务能稳跑」，数字不对外。**caveat（v2）**：受答案固化影响（§六），读型
    任务可能 parrot 卡内答案——此测法只做「录过能跑」的下限 sanity，数字不作为能力
    证明；彻底修掉靠 TreeForge 蒸馏侧的易变值规则（已随 S0b 交付，存量卡重蒸后生效）。
-2. **不相交泛化**（有信息量的数字）：蒸馏任务集 A 与测试任务集 B **不相交**（同站的
-   变体任务，如蒸馏「按数量筛商品/按状态筛订单」，测「按价格筛商品/按日期筛订单」）。
-   衡量任务知识的近邻泛化——若这个数字也好，说明任务级 skill 不止 RPA。**注意**：
-   近邻变体（§4.4 的「不命中」区）在此口径下应判未命中回落探索，即测的是「不误命中
-   + 站点级兜底」，别和口径 C 的命中路径混淆。
+2. **不相交泛化**（有信息量的数字）：蒸馏任务集 A 与测试任务集 B **不相交**。按
+   docs/p7/04 的两轴判据，「变体」须限定为**跨模板**变体（如蒸馏「按数量筛商品」，
+   测「按价格筛商品」——同站不同意图模板）；同模板换实体变体（「按数量筛出 0 库存」
+   vs「按数量筛出 3 库存」）**应命中**模板卡，属命中路径而非本口径。跨模板变体在
+   此口径下应判未命中回落探索，即测的是「不误命中 + 站点级兜底」，别和口径 C 的
+   命中路径混淆。误命中率统计按 `intent_template_id` **模板等价类**（docs/p7/04
+   §4.5——命中同模板另一张卡算正确命中，非误命中）。
 
 配套指标：命中率 / 误命中率 / 漏命中率（从 S4 日志统计）——比 SR 更早暴露检索质量
 问题。
@@ -349,7 +359,7 @@ S5 半天（evals 工作空间，跑口径 C 批量时做）。
 | 匹配调用阻断 agent 启动 | 全异常捕获 + 15s 超时 + API 失败一次重试后降级 null（§4.3/4.5） |
 | 上下文膨胀 | catalog 6k/44 任务一次调用；命中卡 ≤3k chars/步（vs 站点卡 12.3k 已在跑）；总量远小于 DOM 预算 |
 | 卡片过期（站点改版） | v1 靠「指引非脚本」自适应 + 重新蒸馏；不做自动失效 |
-| 近邻任务该不该命中 | v1 严格不命中（回落探索，站点级兜底）；「cousin 档匹配」留作后续实验，先拿日志说话 |
+| 近邻任务该不该命中 | 已裁决（docs/p7/04，issue #182 实测驱动）：实体差异命中 / 模板差异不命中（两轴判据）；分级输出 match_kind + 读型 task_kind 加严 |
 | 多 host 任务 | v1 仅当前 host_key；跨 host 匹配不做（产品场景不支持） |
 | 匹配调用成本 | 每任务一次调用（~3k token 级），可忽略 |
 
@@ -378,36 +388,18 @@ S5 半天（evals 工作空间，跑口径 C 批量时做）。
 }
 ```
 
-## 附录 B：匹配 prompt 草案（v2 微调）与注入头声明
+## 附录 B：匹配 prompt 与分级注入头（判据演进见 docs/p7/04）
 
-匹配走 tool-enforced structured output（§4.3），以下为 prompt 主体（双语任务均适用；
-输出经 `task_match_result` 工具强制返回，无需在 prompt 里祈求 STRICT JSON）：
+匹配走 tool-enforced structured output（§4.3）。prompt 主体**不再在本附录全文维护**
+（v2 原单轴版已被 issue #182 实测否决；现行版本 = docs/p7/04 §4.1 的 v3 定稿版，
+与 `task_matcher.py` 实现逐字一致——两处全文必漂移，唯一真源是代码 + 04）。
 
-```
-You are a task-matching judge. Given a user task and a catalog of recorded task skills,
-decide which recorded task is ESSENTIALLY THE SAME operation as the user task.
+tool schema：`{"match": string|null, "match_kind": "same_task"|"same_template"|null,
+"task_kind": "read"|"operate"|null, "confidence": "high"|"medium"|"low", "reason": string}`；
+解析侧 `confidence=="low"` 一律降档为 null（§4.3）；`match_kind`/`task_kind` 白名单
+归一化 + 保守缺省（docs/p7/04 §4.2：缺省 same_task / None = v2 单档行为）。
 
-Rules:
-- Match ONLY if a recorded task has the same goal on the same kind of target object
-  (e.g. "count products with 0 quantity" matches a card describing exactly that).
-  Surface wording may differ (synonyms, language).
-- "Similar but different" is NOT a match: different filter dimension (by SKU vs by name),
-  different object (orders vs invoices), different output (count vs list vs detail).
-- When in doubt, return null — a wrong match is worse than no match; the agent will
-  explore fine on its own.
-
-User task:
-{task}
-
-Catalog (same site):
-- `slug` — {description} | keywords: {keywords}
-...
-```
-
-tool schema：`{"match": string|null, "confidence": "high"|"medium"|"low", "reason": string}`；
-解析侧 `confidence=="low"` 一律降档为 null（§4.3）。
-
-命中卡注入头声明（置于 `[Task Skill]` 块首；末句为 v2 增补）：
+注入头分级（docs/p7/04 §4.3，置于 `[Task Skill]` 块首）——本尊档 = v2 原文：
 
 ```
 A recorded task matching your current goal was found (slug: {slug}). It describes a
@@ -415,6 +407,25 @@ PROVEN flow for essentially this task — follow it as guidance. The live page i
 source of truth: if any step no longer matches reality, adapt and explore on your own.
 Concrete values in this card (counts, amounts, dates, names) are snapshots from the
 recording session — always re-read the current value from the page.
+```
+
+同模板换实体档（match_kind=same_template）：
+
+```
+A recorded task following the SAME operation template as your current goal was found
+(slug: {slug}). It was recorded for a DIFFERENT instance of this task type: every
+concrete value in it (product names, dates, counts, amounts) belongs to that instance
+and is wrong for your task. Follow its step sequence and navigation path as guidance,
+substituting your task's own entities. The live page is the source of truth: if any
+step no longer matches reality, adapt and explore on your own.
+```
+
+读型加严段（task_kind=read 时无论本尊/变体都追加）：
+
+```
+Your task asks you to READ a fact from the site: this card shows the PATH to that
+fact, never the fact itself. Do not report any value taken from this card — compute
+the answer from the live page.
 ```
 
 ## 附录 C：v1 → v2 修订对照（评审发现 → 设计裁决）

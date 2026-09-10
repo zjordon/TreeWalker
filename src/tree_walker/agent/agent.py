@@ -505,7 +505,7 @@ class Agent(StepPipeline, RerunMixin):
         ``Page.navigate`` 应答可能早于新文档 commit，紧随其后 ``get_current_url``
         会读到旧页 host——用导航目标是从根上消竞态；无初始 URL（web 控制台等
         产品场景）才读当前页。catalog 空 / 无任务文本 / 未命中 / low 降档 /
-        调用失败都不注入（安全降级 = 现状）。命中后组装注入文本（头声明 +
+        调用失败都不注入（安全降级 = 现状）。命中后组装注入文本（分级头 +
         三件套全文）存 ``_task_skill_text``，由 step 每步带进 state message 的
         ``[Task Skill]`` 块。
         """
@@ -519,7 +519,9 @@ class Agent(StepPipeline, RerunMixin):
             return
         match = await match_task_skill(self._safe_task, catalog, self._task_skill_llm)
         # S4 匹配日志（docs/p7/03 §七）：单行 JSON——命中/未命中/降档都记，
-        # catalog_newest_distilled_at 是手工迁移（S0a/S0b 之间）的过期探针。
+        # catalog_newest_distilled_at 是手工迁移（S0a/S0b 之间）的过期探针；
+        # match_kind/task_kind = docs/p7/04 §4.4 分级字段（无命中时 match_kind
+        # 不适用记 null；task_kind 是用户任务属性，无论命中与否照记）。
         logger.info(
             "task-skill-match: %s",
             json.dumps(
@@ -533,6 +535,8 @@ class Agent(StepPipeline, RerunMixin):
                     "confidence": match.confidence,
                     "reason": match.reason,
                     "downgraded": match.downgraded,
+                    "match_kind": match.match_kind if match.slug else None,
+                    "task_kind": match.task_kind,
                 },
                 ensure_ascii=False,
             ),
@@ -544,7 +548,10 @@ class Agent(StepPipeline, RerunMixin):
             return
         self._task_skill_slug = match.slug
         self._task_skill_text = build_task_skill_text(
-            match.slug, self._task_skill_loader.card_text(card)
+            match.slug,
+            self._task_skill_loader.card_text(card),
+            match_kind=match.match_kind,
+            task_kind=match.task_kind,
         )
         logger.info("task-skill hit: slug=%s chars=%d", match.slug, len(self._task_skill_text))
 

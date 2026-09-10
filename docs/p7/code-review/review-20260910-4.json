@@ -1,0 +1,176 @@
+{
+  "status": "complete",
+  "llm": {
+    "model": "glm-5.3"
+  },
+  "message": "Review complete: 0 finding(s) across 6 selected item(s).",
+  "summary": {
+    "files_reviewed": 6,
+    "comments": 0,
+    "total_tokens": 782438,
+    "input_tokens": 760369,
+    "output_tokens": 22069,
+    "cache_read_tokens": 659264,
+    "elapsed": "10m26s"
+  },
+  "tool_calls": {
+    "total": 33,
+    "by_tool": {
+      "code_search": 18,
+      "file_find": 1,
+      "file_read": 14
+    },
+    "failure": 0,
+    "failure_by_tool": {},
+    "failure_details": []
+  },
+  "comments": [],
+  "groups": [
+    {
+      "label": "Task-skill matching feature (p7): matcher logic, agent integration, tests, and regression example",
+      "files": [
+        "src/tree_walker/skills/task_matcher.py",
+        "src/tree_walker/agent/agent.py",
+        "tests/test_task_skill.py",
+        "examples/p7_task_skill_match_regression.py"
+      ]
+    },
+    {
+      "label": "P7 code review documentation",
+      "files": [
+        "docs/p7/code-review/review-20260910-3.json"
+      ]
+    },
+    {
+      "label": "Repository ignore rules",
+      "files": [
+        ".gitignore"
+      ]
+    }
+  ],
+  "session_id": "fa9cdb87-8a9a-4fda-ba25-4ddde5b60b41",
+  "manifest": {
+    "schema_version": "ocr.run-manifest/v1",
+    "run_id": "fa9cdb87-8a9a-4fda-ba25-4ddde5b60b41",
+    "operation": "review",
+    "terminal_state": "complete",
+    "repository": {
+      "identity_sha256": "2868bcfb033292e0d47631dc911d0e36e5dcedaf9e0bcacffe6c4716bb93dfda"
+    },
+    "input": {
+      "mode": "range",
+      "requested_from": "master",
+      "requested_head": "feat/182-task-skill-template-matching",
+      "resolved_base": "8ddd92bb143f75b3176117d4176aecc045fcccc1",
+      "resolved_head": "226849f41b693f6662d88fbec8c233df3e6eb4fa",
+      "exact_range": "8ddd92bb143f75b3176117d4176aecc045fcccc1..226849f41b693f6662d88fbec8c233df3e6eb4fa",
+      "source_artifact_sha256": "324c894caa63753782a1d9254eee4808066bab77f97da12e860d8f75c5c163b7"
+    },
+    "execution": {
+      "ocr_version": "v1.11.7",
+      "model": "glm-5.3",
+      "configured_concurrency": 8,
+      "rule_config_sha256": "ce9e75a06cc5750ff90f027209c5ef79d05afec74b3ac88a5163b1029f589a97",
+      "runtime_config_sha256": "841fe9ad288d2dd9efc84c443193c492ef06b26edf31ff5f5a1b01637fef2b0c"
+    },
+    "coverage": {
+      "selected": [
+        {
+          "item_id": "2f09cae2e2780e5282c60718bffd0642bdb69f5d3c8521946edaac8139591c32",
+          "path": "src/tree_walker/skills/task_matcher.py",
+          "fingerprint": "f1e96d2b6c54f0988524aa82965b08eabecb141ceb63fc5ef28151dd7b58628e"
+        },
+        {
+          "item_id": "4ee117859881ae2cf47dc75925bc986b2e8d2260ce34f04657b06be516e9b0c8",
+          "path": "tests/test_task_skill.py",
+          "fingerprint": "bf4f2725ba9a8752872d1458ab1550323960c8e610ea12b03647cfcd87eb63c7"
+        },
+        {
+          "item_id": "8a52fce9e491f29d4723757e736e1ad064af14771492395fde165a4274a0da36",
+          "path": "examples/p7_task_skill_match_regression.py",
+          "fingerprint": "762f5e7c31e4ef0f943cf2ea21c089605e6799b218a356bd33ddd19d978b6778"
+        },
+        {
+          "item_id": "aee3b1f00d3b8ee155a1c70821fc236c9c1ff7be4dd20f958ed1cf1eb98d7c76",
+          "path": ".gitignore",
+          "fingerprint": "75426a5a94af15883be3a09d93a387ecf9831a7ea3ff7385bb9be9b1115e3e3d"
+        },
+        {
+          "item_id": "eb718f43f104f5bc548aa917b79ff02e386e005c0f8262f44b919e1e5f28caf4",
+          "path": "docs/p7/code-review/review-20260910-3.json",
+          "fingerprint": "ac859298c3fbcfc05b0f4a72d19f7dceeb60df0722da8bf8f69d064c43d72991"
+        },
+        {
+          "item_id": "fb114deba92ef927cdf263ba6759dc0ec2971e3a956aadba7ffe715262074817",
+          "path": "src/tree_walker/agent/agent.py",
+          "fingerprint": "405c2886ef360d6dcde8acffaf75d084e0043cbb584373c8a96678a3e436fd96"
+        }
+      ],
+      "completed": [
+        {
+          "item_id": "2f09cae2e2780e5282c60718bffd0642bdb69f5d3c8521946edaac8139591c32",
+          "path": "src/tree_walker/skills/task_matcher.py",
+          "fingerprint": "f1e96d2b6c54f0988524aa82965b08eabecb141ceb63fc5ef28151dd7b58628e"
+        },
+        {
+          "item_id": "4ee117859881ae2cf47dc75925bc986b2e8d2260ce34f04657b06be516e9b0c8",
+          "path": "tests/test_task_skill.py",
+          "fingerprint": "bf4f2725ba9a8752872d1458ab1550323960c8e610ea12b03647cfcd87eb63c7"
+        },
+        {
+          "item_id": "8a52fce9e491f29d4723757e736e1ad064af14771492395fde165a4274a0da36",
+          "path": "examples/p7_task_skill_match_regression.py",
+          "fingerprint": "762f5e7c31e4ef0f943cf2ea21c089605e6799b218a356bd33ddd19d978b6778"
+        },
+        {
+          "item_id": "aee3b1f00d3b8ee155a1c70821fc236c9c1ff7be4dd20f958ed1cf1eb98d7c76",
+          "path": ".gitignore",
+          "fingerprint": "75426a5a94af15883be3a09d93a387ecf9831a7ea3ff7385bb9be9b1115e3e3d"
+        },
+        {
+          "item_id": "eb718f43f104f5bc548aa917b79ff02e386e005c0f8262f44b919e1e5f28caf4",
+          "path": "docs/p7/code-review/review-20260910-3.json",
+          "fingerprint": "ac859298c3fbcfc05b0f4a72d19f7dceeb60df0722da8bf8f69d064c43d72991"
+        },
+        {
+          "item_id": "fb114deba92ef927cdf263ba6759dc0ec2971e3a956aadba7ffe715262074817",
+          "path": "src/tree_walker/agent/agent.py",
+          "fingerprint": "405c2886ef360d6dcde8acffaf75d084e0043cbb584373c8a96678a3e436fd96"
+        }
+      ],
+      "reused": [],
+      "failed": [],
+      "waived": []
+    },
+    "elapsed_ms": 625661
+  },
+  "retry_report": {
+    "schema_version": "ocr.llm-retry-report/v1",
+    "total_requests": 29,
+    "retried_requests": 0,
+    "total_retries": 0,
+    "recovered_requests": 0,
+    "failed_requests": 1,
+    "cancelled_requests": 0,
+    "requests": [
+      {
+        "logical_request_id": "220b996d93bc9cf29d92be0f170c11f95f5b5f8a78c39b752bd576b3bb9698a3",
+        "provider": "",
+        "model": "glm-5.3",
+        "file_path": "examples/p7_task_skill_match_regression.py,src/tree_walker/agent/agent.py,src/tree_walker/skills/task_matcher.py,tests/test_task_skill.py",
+        "task_type": "plan_task",
+        "request_no": 1,
+        "outcome": "failed",
+        "attempts": [
+          {
+            "attempt": 1,
+            "outcome": "error",
+            "error_class": "timeout",
+            "failure_phase": "context",
+            "duration_to_headers_ms": 300000
+          }
+        ]
+      }
+    ]
+  }
+}

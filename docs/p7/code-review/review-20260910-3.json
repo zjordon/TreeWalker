@@ -1,0 +1,184 @@
+{
+  "status": "failed",
+  "llm": {
+    "model": "glm-5.3"
+  },
+  "message": "Review failed (cancelled): 0 finding(s); 5 of 5 selected item(s) failed.",
+  "summary": {
+    "files_reviewed": 5,
+    "comments": 0,
+    "total_tokens": 0,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "elapsed": "6s"
+  },
+  "tool_calls": {
+    "total": 0,
+    "by_tool": {},
+    "failure": 0,
+    "failure_by_tool": {},
+    "failure_details": []
+  },
+  "comments": [],
+  "groups": [
+    {
+      "label": ".gitignore",
+      "files": [
+        ".gitignore"
+      ]
+    },
+    {
+      "label": "examples/p7_task_skill_match_regression.py",
+      "files": [
+        "examples/p7_task_skill_match_regression.py"
+      ]
+    },
+    {
+      "label": "src/tree_walker/agent/agent.py",
+      "files": [
+        "src/tree_walker/agent/agent.py"
+      ]
+    },
+    {
+      "label": "src/tree_walker/skills/task_matcher.py",
+      "files": [
+        "src/tree_walker/skills/task_matcher.py"
+      ]
+    },
+    {
+      "label": "tests/test_task_skill.py",
+      "files": [
+        "tests/test_task_skill.py"
+      ]
+    }
+  ],
+  "session_id": "1cb3c1cc-0aae-4f2d-9edf-e05655f42ddb",
+  "manifest": {
+    "schema_version": "ocr.run-manifest/v1",
+    "run_id": "1cb3c1cc-0aae-4f2d-9edf-e05655f42ddb",
+    "operation": "review",
+    "terminal_state": "failed",
+    "repository": {
+      "identity_sha256": "2868bcfb033292e0d47631dc911d0e36e5dcedaf9e0bcacffe6c4716bb93dfda"
+    },
+    "input": {
+      "mode": "range",
+      "requested_from": "master",
+      "requested_head": "feat/182-task-skill-template-matching",
+      "resolved_base": "8ddd92bb143f75b3176117d4176aecc045fcccc1",
+      "resolved_head": "6d3f72f5ab5610fc3197e6492a6e44d9f491cf81",
+      "exact_range": "8ddd92bb143f75b3176117d4176aecc045fcccc1..6d3f72f5ab5610fc3197e6492a6e44d9f491cf81",
+      "source_artifact_sha256": "6bf8e7c108225d65fb3a8b6864bbb1fef0460b1f6e61e7a239a0502f749cb4ea"
+    },
+    "execution": {
+      "ocr_version": "v1.11.7",
+      "model": "glm-5.3",
+      "configured_concurrency": 8,
+      "rule_config_sha256": "ce9e75a06cc5750ff90f027209c5ef79d05afec74b3ac88a5163b1029f589a97",
+      "runtime_config_sha256": "841fe9ad288d2dd9efc84c443193c492ef06b26edf31ff5f5a1b01637fef2b0c"
+    },
+    "coverage": {
+      "selected": [
+        {
+          "item_id": "2f09cae2e2780e5282c60718bffd0642bdb69f5d3c8521946edaac8139591c32",
+          "path": "src/tree_walker/skills/task_matcher.py",
+          "fingerprint": "f1e96d2b6c54f0988524aa82965b08eabecb141ceb63fc5ef28151dd7b58628e"
+        },
+        {
+          "item_id": "4ee117859881ae2cf47dc75925bc986b2e8d2260ce34f04657b06be516e9b0c8",
+          "path": "tests/test_task_skill.py",
+          "fingerprint": "bf4f2725ba9a8752872d1458ab1550323960c8e610ea12b03647cfcd87eb63c7"
+        },
+        {
+          "item_id": "8a52fce9e491f29d4723757e736e1ad064af14771492395fde165a4274a0da36",
+          "path": "examples/p7_task_skill_match_regression.py",
+          "fingerprint": "9caec78f41727f5a94d0bdeab054ee46a1a179500292800d3596ca7ef12178a1"
+        },
+        {
+          "item_id": "aee3b1f00d3b8ee155a1c70821fc236c9c1ff7be4dd20f958ed1cf1eb98d7c76",
+          "path": ".gitignore",
+          "fingerprint": "75426a5a94af15883be3a09d93a387ecf9831a7ea3ff7385bb9be9b1115e3e3d"
+        },
+        {
+          "item_id": "fb114deba92ef927cdf263ba6759dc0ec2971e3a956aadba7ffe715262074817",
+          "path": "src/tree_walker/agent/agent.py",
+          "fingerprint": "405c2886ef360d6dcde8acffaf75d084e0043cbb584373c8a96678a3e436fd96"
+        }
+      ],
+      "completed": [],
+      "reused": [],
+      "failed": [
+        {
+          "item_id": "2f09cae2e2780e5282c60718bffd0642bdb69f5d3c8521946edaac8139591c32",
+          "path": "src/tree_walker/skills/task_matcher.py",
+          "fingerprint": "f1e96d2b6c54f0988524aa82965b08eabecb141ceb63fc5ef28151dd7b58628e",
+          "classification": "cancelled",
+          "reason": "review was cancelled"
+        },
+        {
+          "item_id": "4ee117859881ae2cf47dc75925bc986b2e8d2260ce34f04657b06be516e9b0c8",
+          "path": "tests/test_task_skill.py",
+          "fingerprint": "bf4f2725ba9a8752872d1458ab1550323960c8e610ea12b03647cfcd87eb63c7",
+          "classification": "cancelled",
+          "reason": "review was cancelled"
+        },
+        {
+          "item_id": "8a52fce9e491f29d4723757e736e1ad064af14771492395fde165a4274a0da36",
+          "path": "examples/p7_task_skill_match_regression.py",
+          "fingerprint": "9caec78f41727f5a94d0bdeab054ee46a1a179500292800d3596ca7ef12178a1",
+          "classification": "cancelled",
+          "reason": "review was cancelled"
+        },
+        {
+          "item_id": "aee3b1f00d3b8ee155a1c70821fc236c9c1ff7be4dd20f958ed1cf1eb98d7c76",
+          "path": ".gitignore",
+          "fingerprint": "75426a5a94af15883be3a09d93a387ecf9831a7ea3ff7385bb9be9b1115e3e3d",
+          "classification": "cancelled",
+          "reason": "review was cancelled"
+        },
+        {
+          "item_id": "fb114deba92ef927cdf263ba6759dc0ec2971e3a956aadba7ffe715262074817",
+          "path": "src/tree_walker/agent/agent.py",
+          "fingerprint": "405c2886ef360d6dcde8acffaf75d084e0043cbb584373c8a96678a3e436fd96",
+          "classification": "cancelled",
+          "reason": "review was cancelled"
+        }
+      ],
+      "waived": []
+    },
+    "run_failure": {
+      "classification": "cancelled",
+      "reason": "review was cancelled"
+    },
+    "elapsed_ms": 5529
+  },
+  "retry_report": {
+    "schema_version": "ocr.llm-retry-report/v1",
+    "total_requests": 1,
+    "retried_requests": 0,
+    "total_retries": 0,
+    "recovered_requests": 0,
+    "failed_requests": 0,
+    "cancelled_requests": 1,
+    "requests": [
+      {
+        "logical_request_id": "36cc07c501d6ad7afdfd03d0cf45afa8df55dc42f9fd3e089fe80d855cff3de5",
+        "provider": "",
+        "model": "glm-5.3",
+        "file_path": "__grouping__",
+        "task_type": "grouping_task",
+        "request_no": 1,
+        "outcome": "cancelled",
+        "attempts": [
+          {
+            "attempt": 1,
+            "outcome": "error",
+            "error_class": "cancelled",
+            "failure_phase": "context",
+            "duration_to_headers_ms": 4834
+          }
+        ]
+      }
+    ]
+  }
+}
