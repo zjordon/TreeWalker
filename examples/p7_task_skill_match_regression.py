@@ -14,8 +14,9 @@ r"""P7 任务级 skill 匹配离线回归（docs/p7/04 §七 S3，issue #182）�
      卡的模板 = 本尊任务的 intent_template_id——正确性按**模板等价类**判
      （docs/p7/04 §4.5：42 模板 44 卡，命中同模板另一张卡算正确命中）。
 
-调用失败（reason 以 "call failed" 开头）在 harness 层重试至 3 次——基础设施
-故障不是匹配语义，不得计入未命中（match_task_skill 内部只重试一次）。
+调用失败（``TaskSkillMatch.call_failed``——API 异常/超时重试后仍失败）在 harness
+层重试至 3 次——基础设施故障不是匹配语义，不得计入未命中（match_task_skill
+内部只重试一次）。
 
 用法（TreeWalker 仓库根）：
   uv run python examples/p7_task_skill_match_regression.py --eval-root <evals/webarena>
@@ -81,11 +82,11 @@ def load_replay(eval_root: Path, tasks_by_id: dict[int, dict]) -> dict[str, int]
 
 
 async def match_with_retry(task_text: str, catalog, llm, sem: asyncio.Semaphore):
-	"""并发限流跑一次匹配；call-failed 在 harness 层再试 2 次（共 3 次）。"""
+	"""并发限流跑一次匹配；call_failed 在 harness 层再试 2 次（共 3 次）。"""
 	async with sem:
 		for attempt in range(1, 4):
 			m = await match_task_skill(task_text, catalog, llm)
-			if not m.reason.startswith("call failed"):
+			if not m.call_failed:
 				return m
 			logger.warning("call failed (attempt %d/3): %s", attempt, m.reason)
 			await asyncio.sleep(2.0)
@@ -123,6 +124,14 @@ async def main() -> int:
 	tasks = load_tasks(args.eval_root)
 	tasks_by_id = {t["task_id"]: t for t in tasks}
 	replay = load_replay(args.eval_root, tasks_by_id)
+	# fail fast（review-20260910-1）：catalog 里有卡缺 replay 映射的话，card_template
+	# 取值会在 184 次 LLM 调用全部完成后的统计阶段 KeyError——整轮结果报废。
+	unmapped = {c.slug for c in catalog} - set(replay)
+	if unmapped:
+		raise SystemExit(
+			f"catalog 卡缺 replay 映射: {sorted(unmapped)}——card_template 会 KeyError，"
+			f"先补 config/replay_map.json 再跑"
+		)
 	replay_ids = set(replay.values())
 	# 卡的模板 = 本尊任务的 intent_template_id（模板等价类，docs/p7/04 §4.5）
 	card_template = {slug: tasks_by_id[tid]["intent_template_id"] for slug, tid in replay.items()}
@@ -220,12 +229,14 @@ async def main() -> int:
 
 	# ── 报告 ───────────────────────────────────────────────────────────────
 	rp, vp = metrics["replay"], metrics["variants"]
+	# --limit 前缀可能不含变体任务（review-20260910-1：除零丢整轮结果）
+	variant_rate = vp["correct"] / vp["total"] if vp["total"] else 0.0
 	print("\n===== 匹配离线回归结果 =====")
 	print(f"回放集:  正确命中 {rp['correct']}/{rp['total']}"
 	      f"（exact slug {rp['exact_slug']}；漏命中 {len(rp['missed'])}）")
 	print(f"泛化集:  命中 {vp['hit']}/{vp['total']}"
 	      f" | 正确模板 {vp['correct']}/{vp['total']}"
-	      f"（{vp['correct'] / vp['total']:.1%}）"
+	      f"（{variant_rate:.1%}）"
 	      f" | 跨模板误命中 {len(vp['cross_template'])} | 未命中 {vp['missed']}")
 	print(f"降档: {metrics['downgraded']}；命中分级分布: {metrics['match_kind_of_hits']}")
 	print(f"零命中模板（有卡且 correct=0）: {len(zero_hit_templates)} 个 -> {zero_hit_templates}")
@@ -255,7 +266,7 @@ async def main() -> int:
 	if args.gate:
 		ok = (
 			rp["correct"] == GATE_REPLAY_TOTAL == rp["total"]
-			and vp["correct"] / vp["total"] >= GATE_VARIANT_RATE
+			and variant_rate >= GATE_VARIANT_RATE
 		)
 		print(f"\n门槛判定: {'PASS' if ok else 'FAIL'}"
 		      f"（要求 回放 {GATE_REPLAY_TOTAL}/{GATE_REPLAY_TOTAL} + 泛化 ≥{GATE_VARIANT_RATE:.0%}）")

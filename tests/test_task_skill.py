@@ -349,6 +349,34 @@ class TestMatchTaskSkill:
         assert m.downgraded is True
 
     @pytest.mark.asyncio
+    async def test_task_kind_carried_on_no_hit_paths(self):
+        # review-20260910-1：task_kind 是用户任务属性，三条未命中早退路径
+        # （null / 未知 slug / low 降档）都不得丢字段——S4 日志契约「无论命中与否照记」
+        cases = [
+            {"match": None, "task_kind": "read", "confidence": "high", "reason": "no card"},
+            {"match": "ghost", "task_kind": "read", "confidence": "high", "reason": "r"},
+            {"match": "slug-a", "task_kind": "read", "confidence": "low", "reason": "unsure"},
+        ]
+        for payload in cases:
+            llm = FakeMatchLLM([payload])
+            m = await match_task_skill("t", _catalog("slug-a"), llm)
+            assert m.slug is None
+            assert m.task_kind == "read", f"payload={payload}"
+
+    @pytest.mark.asyncio
+    async def test_call_failed_flag_set_only_on_failure(self):
+        # review-20260910-1：机器可读失败契约（离线回归据此重试，别前缀匹配 reason）
+        llm = FakeMatchLLM([RuntimeError("boom"), RuntimeError("boom2")])
+        m = await match_task_skill("t", _catalog("slug-a"), llm)
+        assert m.call_failed is True
+
+        llm2 = FakeMatchLLM(
+            [RuntimeError("transient"), {"match": None, "confidence": "high", "reason": "r"}]
+        )
+        m2 = await match_task_skill("t", _catalog("slug-a"), llm2)
+        assert m2.call_failed is False
+
+    @pytest.mark.asyncio
     async def test_prompt_contains_task_and_catalog(self):
         llm = FakeMatchLLM([{"match": None, "confidence": "high", "reason": "r"}])
         await match_task_skill("THE TASK TEXT", _catalog("slug-a"), llm)

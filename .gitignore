@@ -236,8 +236,8 @@ rerun-history/
 # Run artifacts (regenerable debug/eval outputs; never commit)
 evaluate_output/
 examples/_model_page_view.txt
-# 本地脚本产物（examples/p7_* 默认 --out 落点，如任务级 skill 匹配离线回归）
-out/
+# 本地脚本产物（examples/p7_* 默认 --out 落点，如任务级 skill 匹配离线回归）；锚定仓库根
+/out/
 # TreeForge 蒸馏直装（docs/p7/03 §2.5 形态 A）的运行态 registry——distill --output
 # 指向本仓库根时落在此，卡片（domain-skills/）进 git、registry 不进。
 # 锚定仓库根（/registry/），不匹配任意深度的同名目录。

@@ -85,6 +85,7 @@ _MATCH_OUTPUT_SCHEMA = {
         },
         "match_kind": {
             "type": ["string", "null"],
+            "enum": ["same_task", "same_template", None],
             "description": (
                 "same_task = same template AND same entity values; "
                 "same_template = same template with different entity values; null when no match."
@@ -92,6 +93,7 @@ _MATCH_OUTPUT_SCHEMA = {
         },
         "task_kind": {
             "type": ["string", "null"],
+            "enum": ["read", "operate", None],
             "description": "Whether the user task reads a fact from the site (read) or changes site state (operate).",
         },
         "confidence": {
@@ -149,7 +151,9 @@ class TaskSkillMatch:
     ``match_kind``：``same_task``（同模板同实体=本尊）/ ``same_template``（同模板
     换实体=变体），驱动注入头分级；``task_kind``：``read`` / ``operate`` / None，
     读型触发答案现取加严段。两者保守缺省（same_task / None）——缺失或乱值归一化
-    后与 v2 单档行为一致（docs/p7/04 §4.2）。
+    后与 v2 单档行为一致（docs/p7/04 §4.2）。``call_failed``：API 异常/超时重试后
+    仍失败（基础设施故障，非匹配语义）——离线回归 harness 据此重试，别再前缀匹配
+    reason 文本（review-20260910-1）。
     """
 
     slug: str | None
@@ -158,6 +162,7 @@ class TaskSkillMatch:
     downgraded: bool = False
     match_kind: str = "same_task"
     task_kind: str | None = None
+    call_failed: bool = False
 
 
 def build_task_skill_text(
@@ -214,7 +219,9 @@ async def match_task_skill(
         except Exception as e:
             logger.warning("task-skill match call failed (attempt %d): %s", attempt, e)
             if attempt == 2:
-                return TaskSkillMatch(slug=None, confidence=None, reason=f"call failed: {e}")
+                return TaskSkillMatch(
+                    slug=None, confidence=None, reason=f"call failed: {e}", call_failed=True
+                )
     if not isinstance(result, dict):
         return TaskSkillMatch(slug=None, confidence=None, reason="unparseable output")
 
@@ -232,16 +239,28 @@ async def match_task_skill(
     if task_kind not in ("read", "operate"):
         task_kind = None
     if slug.lower() in _NULL_SLUG_LITERALS:
-        return TaskSkillMatch(slug=None, confidence=confidence, reason=reason)
+        # task_kind 是用户任务属性，未命中路径也照带（agent.py S4 日志契约：
+        # 「无论命中与否照记」——review-20260910-1：此前三条早退路径静默丢字段）。
+        return TaskSkillMatch(
+            slug=None, confidence=confidence, reason=reason, task_kind=task_kind
+        )
     if slug not in known_slugs:
         logger.warning(
             "task-skill: matched slug %r not in catalog — treating as no match", slug
         )
-        return TaskSkillMatch(slug=None, confidence=confidence, reason=f"unknown slug: {slug}")
+        return TaskSkillMatch(
+            slug=None, confidence=confidence, reason=f"unknown slug: {slug}", task_kind=task_kind
+        )
     if confidence not in ("high", "medium"):
         # 白名单而非黑名单：非 high/medium（含 "low"、缺失、数字等 schema 外值——
         # text 兜底路径不做 schema 校验）一律降档为未命中，防绕过降档守卫。
-        return TaskSkillMatch(slug=None, confidence=confidence, reason=reason, downgraded=True)
+        return TaskSkillMatch(
+            slug=None,
+            confidence=confidence,
+            reason=reason,
+            downgraded=True,
+            task_kind=task_kind,
+        )
     return TaskSkillMatch(
         slug=slug,
         confidence=confidence,
