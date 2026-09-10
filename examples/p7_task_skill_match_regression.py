@@ -62,8 +62,12 @@ def load_tasks(eval_root: Path) -> list[dict]:
 		t for t in raw if any(s == "shopping_admin" for s in t.get("sites", []))
 	]
 	for t in tasks:
-		if not t.get("intent") or not t.get("start_url"):
-			raise SystemExit(f"task {t.get('task_id')} 缺 intent/start_url——数据源不对？")
+		# intent_template_id 与另两者同为统计硬依赖（card_template/rows 直接键访问），
+		# 缺失时变体任务会在 184 次调用跑完后才 KeyError——必须 startup 就拦（review-20260910-2）
+		if not t.get("intent") or not t.get("start_url") or "intent_template_id" not in t:
+			raise SystemExit(
+				f"task {t.get('task_id')} 缺 intent/start_url/intent_template_id——数据源不对？"
+			)
 	return tasks
 
 
@@ -83,14 +87,17 @@ def load_replay(eval_root: Path, tasks_by_id: dict[int, dict]) -> dict[str, int]
 
 async def match_with_retry(task_text: str, catalog, llm, sem: asyncio.Semaphore):
 	"""并发限流跑一次匹配；call_failed 在 harness 层再试 2 次（共 3 次）。"""
-	async with sem:
-		for attempt in range(1, 4):
+	for attempt in range(1, 4):
+		# 只在调用本身占并发槽——退避等待期间不占（review-20260910-2：故障突发时
+		# 槽被 sleep 占着会让有效并行度塌到零）
+		async with sem:
 			m = await match_task_skill(task_text, catalog, llm)
-			if not m.call_failed:
-				return m
-			logger.warning("call failed (attempt %d/3): %s", attempt, m.reason)
+		if not m.call_failed:
+			return m
+		logger.warning("call failed (attempt %d/3): %s", attempt, m.reason)
+		if attempt < 3:  # 末次失败直接返回，不空等 2s
 			await asyncio.sleep(2.0)
-		return m  # type: ignore[possibly-undefined]
+	return m  # type: ignore[possibly-undefined]
 
 
 async def main() -> int:
@@ -146,8 +153,9 @@ async def main() -> int:
 	started = time.monotonic()
 	results = await asyncio.gather(*[
 		match_with_retry(
-			# 离线保真：任务文本组装对齐 runner.py:349
-			f"{t['intent']}\n\n起始页: {t['start_url']}" if t["start_url"] else t["intent"],
+			# 离线保真：任务文本组装对齐 runner.py:349（load_tasks 已守 start_url 非空，
+			# 无需再留 fallback 分支——review-20260910-2）
+			f"{t['intent']}\n\n起始页: {t['start_url']}",
 			catalog, matcher_llm, sem,
 		)
 		for t in tasks_to_run
