@@ -1,0 +1,186 @@
+{
+  "status": "complete",
+  "llm": {
+    "model": "glm-5.3"
+  },
+  "message": "Review complete: 0 finding(s) across 10 selected item(s).",
+  "summary": {
+    "files_reviewed": 10,
+    "comments": 0,
+    "total_tokens": 1130471,
+    "input_tokens": 1070737,
+    "output_tokens": 59734,
+    "cache_read_tokens": 864704,
+    "elapsed": "7m44s"
+  },
+  "tool_calls": {
+    "total": 51,
+    "by_tool": {
+      "code_search": 24,
+      "file_read": 25,
+      "file_read_diff": 2
+    },
+    "failure": 0,
+    "failure_by_tool": {},
+    "failure_details": []
+  },
+  "comments": [],
+  "groups": [
+    {
+      "label": "Issue 185 CDP shape fix: core implementation (agent views, browser session, tool actions/models) + debug script",
+      "files": [
+        "examples/debug_issue185_cdp_shape.py",
+        "src/tree_walker/agent/views.py",
+        "src/tree_walker/browser/session.py",
+        "src/tree_walker/tools/actions.py",
+        "src/tree_walker/tools/models.py"
+      ]
+    },
+    {
+      "label": "Tests covering action result semantics, form interaction, read file/grid, and screenshot behavior",
+      "files": [
+        "tests/test_action_result_semantics.py",
+        "tests/test_p7_form_interaction_fixes.py",
+        "tests/test_read_file.py",
+        "tests/test_read_grid.py",
+        "tests/test_screenshot.py"
+      ]
+    }
+  ],
+  "session_id": "eee61494-273b-4444-940a-683ad4e7cc12",
+  "manifest": {
+    "schema_version": "ocr.run-manifest/v1",
+    "run_id": "eee61494-273b-4444-940a-683ad4e7cc12",
+    "operation": "review",
+    "terminal_state": "complete",
+    "repository": {
+      "identity_sha256": "2868bcfb033292e0d47631dc911d0e36e5dcedaf9e0bcacffe6c4716bb93dfda"
+    },
+    "input": {
+      "mode": "range",
+      "requested_from": "master",
+      "requested_head": "fix/185-tool-layer-reliability",
+      "resolved_base": "33c44ce6a64ee1c83dc47585054c6018d5cdba4c",
+      "resolved_head": "e9ef67fc400b9b67a60e9e76423a139d55c633a1",
+      "exact_range": "33c44ce6a64ee1c83dc47585054c6018d5cdba4c..e9ef67fc400b9b67a60e9e76423a139d55c633a1",
+      "source_artifact_sha256": "b61ac3d72a01c8565edef72294422b4c4d6a9e07556071e14d823909a3f2d37a"
+    },
+    "execution": {
+      "ocr_version": "v1.12.0",
+      "model": "glm-5.3",
+      "configured_concurrency": 8,
+      "rule_config_sha256": "e85d22baeb3a9d3f35b254ea1df9f9644e5523ffdc5302939267695650e429c0",
+      "runtime_config_sha256": "841fe9ad288d2dd9efc84c443193c492ef06b26edf31ff5f5a1b01637fef2b0c"
+    },
+    "coverage": {
+      "selected": [
+        {
+          "item_id": "08ee925d19235a3c2742fde5750a80165f6d18054133af1071fffe1df7855249",
+          "path": "tests/test_action_result_semantics.py",
+          "fingerprint": "ae4892fd6b19d7896226e6afa5a96583de65223afdcd25a1cde929ac838c8d8d"
+        },
+        {
+          "item_id": "102ddb85ec832fa28af84cda4c3ddac1e83fd4a836adee089ed2342759711f70",
+          "path": "src/tree_walker/tools/models.py",
+          "fingerprint": "5532710413440bb4e017ec158bb689fdeef0606b6a362e4461bf1c8b28644d9b"
+        },
+        {
+          "item_id": "160e80aaac30a94032dfbe10df91aec3ee2d6f5d87340cde188a302bf3224c70",
+          "path": "tests/test_read_grid.py",
+          "fingerprint": "ff60d07d07478021de18b499f937528108841d5b0f35bee61a0d42f2aab1b1c8"
+        },
+        {
+          "item_id": "2f81937278beb7c84917a7c21aa1333f6c070018c00b458752d7a0c42fb4d980",
+          "path": "tests/test_screenshot.py",
+          "fingerprint": "15f50542a4847b299a9545b68f1290c8ef5b9b05758dae3e4ba9173868f3868f"
+        },
+        {
+          "item_id": "3ced301830bd69c7c311c2e897540d75184ad6c30bd76d84dd1e532fc01e6820",
+          "path": "examples/debug_issue185_cdp_shape.py",
+          "fingerprint": "207aa69f7bf1795e5754afd3574b2b1f526b26030df8ddba28f8716f713ad49a"
+        },
+        {
+          "item_id": "43c14cd781af742131d6635e7ed572d9bb36bb53bdce4a93c25381bc1b2ddc25",
+          "path": "src/tree_walker/agent/views.py",
+          "fingerprint": "bd7b2936175768d5f08ca2fb0d67d97e4bfd61f28994e4b8677d82f986b383f4"
+        },
+        {
+          "item_id": "6d1cd586e9b8ae0df91a1905ca93db387118eed5f0366496514c8e4211c01609",
+          "path": "tests/test_p7_form_interaction_fixes.py",
+          "fingerprint": "9d82b068a887aa166c9bc81f27ac96882823bd8a4c1f1f2e6c56157816e4a0f2"
+        },
+        {
+          "item_id": "74add141f3cd5b1c1da95b093cbc542440086575bced240cd1aa736d8fd4c9f8",
+          "path": "tests/test_read_file.py",
+          "fingerprint": "6630117bae8249e086c5e623d714f1b698f25b86bb08305d8d3ed1d2f33c7a99"
+        },
+        {
+          "item_id": "9648d199d9f92dffd0c60bfea16fe64f3695bbfe963292e7b7fb964cc92c21b1",
+          "path": "src/tree_walker/tools/actions.py",
+          "fingerprint": "bff108432fff0291eac4e567c9fb9a2508672eeaf4c2298807389a846a04fea1"
+        },
+        {
+          "item_id": "9932efe4e9494be618ed91e3e77812ba901e8403cccfa6417c9da7c83e77bfbd",
+          "path": "src/tree_walker/browser/session.py",
+          "fingerprint": "959d61c7fac6cea481a0c79920eb23ea747f3637156150476e0540063fac40e5"
+        }
+      ],
+      "completed": [
+        {
+          "item_id": "08ee925d19235a3c2742fde5750a80165f6d18054133af1071fffe1df7855249",
+          "path": "tests/test_action_result_semantics.py",
+          "fingerprint": "ae4892fd6b19d7896226e6afa5a96583de65223afdcd25a1cde929ac838c8d8d"
+        },
+        {
+          "item_id": "102ddb85ec832fa28af84cda4c3ddac1e83fd4a836adee089ed2342759711f70",
+          "path": "src/tree_walker/tools/models.py",
+          "fingerprint": "5532710413440bb4e017ec158bb689fdeef0606b6a362e4461bf1c8b28644d9b"
+        },
+        {
+          "item_id": "160e80aaac30a94032dfbe10df91aec3ee2d6f5d87340cde188a302bf3224c70",
+          "path": "tests/test_read_grid.py",
+          "fingerprint": "ff60d07d07478021de18b499f937528108841d5b0f35bee61a0d42f2aab1b1c8"
+        },
+        {
+          "item_id": "2f81937278beb7c84917a7c21aa1333f6c070018c00b458752d7a0c42fb4d980",
+          "path": "tests/test_screenshot.py",
+          "fingerprint": "15f50542a4847b299a9545b68f1290c8ef5b9b05758dae3e4ba9173868f3868f"
+        },
+        {
+          "item_id": "3ced301830bd69c7c311c2e897540d75184ad6c30bd76d84dd1e532fc01e6820",
+          "path": "examples/debug_issue185_cdp_shape.py",
+          "fingerprint": "207aa69f7bf1795e5754afd3574b2b1f526b26030df8ddba28f8716f713ad49a"
+        },
+        {
+          "item_id": "43c14cd781af742131d6635e7ed572d9bb36bb53bdce4a93c25381bc1b2ddc25",
+          "path": "src/tree_walker/agent/views.py",
+          "fingerprint": "bd7b2936175768d5f08ca2fb0d67d97e4bfd61f28994e4b8677d82f986b383f4"
+        },
+        {
+          "item_id": "6d1cd586e9b8ae0df91a1905ca93db387118eed5f0366496514c8e4211c01609",
+          "path": "tests/test_p7_form_interaction_fixes.py",
+          "fingerprint": "9d82b068a887aa166c9bc81f27ac96882823bd8a4c1f1f2e6c56157816e4a0f2"
+        },
+        {
+          "item_id": "74add141f3cd5b1c1da95b093cbc542440086575bced240cd1aa736d8fd4c9f8",
+          "path": "tests/test_read_file.py",
+          "fingerprint": "6630117bae8249e086c5e623d714f1b698f25b86bb08305d8d3ed1d2f33c7a99"
+        },
+        {
+          "item_id": "9648d199d9f92dffd0c60bfea16fe64f3695bbfe963292e7b7fb964cc92c21b1",
+          "path": "src/tree_walker/tools/actions.py",
+          "fingerprint": "bff108432fff0291eac4e567c9fb9a2508672eeaf4c2298807389a846a04fea1"
+        },
+        {
+          "item_id": "9932efe4e9494be618ed91e3e77812ba901e8403cccfa6417c9da7c83e77bfbd",
+          "path": "src/tree_walker/browser/session.py",
+          "fingerprint": "959d61c7fac6cea481a0c79920eb23ea747f3637156150476e0540063fac40e5"
+        }
+      ],
+      "reused": [],
+      "failed": [],
+      "waived": []
+    },
+    "elapsed_ms": 464328
+  }
+}
