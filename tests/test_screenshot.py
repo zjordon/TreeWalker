@@ -157,6 +157,19 @@ class TestTakeScreenshotParams:
 		assert data == _base64.b64decode("iVBORw0KGgo=")
 
 	@pytest.mark.asyncio
+	async def test_guard_disabled_transport_timeout_not_misattributed(self):
+		"""review 修正：guard 关闭时从未设置过超时——协程内部（CDP 传输层）抛出的
+		TimeoutError 保持原样上抛，不得渲染成 "timed out after 0s ... raw media"。
+		"""
+		client = _make_mock_cdp_client(
+			capture_side_effect=TimeoutError("transport timed out"),
+		)
+		session = await _start_session(client)
+		session._settings.screenshot_timeout = 0
+		with pytest.raises(TimeoutError):
+			await session.take_screenshot()
+
+	@pytest.mark.asyncio
 	async def test_missing_data_raises_runtime_error(self):
 		client = _make_mock_cdp_client(capture_return={})
 		session = await _start_session(client)

@@ -299,6 +299,48 @@ class TestReadGridGroupCount:
 		result = await Tools().execute("read_grid", {"group_count": "   "}, _FakeBrowser())
 		assert result.error and "group_count must be a non-empty string" in result.error
 
+	@pytest.mark.asyncio
+	async def test_group_count_strips_surrounding_whitespace(self):
+		"""review 修正：" billing_name "（LLM 输出常见）须归一化后正常计数，
+		而非整表落 "(missing)"。"""
+		rows = [
+			{"billing_name": "Emma Davis"},
+			{"billing_name": "Emma Davis"},
+			{"billing_name": "Lisa Green"},
+		]
+		browser = _FakeBrowser(ui_result=_ui_result(rows=rows, total_records=3))
+		result = await Tools().execute("read_grid", {"group_count": " billing_name "}, browser)
+		assert not result.error
+		assert "group_count[billing_name] over 3 rows" in result.extracted_content
+		assert '"Emma Davis": 2' in result.extracted_content
+		assert "(missing)" not in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_group_count_legacy_channel_page_local_note(self):
+		"""review 修正：legacy/dom 不回传 total_records，未读全警示永不触发——
+		须补 page-local 提示，防止单页计数被当全局精确值。"""
+		legacy = {
+			"channel": "legacy_ajax", "namespace": "reviewGrid",
+			"rows": [{"ID": "1"}, {"ID": "1"}, {"ID": "2"}], "rows_returned": 3,
+			"headers": ["ID"],
+			"applied": None, "active_before": None, "partial": False,
+		}
+		browser = _FakeBrowser(evaluate_side_effects=[json.dumps(legacy)])
+		result = await Tools().execute("read_grid", {"group_count": "ID"}, browser)
+		assert not result.error
+		assert '"1": 2' in result.extracted_content
+		assert "page-local counts" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_group_count_uiregistry_full_read_no_page_local_note(self):
+		"""uiregistry 全量读（rows==total）既无未读全警示也无 page-local 提示。"""
+		rows = [{"billing_name": "X"}]
+		browser = _FakeBrowser(ui_result=_ui_result(rows=rows, total_records=1))
+		result = await Tools().execute("read_grid", {"group_count": "billing_name"}, browser)
+		assert not result.error
+		assert "page-local" not in result.extracted_content
+		assert "counted" not in result.extracted_content
+
 
 # ── E：legacy/DOM 不兼容诊断（issue #185 现象④） ──────────────────────────────
 
@@ -324,6 +366,8 @@ class TestReadGridLegacyDiagnostics:
 
 	@pytest.mark.asyncio
 	async def test_zero_rows_with_filters_noted(self):
+		"""review 修正：legacy/dom 从不应用 filters/search——被忽略的条件不可能导致
+		0 行，note 须明说"非 filters 之故"，不得建议 retry without filters。"""
 		legacy = {
 			"channel": "legacy_ajax", "namespace": "reviewGrid",
 			"rows": [], "rows_returned": 0, "headers": ["ID"],
@@ -334,7 +378,34 @@ class TestReadGridLegacyDiagnostics:
 			"read_grid", {"filters": {"status": "pending"}}, browser)
 		assert not result.error
 		assert "0 rows returned" in result.extracted_content
-		assert "does not support" in result.extracted_content
+		assert "NOT" in result.extracted_content and "not the cause" in result.extracted_content
+		assert "retry without filters" not in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_zero_rows_without_filters_stale_response_hint(self):
+		legacy = {
+			"channel": "legacy_ajax", "namespace": "reviewGrid",
+			"rows": [], "rows_returned": 0, "headers": ["ID"],
+			"applied": None, "active_before": None, "partial": False,
+		}
+		browser = _FakeBrowser(evaluate_side_effects=[json.dumps(legacy)])
+		result = await Tools().execute("read_grid", {}, browser)
+		assert not result.error
+		assert "0 rows returned" in result.extracted_content
+		assert "stale/empty response" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_uiregistry_all_empty_rows_from_field_mismatch_noted(self):
+		"""review 修正：主通道 uiregistry 按 data-source 字段名 hasOwnProperty 过滤
+		fields——猜错字段名同样得到全空对象行，须同样给 note（措辞区分字段名体系）。"""
+		browser = _FakeBrowser(ui_result=_ui_result(
+			rows=[{}, {}, {}], total_records=3,
+		))
+		result = await Tools().execute(
+			"read_grid", {"fields": ["no_such_field"]}, browser)
+		assert not result.error
+		assert "came back EMPTY" in result.extracted_content
+		assert "data-source field names" in result.extracted_content
 
 	@pytest.mark.asyncio
 	async def test_healthy_legacy_read_no_diagnostic_note(self):

@@ -569,6 +569,12 @@ return (async function(){
 _NAVIGATE_EMPTY_RETRY_WAIT = 3.0   # 首次发现空 DOM 后等待重查
 _NAVIGATE_EMPTY_RELOAD_WAIT = 5.0  # reload 后等待
 
+# issue #185 review：read_file 截断 footer（~100+ 字符，含 "use offset=N to continue"
+# 续读指针）本身也占 extracted_content 预算——窗口顶满 display_max_chars 时 footer
+# 尾部会被 ActionResult.__str__ 再次切掉（task_64 正是靠该指针续读的多块场景）。
+# 预留固定余量，保证「footer 说展示了多少 = LLM 真看到多少」连 footer 自身也成立。
+_READ_FILE_FOOTER_RESERVE = 160
+
 # 网络错误码 → 触发 "site unavailable" 友好提示（参照 browser-use service.py:544-557）
 _NAVIGATE_NET_ERROR_MARKERS = (
     "ERR_NAME_NOT_RESOLVED",
@@ -2245,13 +2251,17 @@ class Tools:
             return ActionResult(extracted_content=msg, long_term_memory=msg)
         offset = params.get("offset", 0)
         limit = params.get("limit")
-        # issue #185 现象③：窗口必须 ≤ LLM 实际可见上限——ActionResult.__str__
-        # 的 display_max_chars 会静默截断 extracted_content，窗口大于它时 footer
-        # 报 5000 而 LLM 只见 4000，每块尾 1000 字符永远不可见（task_64 tally
-        # 漂移推手）。取 min 保证「footer 说展示了多少 = LLM 真看到多少」。
-        max_chars = min(
-            self._truncation.read_file_max_chars,
-            self._truncation.display_max_chars,
+        # issue #185 现象③（+review footer 预算修正）：窗口必须 ≤ LLM 实际可见上限
+        # ——ActionResult.__str__ 的 display_max_chars 会静默截断 extracted_content，
+        # 窗口大于它时 footer 报 5000 而 LLM 只见 4000，每块尾 1000 字符永远不可见
+        # （task_64 tally 漂移推手）。再减 footer 余量，保证截断时 footer（含
+        # use offset=N 续读指针）完整可见；下限 200 防极小 display 配置。
+        max_chars = max(
+            200,
+            min(
+                self._truncation.read_file_max_chars,
+                self._truncation.display_max_chars,
+            ) - _READ_FILE_FOOTER_RESERVE,
         )
         window = limit if (limit is not None and limit < max_chars) else max_chars
         if offset >= total_chars:
@@ -2608,12 +2618,16 @@ class Tools:
             not isinstance(fields, list) or not all(isinstance(f, str) for f in fields)
         ):
             return ActionResult(error="read_grid failed: fields must be a list of strings.")
-        # D（issue #185 现象②）：group_count 聚合字段守卫
+        # D（issue #185 现象②）：group_count 聚合字段守卫（review 修正：校验判空白
+        # 后还需归一化——" billing_name " 这类带首尾空格的 LLM 输出可通过校验却
+        # 匹配不到任何行，整表落 "(missing)"）。
         group_field = params.get("group_count")
         if group_field is not None and (
             not isinstance(group_field, str) or not group_field.strip()
         ):
             return ActionResult(error="read_grid failed: group_count must be a non-empty string field name.")
+        if isinstance(group_field, str):
+            group_field = group_field.strip()
         fresh = bool(params.get("fresh", True))
 
         payload = {
@@ -2688,10 +2702,14 @@ class Tools:
             notes.append(f"cleared leftover grid state before read: {leftover[:140]}")
         if result.get("partial"):
             notes.append("partial: data was still loading when the read returned — totals may be stale; retry if counts look short")
-        # E（issue #185 现象④）：legacy/DOM 通道"成功但无数据"的两种形态给明确诊断
-        # ——fields 与显示名表头不匹配（逐 cell 被滤成全空对象行）与 0 行（多半是
-        # 通道不支持 filters/search）——agent 免于反复盲试（task_112 step6 形态）。
-        if result.get("channel") in ("legacy_ajax", "dom_table"):
+        # E（issue #185 现象④，+review 修正）：三类"成功但无数据"形态给明确诊断，
+        # agent 免于反复盲试（task_112 step6 形态）。legacy/DOM 通道按显示名表头
+        # 逐 cell 过滤 fields；uiregistry 主通道按 data-source 字段名 hasOwnProperty
+        # 过滤——猜错字段名都会得到 [{} × N] 全空行（review：主通道同样要提示）。
+        # 0 行分支注意语义：legacy/DOM 从不应用 filters/search（被忽略的条件不可能
+        # 导致 0 行），不得建议 "retry without filters"。
+        _channel = result.get("channel")
+        if _channel in ("legacy_ajax", "dom_table"):
             _rows = result.get("rows") or []
             _heads = result.get("headers") or []
             if _rows and all(not r for r in _rows):
@@ -2701,11 +2719,22 @@ class Tools:
                     "channels key rows by display-name headers; retry without fields "
                     "or with the listed header names")
             elif not _rows:
+                if filters or search:
+                    notes.append(
+                        "0 rows returned; note the requested filters/search were NOT "
+                        "applied on this channel, so they are not the cause — verify "
+                        "the grid shows rows on this page or use the UI Filters panel")
+                else:
+                    notes.append(
+                        "0 rows returned; if the grid visibly shows rows, the channel "
+                        "may have parsed a stale/empty response — retry or read via evaluate")
+        elif _channel == "uiregistry":
+            _rows = result.get("rows") or []
+            if _rows and all(not r for r in _rows):
                 notes.append(
-                    "0 rows returned; if the grid visibly shows rows, this channel "
-                    "likely does not support the requested filters/search (legacy: "
-                    "paging/sorting only) — retry without filters or use the UI "
-                    "Filters panel")
+                    f"all {len(_rows)} rows came back EMPTY: requested fields {fields} "
+                    "match none of this grid's data-source field names — retry "
+                    "without fields to see the available keys")
 
         # D：group_count 回显——不受 saved_to 分支影响（rows 落盘时结论仍须可见，
         # 否则大网格读得了数据丢结论）。
@@ -2721,6 +2750,13 @@ class Tools:
             if isinstance(total, int) and total > rows_read:
                 gc_line += (f" — ⚠️ counted {rows_read} of total {total} rows; "
                             "read remaining pages for exact counts")
+            elif result.get("channel") in ("legacy_ajax", "dom_table"):
+                # review 修正：这两条通道不回传 total_records，上面的未读全警示永不
+                # 触发；dom_table 只读当前可见页、legacy 受 pageSize 限制——不标注
+                # 会被当全局精确值（models.py 不再承诺 exact，双保险）。
+                gc_line += (" — ⚠️ page-local counts: this channel returns only the "
+                            "current page/pageSize rows and reports no total; "
+                            "page through or filter per-candidate for exact counts")
             if len(group_counts) == 1 and group_counts[0][0] == "(missing)":
                 gc_line += (" — ⚠️ field not present in returned rows; check the "
                             "field name (legacy/DOM channels use display-name headers)")

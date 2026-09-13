@@ -122,10 +122,10 @@ class TestEvaluateSelfHeal:
 
     @pytest.mark.asyncio
     async def test_runtime_promise_rejection_still_matched_via_text(self):
-        """运行期 promise 拒绝的语义在 text（非 description）——拼接后仍应能匹配。
+        """运行期 promise 拒绝的语义在 text（非 description）——错误消息仍含语义。
 
         真实形态（task_64 step9）：text = "Uncaught (in promise) SyntaxError: ..."
-        该形态无自愈候选，但断言拼接不吞 text 侧语义即可（走原始错误路径）。
+        该形态无自愈候选（不得重跑），错误经 _format_eval_exception 原样上抛。
         """
         bs = _make_session()
         bs.client.send.Runtime.evaluate = AsyncMock(return_value={
@@ -135,6 +135,31 @@ class TestEvaluateSelfHeal:
         })
         with pytest.raises(RuntimeError, match="Unexpected token"):
             await bs.evaluate("fetch('/x').then(r=>r.json())")
+        # 语义在 text 的运行期错误不触发自愈重试
+        assert bs.client.send.Runtime.evaluate.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_runtime_inner_eval_syntax_error_does_not_self_heal(self):
+        """review 修正：代码内部 eval/new Function 抛出的运行期 SyntaxError
+        （description 为 "Uncaught ..." 前缀 + 全量堆栈）不得触发自愈——外层代码
+        可能已有副作用（fetch/点击），重跑不安全。仅编译期形态（description 以
+        "SyntaxError:" 开头）参与自愈匹配。
+        """
+        bs = _make_session()
+        bs.client.send.Runtime.evaluate = AsyncMock(return_value={
+            "exceptionDetails": {
+                "text": "Uncaught",
+                "exception": {
+                    "description": "Uncaught SyntaxError: Illegal return statement\n"
+                                   "    at eval (<anonymous>:1:1)\n"
+                                   "    at <anonymous>:2:1",
+                },
+            },
+        })
+        with pytest.raises(RuntimeError, match="Illegal return statement"):
+            await bs.evaluate("fetch('/x'); eval('return 1')")
+        # 未发生自愈重试（只有首次调用），错误原样上抛
+        assert bs.client.send.Runtime.evaluate.await_count == 1
 
 
 # ── 建议1：数据网格行渲染冻结 kick（session 层） ────────────────────────

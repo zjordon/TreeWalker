@@ -38,11 +38,12 @@ def _seed(path, text: str) -> None:
 
 
 def _max_chars() -> int:
-	"""Effective read window (issue #185 现象③): min(read_file_max_chars,
-	display_max_chars) — the LLM-visible cap ActionResult.__str__ enforces.
-	窗口大于 display 上限时 footer 会谎报展示量（块尾字符静默不可见）。"""
+	"""Effective read window (issue #185 现象③ + review 修正): min(read_file_max_chars,
+	display_max_chars) 再减 footer 余量——截断时 footer（含续读指针）须完整落在
+	ActionResult.__str__ 的 display 截断之内。"""
+	from tree_walker.tools.actions import _READ_FILE_FOOTER_RESERVE
 	t = Tools()._truncation
-	return min(t.read_file_max_chars, t.display_max_chars)
+	return max(200, min(t.read_file_max_chars, t.display_max_chars) - _READ_FILE_FOOTER_RESERVE)
 
 
 # ── Basic read ─────────────────────────────────────────────────────
@@ -150,19 +151,21 @@ class TestReadFileTruncation:
 		assert r.extracted_content == "y" * n
 
 	@pytest.mark.asyncio
-	async def test_window_never_exceeds_display_cap(self, tmp_path):
-		"""issue #185 现象③契约：窗口 ≤ display_max_chars——介于两上限之间的文件
-		必须在 display 上限处截断（footer 诚实），不得按 read_file_max_chars 放行。"""
+	async def test_window_leaves_footer_visible_within_display_cap(self, tmp_path):
+		"""issue #185 现象③契约（review footer 预算修正）：窗口 + footer 整体必须
+		≤ display_max_chars——截断时 footer（含 use offset=N 续读指针）完整可见，
+		不得被 ActionResult.__str__ 再次切掉（task_64 靠该指针做多块续读）。"""
 		t = Tools()._truncation
-		if t.display_max_chars >= t.read_file_max_chars:
-			pytest.skip("display cap >= read cap — min() is the read cap itself")
-		between = t.display_max_chars + 100
-		p = tmp_path / "between.txt"
-		_seed(p, "z" * between)
+		total = t.display_max_chars + 2000  # 必然多块
+		p = tmp_path / "big.txt"
+		_seed(p, "x" * total)
 		r = await _run({"path": str(p)})
 		assert r.error is None
-		assert (f"[...truncated: showing {t.display_max_chars} of {between} chars"
-				in r.extracted_content)
+		# footer 完整可见：truncated 标记 + 续读指针都在
+		assert "[...truncated:" in r.extracted_content
+		assert "to continue]" in r.extracted_content
+		# 整体（窗口 + footer）不超过 display 上限 → __str__ 不会再截断
+		assert len(r.extracted_content) <= t.display_max_chars
 
 	@pytest.mark.asyncio
 	async def test_limit_above_window_still_clamped(self, tmp_path):

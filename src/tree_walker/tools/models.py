@@ -326,11 +326,12 @@ class ReadFileParams(BaseModel):
     offset: int = Field(
         default=0, ge=0,
         description="0-based character offset to start reading at (for paginating files larger "
-        "than read_file_max_chars; pair with the truncation footer's 'use offset=N to continue').",
+        "than the effective read window; pair with the truncation footer's 'use offset=N to continue').",
     )
     limit: int | None = Field(
         default=None, ge=1,
-        description="Max characters to return from this read (default: read_file_max_chars). "
+        description="Max characters to return from this read (default: the effective read "
+        "window = min(read_file_max_chars, LLM display cap) minus a footer reserve). "
         "Use with offset to page through very large files.",
     )
 
@@ -561,13 +562,15 @@ class ReadGridParams(BaseModel):
     group_count: str | None = Field(
         default=None,
         description=(
-            "Field name to aggregate on, e.g. 'billing_name': returns exact per-value "
-            "row counts (computed in Python — exact, no context tallying; the "
-            "decisive tool for count-per-X questions). Works on every channel; "
-            "combines with filters/sorting/paging as usual. Pass fields=[that field] "
-            "to slim the returned rows. If counts come back '(missing)', the field "
-            "name is not present in the rows (legacy/DOM channels use display-name "
-            "headers)."
+            "Field name to aggregate on, e.g. 'billing_name': returns per-value row "
+            "counts computed in Python over the rows this call returned (no context "
+            "tallying; the decisive tool for count-per-X questions). Watch the "
+            "appended warnings — 'counted X of total Y' means page through for exact "
+            "totals; legacy/DOM channels are page-local (current page/pageSize rows "
+            "only, no total reported). Works on every channel. Pass fields=[that "
+            "field] to slim the returned rows. If counts come back '(missing)', the "
+            "field name is not present in the rows (legacy/DOM channels use "
+            "display-name headers)."
         ),
     )
 
