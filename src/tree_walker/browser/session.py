@@ -2046,6 +2046,27 @@ class BrowserSession:
                 result = await asyncio.wait_for(coro, timeout=timeout)
             else:
                 result = await coro
+        except TimeoutError as e:
+            # issue #185 现象⑤（+review 修正）：asyncio.TimeoutError（3.11+ 即内建
+            # TimeoutError，OSError 子类——必须放在 except Exception 之前）的
+            # str() 是空串，不加这层时日志/ActionResult/LLM 三层只见
+            # "Screenshot failed: "（task_374 三连 10.00s 空消息，为止损烧 6 步）。
+            # 仅在 guard 开启（wait_for 分支）时才归因为等帧超时——裸媒体文档
+            # （image/video 无合成器新帧）与最小化/遮挡窗口（P6 screencast 零帧
+            # 同因）是两种已知成因，文案给出成因与出路；guard 关闭
+            # （screenshot_timeout≤0 从未设置超时）或协程内部（CDP 传输层）抛出
+            # 的 TimeoutError 保持原样上抛，不得渲染成 "timed out after 0s"。
+            if timeout and timeout > 0:
+                msg = (
+                    f"timed out after {timeout}s waiting for a frame — raw media pages "
+                    "(image/video URLs have no page DOM to screenshot) and minimized/"
+                    "occluded windows both cause this; navigate to an HTML page wrapping "
+                    "the media, or report/save the media URL instead of screenshotting"
+                )
+                logger.warning("Page.captureScreenshot failed: %s", msg)
+                raise RuntimeError(msg) from e
+            logger.warning("Page.captureScreenshot failed: TimeoutError (guard disabled)")
+            raise
         except Exception as e:
             logger.warning("Page.captureScreenshot failed: %s", e)
             raise
@@ -3581,7 +3602,19 @@ return (async function(){
             )
         if result.get("exceptionDetails"):
             exc = result["exceptionDetails"]
-            err_text = str(exc.get("text", ""))
+            # issue #185 根因A + review 修正：编译期 SyntaxError 的 text 恒为
+            # "Uncaught"，description 形如 "SyntaxError: ..."（无 Uncaught 前缀、无
+            # 堆栈——examples/debug_issue185_cdp_shape.py 于 Chrome 152 实测）。仅该
+            # 形态进入自愈/截断提示的匹配文本；运行期异常（含代码内部 eval/
+            # new Function 抛出的 SyntaxError——description 为 "Uncaught ..." 前缀
+            # + 全量堆栈；promise 拒绝的语义在 text）混入匹配会误触发自愈：把可能
+            # 已有副作用（fetch/点击）的外层代码包 IIFE 重跑，打破"语法错误无副
+            # 作用，试错安全"的前提。错误语义的上抛不受影响（_format_eval_exception
+            # 直接读原始 exceptionDetails，不经过 err_text）。
+            _text = str(exc.get("text", ""))
+            _desc = str(exc.get("exception", {}).get("description") or "")
+            compile_time = _text == "Uncaught" and _desc.startswith("SyntaxError:")
+            err_text = f"{_text} {_desc}" if compile_time else ""
             # P7 form_interaction 建议5：已知 SyntaxError 的确定性自愈（仅无输入路径——
             # args/elements 模式代码在函数体内，裸 return 合法，语法错误形态不同）。
             # 候选按序试跑（语法错误无副作用）；全部失败则抛原错误（附截断提示）。

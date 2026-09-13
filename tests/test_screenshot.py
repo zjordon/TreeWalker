@@ -110,8 +110,10 @@ class TestTakeScreenshotParams:
 
 	@pytest.mark.asyncio
 	async def test_hanging_capture_times_out(self):
-		"""§1.7 预案（阶段二 e2e 实测命中）：captureScreenshot 等不到帧无限挂 →
-		screenshot_timeout 单请求超时抛 TimeoutError（get_state 兜 None 不挂步）。"""
+		"""§1.7 预案 + issue #185 现象⑤：captureScreenshot 等不到帧无限挂 →
+		screenshot_timeout 超时抛**满信息** RuntimeError（裸 TimeoutError 的
+		str() 是空串——日志/ActionResult/LLM 三层只见 "Screenshot failed: "）。
+		"""
 		import asyncio as _asyncio
 
 		async def hang(*args, **kwargs):
@@ -120,8 +122,28 @@ class TestTakeScreenshotParams:
 		client = _make_mock_cdp_client(capture_side_effect=hang)
 		session = await _start_session(client)
 		session._settings.screenshot_timeout = 0.05
-		with pytest.raises(_asyncio.TimeoutError):
+		with pytest.raises(RuntimeError) as ei:
 			await session.take_screenshot()
+		# 两种成因（裸媒体页 / 最小化遮挡）与出路都必须出现在文案里
+		assert "raw media pages" in str(ei.value)
+		assert "minimized" in str(ei.value)
+		assert "timed out after 0.05s" in str(ei.value)
+
+	@pytest.mark.asyncio
+	async def test_action_layer_receives_full_message_on_timeout(self):
+		"""_action_screenshot 对超时拿到的也是满信息 error（非空串）。"""
+		import asyncio as _asyncio
+
+		async def hang(*args, **kwargs):
+			await _asyncio.sleep(999)
+
+		client = _make_mock_cdp_client(capture_side_effect=hang)
+		session = await _start_session(client)
+		session._settings.screenshot_timeout = 0.05
+		result = await Tools().execute("screenshot", {}, session)
+		assert result.error is not None
+		assert "Screenshot failed" in result.error
+		assert "raw media pages" in result.error
 
 	@pytest.mark.asyncio
 	async def test_timeout_zero_disables_guard(self):
@@ -133,6 +155,19 @@ class TestTakeScreenshotParams:
 		session._settings.screenshot_timeout = 0
 		data = await session.take_screenshot()
 		assert data == _base64.b64decode("iVBORw0KGgo=")
+
+	@pytest.mark.asyncio
+	async def test_guard_disabled_transport_timeout_not_misattributed(self):
+		"""review 修正：guard 关闭时从未设置过超时——协程内部（CDP 传输层）抛出的
+		TimeoutError 保持原样上抛，不得渲染成 "timed out after 0s ... raw media"。
+		"""
+		client = _make_mock_cdp_client(
+			capture_side_effect=TimeoutError("transport timed out"),
+		)
+		session = await _start_session(client)
+		session._settings.screenshot_timeout = 0
+		with pytest.raises(TimeoutError):
+			await session.take_screenshot()
 
 	@pytest.mark.asyncio
 	async def test_missing_data_raises_runtime_error(self):

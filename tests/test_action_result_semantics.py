@@ -56,3 +56,17 @@ class TestActionResultSuccessSemantics:
     def test_str_shows_extracted(self):
         r = ActionResult(extracted_content="data")
         assert "EXTRACTED: data" in str(r)
+
+    def test_str_marks_display_truncation_when_over_cap(self):
+        """issue #185 现象③：extracted_content 超过 display_max_chars 时必须带
+        显式截断标记——静默截断曾让 read_file 每块尾 1000 字符对 LLM 永不可见。"""
+        cap = ActionResult.display_max_chars
+        r = ActionResult(extracted_content="a" * (cap + 10))
+        s = str(r)
+        assert f"showing {cap} of {cap + 10} chars" in s
+        assert "[...display truncated" in s
+
+    def test_str_no_marker_when_within_cap(self):
+        cap = ActionResult.display_max_chars
+        r = ActionResult(extracted_content="a" * cap)  # 恰好等于上限：不截断
+        assert "[...display truncated" not in str(r)

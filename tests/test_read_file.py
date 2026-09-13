@@ -38,8 +38,12 @@ def _seed(path, text: str) -> None:
 
 
 def _max_chars() -> int:
-	"""Read the configured truncation threshold (default 5000, env-overridable)."""
-	return Tools()._truncation.read_file_max_chars
+	"""Effective read window (issue #185 现象③ + review 修正): min(read_file_max_chars,
+	display_max_chars) 再减 footer 余量——截断时 footer（含续读指针）须完整落在
+	ActionResult.__str__ 的 display 截断之内。"""
+	from tree_walker.tools.actions import _READ_FILE_FOOTER_RESERVE
+	t = Tools()._truncation
+	return max(200, min(t.read_file_max_chars, t.display_max_chars) - _READ_FILE_FOOTER_RESERVE)
 
 
 # ── Basic read ─────────────────────────────────────────────────────
@@ -145,6 +149,34 @@ class TestReadFileTruncation:
 		assert "[...truncated]" not in r.extracted_content
 		assert "truncated" not in r.long_term_memory
 		assert r.extracted_content == "y" * n
+
+	@pytest.mark.asyncio
+	async def test_window_leaves_footer_visible_within_display_cap(self, tmp_path):
+		"""issue #185 现象③契约（review footer 预算修正）：窗口 + footer 整体必须
+		≤ display_max_chars——截断时 footer（含 use offset=N 续读指针）完整可见，
+		不得被 ActionResult.__str__ 再次切掉（task_64 靠该指针做多块续读）。"""
+		t = Tools()._truncation
+		total = t.display_max_chars + 2000  # 必然多块
+		p = tmp_path / "big.txt"
+		_seed(p, "x" * total)
+		r = await _run({"path": str(p)})
+		assert r.error is None
+		# footer 完整可见：truncated 标记 + 续读指针都在
+		assert "[...truncated:" in r.extracted_content
+		assert "to continue]" in r.extracted_content
+		# 整体（窗口 + footer）不超过 display 上限 → __str__ 不会再截断
+		assert len(r.extracted_content) <= t.display_max_chars
+
+	@pytest.mark.asyncio
+	async def test_limit_above_window_still_clamped(self, tmp_path):
+		"""显式 limit 超过有效窗口 → 仍钳到窗口（task_64 step6 实发 limit=6500）。"""
+		n = _max_chars()
+		p = tmp_path / "big.txt"
+		_seed(p, "x" * (n + 500))
+		r = await _run({"path": str(p), "limit": n + 10_000})
+		assert r.error is None
+		assert r.extracted_content.startswith("x" * n)
+		assert f"use offset={n} to continue" in r.extracted_content
 
 
 # ── Empty file soft-miss (corrects the "OK" ambiguity) ─────────────
