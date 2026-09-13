@@ -120,12 +120,24 @@ class TestStep1CreateSimplifiedTree:
 		assert result is not None
 		assert result.original_node.node_value == 'Hello World'
 
-	def test_text_node_single_char_skipped(self):
-		"""Text 'x' (len 1 after strip) -> None."""
-		text_node = _make_text_node('x')
-		serializer = DOMTreeSerializer(root_node=_make_node(tag='body'))
-		result = serializer._create_simplified_tree(text_node)
-		assert result is None
+	def test_text_node_single_char_alnum_kept(self):
+		"""len==1 的字母数字文本保留（dom-snapshot v0.1.1 修复，dom-snapshot#1）。
+
+		个位数表格数值（qty/计数列）不再被 len>1 过滤器误杀——'$' 等符号位
+		单独出现仍属装饰符走下一用例。"""
+		for s in ("4", "7", "x", "男"):
+			text_node = _make_text_node(s)
+			serializer = DOMTreeSerializer(root_node=_make_node(tag='body'))
+			result = serializer._create_simplified_tree(text_node)
+			assert result is not None, f"{s!r} 应保留"
+			assert result.original_node.node_value == s
+
+	def test_text_node_single_char_decorative_skipped(self):
+		"""len==1 的装饰符（•/|/· 等，isalnum 为 False）仍滤——噪声过滤意图不破。"""
+		for s in ("•", "|", "·", "-", "$", "。"):
+			text_node = _make_text_node(s)
+			serializer = DOMTreeSerializer(root_node=_make_node(tag='body'))
+			assert serializer._create_simplified_tree(text_node) is None, f"{s!r} 应过滤"
 
 	def test_forced_visibility_aria(self):
 		"""Invisible element with aria-label attribute -> preserved via forced visibility."""
