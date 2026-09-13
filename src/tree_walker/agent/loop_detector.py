@@ -157,3 +157,67 @@ class ActionLoopDetector:
         if messages:
             return "\n\n".join(messages)
         return None
+
+
+class FailureStreakTracker:
+    """issue #186 现象①：同动作跨步连败跟踪——失败感知的止损 nudge 源。
+
+    与 ``ActionLoopDetector`` 互补而非替代：后者成功无关（repetition 阈值 ≥5
+    是为容忍翻页类正当重复），这里只看失败——失败是强得多的信号，阈值可以很低
+    （2）。task_374 形态（4 次相同参数 screenshot 失败 + 原地发明 document.write
+    workaround）两层既有机制全空转：``consecutive_failures`` 多动作步失败不计且
+    被重置，loop detector 4 < 5 且页面指纹在变。
+
+    语义：per-action-name 独立计数，该动作成功即清零（含通知状态）；
+    ``done`` 豁免（失败自进澄清梯）。通知去抖：每档只报一次——streak 2 首报、
+    3 不重报、4 升级报、5+ 不重报；streak 冻结（agent 转做别的）时不重复注入。
+    """
+
+    NUDGE_AT = 2
+    ESCALATE_AT = 4
+    _EXEMPT = frozenset({"done"})
+
+    def __init__(self) -> None:
+        self._streaks: dict[str, int] = {}
+        self._notified_at: dict[str, int] = {}
+
+    def record(self, name: str, failed: bool) -> None:
+        """Record one executed action's outcome; success clears that action's streak."""
+        if name in self._EXEMPT:
+            return
+        if failed:
+            self._streaks[name] = self._streaks.get(name, 0) + 1
+        else:
+            self._streaks.pop(name, None)
+            self._notified_at.pop(name, None)
+
+    def nudge(self) -> str | None:
+        """Return the stop-loss nudge for the worst active streak, or None."""
+        if not self._streaks:
+            return None
+        name, streak = max(self._streaks.items(), key=lambda kv: kv[1])
+        if streak < self.NUDGE_AT:
+            return None
+        notified = self._notified_at.get(name, 0)
+        # 去抖：2 首报（notified<2），3 不重报（notified>=2 且 streak<4），
+        # 4 升级报（notified<4 且 streak>=4），5+ 不重报（notified>=4）
+        if notified >= self.ESCALATE_AT:
+            return None
+        if notified >= self.NUDGE_AT and streak < self.ESCALATE_AT:
+            return None
+        self._notified_at[name] = streak
+        if streak >= self.ESCALATE_AT:
+            return (
+                f"⚠️ You have failed '{name}' {streak} times in a row. "
+                "Strongly consider declaring this sub-goal unreachable: complete "
+                "or verify the task's actual deliverable, or finish with an honest "
+                "partial result (done with success=false, describing what was "
+                "accomplished and what is missing)."
+            )
+        return (
+            f"⚠️ You have failed '{name}' {streak} times in a row. Stop retrying "
+            "or inventing workarounds for this approach. Re-read the original "
+            "task and switch to a different approach that directly advances the "
+            "task's final goal — also ask whether the failing sub-goal is "
+            "required by the task at all."
+        )

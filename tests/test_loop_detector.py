@@ -300,3 +300,91 @@ class TestLoopDetectorWindow:
             d.record_action("click", {"index": 100 + i})
         assert d.max_repetition_count == 1
         assert d.get_nudge_message() is None
+
+
+# ── issue #186 现象①：FailureStreakTracker（失败感知连败止损） ────────────────
+
+
+class TestFailureStreakTracker:
+    """跨步 per-action 连败计数：多动作步失败也计、成功清零、done 豁免、nudge 去抖分档。"""
+
+    def test_below_threshold_no_nudge(self):
+        from tree_walker.agent.loop_detector import FailureStreakTracker
+        t = FailureStreakTracker()
+        t.record("screenshot", failed=True)
+        assert t.nudge() is None  # streak=1 < 2
+
+    def test_two_consecutive_failures_nudge_level1(self):
+        from tree_walker.agent.loop_detector import FailureStreakTracker
+        t = FailureStreakTracker()
+        t.record("screenshot", failed=True)
+        t.record("screenshot", failed=True)
+        msg = t.nudge()
+        assert msg is not None
+        assert "failed 'screenshot' 2 times" in msg
+        assert "Re-read the original task" in msg  # 止损+回归目标文案
+
+    def test_third_failure_same_tier_no_renotify(self):
+        from tree_walker.agent.loop_detector import FailureStreakTracker
+        t = FailureStreakTracker()
+        for _ in range(3):
+            t.record("screenshot", failed=True)
+        assert t.nudge() is not None  # streak=2 首报
+        assert t.nudge() is None  # streak=3 同档不重报
+
+    def test_fourth_failure_escalates_once(self):
+        from tree_walker.agent.loop_detector import FailureStreakTracker
+        t = FailureStreakTracker()
+        for _ in range(4):
+            t.record("evaluate", failed=True)
+        msg = t.nudge()
+        assert msg is not None
+        assert "4 times" in msg
+        assert "honest partial result" in msg  # 升级措辞：诚实部分结果出路
+        assert t.nudge() is None  # 5+ 不重报
+        for _ in range(3):
+            t.record("evaluate", failed=True)
+            assert t.nudge() is None  # streak 冻结在高档位不再注入
+
+    def test_success_clears_streak_and_notification_state(self):
+        from tree_walker.agent.loop_detector import FailureStreakTracker
+        t = FailureStreakTracker()
+        t.record("screenshot", failed=True)
+        t.record("screenshot", failed=True)
+        assert t.nudge() is not None
+        t.record("screenshot", failed=False)  # 成功清零（含通知状态）
+        assert t.nudge() is None
+        t.record("screenshot", failed=True)
+        t.record("screenshot", failed=True)  # 重新连败 2 → 再报
+        assert t.nudge() is not None
+
+    def test_done_exempt(self):
+        from tree_walker.agent.loop_detector import FailureStreakTracker
+        t = FailureStreakTracker()
+        for _ in range(5):
+            t.record("done", failed=True)
+        assert t.nudge() is None
+
+    def test_per_action_name_independent(self):
+        from tree_walker.agent.loop_detector import FailureStreakTracker
+        t = FailureStreakTracker()
+        t.record("screenshot", failed=True)
+        t.record("evaluate", failed=True)  # 不同动作互不清零
+        t.record("screenshot", failed=True)  # screenshot streak=2
+        msg = t.nudge()
+        assert msg is not None and "'screenshot'" in msg
+        t.record("screenshot", failed=False)  # 清 screenshot
+        t.record("evaluate", failed=True)  # evaluate streak=2
+        msg = t.nudge()
+        assert msg is not None and "'evaluate'" in msg
+
+    def test_task374_shape_multi_action_step_failures_counted(self):
+        """task_374 形态：[close_tab OK, screenshot 失败] 步 + 单独 screenshot 失败步
+        ——consecutive_failures 对这种不计且被重置；这里必须第 2 次失败即触发。"""
+        from tree_walker.agent.loop_detector import FailureStreakTracker
+        t = FailureStreakTracker()
+        t.record("close_tab", failed=False)  # 同步成功动作
+        t.record("screenshot", failed=True)  # 同步失败动作（step 7）
+        assert t.nudge() is None
+        t.record("screenshot", failed=True)  # 下一单独失败步（step 8）
+        assert t.nudge() is not None

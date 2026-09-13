@@ -595,7 +595,10 @@ class DoneParams(BaseModel):
             "Whether the task was completed successfully. Set to False if any "
             "stated requirement was unmet, the page did not contain the expected "
             "data, or a step could not be verified. Leave True only when every "
-            "requirement was directly confirmed this session."
+            "requirement was directly confirmed this session. If any part of "
+            "your data is incomplete or still marked uncertain — a value with "
+            "`?`, an unread gap, a partial tally — verify it first or set "
+            "success=False."
         ),
     )
     files_to_display: list[str] = Field(

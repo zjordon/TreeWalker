@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import time
 import traceback
 import uuid
@@ -46,7 +47,7 @@ from tree_walker.prompts.system_prompt import build_state_blocks, build_state_me
 
 if TYPE_CHECKING:
     from tree_walker.config import TruncationSettings
-    from tree_walker.agent.loop_detector import ActionLoopDetector
+    from tree_walker.agent.loop_detector import ActionLoopDetector, FailureStreakTracker
     from tree_walker.agent.message_compactor import MessageCompactor
     from tree_walker.agent.plan_manager import PlanManager
     from tree_walker.browser.session import BrowserSession
@@ -142,6 +143,10 @@ class StepPipeline:
     _system_prompt: str
     _tool_schema: dict[str, Any]
     loop_detector: ActionLoopDetector
+    # issue #186 现象①：失败感知连败跟踪（agent.py 实例化，见 FailureStreakTracker）
+    failure_streak: FailureStreakTracker
+    # issue #186 现象②：done(success=True) 不确定标记门禁开关（AGENT_DONE_GATE）
+    _enable_done_gate: bool
     _compactor: MessageCompactor | None
     plan_manager: PlanManager | None
     _enable_planning: bool
@@ -321,6 +326,12 @@ class StepPipeline:
                 self.loop_detector.max_repetition_count,
                 self.loop_detector.consecutive_stagnant_pages,
             )
+        # issue #186 现象①：连败止损 nudge（失败感知，阈值 2/4 分级带去抖）——与
+        # loop nudge 同位并入；state message 每步重建，天然自清。
+        streak_nudge = self.failure_streak.nudge()
+        if streak_nudge:
+            logger.info("Failure-streak nudge injected: %s", streak_nudge[:100])
+            nudge = "\n\n".join(x for x in (nudge, streak_nudge) if x)
 
         # 4b. Check for new downloads
         download_notice: str | None = None
@@ -943,7 +954,10 @@ class StepPipeline:
         ))
 
         if self._is_valid_action(response):
-            return await self._validate_params_or_retry(response, messages)
+            # issue #186 现象②：形状校验通过的响应过一次 done 完整性门禁
+            #（只对 done+success=True 生效，其余原样穿透）
+            return await self._gate_uncertain_success_done(
+                await self._validate_params_or_retry(response, messages), messages)
 
         # Retry: append clarification message
         logger.warning("LLM returned empty action, retrying with clarification...")
@@ -958,11 +972,76 @@ class StepPipeline:
         ))
 
         if self._is_valid_action(response):
-            return await self._validate_params_or_retry(response, messages)
+            return await self._gate_uncertain_success_done(
+                await self._validate_params_or_retry(response, messages), messages)
 
         # Fallback: insert safe done action
         logger.warning("LLM still returned empty action after retry, using fallback done")
         return _fallback_done_output()
+
+    async def _gate_uncertain_success_done(
+        self,
+        response: dict[str, Any],
+        messages: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """issue #186 现象②：done(success=True) 携带未消解不确定标记时的步内门禁。
+
+        task_64 形态：step16 memory 明写 ``Emma Davis=1?`` + 60 行未读缺口，
+        问号无新证据蒸发后仍 done(success=True) 收题（DB 真值该名字恰好是被
+        漏计的那个）。门禁只把 agent 自己写下的疑虑当真：
+
+        - 只拦 ``success`` 为 True 的 done（缺省=True 一并拦）；``success=False``
+          的诚实收题必须畅通；honest-done（带外标记）跳过；
+        - 每 run 封顶 ``_DONE_GATE_MAX_PER_RUN`` 次（``AgentState.done_gate_uses``
+          计数），单次调用只重试一次——重试响应仍带标记则放行（agent 坚持）；
+        - 重试响应过一次 ``_validate_action_params``（纯形状校验，不再进 LLM
+          梯）；无效或无动作则放行原响应。
+        """
+        action = response.get("action") or {}
+        if str(name_of(action) or "") != "done":
+            return response
+        if is_honest_failure_action(action):
+            return response
+        params = params_of(action)
+        if params.get("success", True) is not True:
+            return response
+        if not getattr(self, "_enable_done_gate", True):
+            return response
+        if self.state.done_gate_uses >= _DONE_GATE_MAX_PER_RUN:
+            return response
+        hits = scan_uncertainty_markers(
+            str(response.get("evaluation_previous_goal") or ""),
+            str(response.get("memory") or ""),
+            str(params.get("text") or ""),
+        )
+        if not hits:
+            return response
+        self.state.done_gate_uses += 1
+        logger.warning(
+            "done(success=True) with unresolved uncertainty markers %s — "
+            "verification retry (%d/%d)",
+            hits, self.state.done_gate_uses, _DONE_GATE_MAX_PER_RUN,
+        )
+        feedback = (
+            "Your own evaluation/memory contains unresolved uncertainty "
+            f"(matched: {', '.join(repr(h) for h in hits)}). You are about to "
+            "call done(success=true) on incomplete data. Either (a) verify the "
+            "missing pieces with tools first, or (b) call done(success=false) "
+            "describing exactly what was accomplished and what remains "
+            "unverified. Do NOT restate done(success=true) while the same "
+            "markers remain unresolved."
+        )
+        retry_messages = list(messages) + [{"role": "user", "content": feedback}]
+        retried = self._normalize_llm_response(await self.llm.get_action(
+            system_prompt=self._system_prompt,
+            messages=retry_messages,
+            tool_schema=self._tool_schema,
+        ))
+        if not self._is_valid_action(retried):
+            return response
+        if self._validate_action_params(retried) is not None:
+            return response
+        return retried
 
     async def _validate_params_or_retry(
         self,
@@ -1268,6 +1347,12 @@ class StepPipeline:
                 result = ActionResult(error=f"{type(e).__name__}: {e}")
 
             results.append(result)
+
+            # issue #186 现象①：连败跟踪——多动作步内的失败也计（task_374 形态：
+            # [close_tab OK, screenshot 失败] 步，consecutive_failures 对这种不计
+            # 且会被后续成功步重置）；该动作成功即清零；done 豁免。跳过的动作
+            # （序列截断）不执行不记录。
+            self.failure_streak.record(action_name, bool(result.error))
 
             duration = time.time() - tool_start
             if self._obs_bus and tool_call_id:
@@ -1808,3 +1893,51 @@ _CONNECTION_ERROR_PATTERNS = (
 
 # Actions excluded from loop detection — always hash the same or are terminal.
 _LOOP_EXEMPT_ACTIONS = frozenset({"wait", "done", "go_back"})
+
+
+# ── issue #186 现象②：done(success=True) 不确定标记门禁 ─────────────────────
+
+# 词尾 ?：贴数字/标识符的悬而未决值（task_64 step16 的 "Emma Davis=1?" "=2?"
+# "Davis?"）。token 不含空格 → 整句疑问（"Is this right?"）也会命中——自评里的
+# 疑问句本身就是未消解状态，可接受；(?<![\w?]) 排除 "???" 连问与 token 中段。
+_TOKEN_Q_RE = re.compile(r"(?<![\w?])[\w.\-=]{1,64}\?(?=\s|$)")
+_URL_RE = re.compile(r"https?://\S+")
+_UNCERTAIN_KEYWORDS = (
+    "unknown", "unverified", "unread", "gap", "missing", "pending",
+    "partial", "uncertain", "unclear", "not sure", "not verified",
+    "not confirmed", "needs verification", "to verify", "to check",
+)
+
+
+def scan_uncertainty_markers(*texts: str) -> list[str]:
+    """扫 evaluation/memory/done 文本中未消解的不确定标记（issue #186 现象②）。
+
+    先剥 URL（query string 的 ``?`` 不是疑虑）；词尾 ``?`` 取 token 原文、关键词
+    按整词（``\\b``）小写匹配。返回命中样本（去重、保序、封顶 3 个）供门禁的
+    反馈消息引用——把 agent 自己写下的疑虑原样递回给它。
+    """
+    hits: list[str] = []
+    seen: set[str] = set()
+
+    def _add(sample: str) -> None:
+        if len(hits) >= 3 or sample in seen:
+            return
+        seen.add(sample)
+        hits.append(sample)
+
+    for t in texts:
+        if not t:
+            continue
+        stripped = _URL_RE.sub("", str(t))
+        for m in _TOKEN_Q_RE.findall(stripped):
+            _add(m)
+        low = stripped.lower()
+        for kw in _UNCERTAIN_KEYWORDS:
+            if re.search(rf"\b{re.escape(kw)}\b", low):
+                _add(kw)
+    return hits
+
+
+# 门禁每 run 触发封顶（防「每步重发带标记的 done」循环：打回→agent 换工具→
+# 再 done 又带新标记→再打回……每次循环都强制了一轮验证推进，但必须有界）。
+_DONE_GATE_MAX_PER_RUN = 2

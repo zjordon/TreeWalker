@@ -95,6 +95,10 @@ class AgentState(BaseModel):
     # 次数——确定性 _finalize bug 会让 run 报成功但 history 残缺（最坏是 done 步
     # 不进 history），此计数让降级可观测，run() 连续达阈值时升级终止。
     finalize_degraded_steps: int = 0
+    # issue #186 现象②：done(success=True) 不确定标记门禁的累计触发次数——每
+    # run 封顶（防「每步重发带标记的 done」循环），0 = 未触发。AGENT_DONE_GATE=0
+    # 关门禁时也保持 0（短路在计数之前）。
+    done_gate_uses: int = 0
 
     class Config:
         arbitrary_types_allowed = True

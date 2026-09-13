@@ -1,0 +1,206 @@
+"""issue #186 现象②：done(success=True) 不确定标记门禁的测试。
+
+背景（docs/bug-fix/186-behavior-discipline-analysis.md §2）：task_64 step16
+memory 明写 ``Emma Davis=1?`` + 60 行未读缺口，问号无新证据蒸发后仍
+done(success=True) 收题（DB 真值该名字恰好是被漏计的那个，正确答案含两个
+客户名）。门禁只把 agent 自己写下的疑虑当真：扫描 evaluation/memory/done
+文本的未消解标记（词尾 ``?`` / 不确定关键词），命中则给一次「补验证或诚实
+降级」的步内重试，每 run 封顶 2 次。
+"""
+
+from __future__ import annotations
+
+from typing import Any
+from unittest.mock import AsyncMock
+
+import pytest
+
+from tree_walker.agent.step import StepPipeline, scan_uncertainty_markers
+from tree_walker.agent.views import AgentState
+from tree_walker.tools.actions import Tools
+
+
+# ── scan_uncertainty_markers（纯函数） ───────────────────────────────────
+
+
+class TestScanUncertaintyMarkers:
+    def test_token_trailing_question(self):
+        # task_64 实形：悬而未决的计数值
+        hits = scan_uncertainty_markers("Emma Davis=1?", "tally: Lisa Green=2?")
+        assert "Davis=1?" in hits
+        assert "Green=2?" in hits
+
+    def test_bare_name_question_mark(self):
+        hits = scan_uncertainty_markers("status unknown? proceeding")
+        assert "unknown?" in hits
+
+    def test_keywords_word_match(self):
+        hits = scan_uncertainty_markers("a ~60-row gap remains unverified")
+        assert "gap" in hits and "unverified" in hits
+        assert scan_uncertainty_markers("the message was pending review") == ["pending"]
+
+    def test_keyword_substring_not_matched(self):
+        # 整词匹配：schema 里的 "data_gap_field" 不算 gap 命中
+        assert scan_uncertainty_markers("field data_gap_field not present") == []
+
+    def test_url_query_question_mark_not_a_hit(self):
+        assert scan_uncertainty_markers("see http://x.com/a?b=1&c=2? for details") == []
+
+    def test_clean_text_zero_hits(self):
+        assert scan_uncertainty_markers(
+            "All 308 rows read and counted; answer verified via filtered re-read.",
+            "Lisa Green has 3 orders (confirmed).",
+        ) == []
+
+    def test_sentence_question_counts_as_uncertainty(self):
+        # 整句疑问（"Is this right?"）按设计命中——自评里的疑问句本身就是未消解状态
+        assert scan_uncertainty_markers("Saved. Is this right?") == ["right?"]
+
+    def test_dedupe_and_cap_three(self):
+        text = "a=1? b=2? c=3? d=4? e=5? plus unknown and unread"
+        hits = scan_uncertainty_markers(text)
+        assert len(hits) == 3
+        assert len(set(hits)) == 3
+
+    def test_empty_and_none_safe(self):
+        assert scan_uncertainty_markers("", None, "") == []  # type: ignore[arg-type]
+
+
+# ── _gate_uncertain_success_done（管线门禁，鸭子类型桩） ──────────────────
+
+
+def _make_pipeline(
+    llm_side_effect: Any = None,
+    *,
+    gate_enabled: bool = True,
+    done_gate_uses: int = 0,
+) -> StepPipeline:
+    """免构造管线：只挂门禁方法触碰的属性（沿 test_p7 _make_session 模式）。"""
+    p = StepPipeline.__new__(StepPipeline)
+    p.state = AgentState()
+    p.state.done_gate_uses = done_gate_uses
+    p._enable_done_gate = gate_enabled
+    p.tools = Tools()
+    p.llm = AsyncMock()
+    if llm_side_effect is not None:
+        p.llm.get_action = AsyncMock(side_effect=llm_side_effect)
+    p._system_prompt = "sys"
+    p._tool_schema = {}
+    return p
+
+
+def _done_response(text: str = "answer", success: Any = True, **brain: str) -> dict[str, Any]:
+    resp: dict[str, Any] = {
+        "action": {"name": "done", "params": {"text": text, "success": success}},
+        "evaluation_previous_goal": "",
+        "memory": "",
+    }
+    resp.update(brain)
+    return resp
+
+
+def _other_response() -> dict[str, Any]:
+    return {"action": {"name": "wait", "params": {"seconds": 1}}}
+
+
+class TestGateUncertainSuccessDone:
+    @pytest.mark.asyncio
+    async def test_marker_in_memory_triggers_one_retry_with_feedback(self):
+        retried = _done_response(text="verified answer")  # 重试响应干净
+        pipe = _make_pipeline(llm_side_effect=[retried])
+        dirty = _done_response(memory="Tally: Emma Davis=1? and a ~60-row gap")
+        out = await pipe._gate_uncertain_success_done(dirty, [{"role": "user", "content": "m"}])
+        assert pipe.llm.get_action.await_count == 1
+        feedback = pipe.llm.get_action.call_args.kwargs["messages"][-1]["content"]
+        assert "unresolved uncertainty" in feedback
+        assert "Davis=1?" in feedback or "gap" in feedback  # 引用 agent 自己的标记
+        assert out is retried
+        assert pipe.state.done_gate_uses == 1
+
+    @pytest.mark.asyncio
+    async def test_marker_in_evaluation_also_scanned(self):
+        retried = _done_response(text="ok")
+        pipe = _make_pipeline(llm_side_effect=[retried])
+        dirty = _done_response(evaluation_previous_goal="Partially — count unverified")
+        out = await pipe._gate_uncertain_success_done(dirty, [])
+        assert pipe.llm.get_action.await_count == 1
+        assert out is retried
+
+    @pytest.mark.asyncio
+    async def test_retry_still_dirty_passes_through_single_shot(self):
+        # 单次性：重试响应仍是带标记的 done(success=True) → 照样放行（agent 坚持）
+        still_dirty = _done_response(text="same answer", memory="Emma Davis=1?")
+        pipe = _make_pipeline(llm_side_effect=[still_dirty])
+        dirty = _done_response(memory="Emma Davis=1?")
+        out = await pipe._gate_uncertain_success_done(dirty, [])
+        assert pipe.llm.get_action.await_count == 1  # 没有第二次重试
+        assert out is still_dirty
+
+    @pytest.mark.asyncio
+    async def test_retry_invalid_params_falls_back_to_original(self):
+        bad = {"action": {"name": "done", "params": {}}}  # 缺 text → 形状校验失败
+        pipe = _make_pipeline(llm_side_effect=[bad])
+        dirty = _done_response(memory="x is unknown")
+        out = await pipe._gate_uncertain_success_done(dirty, [])
+        assert out is dirty
+
+    @pytest.mark.asyncio
+    async def test_retry_invalid_action_falls_back_to_original(self):
+        pipe = _make_pipeline(llm_side_effect=[{"no_action": True}])
+        dirty = _done_response(memory="x is unknown")
+        out = await pipe._gate_uncertain_success_done(dirty, [])
+        assert out is dirty
+
+    @pytest.mark.asyncio
+    async def test_success_false_done_not_gated(self):
+        pipe = _make_pipeline()
+        resp = _done_response(text="partial", success=False, memory="Emma Davis=1?")
+        out = await pipe._gate_uncertain_success_done(resp, [])
+        assert out is resp
+        pipe.llm.get_action.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_done_action_passthrough(self):
+        pipe = _make_pipeline()
+        resp = _other_response()
+        out = await pipe._gate_uncertain_success_done(resp, [])
+        assert out is resp
+        pipe.llm.get_action.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_per_run_cap_reached_short_circuits(self):
+        pipe = _make_pipeline(done_gate_uses=2)
+        dirty = _done_response(memory="Emma Davis=1?")
+        out = await pipe._gate_uncertain_success_done(dirty, [])
+        assert out is dirty
+        pipe.llm.get_action.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_gate_disabled_via_flag(self):
+        pipe = _make_pipeline(gate_enabled=False)
+        dirty = _done_response(memory="Emma Davis=1?")
+        out = await pipe._gate_uncertain_success_done(dirty, [])
+        assert out is dirty
+        pipe.llm.get_action.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_clean_success_done_untouched(self):
+        pipe = _make_pipeline()
+        clean = _done_response(
+            memory="All 308 rows counted via group_count; verified by filtered re-read.",
+        )
+        out = await pipe._gate_uncertain_success_done(clean, [])
+        assert out is clean
+        pipe.llm.get_action.assert_not_awaited()
+
+
+# ── 配置默认值 ──────────────────────────────────────────────────────────
+
+
+class TestGateConfig:
+    def test_default_on(self):
+        from tree_walker.config import AgentSettings
+        assert AgentSettings().done_uncertainty_gate is True
+
+    def test_state_field_defaults_zero(self):
+        assert AgentState().done_gate_uses == 0
