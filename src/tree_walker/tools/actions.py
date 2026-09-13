@@ -515,6 +515,7 @@ return (async function(){
         return JSON.stringify({
             channel: 'legacy_ajax', namespace: (g.containerId || ''),
             rows: rows, rows_returned: rows.length,
+            headers: heads,
             info: info ? info.textContent.trim().slice(0, 80) : null,
             applied: { sorting: p.sorting || null,
                 page_size: p.paging ? p.paging.pageSize : 200,
@@ -556,6 +557,7 @@ return (async function(){
         }
         return JSON.stringify({
             channel: 'dom_table', namespace: null, rows: rows, rows_returned: rows.length,
+            headers: heads,
             applied: null, active_before: null, partial: false,
             note: 'DOM channel: current-page visible rows only; no server-side sorting/paging'
         });
@@ -2243,7 +2245,14 @@ class Tools:
             return ActionResult(extracted_content=msg, long_term_memory=msg)
         offset = params.get("offset", 0)
         limit = params.get("limit")
-        max_chars = self._truncation.read_file_max_chars
+        # issue #185 现象③：窗口必须 ≤ LLM 实际可见上限——ActionResult.__str__
+        # 的 display_max_chars 会静默截断 extracted_content，窗口大于它时 footer
+        # 报 5000 而 LLM 只见 4000，每块尾 1000 字符永远不可见（task_64 tally
+        # 漂移推手）。取 min 保证「footer 说展示了多少 = LLM 真看到多少」。
+        max_chars = min(
+            self._truncation.read_file_max_chars,
+            self._truncation.display_max_chars,
+        )
         window = limit if (limit is not None and limit < max_chars) else max_chars
         if offset >= total_chars:
             # offset 越过文件尾：软提示（非 error），对齐 empty soft-miss。
@@ -2599,6 +2608,12 @@ class Tools:
             not isinstance(fields, list) or not all(isinstance(f, str) for f in fields)
         ):
             return ActionResult(error="read_grid failed: fields must be a list of strings.")
+        # D（issue #185 现象②）：group_count 聚合字段守卫
+        group_field = params.get("group_count")
+        if group_field is not None and (
+            not isinstance(group_field, str) or not group_field.strip()
+        ):
+            return ActionResult(error="read_grid failed: group_count must be a non-empty string field name.")
         fresh = bool(params.get("fresh", True))
 
         payload = {
@@ -2630,6 +2645,19 @@ class Tools:
                 "(no UI-component grid, legacy grid, or table found on this page)"
             ))
 
+        # D（issue #185 现象②）：group_count 聚合在 Python 侧做（确定性计数，通道
+        # 无关——legacy/DOM 通道同样生效），把"数数"任务从上下文 tally 中解救出来
+        #（task_64：308 行按 billing_name 计数，LLM 分块 tally 漏计 Emma Davis）。
+        group_counts: list[tuple[str, int]] | None = None
+        if group_field is not None:
+            counts: dict[str, int] = {}
+            for r in result.get("rows") or []:
+                v = r.get(group_field)
+                k = ("(missing)" if v is None
+                     or (isinstance(v, str) and not v.strip()) else str(v))
+                counts[k] = counts.get(k, 0) + 1
+            group_counts = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+
         # 大结果落盘（镜像 _action_evaluate 的分级策略；OSError 不失败只 warning）
         text = json.dumps(result, ensure_ascii=False, default=str)
         tr = self._truncation
@@ -2660,15 +2688,55 @@ class Tools:
             notes.append(f"cleared leftover grid state before read: {leftover[:140]}")
         if result.get("partial"):
             notes.append("partial: data was still loading when the read returned — totals may be stale; retry if counts look short")
+        # E（issue #185 现象④）：legacy/DOM 通道"成功但无数据"的两种形态给明确诊断
+        # ——fields 与显示名表头不匹配（逐 cell 被滤成全空对象行）与 0 行（多半是
+        # 通道不支持 filters/search）——agent 免于反复盲试（task_112 step6 形态）。
+        if result.get("channel") in ("legacy_ajax", "dom_table"):
+            _rows = result.get("rows") or []
+            _heads = result.get("headers") or []
+            if _rows and all(not r for r in _rows):
+                notes.append(
+                    f"all {len(_rows)} rows came back EMPTY: requested fields {fields} "
+                    f"match none of this channel's headers {_heads[:12]} — legacy/DOM "
+                    "channels key rows by display-name headers; retry without fields "
+                    "or with the listed header names")
+            elif not _rows:
+                notes.append(
+                    "0 rows returned; if the grid visibly shows rows, this channel "
+                    "likely does not support the requested filters/search (legacy: "
+                    "paging/sorting only) — retry without filters or use the UI "
+                    "Filters panel")
+
+        # D：group_count 回显——不受 saved_to 分支影响（rows 落盘时结论仍须可见，
+        # 否则大网格读得了数据丢结论）。
+        gc_line: str | None = None
+        if group_counts is not None:
+            rows_read = result.get("rows_returned", len(result.get("rows") or []))
+            top = group_counts[:50]
+            gc_line = (f"group_count[{group_field}] over {rows_read} rows: "
+                       + json.dumps(dict(top), ensure_ascii=False))
+            if len(group_counts) > len(top):
+                gc_line += f" (+{len(group_counts) - len(top)} more values omitted)"
+            total = result.get("total_records")
+            if isinstance(total, int) and total > rows_read:
+                gc_line += (f" — ⚠️ counted {rows_read} of total {total} rows; "
+                            "read remaining pages for exact counts")
+            if len(group_counts) == 1 and group_counts[0][0] == "(missing)":
+                gc_line += (" — ⚠️ field not present in returned rows; check the "
+                            "field name (legacy/DOM channels use display-name headers)")
 
         if saved_to:
             visible = (f"read_grid [{' | '.join(meta_bits)}] full result ({len(text)} chars) "
                        f"saved to {saved_to}. Preview: {text[:300]}...")
         else:
             visible = f"read_grid [{' | '.join(meta_bits)}] {text[:tr.eval_result_max_chars]}"
+        if gc_line:
+            visible = f"{gc_line} | {visible}"
         for n in notes:
             visible += f"  ⚠️ {n}"
         memory = "read_grid: " + ", ".join(meta_bits) + (f", saved={saved_to}" if saved_to else "")
+        if group_counts is not None:
+            memory += f", group_count({group_field})={len(group_counts)} values"
         return ActionResult(extracted_content=visible, long_term_memory=memory)
 
     async def _eval_grid_channel(

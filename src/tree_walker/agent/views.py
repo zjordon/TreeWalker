@@ -45,7 +45,17 @@ class ActionResult(BaseModel):
         if self.error:
             parts.append(f"ERROR: {self.error}")
         if self.extracted_content:
-            parts.append(f"EXTRACTED: {self.extracted_content[:self.display_max_chars]}")
+            visible = self.extracted_content[: self.display_max_chars]
+            # issue #185 现象③：静默截断曾让 read_file 每块尾 1000 字符对 LLM
+            # 永不可见而 footer 谎报已展示——超限时追加显式标记（全局安全网，
+            # extract 等大结果同样受益）。
+            marker = (
+                f" [...display truncated: showing {self.display_max_chars} of "
+                f"{len(self.extracted_content)} chars — re-read with a smaller window]"
+                if len(self.extracted_content) > self.display_max_chars
+                else ""
+            )
+            parts.append(f"EXTRACTED: {visible}{marker}")
         if self.is_done:
             parts.append(f"DONE (success={self.success})")
         if not parts:

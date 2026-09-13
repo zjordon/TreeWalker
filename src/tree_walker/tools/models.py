@@ -401,7 +401,9 @@ class EvaluateParams(BaseModel):
         "Contrast: with `args`/`elements` the code IS wrapped as "
         "function(...a){ ... } and then MUST `return`. Use ONLY browser APIs "
         "(document, window, fetch); NO Node.js APIs. Return a primitive or a "
-        "JSON-serializable object/array. Keep output small."
+        "JSON-serializable object/array. Keep output small. Keep CODE short "
+        "(< ~300 chars) — longer nested code tends to lose brace balance; "
+        "split into several evaluate calls instead."
     ))
     # ── 阶段二（二.B）：per-call 执行控制 ──
     await_promise: bool = Field(
@@ -554,6 +556,18 @@ class ReadGridParams(BaseModel):
             "True (default): clear leftover server-side bookmark filters/search before "
             "applying the given params — grids inherit filter state from previous "
             "sessions. False: apply on top of the current state."
+        ),
+    )
+    group_count: str | None = Field(
+        default=None,
+        description=(
+            "Field name to aggregate on, e.g. 'billing_name': returns exact per-value "
+            "row counts (computed in Python — exact, no context tallying; the "
+            "decisive tool for count-per-X questions). Works on every channel; "
+            "combines with filters/sorting/paging as usual. Pass fields=[that field] "
+            "to slim the returned rows. If counts come back '(missing)', the field "
+            "name is not present in the rows (legacy/DOM channels use display-name "
+            "headers)."
         ),
     )
 

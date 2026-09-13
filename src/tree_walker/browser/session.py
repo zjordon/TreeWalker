@@ -2046,6 +2046,21 @@ class BrowserSession:
                 result = await asyncio.wait_for(coro, timeout=timeout)
             else:
                 result = await coro
+        except TimeoutError as e:
+            # issue #185 现象⑤：asyncio.TimeoutError（3.11+ 即内建 TimeoutError，
+            # OSError 子类——必须放在 except Exception 之前）的 str() 是空串，不加
+            # 这层时日志/ActionResult/LLM 三层只见 "Screenshot failed: "（task_374
+            # 三连 10.00s 空消息，为止损烧 6 步）。裸媒体文档（image/video 无
+            # 合成器新帧）与最小化/遮挡窗口（P6 screencast 零帧同因）都走这里；
+            # 文案给出两种成因与出路，避免 agent 当可重试故障连环重试。
+            msg = (
+                f"timed out after {timeout}s waiting for a frame — raw media pages "
+                "(image/video URLs have no page DOM to screenshot) and minimized/"
+                "occluded windows both cause this; navigate to an HTML page wrapping "
+                "the media, or report/save the media URL instead of screenshotting"
+            )
+            logger.warning("Page.captureScreenshot failed: %s", msg)
+            raise RuntimeError(msg) from e
         except Exception as e:
             logger.warning("Page.captureScreenshot failed: %s", e)
             raise
@@ -3581,7 +3596,13 @@ return (async function(){
             )
         if result.get("exceptionDetails"):
             exc = result["exceptionDetails"]
-            err_text = str(exc.get("text", ""))
+            # issue #185 根因A：编译期 SyntaxError 的 text 恒为 "Uncaught"，语义只在
+            # exception.description（examples/debug_issue185_cdp_shape.py 于 Chrome 152
+            # 实测）；运行期 promise 拒绝则语义在 text。下方自愈候选与截断提示两处
+            # 子串匹配都对拼接后的全量文本——只看 text 时永不命中（B 轮 52 次
+            # evaluate 失败中 20 次自愈未触发、18 次提示未触发）。
+            err_text = str(exc.get("text", "")) + " " + str(
+                exc.get("exception", {}).get("description") or "")
             # P7 form_interaction 建议5：已知 SyntaxError 的确定性自愈（仅无输入路径——
             # args/elements 模式代码在函数体内，裸 return 合法，语法错误形态不同）。
             # 候选按序试跑（语法错误无副作用）；全部失败则抛原错误（附截断提示）。

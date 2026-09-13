@@ -214,6 +214,153 @@ class TestReadGridSummary:
 		assert "saved=" in result.long_term_memory
 
 
+# ── D：group_count 聚合（issue #185 现象②） ──────────────────────────────────
+
+
+class TestReadGridGroupCount:
+	@pytest.mark.asyncio
+	async def test_exact_counts_with_duplicates(self):
+		"""task_64 场景：同名行分散出现，Python 侧计数必须精确（Emma Davis 漏计类）。"""
+		rows = [
+			{"billing_name": "Lisa Green", "entity_id": "1"},
+			{"billing_name": "Emma Davis", "entity_id": "2"},
+			{"billing_name": "Katie Wong", "entity_id": "3"},
+			{"billing_name": "Emma Davis", "entity_id": "4"},
+			{"billing_name": "Katie Wong", "entity_id": "5"},
+			{"billing_name": "Katie Wong", "entity_id": "6"},
+		]
+		browser = _FakeBrowser(ui_result=_ui_result(rows=rows, total_records=6))
+		result = await Tools().execute("read_grid", {"group_count": "billing_name"}, browser)
+		assert not result.error
+		vis = result.extracted_content
+		assert "group_count[billing_name] over 6 rows" in vis
+		assert '"Katie Wong": 3' in vis
+		assert '"Emma Davis": 2' in vis
+		assert '"Lisa Green": 1' in vis
+		# 计数行置于 meta 摘要之前（结论优先）
+		assert vis.index("group_count[") < vis.index("read_grid [")
+		# total==rows_read → 无未读全警告
+		assert "counted" not in vis
+
+	@pytest.mark.asyncio
+	async def test_partial_total_warns(self):
+		"""total_records > rows_read → 显式提示计数未覆盖全量。"""
+		rows = [{"billing_name": "A"}, {"billing_name": "A"}, {"billing_name": "A"}]
+		browser = _FakeBrowser(ui_result=_ui_result(rows=rows, total_records=308))
+		result = await Tools().execute("read_grid", {"group_count": "billing_name"}, browser)
+		assert "counted 3 of total 308" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_missing_field_all_missing_warns(self):
+		"""字段不在行里 → 全 (missing) 折叠 + 字段名核查提示（与 E 的表头语义联动）。"""
+		rows = [{"ID": "1"}, {"ID": "2"}]
+		browser = _FakeBrowser(ui_result=_ui_result(rows=rows, total_records=2))
+		result = await Tools().execute("read_grid", {"group_count": "review_id"}, browser)
+		assert '"(missing)": 2' in result.extracted_content
+		assert "field not present in returned rows" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_blank_and_none_values_fold_to_missing(self):
+		rows = [
+			{"billing_name": "A"},
+			{"billing_name": ""},
+			{"billing_name": None},
+			{"no_such_field": 1},
+		]
+		browser = _FakeBrowser(ui_result=_ui_result(rows=rows, total_records=4))
+		result = await Tools().execute("read_grid", {"group_count": "billing_name"}, browser)
+		assert '"(missing)": 3' in result.extracted_content
+		assert '"A": 1' in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_top50_cap_marks_omission(self):
+		rows = [{"billing_name": f"n{i:03d}", "entity_id": str(i)} for i in range(60)]
+		browser = _FakeBrowser(ui_result=_ui_result(rows=rows, total_records=60))
+		result = await Tools().execute("read_grid", {"group_count": "billing_name"}, browser)
+		assert "+10 more values omitted" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_group_count_visible_even_when_saved_to_file(self, tmp_path):
+		"""大结果落盘分支：计数行仍须可见（读得了数据不能丢结论）。"""
+		rows = [{"billing_name": "X", "big": "y" * 40} for _ in range(200)]
+		browser = _FakeBrowser(ui_result=_ui_result(rows=rows, total_records=200))
+		tools = Tools(truncation=TruncationSettings(
+			eval_save_threshold=2000, eval_output_dir=str(tmp_path),
+		))
+		result = await tools.execute("read_grid", {"group_count": "billing_name"}, browser)
+		assert "saved to" in result.extracted_content
+		assert '"X": 200' in result.extracted_content
+		assert "group_count(billing_name)" in result.long_term_memory
+
+	@pytest.mark.asyncio
+	async def test_group_count_param_validation(self):
+		result = await Tools().execute("read_grid", {"group_count": 42}, _FakeBrowser())
+		assert result.error and "group_count must be a non-empty string" in result.error
+		result = await Tools().execute("read_grid", {"group_count": "   "}, _FakeBrowser())
+		assert result.error and "group_count must be a non-empty string" in result.error
+
+
+# ── E：legacy/DOM 不兼容诊断（issue #185 现象④） ──────────────────────────────
+
+
+class TestReadGridLegacyDiagnostics:
+	@pytest.mark.asyncio
+	async def test_fields_header_mismatch_all_empty_rows_noted(self):
+		"""task_112 step6 形态：fields 请求名与 legacy 显示名表头不匹配 → 全空
+		对象行 + note 附可用表头名单（免试止损）。"""
+		legacy = {
+			"channel": "legacy_ajax", "namespace": "reviewGrid",
+			"rows": [{}, {}, {}], "rows_returned": 3,
+			"headers": ["ID", "Created", "Status", "Title"],
+			"applied": None, "active_before": None, "partial": False,
+		}
+		browser = _FakeBrowser(evaluate_side_effects=[json.dumps(legacy)])
+		result = await Tools().execute(
+			"read_grid", {"fields": ["review_id", "sku"]}, browser)
+		assert not result.error
+		assert "came back EMPTY" in result.extracted_content
+		assert "display-name headers" in result.extracted_content
+		assert "'ID'" in result.extracted_content  # 可用表头名单进 note
+
+	@pytest.mark.asyncio
+	async def test_zero_rows_with_filters_noted(self):
+		legacy = {
+			"channel": "legacy_ajax", "namespace": "reviewGrid",
+			"rows": [], "rows_returned": 0, "headers": ["ID"],
+			"applied": None, "active_before": None, "partial": False,
+		}
+		browser = _FakeBrowser(evaluate_side_effects=[json.dumps(legacy)])
+		result = await Tools().execute(
+			"read_grid", {"filters": {"status": "pending"}}, browser)
+		assert not result.error
+		assert "0 rows returned" in result.extracted_content
+		assert "does not support" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_healthy_legacy_read_no_diagnostic_note(self):
+		legacy = {
+			"channel": "legacy_ajax", "namespace": "reviewGrid",
+			"rows": [{"ID": "353", "Title": "Bad!"}], "rows_returned": 1,
+			"headers": ["ID", "Title"],
+			"applied": None, "active_before": None, "partial": False,
+		}
+		browser = _FakeBrowser(evaluate_side_effects=[json.dumps(legacy)])
+		result = await Tools().execute("read_grid", {}, browser)
+		assert not result.error
+		assert "came back EMPTY" not in result.extracted_content
+		assert "0 rows returned" not in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_uiregistry_zero_rows_not_misdiagnosed(self):
+		"""uiRegistry 主通道 0 行通常是真过滤结果（有 total_records 佐证）——不套
+		legacy 诊断，避免误报。"""
+		browser = _FakeBrowser(ui_result=_ui_result(rows=[], total_records=0))
+		result = await Tools().execute(
+			"read_grid", {"filters": {"status": "nope"}}, browser)
+		assert not result.error
+		assert "0 rows returned" not in result.extracted_content
+
+
 # ── B2：[Grid] 元信息渲染 ─────────────────────────────────────────────────────
 
 

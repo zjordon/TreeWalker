@@ -38,8 +38,11 @@ def _seed(path, text: str) -> None:
 
 
 def _max_chars() -> int:
-	"""Read the configured truncation threshold (default 5000, env-overridable)."""
-	return Tools()._truncation.read_file_max_chars
+	"""Effective read window (issue #185 现象③): min(read_file_max_chars,
+	display_max_chars) — the LLM-visible cap ActionResult.__str__ enforces.
+	窗口大于 display 上限时 footer 会谎报展示量（块尾字符静默不可见）。"""
+	t = Tools()._truncation
+	return min(t.read_file_max_chars, t.display_max_chars)
 
 
 # ── Basic read ─────────────────────────────────────────────────────
@@ -145,6 +148,32 @@ class TestReadFileTruncation:
 		assert "[...truncated]" not in r.extracted_content
 		assert "truncated" not in r.long_term_memory
 		assert r.extracted_content == "y" * n
+
+	@pytest.mark.asyncio
+	async def test_window_never_exceeds_display_cap(self, tmp_path):
+		"""issue #185 现象③契约：窗口 ≤ display_max_chars——介于两上限之间的文件
+		必须在 display 上限处截断（footer 诚实），不得按 read_file_max_chars 放行。"""
+		t = Tools()._truncation
+		if t.display_max_chars >= t.read_file_max_chars:
+			pytest.skip("display cap >= read cap — min() is the read cap itself")
+		between = t.display_max_chars + 100
+		p = tmp_path / "between.txt"
+		_seed(p, "z" * between)
+		r = await _run({"path": str(p)})
+		assert r.error is None
+		assert (f"[...truncated: showing {t.display_max_chars} of {between} chars"
+				in r.extracted_content)
+
+	@pytest.mark.asyncio
+	async def test_limit_above_window_still_clamped(self, tmp_path):
+		"""显式 limit 超过有效窗口 → 仍钳到窗口（task_64 step6 实发 limit=6500）。"""
+		n = _max_chars()
+		p = tmp_path / "big.txt"
+		_seed(p, "x" * (n + 500))
+		r = await _run({"path": str(p), "limit": n + 10_000})
+		assert r.error is None
+		assert r.extracted_content.startswith("x" * n)
+		assert f"use offset={n} to continue" in r.extracted_content
 
 
 # ── Empty file soft-miss (corrects the "OK" ambiguity) ─────────────

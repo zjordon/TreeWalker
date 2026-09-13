@@ -67,11 +67,16 @@ class TestSyntaxRepairCandidates:
 
 
 class TestEvaluateSelfHeal:
+    # 桩一律用真实 CDP 形状：编译期 SyntaxError 的 text 恒为 "Uncaught"、语义只在
+    # exception.description（issue #185 教训——早期桩把语义写进 text，自愈匹配源
+    # 跟着桩走，真机从未生效）。见 examples/debug_issue185_cdp_shape.py 实测。
+
     @pytest.mark.asyncio
     async def test_illegal_return_retried_with_iife_and_succeeds(self):
         bs = _make_session()
         bs.client.send.Runtime.evaluate = AsyncMock(side_effect=[
-            {"exceptionDetails": {"text": "Uncaught SyntaxError: Illegal return statement"}},
+            {"exceptionDetails": {"text": "Uncaught", "exception": {
+                "description": "SyntaxError: Illegal return statement"}}},
             {"result": {"value": "1"}},
         ])
         out = await bs.evaluate("return document.title")
@@ -84,8 +89,10 @@ class TestEvaluateSelfHeal:
     async def test_retry_also_failing_raises_original(self):
         bs = _make_session()
         bs.client.send.Runtime.evaluate = AsyncMock(side_effect=[
-            {"exceptionDetails": {"text": "Uncaught SyntaxError: Illegal return statement"}},
-            {"exceptionDetails": {"text": "Uncaught SyntaxError: Illegal return statement"}},
+            {"exceptionDetails": {"text": "Uncaught", "exception": {
+                "description": "SyntaxError: Illegal return statement"}}},
+            {"exceptionDetails": {"text": "Uncaught", "exception": {
+                "description": "SyntaxError: Illegal return statement"}}},
         ])
         with pytest.raises(RuntimeError, match="Illegal return statement"):
             await bs.evaluate("return 1")
@@ -94,8 +101,9 @@ class TestEvaluateSelfHeal:
     async def test_truncation_error_gets_hint(self):
         bs = _make_session()
         bs.client.send.Runtime.evaluate = AsyncMock(return_value={
-            "exceptionDetails": {"text": "Uncaught SyntaxError: Unexpected end of input"},
-        })
+            "exceptionDetails": {"text": "Uncaught", "exception": {
+                "description": "SyntaxError: Unexpected end of input"}}},
+        )
         with pytest.raises(RuntimeError, match="truncated"):
             await bs.evaluate("var a = 1;")
 
@@ -103,12 +111,30 @@ class TestEvaluateSelfHeal:
     async def test_missing_catch_second_candidate_succeeds(self):
         bs = _make_session()
         bs.client.send.Runtime.evaluate = AsyncMock(side_effect=[
-            {"exceptionDetails": {"text": "Uncaught SyntaxError: Missing catch or finally after try"}},
-            {"exceptionDetails": {"text": "Uncaught SyntaxError: Missing catch or finally after try"}},  # 候选①仍失败
+            {"exceptionDetails": {"text": "Uncaught", "exception": {
+                "description": "SyntaxError: Missing catch or finally after try"}}},
+            {"exceptionDetails": {"text": "Uncaught", "exception": {
+                "description": "SyntaxError: Missing catch or finally after try"}}},  # 候选①仍失败
             {"result": {"value": "ok"}},  # 候选②成功
         ])
         out = await bs.evaluate("(function(){try{return 'n';})()")
         assert out == "ok"
+
+    @pytest.mark.asyncio
+    async def test_runtime_promise_rejection_still_matched_via_text(self):
+        """运行期 promise 拒绝的语义在 text（非 description）——拼接后仍应能匹配。
+
+        真实形态（task_64 step9）：text = "Uncaught (in promise) SyntaxError: ..."
+        该形态无自愈候选，但断言拼接不吞 text 侧语义即可（走原始错误路径）。
+        """
+        bs = _make_session()
+        bs.client.send.Runtime.evaluate = AsyncMock(return_value={
+            "exceptionDetails": {
+                "text": "Uncaught (in promise) SyntaxError: Unexpected token '<', "
+                        "\"<!doctype \"... is not valid JSON"},
+        })
+        with pytest.raises(RuntimeError, match="Unexpected token"):
+            await bs.evaluate("fetch('/x').then(r=>r.json())")
 
 
 # ── 建议1：数据网格行渲染冻结 kick（session 层） ────────────────────────
