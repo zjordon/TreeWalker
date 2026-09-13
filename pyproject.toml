@@ -12,7 +12,7 @@ dependencies = [
     "click>=8.0.0",
     "markdownify>=0.13.1",
     "aiohttp>=3.9.0",
-    "dom-snapshot>=0.1.0",  # ROADMAP P1：DOM 快照公共库（本地 editable 见 [tool.uv.sources]）
+    "dom-snapshot>=0.1.1",  # ROADMAP P1：DOM 快照公共库（本地 editable 见 [tool.uv.sources]；>=0.1.1 单字符文本修复 dom-snapshot#1）
 ]
 
 [project.optional-dependencies]
@@ -39,5 +39,5 @@ dev = [
 
 [tool.uv.sources]
 # 本地 editable 开发：dom-snapshot 源码在 ../dom-snapshot（与 TreeWalker 同级）。
-# 远端/CI 可改成 { git = "https://github.com/zjordon/dom-snapshot.git", tag = "v0.1.0" }。
+# 远端/CI 可改成 { git = "https://github.com/zjordon/dom-snapshot.git", tag = "v0.1.1" }。
 dom-snapshot = { path = "../dom-snapshot", editable = true }
