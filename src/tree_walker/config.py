@@ -123,6 +123,10 @@ class JudgeSettings:
 class AgentSettings:
     max_steps: int = 100
     max_failures: int = 5
+    # issue #186 现象②：done(success=True) 不确定标记门禁（自评/memory 含词尾?/
+    # 未读缺口等标记时给一次「补验证或诚实降级」的步内重试；每 run 封顶 2 次）。
+    # 软干预默认开；AGENT_DONE_GATE=0 可关（评测口径隔离用）。
+    done_uncertainty_gate: bool = True
     max_actions_per_step: int = 5  # multi-action per step (browser-use parity)
     llm_timeout: int = 120  # seconds; wraps the entire retry sequence
     action_timeout: int = 30  # seconds; per-action execution timeout
@@ -451,6 +455,12 @@ def load_settings() -> Settings:
     agent = AgentSettings(
         max_steps=int(os.environ.get("AGENT_MAX_STEPS", "100")),
         max_failures=int(os.environ.get("AGENT_MAX_FAILURES", "5")),
+        # review 修正：兼容数字习语（=0 关 / =1 开）与字符串习语（false/no/off 关）——
+        # 只认 "true" 会让按注释写 AGENT_DONE_GATE=1 的操作者静默关门禁
+        done_uncertainty_gate=(
+            os.environ.get("AGENT_DONE_GATE", "true").strip().lower()
+            not in ("0", "false", "no", "off")
+        ),
         llm_timeout=int(os.environ.get("AGENT_LLM_TIMEOUT", "120")),
         action_timeout=int(os.environ.get("AGENT_ACTION_TIMEOUT", "30")),
         reconnect_timeout=int(os.environ.get("RECONNECT_TIMEOUT", "30")),

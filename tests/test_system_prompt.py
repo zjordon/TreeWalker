@@ -36,6 +36,19 @@ class TestTaskCompletionRules:
         assert "Check for blocking errors" in prompt
         assert "Any unmet requirement" in prompt
 
+    def test_prompt_contains_data_completeness_check(self):
+        """issue #186 现象②：第 7 条数据完整性检查——未消解标记（词尾?/未读
+        缺口/部分 tally）不得 done(success=true)；复核短名单≠完整性（task_64
+        循环验证形态）。"""
+        prompt = build_system_prompt(
+            action_descriptions=_default_action_descriptions(),
+            task="Test task",
+        )
+        assert "Data completeness" in prompt
+        assert "a value with `?`" in prompt
+        assert "unread gap" in prompt
+        assert "shortlist derived from partial data does NOT establish completeness" in prompt
+
     def test_prompt_contains_success_false_guidance(self):
         prompt = build_system_prompt(
             action_descriptions=_default_action_descriptions(),

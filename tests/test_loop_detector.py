@@ -1,6 +1,11 @@
 """Tests for ActionLoopDetector — action normalization, page stagnation, dual-dim nudges."""
 
-from tree_walker.agent.loop_detector import ActionLoopDetector, PageFingerprint, compute_action_hash
+from tree_walker.agent.loop_detector import (
+    ActionLoopDetector,
+    FailureStreakTracker,
+    PageFingerprint,
+    compute_action_hash,
+)
 
 
 class TestComputeActionHash:
@@ -300,3 +305,126 @@ class TestLoopDetectorWindow:
             d.record_action("click", {"index": 100 + i})
         assert d.max_repetition_count == 1
         assert d.get_nudge_message() is None
+
+
+# ── issue #186 现象①：FailureStreakTracker（失败感知连败止损） ────────────────
+
+
+class TestFailureStreakTracker:
+    """跨步 per-action 连败计数：多动作步失败也计、成功清零、done 豁免、nudge 去抖分档。"""
+
+    def test_below_threshold_no_nudge(self):
+        t = FailureStreakTracker()
+        t.record("screenshot", failed=True)
+        assert t.nudge() is None  # streak=1 < 2
+
+    def test_two_consecutive_failures_nudge_level1(self):
+        t = FailureStreakTracker()
+        t.record("screenshot", failed=True)
+        t.record("screenshot", failed=True)
+        msg = t.nudge()
+        assert msg is not None
+        assert "failed 'screenshot' 2 times" in msg
+        assert "Re-read the original task" in msg  # 止损+回归目标文案
+
+    def test_third_failure_same_tier_no_renotify(self):
+        t = FailureStreakTracker()
+        for _ in range(3):
+            t.record("screenshot", failed=True)
+        assert t.nudge() is not None  # streak=2 首报
+        assert t.nudge() is None  # streak=3 同档不重报
+
+    def test_fourth_failure_escalates_once(self):
+        t = FailureStreakTracker()
+        for _ in range(4):
+            t.record("evaluate", failed=True)
+        msg = t.nudge()
+        assert msg is not None
+        assert "4 times" in msg
+        assert "honest partial result" in msg  # 升级措辞：诚实部分结果出路
+        assert t.nudge() is None  # 5+ 不重报
+        for _ in range(3):
+            t.record("evaluate", failed=True)
+            assert t.nudge() is None  # streak 冻结在高档位不再注入
+
+    def test_success_clears_streak_and_notification_state(self):
+        t = FailureStreakTracker()
+        t.record("screenshot", failed=True)
+        t.record("screenshot", failed=True)
+        assert t.nudge() is not None
+        t.record("screenshot", failed=False)  # 成功清零（含通知状态）
+        assert t.nudge() is None
+        t.record("screenshot", failed=True)
+        t.record("screenshot", failed=True)  # 重新连败 2 → 再报
+        assert t.nudge() is not None
+
+    def test_done_exempt(self):
+        t = FailureStreakTracker()
+        for _ in range(5):
+            t.record("done", failed=True)
+        assert t.nudge() is None
+
+    def test_per_action_name_independent(self):
+        t = FailureStreakTracker()
+        t.record("screenshot", failed=True)
+        t.record("evaluate", failed=True)  # 不同动作互不清零
+        t.record("screenshot", failed=True)  # screenshot streak=2
+        msg = t.nudge()
+        assert msg is not None and "'screenshot'" in msg
+        t.record("screenshot", failed=False)  # 清 screenshot
+        t.record("evaluate", failed=True)  # evaluate streak=2
+        msg = t.nudge()
+        assert msg is not None and "'evaluate'" in msg
+
+    def test_task374_shape_multi_action_step_failures_counted(self):
+        """task_374 形态：[close_tab OK, screenshot 失败] 步 + 单独 screenshot 失败步
+        ——consecutive_failures 对这种不计且被重置；这里必须第 2 次失败即触发。"""
+        t = FailureStreakTracker()
+        t.record("close_tab", failed=False)  # 同步成功动作
+        t.record("screenshot", failed=True)  # 同步失败动作（step 7）
+        assert t.nudge() is None
+        t.record("screenshot", failed=True)  # 下一单独失败步（step 8）
+        assert t.nudge() is not None
+
+    def test_new_failing_tool_not_starved_by_suppressed_streak(self):
+        """review 修正：抑制档动作不得饿死新达阈值动作的首报——screenshot 冻结
+        在 3 档（已报过）期间，evaluate workaround 连败 2 次必须拿到自己的提示。"""
+        t = FailureStreakTracker()
+        for _ in range(3):
+            t.record("screenshot", failed=True)
+        assert t.nudge() is not None  # screenshot 首报（streak=2 档）
+        assert t.nudge() is None  # streak=3 抑制档
+        t.record("evaluate", failed=True)
+        t.record("evaluate", failed=True)  # evaluate 新达 2
+        msg = t.nudge()
+        assert msg is not None
+        assert "'evaluate' 2 times" in msg
+
+    def test_higher_tier_takes_priority_over_new_tier_two(self):
+        """同时可报时高 streak 优先（4 档升级 > 新动作 2 档首报）。"""
+        t = FailureStreakTracker()
+        t.record("screenshot", failed=True)
+        t.record("screenshot", failed=True)
+        t.nudge()  # screenshot 首报，notified=2
+        t.record("screenshot", failed=True)
+        t.record("screenshot", failed=True)  # streak=4 → 升级档
+        t.record("evaluate", failed=True)
+        t.record("evaluate", failed=True)  # evaluate 2 档
+        msg = t.nudge()
+        assert msg is not None
+        assert "'screenshot' 4 times" in msg
+        msg2 = t.nudge()  # screenshot 已升级报过 → evaluate 的首报
+        assert msg2 is not None and "'evaluate' 2 times" in msg2
+
+    def test_peek_does_not_consume_until_acked(self):
+        """review2 #5：查询/提交解耦——peek 只读；LLM 调用失败（未 ack）时下步
+        peek 返回同一候选，首报不丢；ack 后才抑制。"""
+        t = FailureStreakTracker()
+        t.record("screenshot", failed=True)
+        t.record("screenshot", failed=True)
+        c1 = t.peek_nudge()
+        assert c1 is not None and c1[0] == "screenshot" and c1[1] == 2
+        c2 = t.peek_nudge()  # 未 ack → 同一候选可重发
+        assert c2 == c1
+        t.ack_nudge(c1[0], c1[1])
+        assert t.peek_nudge() is None  # 提交后抑制

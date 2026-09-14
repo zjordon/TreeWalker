@@ -12,7 +12,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from tree_walker.agent.loop_detector import ActionLoopDetector
+from tree_walker.agent.loop_detector import ActionLoopDetector, FailureStreakTracker
 from tree_walker.agent.message_compactor import MessageCompactor
 from tree_walker.agent.plan_manager import PlanManager
 from tree_walker.agent.rerun import RerunMixin
@@ -115,6 +115,15 @@ class Agent(StepPipeline, RerunMixin):
         self.state = AgentState()
         self.history = AgentHistoryList()
         self.loop_detector = ActionLoopDetector()
+        # issue #186 现象①：失败感知连败跟踪（与 loop_detector 互补——后者成功无关，
+        # 见 FailureStreakTracker 类注释）。同工具连败 ≥2 注入止损 nudge。
+        self.failure_streak = FailureStreakTracker()
+        # review2 #5：_prepare_context peek 暂存、LLM 响应取得后 _step ack——
+        # 查询即消费会在 LLM 调用失败时把首报静默吞掉。
+        self._pending_streak_nudge: tuple[str, int, str] | None = None
+        # issue #186 现象②：done(success=True) 不确定标记门禁开关（默认开；
+        # 评测口径隔离可 AGENT_DONE_GATE=0 关闭——软干预，非红线项）。
+        self._enable_done_gate = _settings.done_uncertainty_gate
         self._compactor: MessageCompactor | None = None
         if _settings.message_compaction and _settings.message_compaction.enabled:
             self._compactor = MessageCompactor(_settings.message_compaction, self.llm)

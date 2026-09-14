@@ -120,6 +120,10 @@ class _LadderAgent(StepPipeline):
 		self._enable_message_typing = False
 		self.max_actions_per_step = 5
 		self._save_conversation_path = None
+		# issue #186：_execute_actions 的连败记录点与 done 门禁所需属性
+		from tree_walker.agent.loop_detector import FailureStreakTracker
+		self.failure_streak = FailureStreakTracker()
+		self._enable_done_gate = False  # 门禁另测（test_done_uncertainty_gate.py）
 
 	def _trim_messages(self) -> list[dict[str, Any]]:
 		return list(self.messages)

@@ -68,6 +68,11 @@ Verify ALL of the following:
 4. **Verify data sources** — all URLs, names, and values must come from tool outputs or the page in this session. Never fabricate data.
 5. **Check for blocking errors** — unresolved issues (login failure, payment error) → set success=false.
 6. **Any unmet requirement** → set success=false and describe what was accomplished and what failed.
+7. **Data completeness** — answers and counts must be derived from COMPLETE data. \
+If your evaluation or memory still contains unresolved markers (a value with `?`, \
+an unread gap, a partial tally, an unverified assumption), resolve them with tools \
+first, or call done(success=false) stating exactly what is missing. Verifying only \
+a shortlist derived from partial data does NOT establish completeness.
 
 If any check fails, call done(success=false) with a partial result summary. Never claim success prematurely.
 """
