@@ -1,6 +1,7 @@
 # issue #187 分析：anthropic SDK 版本与 temperature 透传——叙事反转与正确的修复方向
 
 - 日期：2026-09-15；分支基线 master `ef625bd`
+- 修订：2026-09-15 v2——eval 仓侧核验（issue 评论）确认核心反转全部属实；纠正本文一处事实错误（§6）
 - 方法：三环境实测签名（本仓 venv 0.109.0 / 临时环境 0.122.0、0.125.0、1.5.0）+ PyPI 版本时间线 + eval 仓证据复核（`docs/skills/shop-admin/harness-optimize.md` 2026-09-12 09:04 条目、`.venv` 实况）
 
 ## 0. 结论速览——issue 的两个前提都不成立，但底层诉求有效
@@ -20,9 +21,9 @@
 | 版本 | 出处 | temperature | 备注 |
 |---|---|---|---|
 | 0.109.0 | 本仓 uv.lock / venv | ✅ | 当前全量测试（2684 测）在此版本跑 |
-| 0.122.0 | eval 仓 venv（9/12 修复后） | ✅ | eval judge `temperature=0` 端到端验证过（task 119 离线重判 1.0） |
+| 0.122.0 | 本地 Windows checkout 的 eval 仓 `.venv`（**非 runner 环境**，见 §6 修订） | ✅ | 0.x 线较新版本（2026-08-13）；eval 评测**未在此版本跑过** |
 | 0.125.0 | PyPI 最后一个 0.x（2026-08-19） | ✅ | 0.x 线全程支持 |
-| **1.4.0** | **eval 仓事发时 venv** | ❌ | **1.x 线**（2026-08 后发布）——移除 temperature/top_p |
+| **1.4.0** | **eval runner venv（事发至今未变）** | ❌ | **1.x 线**（1.4.0 发布于 2026-09-04）——移除 temperature/top_p；22×3 离线重判即在此版本 + 代码层降级上跑 |
 | 1.5.0 | PyPI 当前最新 | ❌ | 参数面：`max_tokens, messages, model, cache_control, container, inference_geo, metadata, output_config, service_tier, stop_sequences, stream, system, thinking, tool_choice, tools, user_profile_id, workspace_id` |
 
 1.x 里采样控制的去处：`output_config: OutputConfigParam`，仅 `effort`（low/medium/high/xhigh/max）与 `format`（structured outputs）——**没有 temperature 等价物**。
@@ -34,7 +35,7 @@
 1. eval 仓以路径依赖安装 tree_walker，其 venv 重新解析 `anthropic>=0.104.0` → 求解器选当时最新 **1.4.0**（无上界，1.x 合法满足）；
 2. 1.x 的 `Messages.create` 无 temperature → judge `_glm_chat_completion` 传 `temperature=0` → 每次调用 `TypeError: unexpected keyword argument 'temperature'`；
 3. 评测器"异常计 0"吞掉 → 22 个 fuzzy/ua 任务 × 三口径 = **66 次评测全部判 0**，运行期间零发现；
-4. eval 仓 9/12 修复：TypeError 降级重试 + venv 落到 **0.122.0**（实为降级到 0.x 线）→ 离线重判翻绿（A +14 / B +19 / C +17，含追加的 task 790）；
+4. eval 仓 9/12 修复：**纯代码层** try/TypeError 降级（去掉 temperature 用端点默认温度重试），**依赖版本未动**（runner venv 仍是 1.4.0）→ 22×3 离线重判全部跑在 1.4.0 + 降级上，翻绿（A +14 / B +19 / C +17，含追加的 task 790）。**代价：eval judge 当前实际是默认采样温度，确定性尚未恢复**——待 TW cap `<1.0` 合入、eval 重装依赖落 0.x 后才成立（eval 仓随后二选一：降级依赖恢复确定性，或接受默认温度并入档）；
 5. 遗留：**本仓 spec 仍无上界**——`>=0.104.0` 今天依然允许任何下游环境解析出 1.5.0 并复现事故。
 
 ## 3. 对 issue 两请求项的重新解读
@@ -46,9 +47,10 @@
 
 **P0（spec 修正 + 契约锁定）**：
 1. pyproject：`anthropic>=0.109.0,<1.0`，注释说明上界理由（1.x 移除 temperature/top_p，采样参数断裂；GLM 兼容端点为 0.x 形状）；
-2. `uv lock` 刷新至 **0.122.0**（与 eval 仓端到端验证过的环境精确对齐，而非追新 0.125——保守取有实证的版本）；
+2. `uv lock` 刷新至 **0.122.0**——理由（v2 修订）：0.x 线内较新版本（2026-08-13），非"与 eval 实证环境对齐"（eval 从未在 0.122 跑过，见 §6）；不追 0.125 仅取保守；
 3. 单测：`_extract_call(temperature=0)` 透传断言（mock client 断言 kwargs 收到 temperature）——把"本仓契约支持控温"钉进测试；
-4. 可选加一条 spec 守护测试：解析 pyproject 的依赖声明断言含 `<1` 上界（防未来"顺手升级"把 cap 抹掉）。
+4. 可选加一条 spec 守护测试：解析 pyproject 的依赖声明断言含 `<1` 上界（防未来"顺手升级"把 cap 抹掉）；
+5. **cap 合入后的回归步骤（时序关键，v2 修订）**：eval 仓此时再新起干净 venv 重解析 tree_walker → anthropic 落 0.x——spec 未 cap 前做该检查会合法解析到 1.5.0，反而误判验收失败；eval judge 确定性的恢复也以此为前提。
 
 **不做（附理由）**：
 - 升级 1.x：与 issue 目标（temperature 可透传）**直接冲突**（1.x 无此参数）；GLM 兼容端点不支持 1.x 平台参数；无本生态验证。
@@ -63,7 +65,15 @@
 - [ ] `Messages.create` 签名含 temperature（0.122 实测 ✅）
 - [ ] 新增透传单测 + spec 守护测试通过
 - [ ] 全量 `uv run python -m pytest tests/ -x -v` 绿、覆盖率 >85%
-- [ ] （可选）eval 仓新起一个干净 venv 重解析 tree_walker → anthropic 落在 0.x（<1.0 生效的直接证据）
+- [ ] （**cap 合入之后**才做，v2 修订）eval 仓新起干净 venv 重解析 tree_walker → anthropic 落在 0.x（<1.0 生效的直接证据；cap 前重解析会合法选到 1.5.0）
+
+## 6. 修订记录（2026-09-15 v2，依据 eval 仓侧核验）
+
+eval 侧对本文逐条实证复核（issue #187 评论）：**核心反转全部属实**（无上界 spec、0.109 含 temperature、1.4/1.5 不含、PyPI 时间线、1.5 参数面一字不差、`_extract_call` 透传），P0 方案确认可执行无保留意见。**纠正本文一处事实错误及其连带论据**：
+
+- ❌ 原文称"eval 仓 venv（9/12 修复后）0.122.0 / 9/12 修复实为降级 / task 119 重判在 0.122 验证"——**均不实**：eval runner venv 至今仍为 **1.4.0**，9/12 修复是纯代码层 TypeError 降级，66 次重判全部跑在 1.4.0+降级上。
+- 错误来源：分析时 `ls` 的是**本地 Windows checkout** 的 eval 仓 `.venv`（恰装 0.122.0），与 **Linux runner** 的 venv（1.4.0）是两台机器两套环境——同名仓多环境，检证必须指认运行侧环境。
+- 连带修正：(1) eval judge 当前为默认采样温度、确定性未恢复，恢复以 TW cap 合入 + eval 重装依赖为前提（§2 步骤 4）；(2) lock 0.122 的论据改为"0.x 线内较新版本"（§4.2）；(3) "干净 venv 重解析落 0.x"的验收挪为 cap 合入后的回归步骤（§4.5/§5）。
 
 ## 附：证据索引
 
