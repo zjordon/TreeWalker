@@ -1969,8 +1969,9 @@ _UNCERTAIN_KEYWORDS = (
 # review2 #4：否定语境——"nothing missing"/"no gap remains"/"no unread rows" 是
 # agent 断言完整性的自信措辞，裸关键词会误报（白耗每 run 仅 2 次的门禁预算，
 # 反馈文案还可能把本已完整的 run 诱导成诚实失败收题）。命中词前的短窗口内
-# 出现否定词则不计。
-_NEGATION_RE = re.compile(r"\b(?:no|nothing|not|none|without|n't)\b")
+# 出现否定词则不计。review3 #1：缩写否定单列一枝不带前置 \b——前置边界要求
+# n 前是词边界，而 isn't/doesn't/wasn't 中 n 前是字母，带 \b 的 n't 永不匹配。
+_NEGATION_RE = re.compile(r"\b(?:no|nothing|not|none|without)\b|n't\b")
 _NEGATION_WINDOW = 25
 
 
@@ -2003,7 +2004,10 @@ def scan_uncertainty_markers(*texts: str) -> list[str]:
                 neg = _NEGATION_RE.search(
                     low, max(0, m.start() - _NEGATION_WINDOW), m.start(),
                 )
-                if neg is None:  # 命中词前无否定词才算疑虑
+                # review3 #2："not sure/not verified/not confirmed" 自带否定词，
+                # 不受窗口抑制——前一从句的否定词（"No gap found, but not sure…"）
+                # 会跨从句误杀疑虑本身，让门禁零命中静默失效
+                if neg is None or kw.startswith("not "):
                     _add(kw)
                     break
                 # 首个出现被否定，仍继续找后续未否定的出现

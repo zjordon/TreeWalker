@@ -83,6 +83,22 @@ class TestScanUncertaintyMarkers:
             "no gap here. Many steps later we discover a new gap in the data"
         ) == ["gap"]
 
+    def test_contraction_negation_suppresses(self):
+        """review3 #1：n't 死分支修复——isn't/wasn't 缩写否定须抑制关键词，
+        带前置 \\b 的 n't 在词内永不匹配。"""
+        assert scan_uncertainty_markers("The tally isn't missing anything.") == []
+        assert scan_uncertainty_markers("there wasn't a gap in the data.") == []
+
+    def test_not_prefixed_keyword_immune_to_window(self):
+        """review3 #2："not sure/not verified" 自带否定词，不被前一从句的
+        否定词跨从句误杀——门禁零命中静默失效。"""
+        assert scan_uncertainty_markers(
+            "No gap found, but not sure the filter was correct"
+        ) == ["not sure"]
+        assert scan_uncertainty_markers(
+            "no issues found, still not verified end to end"
+        ) == ["not verified"]
+
     def test_dedupe_and_cap_three(self):
         text = "a=1? b=2? c=3? d=4? e=5? plus unknown and unread"
         hits = scan_uncertainty_markers(text)
