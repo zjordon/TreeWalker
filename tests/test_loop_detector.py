@@ -415,3 +415,16 @@ class TestFailureStreakTracker:
         assert "'screenshot' 4 times" in msg
         msg2 = t.nudge()  # screenshot 已升级报过 → evaluate 的首报
         assert msg2 is not None and "'evaluate' 2 times" in msg2
+
+    def test_peek_does_not_consume_until_acked(self):
+        """review2 #5：查询/提交解耦——peek 只读；LLM 调用失败（未 ack）时下步
+        peek 返回同一候选，首报不丢；ack 后才抑制。"""
+        t = FailureStreakTracker()
+        t.record("screenshot", failed=True)
+        t.record("screenshot", failed=True)
+        c1 = t.peek_nudge()
+        assert c1 is not None and c1[0] == "screenshot" and c1[1] == 2
+        c2 = t.peek_nudge()  # 未 ack → 同一候选可重发
+        assert c2 == c1
+        t.ack_nudge(c1[0], c1[1])
+        assert t.peek_nudge() is None  # 提交后抑制

@@ -191,12 +191,15 @@ class FailureStreakTracker:
             self._streaks.pop(name, None)
             self._notified_at.pop(name, None)
 
-    def nudge(self) -> str | None:
-        """Return the stop-loss nudge for the worst not-yet-notified streak, or None."""
-        # review 修正：遍历所有达到 NUDGE_AT 的动作（streak 降序），取第一个通过
-        # 自身去抖判定的——只看 max 会把新达阈值动作的首报饿死在抑制档动作后面
-        #（task_374 形态：screenshot 冻结在 3 档期间，agent 原地发明的 evaluate
-        # workaround 连败 2 次，其"换思路"提示被 screenshot 的抑制档屏蔽）。
+    def peek_nudge(self) -> tuple[str, int, str] | None:
+        """（只读）返回当前应注入的止损候选 ``(name, streak, message)`` 或 None。
+
+        review2 #5：查询不落档——_prepare_context 构建状态消息时 peek 只暂存，
+        LLM 响应确实取得后由调用方 ``ack_nudge`` 提交；否则 LLM 调用失败/超时
+        （输出未送达模型）时首报会被去抖永久吞掉，tier-2 止损在该动作上静默
+        丢失。遍历所有达阈动作（streak 降序）取第一个通过自身去抖判定的——
+        只看 max 会把新达阈值动作的首报饿死在抑制档动作后面（review #1）。
+        """
         candidates = sorted(
             ((name, s) for name, s in self._streaks.items() if s >= self.NUDGE_AT),
             key=lambda kv: -kv[1],
@@ -209,20 +212,33 @@ class FailureStreakTracker:
                 continue
             if notified >= self.NUDGE_AT and streak < self.ESCALATE_AT:
                 continue
-            self._notified_at[name] = streak
             if streak >= self.ESCALATE_AT:
-                return (
+                return (name, streak, (
                     f"⚠️ You have failed '{name}' {streak} times in a row. "
                     "Strongly consider declaring this sub-goal unreachable: complete "
                     "or verify the task's actual deliverable, or finish with an honest "
                     "partial result (done with success=false, describing what was "
                     "accomplished and what is missing)."
-                )
-            return (
+                ))
+            return (name, streak, (
                 f"⚠️ You have failed '{name}' {streak} times in a row. Stop retrying "
                 "or inventing workarounds for this approach. Re-read the original "
                 "task and switch to a different approach that directly advances the "
                 "task's final goal — also ask whether the failing sub-goal is "
                 "required by the task at all."
-            )
+            ))
         return None
+
+    def ack_nudge(self, name: str, streak: int) -> None:
+        """提交档位（与 ``peek_nudge`` 配对的写侧）——状态消息确认进入本轮
+        对话（LLM 响应取得）后调用。"""
+        self._notified_at[name] = streak
+
+    def nudge(self) -> str | None:
+        """peek + ack 的便捷组合（单测与简单场景用；step 侧用 peek/ack 分离版）。"""
+        candidate = self.peek_nudge()
+        if candidate is None:
+            return None
+        name, streak, message = candidate
+        self.ack_nudge(name, streak)
+        return message

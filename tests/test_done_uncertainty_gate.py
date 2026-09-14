@@ -56,6 +56,33 @@ class TestScanUncertaintyMarkers:
         # 整句疑问（"Is this right?"）按设计命中——自评里的疑问句本身就是未消解状态
         assert scan_uncertainty_markers("Saved. Is this right?") == ["right?"]
 
+    def test_paren_quote_punct_wrapped_token_q(self):
+        """review2 #3：排除式前瞻覆盖括号/引号/句读包裹的悬置值——尾前瞻
+        (?=\\s|$) 会全部漏检。"""
+        hits = scan_uncertainty_markers("(Emma Davis=1?)")
+        assert "Davis=1?" in hits
+        assert scan_uncertainty_markers("tally: 3?.") == ["3?"]
+        assert scan_uncertainty_markers('"1?", noted') == ["1?"]
+
+    def test_negated_keywords_not_uncertainty(self):
+        """review2 #4：断言完整性的否定语境不误报——白耗门禁预算还可能把完整
+        run 诱导成诚实失败收题。"""
+        assert scan_uncertainty_markers("Nothing missing; all rows read.") == []
+        assert scan_uncertainty_markers("No gap remains in the tally.") == []
+        assert scan_uncertainty_markers("There are no unread rows left.") == []
+
+    def test_negation_window_is_short(self):
+        # 否定词距命中 >25 字符（隔了别的句子）→ 仍算疑虑
+        assert scan_uncertainty_markers(
+            "no issues earlier; however a data gap appears later in the file"
+        ) == ["gap"]
+
+    def test_second_unnegated_occurrence_counts(self):
+        # 首个出现被否定、后续出现未否定（距否定词 >25 字符）→ 仍命中
+        assert scan_uncertainty_markers(
+            "no gap here. Many steps later we discover a new gap in the data"
+        ) == ["gap"]
+
     def test_dedupe_and_cap_three(self):
         text = "a=1? b=2? c=3? d=4? e=5? plus unknown and unread"
         hits = scan_uncertainty_markers(text)
@@ -74,12 +101,14 @@ def _make_pipeline(
     *,
     gate_enabled: bool = True,
     done_gate_uses: int = 0,
+    llm_timeout: float = 120,
 ) -> StepPipeline:
     """免构造管线：只挂门禁方法触碰的属性（沿 test_p7 _make_session 模式）。"""
     p = StepPipeline.__new__(StepPipeline)
     p.state = AgentState()
     p.state.done_gate_uses = done_gate_uses
     p._enable_done_gate = gate_enabled
+    p.llm_timeout = llm_timeout
     p.tools = Tools()
     p.llm = AsyncMock()
     if llm_side_effect is not None:
@@ -199,6 +228,53 @@ class TestGateUncertainSuccessDone:
         dirty = _done_response(memory="Emma Davis=1?")
         with pytest.raises(InterruptedError):
             await pipe._gate_uncertain_success_done(dirty, [])
+
+    @pytest.mark.asyncio
+    async def test_retry_timeout_passes_through_original(self):
+        """review2 #1：门禁重试有自身小超时——内层 TimeoutError（Exception 形态）
+        落在兜底里放行原响应，不上抛把合法 done 步变成失败步。"""
+        import asyncio
+
+        async def hang(**kwargs):
+            await asyncio.sleep(999)
+
+        pipe = _make_pipeline(llm_side_effect=hang, llm_timeout=0.05)
+        dirty = _done_response(memory="Emma Davis=1?")
+        out = await pipe._gate_uncertain_success_done(dirty, [])
+        assert out is dirty
+
+    @pytest.mark.asyncio
+    async def test_retry_cancelled_error_passes_through_original(self):
+        """review2 #1 残余窗口：外层预算取消以 CancelledError 打进内层 await——
+        放行原响应（软干预不吃掉已握有的合法 done）。"""
+        import asyncio
+
+        pipe = _make_pipeline(llm_side_effect=asyncio.CancelledError())
+        dirty = _done_response(memory="Emma Davis=1?")
+        out = await pipe._gate_uncertain_success_done(dirty, [])
+        assert out is dirty
+
+    @pytest.mark.asyncio
+    async def test_string_success_true_still_gated(self):
+        """review2 #2：pydantic lax 放行 "success": "true" 但不回写原 dict——
+        门禁须按执行侧语义判为成功并拦截。"""
+        retried = _done_response(text="verified")
+        pipe = _make_pipeline(llm_side_effect=[retried])
+        dirty = _done_response(memory="Emma Davis=1?")
+        dirty["action"]["params"]["success"] = "true"
+        out = await pipe._gate_uncertain_success_done(dirty, [])
+        assert pipe.llm.get_action.await_count == 1
+        assert out is retried
+
+    @pytest.mark.asyncio
+    async def test_string_success_false_not_gated(self):
+        pipe = _make_pipeline()
+        resp = _done_response(text="partial")
+        resp["action"]["params"]["success"] = "false"
+        resp["memory"] = "Emma Davis=1?"
+        out = await pipe._gate_uncertain_success_done(resp, [])
+        assert out is resp
+        pipe.llm.get_action.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_clean_success_done_untouched(self):

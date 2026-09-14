@@ -206,6 +206,10 @@ class StepPipeline:
                 # P0-1：LLM 期间用户停止 → 输出已丢弃。不执行动作、不进 post_process，
                 # _finalize 的 `if model_output is not None` 守卫会跳过历史写入。
                 return False
+            # review2 #5（issue #186）：止损 nudge 的档位此刻才提交——_prepare_context
+            # 里 peek 只暂存；LLM 调用失败/超时（输出未送达）时首报在下步重发，
+            # 不会"查询即消费"地静默丢失。
+            self._ack_pending_streak_nudge()
             # 归一化在 _get_next_action 内完成（校验/truncate/emit 之前，
             # review7 #6）——其每条返回路径（含 fallback done）都已归一化，
             # 此处不再重复调用（review8 #8：三重归一化 + 同一 WARNING ×3/步）
@@ -327,10 +331,14 @@ class StepPipeline:
                 self.loop_detector.consecutive_stagnant_pages,
             )
         # issue #186 现象①：连败止损 nudge（失败感知，阈值 2/4 分级带去抖）——与
-        # loop nudge 同位并入；state message 每步重建，天然自清。
-        streak_nudge = self.failure_streak.nudge()
+        # loop nudge 同位并入；state message 每步重建，天然自清。review2 #5：peek
+        # 只暂存不落档——LLM 调用失败/超时（输出未送达）时，_step 不调 ack，下步
+        # 重建状态消息时首报重发，不会"查询即消费"地静默丢失。
+        streak_candidate = self.failure_streak.peek_nudge()
+        self._pending_streak_nudge = streak_candidate
+        streak_nudge = streak_candidate[2] if streak_candidate else None
         if streak_nudge:
-            logger.info("Failure-streak nudge injected: %s", streak_nudge[:100])
+            logger.info("Failure-streak nudge staged: %s", streak_nudge[:100])
             nudge = "\n\n".join(x for x in (nudge, streak_nudge) if x)
 
         # 4b. Check for new downloads
@@ -553,6 +561,19 @@ class StepPipeline:
         if _MSG_TYPE not in msg:
             return msg
         return {k: v for k, v in msg.items() if k != _MSG_TYPE}
+
+    def _ack_pending_streak_nudge(self) -> None:
+        """review2 #5（issue #186）：止损 nudge 档位的提交侧。
+
+        _prepare_context 里 peek 只暂存到 ``_pending_streak_nudge``；本方法在
+        LLM 响应确实取得后由 _step 调用——若本步 LLM 调用失败/超时/用户停止
+        （输出未送达模型），ack 不发生，下步重建状态消息时同一档位重发，首报
+        不会被去抖永久吞掉。
+        """
+        pending = getattr(self, "_pending_streak_nudge", None)
+        if pending is not None:
+            self.failure_streak.ack_nudge(pending[0], pending[1])
+            self._pending_streak_nudge = None
 
     def _set_state_message(self, content: str | list[dict[str, Any]]) -> None:
         """设置当前步状态消息，并保留上一份 state 供 LLM 前后对比。
@@ -1003,7 +1024,13 @@ class StepPipeline:
         if is_honest_failure_action(action):
             return response
         params = params_of(action)
-        if params.get("success", True) is not True:
+        # review2 #2：镜像执行侧/pydantic lax 的强转语义再判定——"success": "true"
+        # 字符串经 lax 校验通过但不回写原 dict，`is not True` 的精确布尔判定会把
+        # 它当 success=False 放行、跳过门禁。
+        raw_success = params.get("success", True)
+        if isinstance(raw_success, str):
+            raw_success = raw_success.strip().lower() in ("true", "t", "yes", "y", "on", "1")
+        if not bool(raw_success):
             return response
         if not getattr(self, "_enable_done_gate", True):
             return response
@@ -1036,14 +1063,31 @@ class StepPipeline:
         # 抛 API/网络异常时放行原响应（否则异常一路上抛 _handle_step_error 计
         # consecutive_failures，最坏把 run 推向 max_failures 终止）。用户停止信号
         # （InterruptedError）照常放行传播。
+        # review2 #1：重试调用还落在 _get_next_action 外层 wait_for(llm_timeout)
+        # 预算窗内——预算恰在重试期间耗尽时外层以 CancelledError 取消 await 点
+        # （BaseException，except Exception 接不住）、TimeoutError 在外层抛出，
+        # 已握有的合法 done 整体丢失。内层小超时让取消先以 TimeoutError
+        # （Exception 形态）落在本 except 内；残余的外层取消窗口由 CancelledError
+        # 子句兜底（用户停止走 InterruptedError 信号量，非任务取消，不受影响）。
         try:
-            retried = self._normalize_llm_response(await self.llm.get_action(
-                system_prompt=self._system_prompt,
-                messages=retry_messages,
-                tool_schema=self._tool_schema,
+            retried = self._normalize_llm_response(await asyncio.wait_for(
+                self.llm.get_action(
+                    system_prompt=self._system_prompt,
+                    messages=retry_messages,
+                    tool_schema=self._tool_schema,
+                ),
+                timeout=min(self.llm_timeout, _DONE_GATE_RETRY_TIMEOUT),
             ))
         except InterruptedError:
             raise
+        except asyncio.CancelledError:
+            # 外层预算取消（llm_timeout 窗口耗尽）→ 放行原响应；真正的任务级
+            # 取消会在后续检查点/await 再触发停止链
+            logger.warning(
+                "done-gate verification retry cancelled (outer llm_timeout "
+                "budget?) — passing through original response",
+            )
+            return response
         except Exception as e:
             logger.warning(
                 "done-gate verification retry failed (%s: %s) — passing "
@@ -1913,21 +1957,30 @@ _LOOP_EXEMPT_ACTIONS = frozenset({"wait", "done", "go_back"})
 # 词尾 ?：贴数字/标识符的悬而未决值（task_64 step16 的 "Emma Davis=1?" "=2?"
 # "Davis?"）。token 不含空格 → 整句疑问（"Is this right?"）也会命中——自评里的
 # 疑问句本身就是未消解状态，可接受；(?<![\w?]) 排除 "???" 连问与 token 中段。
-_TOKEN_Q_RE = re.compile(r"(?<![\w?])[\w.\-=]{1,64}\?(?=\s|$)")
+# review2 #3：前瞻用排除式 (?![\w?])——尾前瞻 (?=\s|$) 会漏掉括号/引号/句读
+# 包裹的形态（"(Emma Davis=1?)"、"3?."、'"1?",'），漏检即门禁静默失效。
+_TOKEN_Q_RE = re.compile(r"(?<![\w?])[\w.\-=]{1,64}\?(?![\w?])")
 _URL_RE = re.compile(r"https?://\S+")
 _UNCERTAIN_KEYWORDS = (
     "unknown", "unverified", "unread", "gap", "missing", "pending",
     "partial", "uncertain", "unclear", "not sure", "not verified",
     "not confirmed", "needs verification", "to verify", "to check",
 )
+# review2 #4：否定语境——"nothing missing"/"no gap remains"/"no unread rows" 是
+# agent 断言完整性的自信措辞，裸关键词会误报（白耗每 run 仅 2 次的门禁预算，
+# 反馈文案还可能把本已完整的 run 诱导成诚实失败收题）。命中词前的短窗口内
+# 出现否定词则不计。
+_NEGATION_RE = re.compile(r"\b(?:no|nothing|not|none|without|n't)\b")
+_NEGATION_WINDOW = 25
 
 
 def scan_uncertainty_markers(*texts: str) -> list[str]:
     """扫 evaluation/memory/done 文本中未消解的不确定标记（issue #186 现象②）。
 
     先剥 URL（query string 的 ``?`` 不是疑虑）；词尾 ``?`` 取 token 原文、关键词
-    按整词（``\\b``）小写匹配。返回命中样本（去重、保序、封顶 3 个）供门禁的
-    反馈消息引用——把 agent 自己写下的疑虑原样递回给它。
+    按整词（``\\b``）小写匹配且命中位置前的短窗口内无否定词。返回命中样本
+    （去重、保序、封顶 3 个）供门禁的反馈消息引用——把 agent 自己写下的疑虑
+    原样递回给它。
     """
     hits: list[str] = []
     seen: set[str] = set()
@@ -1946,11 +1999,21 @@ def scan_uncertainty_markers(*texts: str) -> list[str]:
             _add(m)
         low = stripped.lower()
         for kw in _UNCERTAIN_KEYWORDS:
-            if re.search(rf"\b{re.escape(kw)}\b", low):
-                _add(kw)
+            for m in re.finditer(rf"\b{re.escape(kw)}\b", low):
+                neg = _NEGATION_RE.search(
+                    low, max(0, m.start() - _NEGATION_WINDOW), m.start(),
+                )
+                if neg is None:  # 命中词前无否定词才算疑虑
+                    _add(kw)
+                    break
+                # 首个出现被否定，仍继续找后续未否定的出现
     return hits
 
 
 # 门禁每 run 触发封顶（防「每步重发带标记的 done」循环：打回→agent 换工具→
 # 再 done 又带新标记→再打回……每次循环都强制了一轮验证推进，但必须有界）。
 _DONE_GATE_MAX_PER_RUN = 2
+# review2 #1：门禁重试的内层小超时——先于外层 llm_timeout 窗口到期，让预算
+# 耗尽的取消以 TimeoutError（Exception 形态）落在门禁自己的兜底里放行原响应，
+# 而非外层 wait_for 处变成失败步、丢掉已握有的合法 done。
+_DONE_GATE_RETRY_TIMEOUT = 60.0
