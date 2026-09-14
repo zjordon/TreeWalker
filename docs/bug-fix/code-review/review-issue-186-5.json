@@ -1,0 +1,255 @@
+{
+  "status": "complete",
+  "llm": {
+    "model": "glm-5.3"
+  },
+  "message": "Review complete: 2 finding(s) across 11 selected item(s).",
+  "summary": {
+    "files_reviewed": 11,
+    "comments": 2,
+    "total_tokens": 2109241,
+    "input_tokens": 2025442,
+    "output_tokens": 83799,
+    "cache_read_tokens": 1735808,
+    "elapsed": "29m58s"
+  },
+  "tool_calls": {
+    "total": 74,
+    "by_tool": {
+      "code_comment": 2,
+      "code_search": 30,
+      "file_read": 41,
+      "file_read_diff": 1
+    },
+    "failure": 0,
+    "failure_by_tool": {},
+    "failure_details": []
+  },
+  "comments": [
+    {
+      "path": "src/tree_walker/agent/step.py",
+      "content": "内层超时未按剩余预算计算，review2 #1 声称的保护在特定时间窗内失效：外层 `wait_for(self._get_action_with_retry(trimmed), timeout=self.llm_timeout)` 从 Think 阶段起点计时，而这里的 `min(self.llm_timeout, 60.0)` 从**门禁入口**重新计时——只约束绝对值、不约束剩余额度。当首调 + 参数梯已消耗超过 `llm_timeout - min(llm_timeout, 60)` 秒（默认 120s 预算下即 \u003e60s，慢模型/大上下文/视觉场景现实可达）时，外层超时先到期：取消以 CancelledError（BaseException）形态穿透本 except（按 review4 #1 设计不捕获），被外层 wait_for 转成 TimeoutError → 该步变成失败步、已握有的合法 done 响应被丢弃——正是第 2034-2036 行注释声称内层小超时要防止的结果。且此路径上 `done_gate_uses` 已 `+= 1` 但不走 `except Exception` 的 `-= 1` 回滚，预算被消耗却没产出任何重试，违背 review4 #2 的回滚意图。建议用 `_step` 入口记录的 `_step_start_time` 计算剩余预算取小，保证内层 TimeoutError（Exception 形态）恒先落地于本 except：",
+      "suggestion_code": "        try:\n            # 外层 llm_timeout 从 Think 阶段起点计时，此处须按剩余额度取小——\n            # 否则首调+参数梯已耗 \u003ellm_timeout-60s 时外层先到期，取消以\n            # CancelledError 穿透本 except，外层转 TimeoutError 成失败步。\n            elapsed = time.time() - getattr(self, \"_step_start_time\", time.time())\n            retry_timeout = max(0.0, min(\n                _DONE_GATE_RETRY_TIMEOUT, self.llm_timeout - elapsed))\n            retried = self._normalize_llm_response(await asyncio.wait_for(\n                self.llm.get_action(\n                    system_prompt=self._system_prompt,\n                    messages=retry_messages,\n                    tool_schema=self._tool_schema,\n                ),\n                timeout=retry_timeout,\n            ))",
+      "existing_code": "        try:\n            retried = self._normalize_llm_response(await asyncio.wait_for(\n                self.llm.get_action(\n                    system_prompt=self._system_prompt,\n                    messages=retry_messages,\n                    tool_schema=self._tool_schema,\n                ),\n                timeout=min(self.llm_timeout, _DONE_GATE_RETRY_TIMEOUT),\n            ))",
+      "start_line": 1074,
+      "end_line": 1082,
+      "thinking": "Confirmed: `_step_start_time` is set at `_step` entry (line 181) and is available for computing remaining budget. My suggested fix is feasible.\n\nLet me finalize my review. Summary of findings:\n\n**Finding 1 (medium, bug)** — step.py `_gate_uncertain_success_done`: the inner retry timeout `min(self.llm_timeout, _DONE_GATE_RETRY_TIMEOUT)` counts from gate entry, not from the outer `wait_for(llm_timeout)` start (which wraps the whole Think ladder: initial call + clarification/param retries + gate). When the pre-gate ladder already consumed more than `llm_timeout - min(llm_timeout, 60)` seconds (default: \u003e60s of a 120s budget — realistic with slow models/vision contexts), the OUTER timeout fires first while the gate retry is in flight. That cancellation is delivered as CancelledError (BaseException), which the gate deliberately does not catch; the outer wait_for converts it to TimeoutError → the step becomes a failure step and the valid done response already in hand is discarded — exactly the outcome the comment (line 2034-2036 / 1067-1068) claims the inner small timeout prevents. Additionally, `done_gate_uses` stays incremented on this path (rollback only in `except Exception`), leaking budget with no retry delivered, contrary to the review4 #2 rollback intent.\n\nFix: derive inner timeout from remaining budget via `self._step_start_time`.\n\nEverything else reviewed clean:\n- views.py: field addition fine.\n- models.py: description text fine.\n- test_done_uncertainty_gate.py: assertions consistent with implementation and regex semantics (verified each regex expectation by hand).\n- test_unknown_action_name.py: attribute wiring fine.\n- Wiring in agent.py/config.py confirmed (context files).\n\nI'll submit one code_comment, then task_done.",
+      "category": "bug",
+      "severity": "medium"
+    },
+    {
+      "path": "src/tree_walker/agent/step.py",
+      "content": "门禁预算在 InterruptedError 路径不回滚，与同函数 except Exception 分支（review4 #2：\"重试未产出不消耗每 run 仅 2 次的门禁预算\"）语义不一致。done_gate_uses 在 LLM 重试前已 +1；用户 **pause**（非 stop）恰落在重试窗口内时，InterruptedError 传播出去、run 稍后继续，但本档预算已烧掉——两次此类暂停即让门禁对本 run 静默失效（stop 场景 run 结束无所谓，pause 场景预算泄漏是真实的）。建议与 Exception 分支同样回滚：",
+      "suggestion_code": "        except InterruptedError:\n            # 与 except Exception 分支同语义：重试未产出（输出未送达）不消耗\n            # 每 run 仅 2 次的门禁预算——pause 后 run 会继续，预算烧掉即静默失效\n            self.state.done_gate_uses -= 1\n            raise\n        except Exception as e:",
+      "existing_code": "        except InterruptedError:\n            raise\n        except Exception as e:",
+      "start_line": 1083,
+      "end_line": 1085,
+      "thinking": "`_loop_agent` is MagicMock-based → `self.failure_streak.record(...)` hits an auto-created MagicMock → no crash. Existing tests are safe.\n\nNow, one more important check for the **`_ack_pending_streak_nudge` on MagicMock agents**: `getattr(agent, \"_pending_streak_nudge\", None)` — for MagicMock, auto-attribute returns a MagicMock, NOT None. Then `self.failure_streak.ack_nudge(pending[0], pending[1])` — `pending[0]` works on MagicMock (`__getitem__` is configured in MagicMock). No crash. OK.\n\nNow let me consolidate my final review findings.\n\nI've verified the whole implementation quite thoroughly. The genuinely reportable issues:\n\n**Finding 1 (low, bug): 门禁预算在 InterruptedError（pause）路径不回滚。**\n`self.state.done_gate_uses += 1` happens before the retry; the `except InterruptedError: raise` path (and any CancelledError propagation) leaves the increment in place. Per the code's own review4 #2 rationale (\"重试未产出不消耗每 run 仅 2 次的门禁预算\"), a pause during the gate's verification retry burns 1 of only 2 budget units with no gate effect; after a second such event the gate is silently disabled for the rest of the run. Inconsistent with the `except Exception` rollback branch. Severity: low (pause during a ≤60s window is rare; budget=2).\n\nHmm, wait — is this really worth reporting given \"Favor precision over recall\"? It IS a real inconsistency: two exception paths from the same retry call, one rolls back, the other doesn't, without a stated reason. The docstring only says \"用户停止信号照常放行传播\" — stop ends the run so budget doesn't matter; but the same signal also covers pause (per the codebase's own semantics: `_execute_actions` raises InterruptedError for BOTH stopped and paused). And test `test_retry_interrupted_error_propagates` doesn't assert the counter state. I'll report it as low severity.\n\n**Finding 2?** Let me reconsider the `_scan_uncertainty_keywords` negation-window — any real bug? One thing: `low` is URL-stripped BEFORE lowercasing in `_scan_uncertainty_keywords`, and negation/keyword positions are all on `low` — consistent. OK.\n\n**Finding 3?** — `scan_uncertainty_markers` `_TOKEN_Q_RE.findall(stripped)` where stripped is NOT lowercased — tokens preserved as samples for the feedback. Fine.\n\n**Finding 4?** — What about `params.get(\"text\")` being non-str (e.g., dict for variant B)? `str(dict)` → keys become part of scan. e.g. `{\"data\": {...}}` → \"data\" — \"data\" is not a keyword. Fine.\n\n**Finding 5?** — models.py/views.py: clean.\n\n**Finding 6?** — test file issues: \n- `_make_pipeline` doesn't set `_pending_streak_nudge` — not needed (gate doesn't touch it). Fine.\n- Tests look consistent.\n\nHmm, one more potential REAL issue in the test file — `TestGateConfig.test_env_parsing...` calls `load_settings()` which reads MANY env vars; monkeypatch only sets AGENT_DONE_GATE. If the developer's environment has e.g. AGENT_MAX_STEPS unset → defaults fine. OK.\n\nNow — let me reconsider one more time whether there's a **genuine logic bug in the gate's placement relative to `_validate_params_or_retry`'s \"proceeding anyway\" path**: A done with invalid params (e.g., extra=\"forbid\" violation from extra keys) proceeds anyway → execution of `done` with bad params — pre-existing. The gate scans it — could trigger retry; retried validated → replaced with clean done. Fine, even beneficial.\n\n**One more candidate — the gate's `feedback` message and `messages` containing `_MSG_TYPE` keys?** `trimmed = self._trim_messages()` strips `_type` at the boundary (comment says \"_trim_messages 边界剥除\"). So retry_messages are clean. Fine.\n\n**And the sensitivity masking** — `trimmed` is masked (URLs shortened, sensitive masked) per `_save_conversation` docstring. The gate's feedback quotes `hits` samples taken from the RAW response (client restored sensitive values). Could feedback leak sensitive values into... the retry_messages sent to the LLM (already sees raw via client restore?) — the client masks outgoing and restores incoming. The samples are things like \"Davis=1?\" or \"gap\" — could theoretically contain a sensitive value with \"?\"... The LLM sees its own memory anyway (previous_evaluation/previous_memory in state message are raw). Marginal, skip.\n\nNow — **one more REAL issue candidate I should double check: `str.strip().lower() in (...)` includes \"1\" but what about \" True\" with whitespace — stripped. \"TRUE\" lowered. What about pydantic lax accepting \"Y\"/\"yes\"? Covered.\n\nOK. Let me also double-check the **`_step` ack placement vs `_get_next_action` returning `response` at post-LLM stop check #2** (stopped before committing assistant message): `_step` proceeds → ack → `_execute_actions` returns early error result. Ack semantics \"LLM 响应确实取得\" — response was obtained. Correct.\n\n**Now finalize Finding 1 and decide if there are others worth reporting.**\n\nLet me re-examine **the `peek/ack` protocol for a subtle bug**: `peek_nudge` returns the FIRST candidate passing dedup. `_prepare_context` stages it. If LLM call fails → no ack → next step: streak may have GROWN (more failures) → peek returns upgraded message, or same. Fine. If streak RESET (action succeeded) between staging and ack? Ack after response: `ack_nudge(name, streak)` sets `_notified_at[name] = staged_streak` — but if the action succeeded in the SAME step, `record` popped both `_streaks[name]` and `_notified_at[name]`... wait — order in `_step`: ack happens at line 212 (after `_get_next_action`), THEN `_execute_actions` (line 216) → record → success pops `_notified_at`. So ack writes `_notified_at[name]=streak` then record(success) pops it. Fine order.\n\nBut — **edge: ack for a name whose streak was reset mid-step** — can't happen (record runs after ack).\n\n**What about pause after prepare but before LLM: pending stays; user resumes; NEXT step's `_prepare_context` re-peeks — the same candidate (streak unchanged) → re-stage → LLM sees it → ack. Correct.\n\nAlright — now, is Finding 1 solid enough to report? Let me weigh: severity low, but it's a real behavioral inconsistency vs the documented budget semantics. I'll report it with a suggestion: roll back the increment in the `InterruptedError` branch too (or move increment to after successful retry outcome decision — but then the \"invalid retried\" path also consumed budget intentionally... actually simplest: decrement in InterruptedError branch before raise).\n\nWait — actually, hmm. Let me think about whether decrementing on InterruptedError is right: the LLM call was interrupted — no output obtained — same as \"retry failed\" (Exception path) → rollback is consistent. Yes.\n\nAre there any other findings? Let me do one FINAL careful pass over the new module-level regex code for correctness:\n\n```python\n_TOKEN_Q_RE = re.compile(r\"(?\u003c![\\w?])[\\w.\\-=]{1,64}\\?(?![\\w?])\")\n```\n\n- `(?\u003c![\\w?])` — the char before the token must not be word char or `?`.\n- `[\\w.\\-=]{1,64}` — token chars (word, dot, hyphen, equals).\n- `\\?` — literal ?.\n- `(?![\\w?])` — next char not word/`?`.\n\nCase \"Emma Davis=1?\" — token \"Davis=1?\" — preceded by space ✓, followed by EOL ✓. Match ✓.\n\nCase \"???\" — token attempt: `[\\w.\\-=]+` then `\\?` — \"???\" has no leading token chars → no match ✓ (comment says excluded).\n\nCase \"a??b\" — token \"a\" then `\\?` then lookahead `?` is in `[\\w?]` → fail; backtrack: no shorter token... `{1,64}` greedy from \"a\": can't include \"?\". So no match ✓.\n\n`_URL_RE = re.compile(r\"https?://\\S+\")` — strips URLs ✓.\n\n```python\n_NEGATION_RE = re.compile(r\"\\b(?:no|nothing|not|none|without)\\b|n't\\b\")\n```\n\nNote: alternation order no|nothing|not|none — with `\\b...\\b` wrapper around the group only. Wait: `\\b(?:no|nothing|not|none|without)\\b` — for \"nothing\", trying \"no\" matches but trailing `\\b` fails (t follows) → backtrack tries \"nothing\" ✓. Python re does try alternatives in order with backtracking ✓.\n\n`n't\\b` — \"isn't\" → matches \"n't\" ✓. \"can't\" → \"n't\" ✓ (a-n-'-t: substring \"n't\" at index 2) ✓.\n\nNow `_scan_uncertainty_keywords`:\n\n```python\n    low = _URL_RE.sub(\"\", str(text)).lower()\n```\n\nWait — subtle: `.lower()` AFTER strip. The negation search positions — all on `low` ✓.\n\n```python\n        for m in re.finditer(rf\"\\b{re.escape(kw)}\\b\", low):\n```\n\n`kw` already lowercase; `low` lowercase ✓.\n\nHmm — one real subtlety: `_UNCERTAIN_KEYWORDS` contains \"not sure\" — `re.escape(\"not sure\")` → \"not\\ sure\" (space escaped, fine).\n\n`neg is None or kw.startswith(\"not \")` ✓.\n\nOK the regex layer is solid.\n\nLet me now also sanity-check `test_negation_window_is_short` arithmetic to make sure the test isn't flaky: \"no issues earlier; however a data gap appears later in the file\" — position of \"no\" = 0-1. \"gap\" position: count \"no issues earlier; however a data gap \" — let me count: \"no issues earlier; however a data \" = 2+1+6+1+8+1+1+1+7+1+1+1+4+1 = let me just count chars: \"no \" (3) + \"issues \" (7) + \"earlier; \" (9) + \"however \" (8) + \"a \" (2) + \"data \" (5) = 34 → m.start() = 34; window [34-25, 34) = [9, 34) — \"no\" at 0-2 not in window ✓ → hit. Deterministic ✓.\n\nNow, let me make a final decision about reporting findings. My verified finding:\n\n1. **InterruptedError budget leak** (low severity, bug).\n\nAnything else? Let me reconsider the **`test_retry_llm_failure_passes_through_original`** test — creates pipe2 but `pipe.state.done_gate_uses == 0` asserted on pipe1 — fine.\n\nAnd **`_make_pipeline` default `gate_enabled=True` but no `_pending_streak_nudge`** — not needed.\n\nLet me also double check **`test_marker_in_evaluation_also_scanned`**: `_done_response(evaluation_previous_goal=\"Partially — count unverified\")` — wait, \"Partially\" contains keyword \"partial\"! `\\bpartial\\b` — \"partially\" — trailing \"ly\" → `\\b` after \"partial\" fails (l is word char) → no match for \"partial\". \"unverified\" → hit ✓. Also note `_done_response` default text=\"answer\" — no keywords. OK.\n\nOne more on the **models.py** change — description text ends \"verify it first or set success=False.\" — fine.\n\nAnd **views.py** — fine.\n\nHmm, now let me reconsider whether the **`_gate_uncertain_success_done` retried-response validation asymmetry** is worth flagging: the retried response is checked with `_is_valid_action` + `_validate_action_params` but NOT passed through `_validate_params_or_retry`. If retried has invalid params → return original (which HAD valid params). That's a deliberate fallback-to-original. Fine.\n\nWhat about **the gate being bypassed when `_validate_params_or_retry` returns fallback done** — fallback is honest done, skipped ✓.\n\nOK final answer: report Finding 1 (low). \n\nActually hold on — let me reconsider one more potential medium issue I glossed over: **the gate uses `messages` = `trimmed`, but `_get_action_with_retry`'s SECOND call site passes `messages` (the original param) — same for both. ✓.\n\nAnd **the gate's retry does not emit ModelCallEvent/ModelResultEvent observability** — the retry LLM call is invisible to observability (model_call_id not updated). The retried response goes through `_get_next_action`'s post-processing which uses the ORIGINAL model_call_id for... actually ModelResultEvent was already emitted for the ORIGINAL response before the gate? No wait — the gate runs INSIDE `_get_action_with_retry`, which is awaited by `_get_next_action` — the whole ladder (including gate) completes BEFORE `_get_next_action` emits ModelResultEvent with the FINAL (possibly gate-retried) response. So ModelResultEvent reports the final action. ModelCallEvent was emitted once (message_count of trimmed) — the gate's extra LLM call isn't reflected in observability (no second ModelCallEvent, token usage of gate retry lost — `response.get(\"usage\")` from... the gate returns `retried` which may have its own usage; `_get_next_action` reads `response.get(\"usage\")` from the final response ✓). Minor observability gap: gate retry calls invisible in the event stream. Is that worth flagging? It's an observability completeness issue — the event stream would show one ModelCallEvent but two actual LLM calls (token costs). For an eval/observability-focused project this might matter. Hmm — but `_validate_params_or_retry` retries are ALSO invisible (pre-existing pattern — no ModelCallEvent for ladder retries either). So the gate follows the existing convention. Skip.\n\nFINAL: report one low-severity finding (InterruptedError budget rollback inconsistency). \n\nWait — before finalizing, let me reconsider the severity/certainty of that finding once more. The `except InterruptedError: raise` branch — the increment at line 1048 happened. InterruptedError from `self.llm.get_action` — when does LLMClient raise InterruptedError? Per P0-1 comments, during user stop/pause the LLM call raises InterruptedError (the \"输出已丢弃\" path in `_step`'s comment: \"LLM 期间用户停止\"). Actually more precisely — `_get_next_action` handles `model_output is None` from... hmm, actually where does the None come from? `_get_action_with_retry` returning None? Let me not over-verify; the point stands: InterruptedError can originate from the LLM call on user stop/pause, and the test file itself asserts `InterruptedError` propagates from `llm.get_action`. Pause → run continues → budget consumed. Also the asyncio.wait_for timeout path: TimeoutError → caught by `except Exception` → rollback ✓.\n\nSo the leak is specifically InterruptedError-during-retry. It's narrow but real and contradicts the stated budget-rollback design. Report as low.\n\nAlso — should I double check that `except Exception` catches `asyncio.TimeoutError`? In Python 3.11+, asyncio.TimeoutError IS builtins.TimeoutError which inherits from Exception (OSError? no — TimeoutError inherits from OSError! Actually: TimeoutError is a subclass of OSError, which is a subclass of Exception ✓). Fine — confirmed by the passing test presumably.\n\nOne more scan of the diff for anything in **test_unknown_action_name.py** — the two added lines use the same tab indentation ✓; import inside __init__ (fine for test).\n\nAnd **`from tree_walker.agent.loop_detector import FailureStreakTracker` inside `__init__`** — fine.\n\nDone. I'll report the single finding via code_comment, then task_done.\n\nFor the comment location — the existing_code must be from the NEW diff lines. Use:\n\n```python\n        except InterruptedError:\n            raise\n```\n\nThat's in the diff. My suggestion:\n\n```python\n        except InterruptedError:\n            # 与 except Exception 分支同语义：重试未产出（输出未送达）不消耗\n            # 每 run 仅 2 次的门禁预算——pause 后 run 会继续，预算烧掉即静默失效\n            self.state.done_gate_uses -= 1\n            raise\n```\n\nGood. Let me write the final comment.",
+      "category": "bug",
+      "severity": "low"
+    }
+  ],
+  "groups": [
+    {
+      "label": "Agent loop detection feature (detector, agent integration, config, tests)",
+      "files": [
+        "src/tree_walker/agent/agent.py",
+        "src/tree_walker/agent/loop_detector.py",
+        "src/tree_walker/config.py",
+        "tests/test_loop_detector.py"
+      ]
+    },
+    {
+      "label": "Step execution: done uncertainty gate and unknown action handling (step, views, tool models, tests)",
+      "files": [
+        "src/tree_walker/agent/step.py",
+        "src/tree_walker/agent/views.py",
+        "src/tree_walker/tools/models.py",
+        "tests/test_done_uncertainty_gate.py",
+        "tests/test_unknown_action_name.py"
+      ]
+    },
+    {
+      "label": "System prompt update and tests",
+      "files": [
+        "src/tree_walker/prompts/system_prompt.py",
+        "tests/test_system_prompt.py"
+      ]
+    }
+  ],
+  "session_id": "700bf5ef-0d4b-4af5-a3c2-a71e9573667d",
+  "manifest": {
+    "schema_version": "ocr.run-manifest/v1",
+    "run_id": "700bf5ef-0d4b-4af5-a3c2-a71e9573667d",
+    "operation": "review",
+    "terminal_state": "complete",
+    "repository": {
+      "identity_sha256": "2868bcfb033292e0d47631dc911d0e36e5dcedaf9e0bcacffe6c4716bb93dfda"
+    },
+    "input": {
+      "mode": "range",
+      "requested_from": "master",
+      "requested_head": "fix/186-behavior-discipline",
+      "resolved_base": "b00f08b4a0feaa5fcafea3b3249fdd18a3d2695a",
+      "resolved_head": "0f9df6869d5d30960a98cf4512be3cbca0975751",
+      "exact_range": "b00f08b4a0feaa5fcafea3b3249fdd18a3d2695a..0f9df6869d5d30960a98cf4512be3cbca0975751",
+      "source_artifact_sha256": "2ef6c8cd81ae519ec6fd68490416c982b03d62c16dc18efd1600a40c07971eb6"
+    },
+    "execution": {
+      "ocr_version": "v1.12.1",
+      "model": "glm-5.3",
+      "configured_concurrency": 8,
+      "rule_config_sha256": "ddb40005eb732cb8b37d8d3dc1acb82f3aa51fded408c899a092c10349c369c4",
+      "runtime_config_sha256": "841fe9ad288d2dd9efc84c443193c492ef06b26edf31ff5f5a1b01637fef2b0c"
+    },
+    "coverage": {
+      "selected": [
+        {
+          "item_id": "05ea6ae46e6e85c25d4aa676c4acbe6552aac167dbe772307f715d2fe273edaf",
+          "path": "src/tree_walker/agent/step.py",
+          "fingerprint": "2cd404ee1ba3ab6736182d945fcee5b50230f5d9226bc59f4ad5c8aa45c84b1c"
+        },
+        {
+          "item_id": "102ddb85ec832fa28af84cda4c3ddac1e83fd4a836adee089ed2342759711f70",
+          "path": "src/tree_walker/tools/models.py",
+          "fingerprint": "2536f1cd1f4a86767f7c72a0c4680dc5ca905e4e1bfcf868714ea56f79c65a7b"
+        },
+        {
+          "item_id": "43c14cd781af742131d6635e7ed572d9bb36bb53bdce4a93c25381bc1b2ddc25",
+          "path": "src/tree_walker/agent/views.py",
+          "fingerprint": "35f2bb896675631eaf9187967e521649b26a997dd456705c6eb6204d8689b62d"
+        },
+        {
+          "item_id": "505a3fb9b1a34dddbcee9bc45ffddea95b5d888e590304d0cc5e0e3d873b527e",
+          "path": "src/tree_walker/prompts/system_prompt.py",
+          "fingerprint": "44afef47b68291d191d9f81c35316f28cba0b6fd082a3012ad32440a321e9cbb"
+        },
+        {
+          "item_id": "5a368190a1dc3312cc4c26b4188c9f7c4ed3eaffe037a649e5ec8ee80d2fc0aa",
+          "path": "src/tree_walker/agent/loop_detector.py",
+          "fingerprint": "135dedf5143a22aebdb4e8aa9b9d00c5a43ac22e2c3be36c208089bd3c8077d1"
+        },
+        {
+          "item_id": "7b45c25928616481c5c0b587cb8544de6584ac6fa256c9c5d3046eeb8a12212d",
+          "path": "tests/test_loop_detector.py",
+          "fingerprint": "4a5aa3e2f3cc66df28fedafe2802fb8cd87cc491ddf42aaf801d1b86647dfc1c"
+        },
+        {
+          "item_id": "90ec2a697a353fafbd173ba9d7e78fc63acb176cd88d9ae214c37cb596fded91",
+          "path": "tests/test_done_uncertainty_gate.py",
+          "fingerprint": "26d66b1f8a61e32c013a489c7a806b5b72f3921562bb32ac2a007d2d39268b48"
+        },
+        {
+          "item_id": "c44b39733f418ca9b2e0598365872efd8171e43d76fd0b4412f1200989a9cbd8",
+          "path": "src/tree_walker/config.py",
+          "fingerprint": "9d72ff107c9b4104783992e3bb363b9f5da60878dc573f847f7cab7080b384c2"
+        },
+        {
+          "item_id": "c6269941f876fba64ed0da08dd4dea76d676a6e3d723cc0b77b930ced442f376",
+          "path": "tests/test_unknown_action_name.py",
+          "fingerprint": "425bc925db8bb09373233e8de04f4b0a0b61751eea62a6539dfbea3c6a0eecfc"
+        },
+        {
+          "item_id": "d218659241df029aaf21404ac607db919a1881cc32f366476161159c56ef9967",
+          "path": "tests/test_system_prompt.py",
+          "fingerprint": "4c6b35eb9f2e1e1a451d27faff44fdc24add6d635aec838613b45078edf651b2"
+        },
+        {
+          "item_id": "fb114deba92ef927cdf263ba6759dc0ec2971e3a956aadba7ffe715262074817",
+          "path": "src/tree_walker/agent/agent.py",
+          "fingerprint": "f3e41309daebe9a47ce79ecb6322df86d0d95ac8cfd93f5636a62894901ce4c1"
+        }
+      ],
+      "completed": [
+        {
+          "item_id": "05ea6ae46e6e85c25d4aa676c4acbe6552aac167dbe772307f715d2fe273edaf",
+          "path": "src/tree_walker/agent/step.py",
+          "fingerprint": "2cd404ee1ba3ab6736182d945fcee5b50230f5d9226bc59f4ad5c8aa45c84b1c"
+        },
+        {
+          "item_id": "102ddb85ec832fa28af84cda4c3ddac1e83fd4a836adee089ed2342759711f70",
+          "path": "src/tree_walker/tools/models.py",
+          "fingerprint": "2536f1cd1f4a86767f7c72a0c4680dc5ca905e4e1bfcf868714ea56f79c65a7b"
+        },
+        {
+          "item_id": "43c14cd781af742131d6635e7ed572d9bb36bb53bdce4a93c25381bc1b2ddc25",
+          "path": "src/tree_walker/agent/views.py",
+          "fingerprint": "35f2bb896675631eaf9187967e521649b26a997dd456705c6eb6204d8689b62d"
+        },
+        {
+          "item_id": "505a3fb9b1a34dddbcee9bc45ffddea95b5d888e590304d0cc5e0e3d873b527e",
+          "path": "src/tree_walker/prompts/system_prompt.py",
+          "fingerprint": "44afef47b68291d191d9f81c35316f28cba0b6fd082a3012ad32440a321e9cbb"
+        },
+        {
+          "item_id": "5a368190a1dc3312cc4c26b4188c9f7c4ed3eaffe037a649e5ec8ee80d2fc0aa",
+          "path": "src/tree_walker/agent/loop_detector.py",
+          "fingerprint": "135dedf5143a22aebdb4e8aa9b9d00c5a43ac22e2c3be36c208089bd3c8077d1"
+        },
+        {
+          "item_id": "7b45c25928616481c5c0b587cb8544de6584ac6fa256c9c5d3046eeb8a12212d",
+          "path": "tests/test_loop_detector.py",
+          "fingerprint": "4a5aa3e2f3cc66df28fedafe2802fb8cd87cc491ddf42aaf801d1b86647dfc1c"
+        },
+        {
+          "item_id": "90ec2a697a353fafbd173ba9d7e78fc63acb176cd88d9ae214c37cb596fded91",
+          "path": "tests/test_done_uncertainty_gate.py",
+          "fingerprint": "26d66b1f8a61e32c013a489c7a806b5b72f3921562bb32ac2a007d2d39268b48"
+        },
+        {
+          "item_id": "c44b39733f418ca9b2e0598365872efd8171e43d76fd0b4412f1200989a9cbd8",
+          "path": "src/tree_walker/config.py",
+          "fingerprint": "9d72ff107c9b4104783992e3bb363b9f5da60878dc573f847f7cab7080b384c2"
+        },
+        {
+          "item_id": "c6269941f876fba64ed0da08dd4dea76d676a6e3d723cc0b77b930ced442f376",
+          "path": "tests/test_unknown_action_name.py",
+          "fingerprint": "425bc925db8bb09373233e8de04f4b0a0b61751eea62a6539dfbea3c6a0eecfc"
+        },
+        {
+          "item_id": "d218659241df029aaf21404ac607db919a1881cc32f366476161159c56ef9967",
+          "path": "tests/test_system_prompt.py",
+          "fingerprint": "4c6b35eb9f2e1e1a451d27faff44fdc24add6d635aec838613b45078edf651b2"
+        },
+        {
+          "item_id": "fb114deba92ef927cdf263ba6759dc0ec2971e3a956aadba7ffe715262074817",
+          "path": "src/tree_walker/agent/agent.py",
+          "fingerprint": "f3e41309daebe9a47ce79ecb6322df86d0d95ac8cfd93f5636a62894901ce4c1"
+        }
+      ],
+      "reused": [],
+      "failed": [],
+      "waived": []
+    },
+    "elapsed_ms": 1798481
+  },
+  "retry_report": {
+    "schema_version": "ocr.llm-retry-report/v1",
+    "total_requests": 52,
+    "retried_requests": 0,
+    "total_retries": 0,
+    "recovered_requests": 0,
+    "failed_requests": 1,
+    "cancelled_requests": 0,
+    "requests": [
+      {
+        "logical_request_id": "d94b368fd01f1c4a519c4f9ccaa5d22e797efa4c6577969750cb1e180f296260",
+        "provider": "",
+        "model": "glm-5.3",
+        "file_path": "src/tree_walker/agent/step.py,src/tree_walker/agent/views.py,src/tree_walker/tools/models.py,tests/test_done_uncertainty_gate.py,tests/test_unknown_action_name.py",
+        "task_type": "plan_task",
+        "request_no": 1,
+        "outcome": "failed",
+        "attempts": [
+          {
+            "attempt": 1,
+            "outcome": "error",
+            "error_class": "timeout",
+            "failure_phase": "context",
+            "duration_to_headers_ms": 300000
+          }
+        ]
+      }
+    ]
+  }
+}

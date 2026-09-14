@@ -1,0 +1,273 @@
+{
+  "status": "complete",
+  "llm": {
+    "model": "glm-5.3"
+  },
+  "message": "Review complete: 0 finding(s) across 11 selected item(s).",
+  "summary": {
+    "files_reviewed": 11,
+    "comments": 0,
+    "total_tokens": 1383393,
+    "input_tokens": 1323369,
+    "output_tokens": 60024,
+    "cache_read_tokens": 1139904,
+    "elapsed": "14m45s"
+  },
+  "tool_calls": {
+    "total": 54,
+    "by_tool": {
+      "code_search": 27,
+      "file_read": 25,
+      "file_read_diff": 2
+    },
+    "failure": 1,
+    "failure_by_tool": {
+      "code_search": 1
+    },
+    "failure_details": [
+      {
+        "tool_call_number": 21,
+        "tool_name": "code_search",
+        "file_path": "src/tree_walker/agent/loop_detector.py,tests/test_loop_detector.py",
+        "arguments": "{\"file_patterns\":[\"src/\"],\"search_text\":\"TreeWalkerAgent|Agent(\",\"use_perl_regexp\":true}",
+        "error": "git grep failed: exit status 128: fatal: -e option, 'TreeWalkerAgent|Agent(': missing closing parenthesis"
+      }
+    ]
+  },
+  "comments": [],
+  "groups": [
+    {
+      "label": "Loop detector enhancements and tests",
+      "files": [
+        "src/tree_walker/agent/loop_detector.py",
+        "tests/test_loop_detector.py"
+      ]
+    },
+    {
+      "label": "Agent step handling, done uncertainty gate, and action views/models",
+      "files": [
+        "src/tree_walker/agent/agent.py",
+        "src/tree_walker/agent/step.py",
+        "src/tree_walker/agent/views.py",
+        "src/tree_walker/tools/models.py",
+        "tests/test_done_uncertainty_gate.py",
+        "tests/test_unknown_action_name.py"
+      ]
+    },
+    {
+      "label": "Config and system prompt updates with tests",
+      "files": [
+        "src/tree_walker/config.py",
+        "src/tree_walker/prompts/system_prompt.py",
+        "tests/test_system_prompt.py"
+      ]
+    }
+  ],
+  "session_id": "8841cd8b-41b2-4654-90ca-d7807098643d",
+  "manifest": {
+    "schema_version": "ocr.run-manifest/v1",
+    "run_id": "8841cd8b-41b2-4654-90ca-d7807098643d",
+    "operation": "review",
+    "terminal_state": "complete",
+    "repository": {
+      "identity_sha256": "2868bcfb033292e0d47631dc911d0e36e5dcedaf9e0bcacffe6c4716bb93dfda"
+    },
+    "input": {
+      "mode": "range",
+      "requested_from": "master",
+      "requested_head": "fix/186-behavior-discipline",
+      "resolved_base": "b00f08b4a0feaa5fcafea3b3249fdd18a3d2695a",
+      "resolved_head": "e651a598f6e006cafdc26ac35879e38826d706a0",
+      "exact_range": "b00f08b4a0feaa5fcafea3b3249fdd18a3d2695a..e651a598f6e006cafdc26ac35879e38826d706a0",
+      "source_artifact_sha256": "e2c7ca8c1fa7d57747d8d7111c18affc43b50757dfb203ad8fdc9ac4c8c9ee5a"
+    },
+    "execution": {
+      "ocr_version": "v1.12.1",
+      "model": "glm-5.3",
+      "configured_concurrency": 8,
+      "rule_config_sha256": "ddb40005eb732cb8b37d8d3dc1acb82f3aa51fded408c899a092c10349c369c4",
+      "runtime_config_sha256": "841fe9ad288d2dd9efc84c443193c492ef06b26edf31ff5f5a1b01637fef2b0c"
+    },
+    "coverage": {
+      "selected": [
+        {
+          "item_id": "05ea6ae46e6e85c25d4aa676c4acbe6552aac167dbe772307f715d2fe273edaf",
+          "path": "src/tree_walker/agent/step.py",
+          "fingerprint": "b21599b6eefc49e8bb33ac7369ea4ce0511758eb8c023ccc4e83a0d51aec5080"
+        },
+        {
+          "item_id": "102ddb85ec832fa28af84cda4c3ddac1e83fd4a836adee089ed2342759711f70",
+          "path": "src/tree_walker/tools/models.py",
+          "fingerprint": "2536f1cd1f4a86767f7c72a0c4680dc5ca905e4e1bfcf868714ea56f79c65a7b"
+        },
+        {
+          "item_id": "43c14cd781af742131d6635e7ed572d9bb36bb53bdce4a93c25381bc1b2ddc25",
+          "path": "src/tree_walker/agent/views.py",
+          "fingerprint": "35f2bb896675631eaf9187967e521649b26a997dd456705c6eb6204d8689b62d"
+        },
+        {
+          "item_id": "505a3fb9b1a34dddbcee9bc45ffddea95b5d888e590304d0cc5e0e3d873b527e",
+          "path": "src/tree_walker/prompts/system_prompt.py",
+          "fingerprint": "44afef47b68291d191d9f81c35316f28cba0b6fd082a3012ad32440a321e9cbb"
+        },
+        {
+          "item_id": "5a368190a1dc3312cc4c26b4188c9f7c4ed3eaffe037a649e5ec8ee80d2fc0aa",
+          "path": "src/tree_walker/agent/loop_detector.py",
+          "fingerprint": "135dedf5143a22aebdb4e8aa9b9d00c5a43ac22e2c3be36c208089bd3c8077d1"
+        },
+        {
+          "item_id": "7b45c25928616481c5c0b587cb8544de6584ac6fa256c9c5d3046eeb8a12212d",
+          "path": "tests/test_loop_detector.py",
+          "fingerprint": "4a5aa3e2f3cc66df28fedafe2802fb8cd87cc491ddf42aaf801d1b86647dfc1c"
+        },
+        {
+          "item_id": "90ec2a697a353fafbd173ba9d7e78fc63acb176cd88d9ae214c37cb596fded91",
+          "path": "tests/test_done_uncertainty_gate.py",
+          "fingerprint": "23cabf3e3313ef9cb43d699063202f23dab002ebe7d1b612928477cc3eea4631"
+        },
+        {
+          "item_id": "c44b39733f418ca9b2e0598365872efd8171e43d76fd0b4412f1200989a9cbd8",
+          "path": "src/tree_walker/config.py",
+          "fingerprint": "9d72ff107c9b4104783992e3bb363b9f5da60878dc573f847f7cab7080b384c2"
+        },
+        {
+          "item_id": "c6269941f876fba64ed0da08dd4dea76d676a6e3d723cc0b77b930ced442f376",
+          "path": "tests/test_unknown_action_name.py",
+          "fingerprint": "425bc925db8bb09373233e8de04f4b0a0b61751eea62a6539dfbea3c6a0eecfc"
+        },
+        {
+          "item_id": "d218659241df029aaf21404ac607db919a1881cc32f366476161159c56ef9967",
+          "path": "tests/test_system_prompt.py",
+          "fingerprint": "4c6b35eb9f2e1e1a451d27faff44fdc24add6d635aec838613b45078edf651b2"
+        },
+        {
+          "item_id": "fb114deba92ef927cdf263ba6759dc0ec2971e3a956aadba7ffe715262074817",
+          "path": "src/tree_walker/agent/agent.py",
+          "fingerprint": "f3e41309daebe9a47ce79ecb6322df86d0d95ac8cfd93f5636a62894901ce4c1"
+        }
+      ],
+      "completed": [
+        {
+          "item_id": "05ea6ae46e6e85c25d4aa676c4acbe6552aac167dbe772307f715d2fe273edaf",
+          "path": "src/tree_walker/agent/step.py",
+          "fingerprint": "b21599b6eefc49e8bb33ac7369ea4ce0511758eb8c023ccc4e83a0d51aec5080"
+        },
+        {
+          "item_id": "102ddb85ec832fa28af84cda4c3ddac1e83fd4a836adee089ed2342759711f70",
+          "path": "src/tree_walker/tools/models.py",
+          "fingerprint": "2536f1cd1f4a86767f7c72a0c4680dc5ca905e4e1bfcf868714ea56f79c65a7b"
+        },
+        {
+          "item_id": "43c14cd781af742131d6635e7ed572d9bb36bb53bdce4a93c25381bc1b2ddc25",
+          "path": "src/tree_walker/agent/views.py",
+          "fingerprint": "35f2bb896675631eaf9187967e521649b26a997dd456705c6eb6204d8689b62d"
+        },
+        {
+          "item_id": "505a3fb9b1a34dddbcee9bc45ffddea95b5d888e590304d0cc5e0e3d873b527e",
+          "path": "src/tree_walker/prompts/system_prompt.py",
+          "fingerprint": "44afef47b68291d191d9f81c35316f28cba0b6fd082a3012ad32440a321e9cbb"
+        },
+        {
+          "item_id": "5a368190a1dc3312cc4c26b4188c9f7c4ed3eaffe037a649e5ec8ee80d2fc0aa",
+          "path": "src/tree_walker/agent/loop_detector.py",
+          "fingerprint": "135dedf5143a22aebdb4e8aa9b9d00c5a43ac22e2c3be36c208089bd3c8077d1"
+        },
+        {
+          "item_id": "7b45c25928616481c5c0b587cb8544de6584ac6fa256c9c5d3046eeb8a12212d",
+          "path": "tests/test_loop_detector.py",
+          "fingerprint": "4a5aa3e2f3cc66df28fedafe2802fb8cd87cc491ddf42aaf801d1b86647dfc1c"
+        },
+        {
+          "item_id": "90ec2a697a353fafbd173ba9d7e78fc63acb176cd88d9ae214c37cb596fded91",
+          "path": "tests/test_done_uncertainty_gate.py",
+          "fingerprint": "23cabf3e3313ef9cb43d699063202f23dab002ebe7d1b612928477cc3eea4631"
+        },
+        {
+          "item_id": "c44b39733f418ca9b2e0598365872efd8171e43d76fd0b4412f1200989a9cbd8",
+          "path": "src/tree_walker/config.py",
+          "fingerprint": "9d72ff107c9b4104783992e3bb363b9f5da60878dc573f847f7cab7080b384c2"
+        },
+        {
+          "item_id": "c6269941f876fba64ed0da08dd4dea76d676a6e3d723cc0b77b930ced442f376",
+          "path": "tests/test_unknown_action_name.py",
+          "fingerprint": "425bc925db8bb09373233e8de04f4b0a0b61751eea62a6539dfbea3c6a0eecfc"
+        },
+        {
+          "item_id": "d218659241df029aaf21404ac607db919a1881cc32f366476161159c56ef9967",
+          "path": "tests/test_system_prompt.py",
+          "fingerprint": "4c6b35eb9f2e1e1a451d27faff44fdc24add6d635aec838613b45078edf651b2"
+        },
+        {
+          "item_id": "fb114deba92ef927cdf263ba6759dc0ec2971e3a956aadba7ffe715262074817",
+          "path": "src/tree_walker/agent/agent.py",
+          "fingerprint": "f3e41309daebe9a47ce79ecb6322df86d0d95ac8cfd93f5636a62894901ce4c1"
+        }
+      ],
+      "reused": [],
+      "failed": [],
+      "waived": []
+    },
+    "elapsed_ms": 885126
+  },
+  "retry_report": {
+    "schema_version": "ocr.llm-retry-report/v1",
+    "total_requests": 38,
+    "retried_requests": 2,
+    "total_retries": 2,
+    "recovered_requests": 2,
+    "failed_requests": 0,
+    "cancelled_requests": 0,
+    "requests": [
+      {
+        "logical_request_id": "4ce53a001e96dfd8b4f99a56ada4f161036019d5d89ee7f7479c0da94e787572",
+        "provider": "",
+        "model": "glm-5.3",
+        "file_path": "src/tree_walker/agent/agent.py,src/tree_walker/agent/step.py,src/tree_walker/agent/views.py,src/tree_walker/tools/models.py,tests/test_done_uncertainty_gate.py,tests/test_unknown_action_name.py",
+        "task_type": "plan_task",
+        "request_no": 1,
+        "outcome": "recovered",
+        "attempts": [
+          {
+            "attempt": 1,
+            "outcome": "error",
+            "error_class": "network",
+            "failure_phase": "response_decode",
+            "duration_to_headers_ms": 252774
+          },
+          {
+            "attempt": 2,
+            "outcome": "success",
+            "status_code": 200,
+            "observed_backoff_ms": 451,
+            "duration_to_headers_ms": 286918
+          }
+        ]
+      },
+      {
+        "logical_request_id": "5387d25f1f8557fd804aedc2fa988a766468f9696fbc4a3bb737e3beccaa1095",
+        "provider": "",
+        "model": "glm-5.3",
+        "file_path": "src/tree_walker/agent/loop_detector.py,tests/test_loop_detector.py",
+        "task_type": "main_task",
+        "request_no": 6,
+        "outcome": "recovered",
+        "attempts": [
+          {
+            "attempt": 1,
+            "outcome": "error",
+            "error_class": "network",
+            "failure_phase": "response_decode",
+            "duration_to_headers_ms": 7490
+          },
+          {
+            "attempt": 2,
+            "outcome": "success",
+            "status_code": 200,
+            "observed_backoff_ms": 429,
+            "duration_to_headers_ms": 8014
+          }
+        ]
+      }
+    ]
+  }
+}
