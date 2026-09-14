@@ -231,11 +231,19 @@ class TestGateUncertainSuccessDone:
     @pytest.mark.asyncio
     async def test_retry_llm_failure_passes_through_original(self):
         """review 修正：软干预不得把已握有合法 done 响应的步变成失败步——重试
-        调用抛 API/网络异常时放行原响应，异常不上抛。"""
+        调用抛 API/网络异常时放行原响应，异常不上抛；review4 #2：预算回滚，
+        瞬时抖动不消耗每 run 仅 2 次的额度。"""
         pipe = _make_pipeline(llm_side_effect=RuntimeError("api down"))
         dirty = _done_response(memory="Emma Davis=1?")
         out = await pipe._gate_uncertain_success_done(dirty, [])
         assert out is dirty
+        assert pipe.state.done_gate_uses == 0  # 失败放行回滚预算
+        # 预算未耗 → 下一次 dirty done 仍会被拦
+        retried = _done_response(text="verified")
+        pipe2 = _make_pipeline(llm_side_effect=[retried])
+        dirty2 = _done_response(memory="Lisa Green=2?")
+        out2 = await pipe2._gate_uncertain_success_done(dirty2, [])
+        assert pipe2.llm.get_action.await_count == 1
 
     @pytest.mark.asyncio
     async def test_retry_interrupted_error_propagates(self):
@@ -260,15 +268,42 @@ class TestGateUncertainSuccessDone:
         assert out is dirty
 
     @pytest.mark.asyncio
-    async def test_retry_cancelled_error_passes_through_original(self):
-        """review2 #1 残余窗口：外层预算取消以 CancelledError 打进内层 await——
-        放行原响应（软干预不吃掉已握有的合法 done）。"""
+    async def test_retry_cancelled_error_propagates(self):
+        """review4 #1：取消必须原样传播——3.12+ 外层 wait_for 基于 asyncio.timeout，
+        吞掉取消后 __aexit__ 仍抛 TimeoutError（"放行"不成立）；外部强制
+        task.cancel() 被吞后也不会在后续 await 自动再触发。"""
         import asyncio
 
         pipe = _make_pipeline(llm_side_effect=asyncio.CancelledError())
         dirty = _done_response(memory="Emma Davis=1?")
+        with pytest.raises(asyncio.CancelledError):
+            await pipe._gate_uncertain_success_done(dirty, [])
+
+    @pytest.mark.asyncio
+    async def test_done_text_token_question_not_gated(self):
+        """review4 #3：text 是对外交付物——复述任务问句（"Q: … $50?"）的词尾 ?
+        不是 agent 的疑虑，不得误伤完整正确的答案。"""
+        pipe = _make_pipeline()
+        resp = _done_response(
+            text="Q: Which items cost more than $50? A: Widget ($60) — verified.",
+            memory="All items read and compared.",
+        )
+        out = await pipe._gate_uncertain_success_done(resp, [])
+        assert out is resp
+        pipe.llm.get_action.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_done_text_keyword_still_gated(self):
+        """review4 #3 另一面：text 中的不确定关键词（非问句复述）仍触发门禁。"""
+        retried = _done_response(text="cleaned answer")
+        pipe = _make_pipeline(llm_side_effect=[retried])
+        dirty = _done_response(
+            text="Answer: Veronica Costello (third value still unverified)",
+            memory="Counts finalized.",
+        )
         out = await pipe._gate_uncertain_success_done(dirty, [])
-        assert out is dirty
+        assert pipe.llm.get_action.await_count == 1
+        assert out is retried
 
     @pytest.mark.asyncio
     async def test_string_success_true_still_gated(self):

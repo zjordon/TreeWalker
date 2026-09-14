@@ -1036,11 +1036,13 @@ class StepPipeline:
             return response
         if self.state.done_gate_uses >= _DONE_GATE_MAX_PER_RUN:
             return response
+        # review4 #3：text 是对外交付物——agent 常复述任务问句（"Q: … $50?"），
+        # 词尾 ? 对 text 无引语豁免，会误伤完整正确的答案；text 维度只扫不确定
+        # 关键词，词尾 ? 仅对自评字段（evaluation/memory）生效。
         hits = scan_uncertainty_markers(
             str(response.get("evaluation_previous_goal") or ""),
             str(response.get("memory") or ""),
-            str(params.get("text") or ""),
-        )
+        ) or _scan_uncertainty_keywords(str(params.get("text") or ""))
         if not hits:
             return response
         self.state.done_gate_uses += 1
@@ -1062,13 +1064,13 @@ class StepPipeline:
         # review 修正：软干预不得把已握有合法 done 响应的步变成失败步——重试调用
         # 抛 API/网络异常时放行原响应（否则异常一路上抛 _handle_step_error 计
         # consecutive_failures，最坏把 run 推向 max_failures 终止）。用户停止信号
-        # （InterruptedError）照常放行传播。
-        # review2 #1：重试调用还落在 _get_next_action 外层 wait_for(llm_timeout)
-        # 预算窗内——预算恰在重试期间耗尽时外层以 CancelledError 取消 await 点
-        # （BaseException，except Exception 接不住）、TimeoutError 在外层抛出，
-        # 已握有的合法 done 整体丢失。内层小超时让取消先以 TimeoutError
-        # （Exception 形态）落在本 except 内；残余的外层取消窗口由 CancelledError
-        # 子句兜底（用户停止走 InterruptedError 信号量，非任务取消，不受影响）。
+        # （InterruptedError）照常放行传播。review2 #1：内层小超时让预算耗尽的
+        # 取消先以 TimeoutError（Exception 形态）落在本 except 内放行原响应。
+        # review4 #1：取消本身必须原样 re-raise——3.12+ 外层 wait_for 基于
+        # asyncio.timeout，协程吞掉取消后 __aexit__ 在 EXPIRING 态仍抛
+        # TimeoutError（"放行"不成立）；外部强制 task.cancel()（server 关停）
+        # 被吞后也不会在后续 await 自动再触发。不设 CancelledError 子句，保留
+        # 取消语义交由外层转换/传播。
         try:
             retried = self._normalize_llm_response(await asyncio.wait_for(
                 self.llm.get_action(
@@ -1080,18 +1082,14 @@ class StepPipeline:
             ))
         except InterruptedError:
             raise
-        except asyncio.CancelledError:
-            # 外层预算取消（llm_timeout 窗口耗尽）→ 放行原响应；真正的任务级
-            # 取消会在后续检查点/await 再触发停止链
-            logger.warning(
-                "done-gate verification retry cancelled (outer llm_timeout "
-                "budget?) — passing through original response",
-            )
-            return response
         except Exception as e:
+            # review4 #2：重试未产出（异常放行）不消耗每 run 仅 2 次的门禁预算
+            # ——两次基础设施抖动即让门禁对本 run 静默失效。
+            self.state.done_gate_uses -= 1
             logger.warning(
                 "done-gate verification retry failed (%s: %s) — passing "
-                "through original response", type(e).__name__, e,
+                "through original response (budget rolled back)",
+                type(e).__name__, e,
             )
             return response
         if not self._is_valid_action(retried):
@@ -1975,8 +1973,35 @@ _NEGATION_RE = re.compile(r"\b(?:no|nothing|not|none|without)\b|n't\b")
 _NEGATION_WINDOW = 25
 
 
+def _scan_uncertainty_keywords(text: str) -> list[str]:
+    """关键词-only 扫描（一个文本）——否定窗口语义同主扫描。
+
+    done.text 等**对外交付物**专用（review4 #3）：agent 常在答案文本复述任务
+    问句（"Q: … $50?"），词尾 ``?`` 对 text 无引语豁免，会把完整正确的答案
+    误判为疑虑——故 text 只扫不确定关键词、不扫词尾 ``?``。
+    """
+    if not text:
+        return []
+    hits: list[str] = []
+    low = _URL_RE.sub("", str(text)).lower()
+    for kw in _UNCERTAIN_KEYWORDS:
+        for m in re.finditer(rf"\b{re.escape(kw)}\b", low):
+            neg = _NEGATION_RE.search(
+                low, max(0, m.start() - _NEGATION_WINDOW), m.start(),
+            )
+            # review3 #2："not sure/not verified/not confirmed" 自带否定词，
+            # 不受窗口抑制——前一从句的否定词（"No gap found, but not sure…"）
+            # 会跨从句误杀疑虑本身，让门禁零命中静默失效
+            if neg is None or kw.startswith("not "):
+                if kw not in hits:
+                    hits.append(kw)
+                break
+            # 首个出现被否定，仍继续找后续未否定的出现
+    return hits
+
+
 def scan_uncertainty_markers(*texts: str) -> list[str]:
-    """扫 evaluation/memory/done 文本中未消解的不确定标记（issue #186 现象②）。
+    """扫 evaluation/memory 等自评文本中未消解的不确定标记（issue #186 现象②）。
 
     先剥 URL（query string 的 ``?`` 不是疑虑）；词尾 ``?`` 取 token 原文、关键词
     按整词（``\\b``）小写匹配且命中位置前的短窗口内无否定词。返回命中样本
@@ -1998,19 +2023,8 @@ def scan_uncertainty_markers(*texts: str) -> list[str]:
         stripped = _URL_RE.sub("", str(t))
         for m in _TOKEN_Q_RE.findall(stripped):
             _add(m)
-        low = stripped.lower()
-        for kw in _UNCERTAIN_KEYWORDS:
-            for m in re.finditer(rf"\b{re.escape(kw)}\b", low):
-                neg = _NEGATION_RE.search(
-                    low, max(0, m.start() - _NEGATION_WINDOW), m.start(),
-                )
-                # review3 #2："not sure/not verified/not confirmed" 自带否定词，
-                # 不受窗口抑制——前一从句的否定词（"No gap found, but not sure…"）
-                # 会跨从句误杀疑虑本身，让门禁零命中静默失效
-                if neg is None or kw.startswith("not "):
-                    _add(kw)
-                    break
-                # 首个出现被否定，仍继续找后续未否定的出现
+        for kw in _scan_uncertainty_keywords(stripped):
+            _add(kw)
     return hits
 
 
