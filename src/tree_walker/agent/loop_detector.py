@@ -192,32 +192,37 @@ class FailureStreakTracker:
             self._notified_at.pop(name, None)
 
     def nudge(self) -> str | None:
-        """Return the stop-loss nudge for the worst active streak, or None."""
-        if not self._streaks:
-            return None
-        name, streak = max(self._streaks.items(), key=lambda kv: kv[1])
-        if streak < self.NUDGE_AT:
-            return None
-        notified = self._notified_at.get(name, 0)
-        # 去抖：2 首报（notified<2），3 不重报（notified>=2 且 streak<4），
-        # 4 升级报（notified<4 且 streak>=4），5+ 不重报（notified>=4）
-        if notified >= self.ESCALATE_AT:
-            return None
-        if notified >= self.NUDGE_AT and streak < self.ESCALATE_AT:
-            return None
-        self._notified_at[name] = streak
-        if streak >= self.ESCALATE_AT:
-            return (
-                f"⚠️ You have failed '{name}' {streak} times in a row. "
-                "Strongly consider declaring this sub-goal unreachable: complete "
-                "or verify the task's actual deliverable, or finish with an honest "
-                "partial result (done with success=false, describing what was "
-                "accomplished and what is missing)."
-            )
-        return (
-            f"⚠️ You have failed '{name}' {streak} times in a row. Stop retrying "
-            "or inventing workarounds for this approach. Re-read the original "
-            "task and switch to a different approach that directly advances the "
-            "task's final goal — also ask whether the failing sub-goal is "
-            "required by the task at all."
+        """Return the stop-loss nudge for the worst not-yet-notified streak, or None."""
+        # review 修正：遍历所有达到 NUDGE_AT 的动作（streak 降序），取第一个通过
+        # 自身去抖判定的——只看 max 会把新达阈值动作的首报饿死在抑制档动作后面
+        #（task_374 形态：screenshot 冻结在 3 档期间，agent 原地发明的 evaluate
+        # workaround 连败 2 次，其"换思路"提示被 screenshot 的抑制档屏蔽）。
+        candidates = sorted(
+            ((name, s) for name, s in self._streaks.items() if s >= self.NUDGE_AT),
+            key=lambda kv: -kv[1],
         )
+        for name, streak in candidates:
+            notified = self._notified_at.get(name, 0)
+            # 去抖：每档只报一次——2 首报（notified<2），3 不重报（notified>=2 且
+            # streak<4），4 升级报（notified<4 且 streak>=4），5+ 不重报（notified>=4）
+            if notified >= self.ESCALATE_AT:
+                continue
+            if notified >= self.NUDGE_AT and streak < self.ESCALATE_AT:
+                continue
+            self._notified_at[name] = streak
+            if streak >= self.ESCALATE_AT:
+                return (
+                    f"⚠️ You have failed '{name}' {streak} times in a row. "
+                    "Strongly consider declaring this sub-goal unreachable: complete "
+                    "or verify the task's actual deliverable, or finish with an honest "
+                    "partial result (done with success=false, describing what was "
+                    "accomplished and what is missing)."
+                )
+            return (
+                f"⚠️ You have failed '{name}' {streak} times in a row. Stop retrying "
+                "or inventing workarounds for this approach. Re-read the original "
+                "task and switch to a different approach that directly advances the "
+                "task's final goal — also ask whether the failing sub-goal is "
+                "required by the task at all."
+            )
+        return None

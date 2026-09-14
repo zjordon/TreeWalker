@@ -184,6 +184,23 @@ class TestGateUncertainSuccessDone:
         pipe.llm.get_action.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_retry_llm_failure_passes_through_original(self):
+        """review 修正：软干预不得把已握有合法 done 响应的步变成失败步——重试
+        调用抛 API/网络异常时放行原响应，异常不上抛。"""
+        pipe = _make_pipeline(llm_side_effect=RuntimeError("api down"))
+        dirty = _done_response(memory="Emma Davis=1?")
+        out = await pipe._gate_uncertain_success_done(dirty, [])
+        assert out is dirty
+
+    @pytest.mark.asyncio
+    async def test_retry_interrupted_error_propagates(self):
+        """用户停止信号（InterruptedError）不得被软干预吞掉。"""
+        pipe = _make_pipeline(llm_side_effect=InterruptedError())
+        dirty = _done_response(memory="Emma Davis=1?")
+        with pytest.raises(InterruptedError):
+            await pipe._gate_uncertain_success_done(dirty, [])
+
+    @pytest.mark.asyncio
     async def test_clean_success_done_untouched(self):
         pipe = _make_pipeline()
         clean = _done_response(
@@ -204,3 +221,24 @@ class TestGateConfig:
 
     def test_state_field_defaults_zero(self):
         assert AgentState().done_gate_uses == 0
+
+    def test_env_parsing_accepts_numeric_and_string_idioms(self, monkeypatch):
+        """review 修正：AGENT_DONE_GATE 兼容 =0/=1 数字习语与 false/no/off 字符串
+        习语——只认 "true" 会让写 =1 的操作者静默关门禁。"""
+        from tree_walker.config import load_settings
+
+        # load_settings 会探测 localhost:9222（~4s/次）——mock 掉与本测无关的
+        # ws_url 发现，7 个断言才不拖慢套件
+        monkeypatch.setattr("tree_walker.config._fetch_ws_url", lambda *a, **k: "ws://test")
+
+        def _flag(env_val: str) -> bool:
+            monkeypatch.setenv("AGENT_DONE_GATE", env_val)
+            return load_settings().agent.done_uncertainty_gate
+
+        assert _flag("1") is True
+        assert _flag("true") is True
+        assert _flag("TRUE") is True
+        assert _flag("0") is False
+        assert _flag("false") is False
+        assert _flag("no") is False
+        assert _flag("off") is False

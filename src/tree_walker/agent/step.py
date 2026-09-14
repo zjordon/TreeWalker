@@ -1032,11 +1032,24 @@ class StepPipeline:
             "markers remain unresolved."
         )
         retry_messages = list(messages) + [{"role": "user", "content": feedback}]
-        retried = self._normalize_llm_response(await self.llm.get_action(
-            system_prompt=self._system_prompt,
-            messages=retry_messages,
-            tool_schema=self._tool_schema,
-        ))
+        # review 修正：软干预不得把已握有合法 done 响应的步变成失败步——重试调用
+        # 抛 API/网络异常时放行原响应（否则异常一路上抛 _handle_step_error 计
+        # consecutive_failures，最坏把 run 推向 max_failures 终止）。用户停止信号
+        # （InterruptedError）照常放行传播。
+        try:
+            retried = self._normalize_llm_response(await self.llm.get_action(
+                system_prompt=self._system_prompt,
+                messages=retry_messages,
+                tool_schema=self._tool_schema,
+            ))
+        except InterruptedError:
+            raise
+        except Exception as e:
+            logger.warning(
+                "done-gate verification retry failed (%s: %s) — passing "
+                "through original response", type(e).__name__, e,
+            )
+            return response
         if not self._is_valid_action(retried):
             return response
         if self._validate_action_params(retried) is not None:

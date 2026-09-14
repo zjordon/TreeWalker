@@ -455,7 +455,12 @@ def load_settings() -> Settings:
     agent = AgentSettings(
         max_steps=int(os.environ.get("AGENT_MAX_STEPS", "100")),
         max_failures=int(os.environ.get("AGENT_MAX_FAILURES", "5")),
-        done_uncertainty_gate=os.environ.get("AGENT_DONE_GATE", "true").lower() == "true",
+        # review 修正：兼容数字习语（=0 关 / =1 开）与字符串习语（false/no/off 关）——
+        # 只认 "true" 会让按注释写 AGENT_DONE_GATE=1 的操作者静默关门禁
+        done_uncertainty_gate=(
+            os.environ.get("AGENT_DONE_GATE", "true").strip().lower()
+            not in ("0", "false", "no", "off")
+        ),
         llm_timeout=int(os.environ.get("AGENT_LLM_TIMEOUT", "120")),
         action_timeout=int(os.environ.get("AGENT_ACTION_TIMEOUT", "30")),
         reconnect_timeout=int(os.environ.get("RECONNECT_TIMEOUT", "30")),
