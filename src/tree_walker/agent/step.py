@@ -1072,15 +1072,28 @@ class StepPipeline:
         # 被吞后也不会在后续 await 自动再触发。不设 CancelledError 子句，保留
         # 取消语义交由外层转换/传播。
         try:
+            # review5 #1：外层 llm_timeout 从 Think 阶段起点（_step_start_time）计时，
+            # 内层必须按**剩余额度**取小——绝对值 min(llm_timeout, 60) 在首调+参数梯
+            # 已耗 >llm_timeout-60s 时会让外层先到期：取消以 CancelledError 穿透本
+            # except（按 review4 #1 不捕获），被外层转成 TimeoutError → 合法 done 步
+            # 变失败步。剩余额度耗尽时 retry_timeout 归 0 → 内层立即 TimeoutError
+            # （Exception 形态）落在兜底里放行原响应并回滚预算。
+            elapsed = time.time() - getattr(self, "_step_start_time", time.time())
+            retry_timeout = max(0.0, min(
+                _DONE_GATE_RETRY_TIMEOUT, self.llm_timeout - elapsed))
             retried = self._normalize_llm_response(await asyncio.wait_for(
                 self.llm.get_action(
                     system_prompt=self._system_prompt,
                     messages=retry_messages,
                     tool_schema=self._tool_schema,
                 ),
-                timeout=min(self.llm_timeout, _DONE_GATE_RETRY_TIMEOUT),
+                timeout=retry_timeout,
             ))
         except InterruptedError:
+            # review5 #2：与 except Exception 同语义回滚——pause（非 stop）后 run
+            # 会继续，重试未产出却烧掉本档预算，两次即静默失效；stop 场景 run
+            # 结束，回滚无副作用。
+            self.state.done_gate_uses -= 1
             raise
         except Exception as e:
             # review4 #2：重试未产出（异常放行）不消耗每 run 仅 2 次的门禁预算

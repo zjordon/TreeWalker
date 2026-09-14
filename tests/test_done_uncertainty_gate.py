@@ -118,6 +118,7 @@ def _make_pipeline(
     gate_enabled: bool = True,
     done_gate_uses: int = 0,
     llm_timeout: float = 120,
+    step_start_time: float | None = None,
 ) -> StepPipeline:
     """免构造管线：只挂门禁方法触碰的属性（沿 test_p7 _make_session 模式）。"""
     p = StepPipeline.__new__(StepPipeline)
@@ -125,6 +126,8 @@ def _make_pipeline(
     p.state.done_gate_uses = done_gate_uses
     p._enable_done_gate = gate_enabled
     p.llm_timeout = llm_timeout
+    if step_start_time is not None:
+        p._step_start_time = step_start_time
     p.tools = Tools()
     p.llm = AsyncMock()
     if llm_side_effect is not None:
@@ -252,6 +255,38 @@ class TestGateUncertainSuccessDone:
         dirty = _done_response(memory="Emma Davis=1?")
         with pytest.raises(InterruptedError):
             await pipe._gate_uncertain_success_done(dirty, [])
+
+    @pytest.mark.asyncio
+    async def test_retry_interrupted_rolls_back_budget(self):
+        """review5 #2：pause（非 stop）落在重试窗口——run 会继续，重试未产出
+        不得烧掉每 run 仅 2 次的预算。"""
+        pipe = _make_pipeline(llm_side_effect=InterruptedError())
+        dirty = _done_response(memory="Emma Davis=1?")
+        with pytest.raises(InterruptedError):
+            await pipe._gate_uncertain_success_done(dirty, [])
+        assert pipe.state.done_gate_uses == 0
+
+    @pytest.mark.asyncio
+    async def test_inner_timeout_uses_remaining_budget(self):
+        """review5 #1：内层超时按剩余额度取小——首调+参数梯已耗尽预算时
+        （llm_timeout 120、_step_start_time 早于 120s 前），retry_timeout 归 0
+        → 内层立即 TimeoutError 落在兜底放行原响应并回滚，而不是等外层
+        CancelledError 穿透变失败步。"""
+        import asyncio
+        import time as _time
+
+        async def hang(**kwargs):
+            await asyncio.sleep(999)
+
+        pipe = _make_pipeline(
+            llm_side_effect=hang,
+            llm_timeout=120,
+            step_start_time=_time.time() - 120.0,  # 剩余额度 ≈ 0
+        )
+        dirty = _done_response(memory="Emma Davis=1?")
+        out = await pipe._gate_uncertain_success_done(dirty, [])
+        assert out is dirty
+        assert pipe.state.done_gate_uses == 0  # 无产出的重试不耗预算
 
     @pytest.mark.asyncio
     async def test_retry_timeout_passes_through_original(self):
