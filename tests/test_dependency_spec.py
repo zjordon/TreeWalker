@@ -25,13 +25,25 @@ def _anthropic_requirement() -> str:
 
 
 class TestAnthropicDependencyCap:
+    @staticmethod
+    def _specifiers(req: str) -> list[str]:
+        """剥包名后逗号分段精确取约束子句——子串匹配会放过 "<1.5" 这类看似
+        合规实为放行 1.x 的漂移（review #1：下界同理，">=" in req 挡不住降回
+        >=0.104；首段与包名粘连，须先剥 "anthropic" 前缀）。"""
+        body = req[len("anthropic"):] if req.startswith("anthropic") else req
+        return [p.strip() for p in body.split(",")]
+
     def test_requirement_has_upper_bound_below_1(self):
-        req = _anthropic_requirement().replace(" ", "")
-        assert "<1" in req, (
+        req = _anthropic_requirement()
+        specs = self._specifiers(req)
+        assert "<1.0" in specs, (
             f"anthropic 依赖缺少 <1.0 上界：{req!r}——1.x 的 Messages.create "
             "移除 temperature/top_p（issue #187），无上界会让下游重新解析落 1.x"
         )
 
     def test_requirement_has_tested_lower_bound(self):
-        req = _anthropic_requirement().replace(" ", "")
-        assert ">=" in req, f"anthropic 依赖缺少已测试下界（>=0.109）: {req!r}"
+        req = _anthropic_requirement()
+        specs = self._specifiers(req)
+        assert ">=0.109.0" in specs, (
+            f"anthropic 依赖缺少已测试下界（>=0.109.0，本仓全量实证版本）: {req!r}"
+        )

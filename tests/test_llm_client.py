@@ -651,7 +651,9 @@ class TestExtractCallSamplingPassthrough:
         client = LLMClient(settings)
 
         def slow_create(**kwargs):
-            time.sleep(2)
+            # review #2：0.5s 已是超时值 10 倍余量——asyncio.run 退出时
+            # shutdown_default_executor 会等 worker 线程睡完，睡 2s 白拖墙钟
+            time.sleep(0.5)
             return MagicMock()
 
         with patch.object(client.client.messages, "create", side_effect=slow_create):
