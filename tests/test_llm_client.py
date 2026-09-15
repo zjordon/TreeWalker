@@ -615,3 +615,49 @@ class TestTextRetryCap:
         # R4：重试消息为指令型（压重试轮输出长度）
         retry_msgs = mock_create.call_args_list[1].kwargs["messages"]
         assert any("Do not explain" in str(m.get("content", "")) for m in retry_msgs)
+
+
+# ── issue #187：_extract_call 采样参数透传契约 ─────────────────────────
+
+
+class TestExtractCallSamplingPassthrough:
+    """_extract_call 是 **create_kwargs 透传封装——temperature 等采样参数必须
+    原样到达 messages.create（eval judge 的确定性依赖此契约；SDK 1.x 移除该
+    参数导致 66 评测静默计 0 的事故让这个契约需要被钉进测试，配合 pyproject
+    的 <1.0 上界与 tests/test_dependency_spec.py 的守护测试）。"""
+
+    def test_temperature_reaches_create(self):
+        settings = LLMSettings(api_key="test-key")
+        client = LLMClient(settings)
+        captured: dict[str, Any] = {}
+
+        def fake_create(**kwargs):
+            captured.update(kwargs)
+            return MagicMock()
+
+        with patch.object(client.client.messages, "create", side_effect=fake_create):
+            asyncio.run(client._extract_call(
+                call_timeout=None,
+                model="m", max_tokens=1, messages=[],
+                temperature=0, top_p=0.9,
+            ))
+        assert captured.get("temperature") == 0
+        assert captured.get("top_p") == 0.9
+
+    def test_call_timeout_wraps_create(self):
+        """回归护栏：call_timeout 走 asyncio.wait_for 分支（超时抛
+        asyncio.TimeoutError，不被 RateLimit/APIError 分支捕获）。"""
+        settings = LLMSettings(api_key="test-key")
+        client = LLMClient(settings)
+
+        def slow_create(**kwargs):
+            # review #2：0.5s 已是超时值 10 倍余量——asyncio.run 退出时
+            # shutdown_default_executor 会等 worker 线程睡完，睡 2s 白拖墙钟
+            time.sleep(0.5)
+            return MagicMock()
+
+        with patch.object(client.client.messages, "create", side_effect=slow_create):
+            with pytest.raises(asyncio.TimeoutError):
+                asyncio.run(client._extract_call(
+                    call_timeout=0.05, model="m", max_tokens=1, messages=[],
+                ))

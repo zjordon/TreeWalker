@@ -1,0 +1,104 @@
+{
+  "status": "complete",
+  "llm": {
+    "model": "glm-5.3"
+  },
+  "message": "Review complete: 0 finding(s) across 3 selected item(s).",
+  "summary": {
+    "files_reviewed": 3,
+    "comments": 0,
+    "total_tokens": 133731,
+    "input_tokens": 114755,
+    "output_tokens": 18976,
+    "cache_read_tokens": 57344,
+    "elapsed": "4m40s"
+  },
+  "tool_calls": {
+    "total": 10,
+    "by_tool": {
+      "code_search": 7,
+      "file_find": 1,
+      "file_read": 2
+    },
+    "failure": 0,
+    "failure_by_tool": {},
+    "failure_details": []
+  },
+  "comments": [],
+  "groups": [
+    {
+      "label": "small change set",
+      "files": [
+        "pyproject.toml",
+        "tests/test_dependency_spec.py",
+        "tests/test_llm_client.py"
+      ]
+    }
+  ],
+  "session_id": "73e7628e-d044-4662-b77f-9821d78c0740",
+  "manifest": {
+    "schema_version": "ocr.run-manifest/v1",
+    "run_id": "73e7628e-d044-4662-b77f-9821d78c0740",
+    "operation": "review",
+    "terminal_state": "complete",
+    "repository": {
+      "identity_sha256": "2868bcfb033292e0d47631dc911d0e36e5dcedaf9e0bcacffe6c4716bb93dfda"
+    },
+    "input": {
+      "mode": "range",
+      "requested_from": "master",
+      "requested_head": "fix/187-anthropic-sdk-cap",
+      "resolved_base": "e3400a2a1e8d7c272f4ba4a83f1e846256b896fa",
+      "resolved_head": "27450260951220cccfb29b09bde4eb4b28c1b12d",
+      "exact_range": "e3400a2a1e8d7c272f4ba4a83f1e846256b896fa..27450260951220cccfb29b09bde4eb4b28c1b12d",
+      "source_artifact_sha256": "50f1d8eac2eb37a216cb4cedbc992773403fbc311b6e8374d9f49687c763fb77"
+    },
+    "execution": {
+      "ocr_version": "v1.12.1",
+      "model": "glm-5.3",
+      "configured_concurrency": 8,
+      "rule_config_sha256": "ddb40005eb732cb8b37d8d3dc1acb82f3aa51fded408c899a092c10349c369c4",
+      "runtime_config_sha256": "841fe9ad288d2dd9efc84c443193c492ef06b26edf31ff5f5a1b01637fef2b0c"
+    },
+    "coverage": {
+      "selected": [
+        {
+          "item_id": "447e9647bb8bd3d4085989abba9e49aca2bf47a267a9743d60ef2c9529a26ece",
+          "path": "tests/test_llm_client.py",
+          "fingerprint": "a23fb71c8cb5119b6bf843ea01a049f92e4cab4cc684bedf0f068c2e3470789a"
+        },
+        {
+          "item_id": "5cbd12cf7190e2b917a1e821caa9fbd551d91ea1e0176c1baf71db3d11f3b891",
+          "path": "tests/test_dependency_spec.py",
+          "fingerprint": "fbb5af8e83798063f9e75d5d82925cc3637bf90f14b4f2fc16c72640d1106762"
+        },
+        {
+          "item_id": "fb2abd4d06e90b893c1407380be18d7242fd798ebfe7402aba1b861febc0cefe",
+          "path": "pyproject.toml",
+          "fingerprint": "a148306c4432f2b261f6f78aab2651db0ab0252cc474e57bdf03cc52588221dc"
+        }
+      ],
+      "completed": [
+        {
+          "item_id": "447e9647bb8bd3d4085989abba9e49aca2bf47a267a9743d60ef2c9529a26ece",
+          "path": "tests/test_llm_client.py",
+          "fingerprint": "a23fb71c8cb5119b6bf843ea01a049f92e4cab4cc684bedf0f068c2e3470789a"
+        },
+        {
+          "item_id": "5cbd12cf7190e2b917a1e821caa9fbd551d91ea1e0176c1baf71db3d11f3b891",
+          "path": "tests/test_dependency_spec.py",
+          "fingerprint": "fbb5af8e83798063f9e75d5d82925cc3637bf90f14b4f2fc16c72640d1106762"
+        },
+        {
+          "item_id": "fb2abd4d06e90b893c1407380be18d7242fd798ebfe7402aba1b861febc0cefe",
+          "path": "pyproject.toml",
+          "fingerprint": "a148306c4432f2b261f6f78aab2651db0ab0252cc474e57bdf03cc52588221dc"
+        }
+      ],
+      "reused": [],
+      "failed": [],
+      "waived": []
+    },
+    "elapsed_ms": 280200
+  }
+}
