@@ -52,9 +52,10 @@ class TestSyntaxRepairCandidates:
 
     def test_missing_catch_missing_brace_shape_rebuilds_suffix(self):
         # 形态②：连函数闭合括号也缺（504 s13 样本：...return 'not found';})()）
+        # issue #185-c2：失衡样本额外追加第 3 个「补全+插 catch」组合候选
         code = "(function(){try{var b=1;if(b){return 'x';}return 'not found';})()"
         cands = _syntax_repair_candidates(code, "Uncaught SyntaxError: Missing catch or finally after try")
-        assert len(cands) == 2
+        assert len(cands) == 3  # 形态① + 形态② + c2 组合候选
         rebuilt = cands[1]
         assert rebuilt.endswith("}catch(e){return 'Error: '+e.message}})()")
 
@@ -99,13 +100,61 @@ class TestEvaluateSelfHeal:
 
     @pytest.mark.asyncio
     async def test_truncation_error_gets_hint(self):
+        """issue #185-c2：提示按实测语义纠偏——V8 的 EOF/token 错误在本仓证据里
+        100% 意味着定界符失衡，不是文本被砍（旧 "looks truncated" 措辞助长 agent
+        的"传输截断"误读）。"""
         bs = _make_session()
         bs.client.send.Runtime.evaluate = AsyncMock(return_value={
-            "exceptionDetails": {"text": "Uncaught", "exception": {
-                "description": "SyntaxError: Unexpected end of input"}}},
-        )
-        with pytest.raises(RuntimeError, match="truncated"):
+            "exceptionDetails": {
+                "text": "Uncaught",
+                "exception": {"description": "SyntaxError: Unexpected end of input"},
+            },
+        })
+        with pytest.raises(RuntimeError, match="unbalanced braces/parens"):
             await bs.evaluate("var a = 1;")
+
+    @pytest.mark.asyncio
+    async def test_token_error_also_gets_imbalance_hint(self):
+        """c2：触发面扩到 Unexpected token（多余闭合形态）。"""
+        bs = _make_session()
+        bs.client.send.Runtime.evaluate = AsyncMock(return_value={
+            "exceptionDetails": {
+                "text": "Uncaught",
+                "exception": {"description": "SyntaxError: Unexpected token '}'"},
+            },
+        })
+        with pytest.raises(RuntimeError, match="unbalanced braces/parens"):
+            await bs.evaluate("}}")
+
+    @pytest.mark.asyncio
+    async def test_eof_missing_closer_candidate_heals(self):
+        """c2 端到端：EOF 缺闭合（C 轮 549 形态 `((function(){…})()`）——首个候选
+        补全闭合，重试成功。"""
+        bs = _make_session()
+        bs.client.send.Runtime.evaluate = AsyncMock(side_effect=[
+            {"exceptionDetails": {"text": "Uncaught", "exception": {
+                "description": "SyntaxError: Unexpected end of input"}}},
+            {"result": {"value": "ok"}},
+        ])
+        out = await bs.evaluate("((function(){return 'ok'})()")
+        assert out == "ok"
+        retry_expr = bs.client.send.Runtime.evaluate.call_args_list[1][0][0]["expression"]
+        assert retry_expr == "((function(){return 'ok'})())"
+
+    @pytest.mark.asyncio
+    async def test_extra_closer_candidate_heals(self):
+        """c2 端到端：多余闭合（C 轮 699 形态）——删首个错位闭合符后重试成功。"""
+        bs = _make_session()
+        bs.client.send.Runtime.evaluate = AsyncMock(side_effect=[
+            {"exceptionDetails": {"text": "Uncaught", "exception": {
+                "description": "SyntaxError: Unexpected token '}'"}}},
+            {"result": {"value": "not found"}},
+        ])
+        out = await bs.evaluate(
+            "((function(){if(1){return 'x'}return 'not found'}})())")
+        assert out == "not found"
+        retry_expr = bs.client.send.Runtime.evaluate.call_args_list[1][0][0]["expression"]
+        assert "}})()" not in retry_expr  # 首个错位 } 已删
 
     @pytest.mark.asyncio
     async def test_missing_catch_second_candidate_succeeds(self):
@@ -221,3 +270,67 @@ class TestKickFrozenDataGrid:
         assert out["ready"] is True
         assert out["grid_kick"] is True
         assert out["grid_rows"] == 7
+
+
+# ── issue #185-c2：定界符平衡修复候选（纯函数边界） ─────────────────────
+
+
+class TestBalanceRepairCandidates:
+    """C 轮 22/22 编译失败全为定界符失衡；18 处主导形态原无候选——本轮解除
+    后置（docs/bug-fix/185-c2-balance-repair-impl-plan.md）。"""
+
+    def test_balanced_code_eof_branch_no_candidates(self):
+        # 已平衡代码不得产生补全候选（防误改）
+        assert _syntax_repair_candidates(
+            "(function(){return 1})()", "SyntaxError: Unexpected end of input",
+        ) == []
+
+    def test_non_closer_token_error_no_candidates(self):
+        # "Unexpected token ;" 这类真语法错（非多余闭合）——扫描找不到错位闭合
+        assert _syntax_repair_candidates("var x=;", "SyntaxError: Unexpected token ;") == []
+
+    def test_eof_completion_canonical_order(self):
+        # 栈 (( → 补 ))（栈序逆置）；附最小补 ) 候选
+        cands = _syntax_repair_candidates(
+            "((function(){var a=1;", "SyntaxError: Unexpected end of input")
+        assert cands[0] == "((function(){var a=1;}))"
+        assert cands[1] == "((function(){var a=1;)"
+
+    def test_extra_closer_two_candidates(self):
+        # 双错位：候选①删首个错位（仍剩一个），候选②再删到平衡
+        cands = _syntax_repair_candidates(
+            "(function(){return 1}}})", "SyntaxError: Unexpected token '}'")
+        assert cands == [
+            "(function(){return 1}})",
+            "(function(){return 1})",
+        ]
+
+    def test_single_extra_closer_one_candidate(self):
+        # 单错位：删除后即平衡，不再产第二候选
+        cands = _syntax_repair_candidates(
+            "(function(){return 1}})", "SyntaxError: Unexpected token '}'")
+        assert cands == ["(function(){return 1})"]
+
+    def test_bare_return_plus_imbalance_composed_candidate(self):
+        # C 轮 698/700 形态：裸 return 叠加失衡——组合候选（补全+包裹）在后
+        cands = _syntax_repair_candidates(
+            "return document.title;", "SyntaxError: Illegal return statement")
+        assert cands[0] == "(()=>{\nreturn document.title;\n})()"  # 平衡主路径在前
+        # 叠加失衡样本：return x + 缺闭合
+        cands2 = _syntax_repair_candidates(
+            "return ((function(){var a=1;", "SyntaxError: Illegal return statement")
+        assert cands2[1].startswith("(()=>{\nreturn ((function(){var a=1;")
+        assert cands2[1].endswith("}))\n})()")
+
+    def test_missing_catch_plus_imbalance_composed_candidate(self):
+        # C 轮 698 形态：缺 catch 叠加失衡
+        cands = _syntax_repair_candidates(
+            "(function(){try{var b=1;", "SyntaxError: Missing catch or finally after try")
+        assert cands and cands[-1].endswith("catch(e){return 'Error: '+e.message}})")
+
+    def test_regex_bracket_limitation_tolerated(self):
+        """已知局限：regex 字面量内的 [] 被误计——候选允许无效，由编译试跑
+        兜底（此处只断言不崩溃且产出候选）。"""
+        cands = _syntax_repair_candidates(
+            "(function(){return 'a'.match(/[((/)", "SyntaxError: Unexpected end of input")
+        assert cands  # 误计产生的补全候选存在；合法性交 CDP 重试把关

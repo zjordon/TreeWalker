@@ -503,8 +503,51 @@ def _normalize_eval_result(result_data: dict) -> str:
     return str(value)
 
 
+_CLOSE_OF = {"(": ")", "[": "]", "{": "}"}
+
+
+def _delimiter_scan(code: str) -> tuple[list[str], int]:
+    """issue #185-c2：字符串/模板字面量与 ``//`` 注释感知的定界符扫描。
+
+    返回 ``(未闭合栈——按开序, 首个错位闭合符的下标；无则 -1)``。已知局限
+    （无害——候选由 CDP 编译试跑把关，不合法即丢弃）：regex 字面量内的
+    ``[](){}`` 会被误计入栈；块注释 ``/* */`` 不识别（C 轮 22 个真实失败
+    样本无一含块注释）。
+    """
+    stack: list[str] = []
+    in_str: str | None = None
+    k = 0
+    n = len(code)
+    while k < n:
+        c = code[k]
+        if in_str:
+            if c == "\\":
+                k += 2
+                continue
+            if c == in_str:
+                in_str = None
+        elif c in "\"'`":
+            in_str = c
+        elif c == "/" and k + 1 < n and code[k + 1] == "/":
+            break  # 行注释：其后无更多可执行定界符
+        elif c in _CLOSE_OF:
+            stack.append(c)
+        elif c in ")]}":
+            if stack and _CLOSE_OF[stack[-1]] == c:
+                stack.pop()
+            else:
+                return stack, k  # 首个错位闭合（多余/错序）
+        k += 1
+    return stack, -1
+
+
+def _close_open_delims(stack: list[str]) -> str:
+    """按栈序逆置生成补全闭合串（``((`` → ``))``）。"""
+    return "".join(_CLOSE_OF[c] for c in reversed(stack))
+
+
 def _syntax_repair_candidates(code: str, err_text: str) -> list[str]:
-    """P7 form_interaction 建议5：按已知 SyntaxError 生成确定性修复候选（按序试跑）。
+    """P7 form_interaction 建议5 + issue #185-c2：按已知 SyntaxError 生成确定性修复候选（按序试跑）。
 
     2026-08-23 复盘（batch1 task-505 step 12 等，同类错误批次内 8 处）：
     - ``Illegal return statement``：LLM 写了顶层裸 return——Runtime.evaluate 按
@@ -516,10 +559,27 @@ def _syntax_repair_candidates(code: str, err_text: str) -> list[str]:
       一个 ``}`` 之前可修）；②连函数闭合括号也缺（去掉尾部 ``})()`` 再补
       ``}catch(...){...}})()`` 可修）。两个候选按序试跑，语法错误无副作用，试错安全。
 
+    issue #185-c2（C 轮 22/22 编译失败全为定界符失衡，主导形态 18 处原无候选——
+    首轮方案 §8 后置的平衡修复候选解除后置）：
+    - ``Unexpected end of input``（缺闭合，13 处）：栈序逆置补全——LLM 自以为
+      写对的程序即「全部闭合都在的前缀」，补全即其本意；另附仅补 ``)`` 的最小
+      修补候选（外层包裹括号漏配的最常见单字符形态，兼防扫描误计）。
+    - ``Unexpected token '}'/')'/']'``（多余闭合，5 处）：删除首个错位闭合符
+      （C 轮 699 真实样本：``…return 'not found'}})())`` 删首个错位 ``}`` 即
+      平衡）；候选②删前两个错位。
+    - 裸 return / 缺 catch **叠加失衡**（698/700 形态）：纯包裹/插 catch 候选在
+      失衡代码上必败——追加「内层补全闭合 + 包裹/插 catch」组合候选。
+
     其余错误返回空列表（不自愈，原样抛出）。
     """
     if "Illegal return statement" in err_text:
-        return ["(()=>{\n" + code + "\n})()"]
+        candidates = ["(()=>{\n" + code + "\n})()"]
+        # c2：裸 return 叠加失衡——内层先补全闭合再包裹，一次到位
+        stack, _ = _delimiter_scan(code)
+        if stack:
+            candidates.append(
+                "(()=>{\n" + code + _close_open_delims(stack) + "\n})()")
+        return candidates
     if "Missing catch or finally after try" in err_text:
         catch = "catch(e){return 'Error: '+e.message}"
         candidates: list[str] = []
@@ -530,6 +590,33 @@ def _syntax_repair_candidates(code: str, err_text: str) -> list[str]:
         # 形态②：连函数闭合括号也缺 —— 去掉尾部 })() 重建闭合
         if code.endswith("})()"):
             candidates.append(code[:-4] + "}" + catch + "})()")
+        # c2：缺 catch 叠加失衡——内层补全闭合后再走形态①的插 catch 位点
+        stack, _ = _delimiter_scan(code)
+        if stack:
+            balanced = code + _close_open_delims(stack)
+            j = balanced.rfind("}")
+            if j > 0:
+                candidates.append(balanced[:j] + catch + balanced[j:])
+        return candidates
+    if "Unexpected end of input" in err_text:
+        stack, _ = _delimiter_scan(code)
+        if not stack:
+            return []
+        completion = _close_open_delims(stack)
+        candidates = [code + completion]
+        if completion != ")":
+            candidates.append(code + ")")  # 最小修补：仅外层包裹括号漏配
+        return candidates
+    if "Unexpected token" in err_text:
+        # 多余闭合：删首个错位闭合符；候选②在①基础上再删下一个错位
+        candidates = []
+        work = code
+        for _ in range(2):
+            _, extra = _delimiter_scan(work)
+            if extra < 0:
+                break
+            work = work[:extra] + work[extra + 1:]
+            candidates.append(work)
         return candidates
     return []
 
@@ -3640,9 +3727,16 @@ return (async function(){
                         break
             if result.get("exceptionDetails"):
                 msg = _format_eval_exception(result["exceptionDetails"], validated_code)
-                if "Unexpected end of input" in err_text:
-                    msg += ("\n⚠️ The code looks truncated — split it into shorter "
-                            "evaluate calls.")
+                # issue #185-c2：C 轮 22/22 编译失败全为定界符失衡——旧措辞
+                # "looks truncated" 与 agent 的"传输截断"误读共振（自评反复出现
+                # "truncated/mangled in transport" 叙事且被重开评论采纳）；按实测
+                # 语义纠偏，触发面扩到 token 闭合错误。
+                if "Unexpected end of input" in err_text or "Unexpected token" in err_text:
+                    msg += ("\n⚠️ The code has unbalanced braces/parens (this V8 "
+                            "error means delimiters never matched, not that text "
+                            "was cut). Check that an IIFE prefix `((function(){...` "
+                            "has its matching `))` / `)())` suffix; keep code under "
+                            "~300 chars or split into several evaluate calls.")
                 raise RuntimeError(msg)
         result_data = result.get("result", {})
         if result_data.get("wasThrown"):
