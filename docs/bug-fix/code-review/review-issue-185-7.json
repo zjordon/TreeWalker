@@ -1,0 +1,181 @@
+{
+  "status": "complete",
+  "llm": {
+    "model": "glm-5.3"
+  },
+  "message": "Review complete: 1 finding(s) across 5 selected item(s).",
+  "summary": {
+    "files_reviewed": 5,
+    "comments": 1,
+    "total_tokens": 667362,
+    "input_tokens": 578495,
+    "output_tokens": 88867,
+    "cache_read_tokens": 337600,
+    "elapsed": "17m22s"
+  },
+  "tool_calls": {
+    "total": 27,
+    "by_tool": {
+      "code_comment": 1,
+      "code_search": 10,
+      "file_find": 1,
+      "file_read": 12,
+      "file_read_diff": 3
+    },
+    "failure": 0,
+    "failure_by_tool": {},
+    "failure_details": []
+  },
+  "comments": [
+    {
+      "path": "src/tree_walker/browser/session.py",
+      "content": "删除类候选的位置交叉验证只覆盖了首个错位（`err_offset != first_extra` 门禁），而候选②的删除完全绕过了该门禁：循环第二轮对 `work` 的再扫描结果未做任何位置验证即删除。当首个错位是经 CDP 验证的真实多余闭合符、且其后源码中存在含未配对闭合符的 regex 字面量（如 `/[)]/g`，`_delimiter_scan` 自述的已知局限）时，再扫描会把幻影闭合符报为下一个错位——候选②删除它得到合法的空字符类 `/[]/g`，编译试跑无法拦截，重试将以 regex 匹配空集的漂移语义静默执行（warning 日志只提供可观测性，不阻止执行）。这正是注释中 review5 #1/review6 #3 要拦的风险类别，但防护只对第一次删除生效，第二次删除是同一防线上的缺口；tests/test_p7_form_interaction_fixes.py 也只测了首个错位的门禁与双真实错位形态，未覆盖此场景。建议对候选②适用同一 fail-safe 标准——例如仅在第二错位与首个已验证错位连排同字符（`}}`/`))` 双闭合笔误形态，删除后左移恰好占位，现有测试 `test_extra_closer_two_candidates` 的 `(function(){return 1}}})` 即此形态）时才生成，否则放弃。",
+      "suggestion_code": "        candidates = []\n        work = code\n        for _ in range(2):\n            _, extra = _delimiter_scan(work)\n            if extra \u003c 0:\n                break\n            if candidates:\n                # 候选②无 CDP 位置证据——仅限与首个已验证错位连排的同字符\n                # （}}/))/]]] 双闭合笔误，删除后左移恰好占位）；regex 幻影闭合\n                # 符与首删位必不相邻，按 review5 #1 同标准 fail-safe 放弃\n                if extra != first_extra or work[extra] != code[first_extra]:\n                    break\n            work = work[:extra] + work[extra + 1:]\n            candidates.append(work)\n        return candidates",
+      "existing_code": "        candidates = []\n        work = code\n        for _ in range(2):\n            _, extra = _delimiter_scan(work)\n            if extra \u003c 0:\n                break\n            work = work[:extra] + work[extra + 1:]\n            candidates.append(work)\n        return candidates",
+      "start_line": 648,
+      "end_line": 656,
+      "thinking": "Good — `_validate_and_fix_javascript` is already imported at line 32. Test file is fine.\n\nNow let me finalize my findings:\n\n**Confirmed Issue #1 (report)**: In `_syntax_repair_candidates`'s \"Unexpected token\" branch, candidate ② (the loop's second deletion) is not covered by the CDP position cross-validation. The gate only validates the FIRST misaligned closer against `err_offset`. After the first (verified) deletion, the rescan of `work` can flag a phantom closer inside a regex literal (documented scanner limitation: `/[)]/g`), and candidate ② deletes it → `/[]/g`, a legal empty character class — the compile-retry guard cannot catch it, and the drifted code executes silently (warning log provides observability but not prevention). This is precisely the risk class the position gate was built for (per the code's own review5 #1/review6 #3 comments), so the protection is inconsistent for the second deletion. No test covers the \"candidate ② deletes a regex phantom\" scenario (test_p7_form_interaction_fixes.py only tests the initial gate: `test_deletion_veto_on_position_mismatch`, and the double-real-extra case: `test_extra_closer_two_candidates`).\n\nSeverity: medium. Category: bug.\n\nSuggestion: restrict candidate ② generation — e.g., only emit the second deletion when the second misaligned closer's position can also be validated, or cap deletion candidates at 1 when the remaining code contains characters the scanner may miscount (regex literals). A simple fail-safe: drop candidate ② entirely (single-deletion only), or require that the deletion index falls outside any regex-literal region. Simplest concrete suggestion: limit the loop to a single deletion (`for _ in range(1)` — i.e., only the verified one), or validate that the second flagged closer is not preceded by an unmatched `/` region... The cleanest minimal suggestion: after the first verified deletion, only append a second candidate if the rescan's misaligned closer equals the position that CDP evidence supports — but there's no second CDP position. Alternative: verify the second deletion position is NOT inside a regex literal by reusing the scan... the scanner itself can't tell. So the practical fix: remove candidate ② or gate it behind an additional check that the character being deleted is not inside a regex literal. Given the codebase's fail-safe philosophy (\"no position evidence → give up\"), the consistent fix is to drop candidate ② (single deletion only), keeping candidate ① which is position-verified. But the test `test_extra_closer_two_candidates` expects 2 candidates for the double-real-extra shape (\"双错位：候选①删首个错位（仍剩一个），候选②再删到平衡\")... so dropping ② would break that test. Hmm. The authors deliberately added candidate ② for the double-real-extra shape. So my suggestion should respect that intent: e.g., validate the second deletion against a re-run... can't. Or: check that the second misaligned closer is not within a regex literal — could approximate by ensuring the deleted char is `)`/`]`/`}` NOT inside slashes... too complex. \n\nAlternative suggestion direction: after candidate ②'s deletion, if the deleted character position lies within a segment that scans as a regex literal (heuristic: preceding unmatched `/`), skip. Or: make candidate ② also require position evidence by sending a cheap second compile probe? That changes architecture. \n\nPractical suggestion: in the loop, only append the second candidate when the deletion is the SAME character class as a balanced continuation... Hmm.\n\nMaybe simpler and defensible: the suggestion is to apply the same fail-safe standard — for candidate ②, require that deleting it yields a scan-balanced result AND the deleted closer is immediately preceded (in context) by a matching structure... I think the cleanest actionable suggestion: bound candidate ② to cases where the second misaligned closer is the character immediately following a matching closer run (e.g., `}}` `))` doubles — the double-typo shape), i.e., only delete when `work[extra-1] == work[extra]` (consecutive duplicate closer — the typical LLM double-closer typo) — that avoids deleting inside `/[)]/` where the preceding char is `[`... wait in `/[)]/`, before the `)` is `[`, so `work[extra-1] == work[extra]` is false → skip. And for `}}` typo it's true. That's a neat heuristic but still heuristic. \n\nHonestly, for the comment I can present the issue and offer the suggestion: extend the fail-safe — e.g., only generate the second deletion when it is adjacent to the first deleted position (consecutive duplicated closer typo `}}`/`))`/`]]`), otherwise skip; or drop candidate ② in the presence of any `/` outside strings (regex literal may exist). I'll phrase the suggestion with the adjacent-duplicate heuristic as one option and note the test `test_extra_closer_two_candidates` expectation: `(function(){return 1}})})` → deletions at 21 and 20 — after deleting index 21 (`}`), rescan flags 20 which is `}` — and work[19] is also `}`? `(function(){return 1}})`: positions: ...`1` at 19, `}` 20, `}` 21 (before deletion), `)` 22. After deleting 21: `...1}}` at 20,21→ now `...1}` 20, `)` 21. Rescan flags... hmm wait after first deletion the misaligned is at 20 (the remaining `}`)? For the consecutive heuristic at original time: extra1=21, extra2=20, |21-20|=1 and same char → adjacent duplicate typo → allowed. For the phantom case: real extra at say 30, phantom at 55 → not adjacent → skip. That works and preserves the tested behavior. I'll offer that as suggestion code but keep it clearly as one possible approach.\n\nLet me draft suggestion code:\n\n```python\n        candidates = []\n        work = code\n        first = True\n        for _ in range(2):\n            _, extra = _delimiter_scan(work)\n            if extra \u003c 0:\n                break\n            if not first:\n                # 候选②无位置证据：仅限与已删位相邻的同字符连排（LLM 双闭合笔误\n                # 形态 }}/))/]]）；regex 幻影闭合符与首删位必不相邻，fail-safe 跳过\n                prev = work[:extra]\n                if not (prev.endswith(code[first_extra]) if ... )\n```\n\nHmm getting convoluted. Simpler: record last deleted index in `work` coordinates:\n\n```python\n        candidates = []\n        work = code\n        last_del: int | None = None\n        for _ in range(2):\n            _, extra = _delimiter_scan(work)\n            if extra \u003c 0:\n                break\n            # 候选②无 CDP 位置证据——仅当与上一删除位相邻且同字符（}} / )) 连排\n            # 笔误形态）才放行；regex 幻影闭合符（如 /[)]/g）与首删位不相邻，跳过\n            if last_del is not None and not (\n                extra == last_del and work[extra] == work[extra - 1]\n            ):\n                break\n            work = work[:extra] + work[extra + 1:]\n            last_del = extra\n            candidates.append(work)\n```\n\nWait — after deleting char at index `extra` in `work`, in the new `work` the preceding char that was at `extra-1` stays at `extra-1`, and the char that followed shifts to `extra`. For the double-typo `}}` at (20,21): delete 21 → new work has `}` at 20 and `)` at 21. Rescan flags 20. Check: extra(20) == last_del(21)? No — 20 ≠ 21. Hmm. The adjacency: extra == last_del - 1? In this case 20 == 21-1 ✓. But after deletion indices shift... For phantom far away, extra \u003c\u003c last_del-1. So condition: `extra == last_del - 1` won't hold for phantom at 55 when last_del=30. But careful: `last_del` refers to the old `work` coordinates, and `extra` to the new `work` — deletion at last_del shifts indices \u003e last_del down by 1. The next typo closer was at last_del+... in the `}}` case: original indices 20,21; delete 21; remaining `}` now at 20; last_del=21; extra=20 = last_del-1 ✓. For a phantom at original 55 → new 54; last_del=30 → 54 ≠ 29 ✓ skip. Also same-char check: `work[extra]` vs deleted char. Fine, I'll present a simplified suggestion — the comment tool's suggestion is advisory; I'll keep it compact:\n\n```python\n        candidates = []\n        work = code\n        last_extra = first_extra\n        for _ in range(2):\n            _, extra = _delimiter_scan(work)\n            if extra \u003c 0:\n                break\n            if extra != last_extra - 1 or work[extra] != code[last_extra]:\n                # 候选②无 CDP 位置证据——仅限紧邻首个已验证错位的同字符连排\n                # （}} / )) 双闭合笔误）；regex 幻影闭合符不相邻，fail-safe 放弃\n                break\n            work = work[:extra] + work[extra + 1:]\n            last_extra = extra\n            candidates.append(work)\n```\n\nWait, but the FIRST iteration also needs to append. In the original loop, first iteration deletes first_extra (verified). My restructure: handle first deletion before loop or make the condition only apply to the second. Let me restructure cleanly:\n\n```python\n        candidates = [code[:first_extra] + code[first_extra + 1:]]\n        work = candidates[0]\n        _, extra = _delimiter_scan(work)\n        # 候选②无 CDP 位置证据：仅当错位紧跟首个已验证错位（同字符连排 }} / ))\n        # 双闭合笔误形态）才放行；regex 幻影闭合符与首删位必不相邻 → fail-safe 放弃\n        if extra == first_extra - 1 and work[extra] == code[first_extra]:\n            candidates.append(work[:extra] + work[extra + 1:])\n        return candidates\n```\n\nHmm wait — for the `}}` case: code = `(function(){return 1}})})`, first_extra=21 (`}` second one? test says scan extra=21 for `(function(){return 1}})()`. Whatever). code[21] = `}`. candidates[0] = delete 21. rescan → extra=20, work[20]... in `(function(){return 1}})()`: index 19=`1`? Let me not over-verify; test `test_extra_closer_two_candidates` uses `(function(){return 1}})})` err_offset=21 expecting both candidates. With my suggested logic: first_extra=21 (the second `}`? or...). Honestly for the suggestion I don't need to be byte-perfect — the reviewer suggestion is directional. But it SHOULD not contradict the existing tests. Let me carefully verify with `(function(){return 1}})})`:\n\nIndices: `(function(){return 1}})})`\n0:( 1:f ... let me count: `(function(){` is 12 chars (0-11: `(`,`f`,`u`,`n`,`c`,`t`,`i`,`o`,`n`,`(`,`)`,`{`), then `return 1` = 12-19 (12..19: r,e,t,u,r,n,space,1), then `}` at 20, `}` at 21, `)` at 22, `}` at 23, `)` at 24, ... wait the string is `(function(){return 1}})})` — after `1`(19): `}`(20) `}`(21) `)`(22) `}`(23) `)`(24). Hmm that's `}})})`  — 5 chars, total length 25.\n\nScan: `(`0 push; `(`8 push; `)`10 pop; `{`11 push; `}`20 — top is `{` → pop; `}`21 — top is `(`, expects `)` → misaligned, extra=21 ✓ (matches err_offset=21 in test). \n\nCurrent code: candidates[0] = delete idx21 → `(function(){return 1}})`... wait deleting index 21 from `(function(){return 1}})})` gives `(function(){return 1}})` — hmm no: removing the char at 21 (second `}`) leaves `(function(){return 1` + `}` (at 20) + `)})` → `(function(){return 1})})`. Test expects cands == [\"(function(){return 1}})\", \"(function(){return 1})\"]. Hmm that doesn't match my trace. Let me recount `(function(){return 1}})})`:\n\n`( f u n c t i o n ( ) { r e t u r n ␣ 1 } } ) } )`\n0  1 2 3 4 5 6 7 8 9 10 11 12...19? `(`=0, `function`=1-8, `(`=9, `)`=10, `{`=11, `return `=12-18 (r12 e13 t14 u15 r16 n17 space18), `1`=19, `}`=20, `}`=21, `)`=22, `}`=23, `)`=24. Length 25.\n\nScan: 0 `(` push [(]; 9 `(` push [(,(]; 10 `)` pop [(]; 11 `{` push [(,{]; 20 `}` pop { → [(]; 21 `}` top `(` expects `)` → extra=21 ✓.\n\nDelete 21 → `(function(){return 1})})`  — but the test asserts cands[0] == \"(function(){return 1}})\"?? That's `(function(){return 1` + `}})`  — that would be deleting the `}` at 23? No wait — \"(function(){return 1}})\" is 23 chars: `(function(){return 1` (20 chars, 0-19) + `}`(20) + `}`(21) + `)`(22). So cands[0] deleted indices 23,24 (`})`)? That doesn't match my trace of the loop either.\n\nHmm wait, maybe I misread the test input. Test: `_syntax_repair_candidates(\"(function(){return 1}}})\", ...)` — the code is `(function(){return 1}}})`, NOT `(function(){return 1}})})`. Let me recount: `(function(){return 1}}})` = `(`,`function`,`(`,`)`,`{`,`return 1`,`}`(20),`}`(21),`}`(22),`)`(23). Scan: 20 `}` closes {, 21 `}` top `(` expects `)` → extra=21 ✓ err_offset=21. Delete 21 → `(function(){return 1}})`  — 23 chars ✓ matches cands[0]. Rescan: 20 `}` closes { → [(], 21(now `}` at 21? new string `(function(){return 1}})`: 0-19 same, 20 `}` closes {→[(], 21 `}` top `(` expects `)` → extra=21. Delete → `(function(){return 1})` ✓ cands[1]. \n\nSo in the tested double-closer typo, the second flagged position in `work` is at index 21 — the SAME index as the first deletion (because deletion shifts following chars left, and the next `}` moves into the deleted slot... no wait — the next `}` was at 22 in the original; after deleting 21, it's at 21). So extra2 == first_extra when the typo is a CONSECUTIVE run `}}`. And the deleted chars: code[first_extra]=`}`, work[extra2]... in new work index 21 is `}` — same char. \n\nSo my suggested condition `extra == first_extra and work[extra] == code[first_extra]`? After deleting 21 from original, new work's `}` (originally at 22) is at 21. extra2 = 21 = first_extra ✓. For a phantom after the first deletion at a far position, extra2 ≠ first_extra generally. Hmm but is \"extra2 == first_extra\" robust? If the typo is `} }` (space between)? `(function(){return 1} })` — scan: 20 `}` closes, 22 `}` misaligned extra=22. Delete → `(function(){return 1} )` rescan: 21 `}` top `(`... wait new string `(function(){return 1} )`: 20 `}` closes {→[(], 21 space, 22 `}`? no — original `...1} })`: 19 `1`, 20 `}`, 21 space, 22 `}`, 23 `)`. Delete 22 → `...1} )` — 20 `}` closes → [(], 21 space, 22 `)` closes → balanced. extra2 would be... rescan finds nothing misaligned → loop breaks after first candidate only. OK so spaced double-typo yields only candidate ① — already the current behavior (loop rescans; extra=-1 → break). Fine.\n\nSo the adjacency/same-index condition works for the tested consecutive run. My suggestion: after the verified first deletion, generate candidate ② only when the rescan's misaligned closer sits at the SAME index (consecutive same-char run shifting into the deleted slot) and is the same character — otherwise fail-safe break. This preserves `test_extra_closer_two_candidates` while blocking distant phantoms.\n\nLet me write the final suggestion code matching repo style (this file uses 4-space indent):\n\n```python\n        candidates = []\n        work = code\n        for _ in range(2):\n            _, extra = _delimiter_scan(work)\n            if extra \u003c 0:\n                break\n            if candidates:\n                # 候选②无 CDP 位置证据——仅限与首个已验证错位连排的同字符\n                # （}}/))/]]] 双闭合笔误，删除后左移恰好占位）；regex 幻影闭合\n                # 符与首删位必不相邻，fail-safe 放弃（review5 #1 同标准）\n                if extra != first_extra or work[extra] != code[first_extra]:\n                    break\n            work = work[:extra] + work[extra + 1:]\n            candidates.append(work)\n        return candidates\n```\n\nWait — for the consecutive `}}` run: first deletion at 21, rescan extra=21 == first_extra=21 ✓ and work[21]=`}` == code[21]=`}` ✓ → candidate ② generated ✓. For phantom at 54 after deleting 30: extra=54 ≠ 30 → break, only candidate ① ✓. \n\nHmm, but one edge: what if the phantom happens to be at exactly first_extra and same char? E.g., real `}` typo at 30, and after deletion, index 30 in work happens to be a regex `}`... `/[}]/g` phantom at exactly 30 after shift means it was at 31 originally — i.e., `/[}]/` IMMEDIATELY after the real extra closer: `...}}/[}]/g...` — hmm, `}` at 30 extra (real), deleted; then `/[}]/g` — the `[` pushes, `}` inside → misaligned at... the `[` push then `}` at some index — top is `[` expects `]`, misaligned → extra = index of `}` in regex = 31? after deleting 30, shifts to 30 == first_extra ✓ and char `}` == `}` ✓ → candidate ② deletes the regex `}` → `/[]/g`?? Wait `/[[]/`... `/[}]/` deleting the `}` gives `/[]/`. Damn — edge case remains: phantom IMMEDIATELY following the first extra. How likely? `...1}}/[}]/g...` — a regex directly adjacent to the extra closer with no separator. Extremely contrived (regex literal as operand right after the typo'd closer). The heuristic reduces the risk surface massively; perfect fix needs regex-literal awareness. Good enough for a suggestion; I'll note it's a tightening option.\n\nAlternatively suggest the cleanest: make candidate ② also subject to fail-safe — i.e., simply don't emit it unless adjacent-run shape. That's what I wrote.\n\nNow, severity/category: bug, medium? The review plan says medium. It causes silent semantic drift in executed code — but requires the phantom-after-verified-extra coincidence. Medium is right.\n\n**Issue #2 — resolved as non-issue**: expression == validated_code confirmed (line 3718); UTF-16 shift direction is fail-safe (mismatch → veto) as analyzed; false-match is geometrically implausible (phantom before true error can't equal a shifted-later offset). Stay silent.\n\n**Issue #3 — resolved as non-issue**: coverage exists and is thorough in the other changed file; acceptance criterion (\u003e500 chars, regex, nested quotes) matches docs/issue/185.md line 78. Stay silent.\n\n**Issue #4 — resolved as non-issue**: hardcoded `D:\\dev\\...` paths in examples/ debug scripts are established repo convention (many existing scripts). Stay silent.\n\nAny other issues I should scan for in the diff?\n\n- `_delimiter_scan` `elif c == \"\\\\\"` — skips 2 chars outside strings. If `\\` is last char, k+=2 exits loop. Fine.\n- In `classify` in debug_c2_eval_failure_shapes.py — temp script, skip.\n- The hint message text — long but fine.\n- `logger.warning(... candidate[:120] ...)` — fine.\n- err_offset `0 \u003c= _col \u003c= len(validated_code)` — note CDP col can equal len for EOF errors; EOF errors use \"Unexpected end of input\" branch which ignores err_offset. Fine.\n\nOne more look at the \"Unexpected end of input\" branch: `if completion != \")\": candidates.append(code + \")\")`. When stack is e.g. `((` → completion `))` ≠ `)` → append `code + \")\"`. But is `code + \")\"` sensible for stack `((`? `((function(){var a=1;` + `)` = `((function(){var a=1;)` — not balanced, compile fails, harmless (retry just fails). Test expects it as cands[1]. OK, by-design \"最小修补\" candidate. Fine.\n\nAnd the composed bare-return candidate: `\"(()=\u003e{\\n\" + code + _close_open_delims(stack) + \"\\n})()\"`. Fine.\n\nMissing-catch composed: `balanced.rfind(\"}\")` then insert catch before it. j \u003e 0 guard ✓. Edge: if balanced has no `}` → rfind returns -1 → guarded ✓.\n\nSo the single reportable issue is #1. Let me also double-check whether the loop's second deletion can delete the OPENER-mismatched shapes... e.g. missing opener + extra closer mixed — the loop deletes up to 2 closers chasing balance; after 2 deletions may still be unbalanced → candidates appended anyway and just fail compile → harmless (compile guard). Only the regex-phantom compiles-drifted case matters. My comment will focus on that.\n\nAlso confirm the exact existing_code snippet to anchor the comment. From the diff:\n\n```python\n        _, first_extra = _delimiter_scan(code)\n        if first_extra \u003c 0 or err_offset is None or err_offset != first_extra:\n            return []\n        candidates = []\n        work = code\n        for _ in range(2):\n            _, extra = _delimiter_scan(work)\n            if extra \u003c 0:\n                break\n            work = work[:extra] + work[extra + 1:]\n            candidates.append(work)\n        return candidates\n```\n\nI'll anchor on the loop lines:\n\n```\n        work = code\n        for _ in range(2):\n            _, extra = _delimiter_scan(work)\n            if extra \u003c 0:\n                break\n            work = work[:extra] + work[extra + 1:]\n            candidates.append(work)\n```\n\nCategory: bug. Severity: medium.\n\nComment content (Chinese): candidate ② unvalidated phantom risk. Include concrete example: `(function(){return 1}}}` followed by regex `/[)]/g`... let me give the concise structural example: 首个错位经 err_offset 验证删除后，再扫描的下一个错位可能落在 regex 字面量内部（如 `/[)]/g` 的 `)`，扫描器已知局限）——候选②将其删除得到合法的空字符类 `/[]/g`，编译试跑无法拦截，重试将执行语义漂移（正则匹配空集）的代码；warning 日志只提供可观测性不阻止执行。建议对候选②适用与候选①一致的 fail-safe 标准（无位置证据不放行），或仅在第二错位与首个已验证错位连排同字符（`}}`/`))` 双闭合笔误形态）时才生成。\n\nSuggestion code as above.\n\nNow file-by-file final pass per instructions:\n\n1. **examples/debug_c2_eval_failure_shapes.py** — temp diagnostic script; repo convention supports it; hardcoded path is convention. No comment. (Reviewed: blocks parsing, classify function — fine for its purpose.)\n2. **examples/debug_c2_exc_position_shape.py** — probe script, tabs style consistent with repo. `client.send.Target...` API usage — can't verify against cdp_use here; it's a temp script referenced by docs/comments. No defects to report confidently.\n3. **src/tree_walker/browser/session.py** — the one finding (#1). Everything else verified sound (err_offset basis confirmed, hint gating, fail-safe None).\n4. **tests/test_evaluate.py** — import present, assertions sound, chr(92) construction intentional. No issues.\n\nReport the single comment, then task_done.",
+      "category": "bug",
+      "severity": "medium"
+    }
+  ],
+  "groups": [
+    {
+      "label": "C2 evaluate shape handling in browser session (debug scripts, implementation, tests)",
+      "files": [
+        "examples/debug_c2_eval_failure_shapes.py",
+        "examples/debug_c2_exc_position_shape.py",
+        "src/tree_walker/browser/session.py",
+        "tests/test_evaluate.py"
+      ]
+    },
+    {
+      "label": "P7 form interaction fixes tests",
+      "files": [
+        "tests/test_p7_form_interaction_fixes.py"
+      ]
+    }
+  ],
+  "warnings": [
+    {
+      "file": "examples/debug_c2_eval_failure_shapes.py,examples/debug_c2_exc_position_shape.py,src/tree_walker/browser/session.py,tests/test_evaluate.py",
+      "message": "round 2: LLM completion error: context deadline exceeded",
+      "type": "review_round_failed"
+    }
+  ],
+  "session_id": "45ab6f26-90fb-461b-91a9-4af64abe94db",
+  "manifest": {
+    "schema_version": "ocr.run-manifest/v1",
+    "run_id": "45ab6f26-90fb-461b-91a9-4af64abe94db",
+    "operation": "review",
+    "terminal_state": "complete",
+    "repository": {
+      "identity_sha256": "2868bcfb033292e0d47631dc911d0e36e5dcedaf9e0bcacffe6c4716bb93dfda"
+    },
+    "input": {
+      "mode": "range",
+      "requested_from": "master",
+      "requested_head": "fix/185-c2-balance-repair",
+      "resolved_base": "9ffe21c35645f2e3e4405b784b18391f0eacdcce",
+      "resolved_head": "ed4992e8d18b036f8eb56db4603497337dcb2f6e",
+      "exact_range": "9ffe21c35645f2e3e4405b784b18391f0eacdcce..ed4992e8d18b036f8eb56db4603497337dcb2f6e",
+      "source_artifact_sha256": "92ba2145c3323f5125e7d95b31ef959dfc74c7a9492facac11afd39e4d41005d"
+    },
+    "execution": {
+      "ocr_version": "v1.12.5",
+      "model": "glm-5.3",
+      "configured_concurrency": 8,
+      "rule_config_sha256": "ddb40005eb732cb8b37d8d3dc1acb82f3aa51fded408c899a092c10349c369c4",
+      "runtime_config_sha256": "841fe9ad288d2dd9efc84c443193c492ef06b26edf31ff5f5a1b01637fef2b0c"
+    },
+    "coverage": {
+      "selected": [
+        {
+          "item_id": "47bb311f983e86632bb1ff2240dee320d269694f7e78d415a572bc25cb3b91c4",
+          "path": "examples/debug_c2_exc_position_shape.py",
+          "fingerprint": "b0328122fa4539d02257298e558d85e4791d17308dba904e7f835b0112a7c6fc"
+        },
+        {
+          "item_id": "614508a236a8327d371cc12c9ced54da84022590ae9fac9d344d226ed0e6108a",
+          "path": "examples/debug_c2_eval_failure_shapes.py",
+          "fingerprint": "f095d12210730cffc6e5e2c4c6b2ac3efafb083836c8355594ade34afbfea99d"
+        },
+        {
+          "item_id": "6d1cd586e9b8ae0df91a1905ca93db387118eed5f0366496514c8e4211c01609",
+          "path": "tests/test_p7_form_interaction_fixes.py",
+          "fingerprint": "4b013ce6018c7a5782178a5e0598d7784159f447ab54ef92c8473597f9c8c58a"
+        },
+        {
+          "item_id": "9932efe4e9494be618ed91e3e77812ba901e8403cccfa6417c9da7c83e77bfbd",
+          "path": "src/tree_walker/browser/session.py",
+          "fingerprint": "678c9f83fcfbac35ab0b2ac1bea48a6542bcee90b363bbc46aecfb8bd206ced0"
+        },
+        {
+          "item_id": "bcc98cc9330f01b09135ec4acd90994e962ac2fd65860f25a1d3040c9ed4fe30",
+          "path": "tests/test_evaluate.py",
+          "fingerprint": "54fed10b7c9d96781076a909f147baf4e06737d5395406228806d0ee771199ee"
+        }
+      ],
+      "completed": [
+        {
+          "item_id": "47bb311f983e86632bb1ff2240dee320d269694f7e78d415a572bc25cb3b91c4",
+          "path": "examples/debug_c2_exc_position_shape.py",
+          "fingerprint": "b0328122fa4539d02257298e558d85e4791d17308dba904e7f835b0112a7c6fc"
+        },
+        {
+          "item_id": "614508a236a8327d371cc12c9ced54da84022590ae9fac9d344d226ed0e6108a",
+          "path": "examples/debug_c2_eval_failure_shapes.py",
+          "fingerprint": "f095d12210730cffc6e5e2c4c6b2ac3efafb083836c8355594ade34afbfea99d"
+        },
+        {
+          "item_id": "6d1cd586e9b8ae0df91a1905ca93db387118eed5f0366496514c8e4211c01609",
+          "path": "tests/test_p7_form_interaction_fixes.py",
+          "fingerprint": "4b013ce6018c7a5782178a5e0598d7784159f447ab54ef92c8473597f9c8c58a"
+        },
+        {
+          "item_id": "9932efe4e9494be618ed91e3e77812ba901e8403cccfa6417c9da7c83e77bfbd",
+          "path": "src/tree_walker/browser/session.py",
+          "fingerprint": "678c9f83fcfbac35ab0b2ac1bea48a6542bcee90b363bbc46aecfb8bd206ced0"
+        },
+        {
+          "item_id": "bcc98cc9330f01b09135ec4acd90994e962ac2fd65860f25a1d3040c9ed4fe30",
+          "path": "tests/test_evaluate.py",
+          "fingerprint": "54fed10b7c9d96781076a909f147baf4e06737d5395406228806d0ee771199ee"
+        }
+      ],
+      "reused": [],
+      "failed": [],
+      "waived": []
+    },
+    "elapsed_ms": 1041542
+  },
+  "retry_report": {
+    "schema_version": "ocr.llm-retry-report/v1",
+    "total_requests": 25,
+    "retried_requests": 0,
+    "total_retries": 0,
+    "recovered_requests": 0,
+    "failed_requests": 1,
+    "cancelled_requests": 0,
+    "requests": [
+      {
+        "logical_request_id": "6d20c6d6372e320f28f86d0221c6cc6343769fd6e828b088c0f74b9fe4377b33",
+        "provider": "",
+        "model": "glm-5.3",
+        "file_path": "examples/debug_c2_eval_failure_shapes.py,examples/debug_c2_exc_position_shape.py,src/tree_walker/browser/session.py,tests/test_evaluate.py",
+        "task_type": "main_task",
+        "request_no": 13,
+        "outcome": "failed",
+        "attempts": [
+          {
+            "attempt": 1,
+            "outcome": "error",
+            "error_class": "timeout",
+            "failure_phase": "context",
+            "duration_to_headers_ms": 300000
+          }
+        ]
+      }
+    ]
+  }
+}

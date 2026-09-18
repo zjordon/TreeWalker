@@ -27,6 +27,7 @@ from pydantic import ValidationError
 
 from tree_walker.browser.session import (
 	BrowserSession,
+	_delimiter_scan,
 	_format_eval_exception,
 	_normalize_eval_result,
 	_validate_and_fix_javascript,
@@ -719,3 +720,62 @@ class TestExtractDataImages:
 		text, images = _extract_data_images("pre " + uri + " post")
 		assert text == "pre [image 1] post"
 		assert images == [uri]
+
+
+class TestValidateAndFixJavascriptLossless:
+	"""issue #185-c2 重开验收：长表达式 / regex 字面量 / 嵌套引号样本经
+	_validate_and_fix_javascript 必须逐字节不变——对「传输层改写代码」指控的
+	无损性正面证明（C 轮 22/22 编译失败全为定界符失衡，无一例改写签名；
+	样本取 C 轮真实代码形态：544 的 replace 链、549 的单双引号混排）。"""
+
+	def test_long_regex_nested_quotes_sample_untouched(self):
+		# 反斜杠一律 chr(92) 显式构造（review3 #3：裸 \d 触发 SyntaxWarning，
+		# 且 or-条件恒等价于 >300）——regex 均为单反斜杠（JSON 解码后的正确形态）。
+		# review6 #4：对齐重开验收口径">500 字符含 regex 与嵌套引号"——追加一段
+		# querySelectorAll/replace 链（C 轮被指控"传输截断"的 544/549 均为长代码）
+		bs = chr(92)
+		sample = (
+			"((function(){var out=[];"
+			"document.querySelectorAll('.data-grid tbody tr').forEach(function(r){"
+			"out.push(r.innerText.replace(/" + bs + "n+/g,' | '))});"
+			"var b=[...document.querySelectorAll('button')]"
+			".find(x=>x.textContent.trim()==='Edit Configurations' && x.title!=\"\");"
+			"var cells=[...document.querySelectorAll('td[data-column=\"qty\"]')]"
+			".map(function(c){return c.innerText.replace(/[" + bs + "s]/g,'')"
+			".replace(/" + bs + "d+" + bs + "." + bs + "d?/g,'N')});"
+			"return 'rows:'+out.length+' btn:\"'+(b?b.className:'none')+'\"'"
+			"+' sample:'+/'$" + bs + "d+" + bs + ".!'/g.source"
+			"+' cells:'+JSON.stringify(cells.slice(0,5))})())"
+		)
+		assert len(sample) > 500  # issue #185 重开验收口径：>500 字符含 regex 与嵌套引号
+		assert _validate_and_fix_javascript(sample) == sample
+		# review8 #1：样本须是可执行 JS（验收口径"原样到达并执行"）——定界符
+		# 平衡 + 已在真机 Chrome 编译执行验证（无异常，返回字符串）
+		assert _delimiter_scan(sample) == ([], -1)
+
+	def test_single_quotes_containing_double_quotes_untouched(self):
+		# 嵌套引号：单引号串内裸双引号（无反斜杠转义 → 不触规则1）
+		sample = "var s='say \"hi\" there';return s+' done \"ok\"'"
+		assert _validate_and_fix_javascript(sample) == sample
+
+	def test_regex_literal_single_backslash_untouched(self):
+		# regex 字面量的 \n \d 为单反斜杠形式（JSON 解码后的正确形态）——
+		# 不触规则 2（只匹配双反斜杠）与规则 7（只匹配裸控制字符）。
+		# 反斜杠用 chr(92) 显式构造，免疫 heredoc/转义歧义（曾因 heredoc 吃
+		# 反斜杠把样本降级成裸换行、误触规则 7）
+		bs = chr(92)
+		sample = (
+			"var a='x" + bs + "n'.replace(/" + bs + "n/g,'|');"
+			"var b=/" + bs + "d{2,4}/.test(a);return a+b"
+		)
+		assert bs + "n" in sample and "\n" not in sample  # 单反斜杠形态、无裸换行
+		assert _validate_and_fix_javascript(sample) == sample
+
+	def test_double_escaped_still_normalized(self):
+		# 反向护栏：LLM 双重转义（JSON 少解一层）仍按既有规则归一——
+		# 防止为通过无损性测试而误删规则（chr(92) 构造，防转义歧义）
+		bs = chr(92)
+		dirty_quote = 'var s="say ' + bs + '"hi' + bs + '";'
+		assert _validate_and_fix_javascript(dirty_quote) == 'var s="say "hi";'
+		dirty_regex = "var r=/" + bs + bs + "d+/;"
+		assert _validate_and_fix_javascript(dirty_regex) == "var r=/" + bs + "d+/;"

@@ -503,8 +503,69 @@ def _normalize_eval_result(result_data: dict) -> str:
     return str(value)
 
 
-def _syntax_repair_candidates(code: str, err_text: str) -> list[str]:
-    """P7 form_interaction 建议5：按已知 SyntaxError 生成确定性修复候选（按序试跑）。
+_CLOSE_OF = {"(": ")", "[": "]", "{": "}"}
+
+
+def _delimiter_scan(code: str) -> tuple[list[str], int]:
+    """issue #185-c2：字符串/模板字面量与 ``//`` 注释感知的定界符扫描。
+
+    返回 ``(未闭合栈——按开序, 首个错位闭合符的下标；无则 -1)``。已知局限：
+    regex 字面量内的 ``[](){}`` 会被误计入栈（候选由 CDP 编译试跑把关；删除类
+    候选另以 CDP 出错位置交叉验证否决，见 ``_syntax_repair_candidates``）；块
+    注释 ``/* */`` 不识别；模板字面量 ``${...}`` 插值整体按字符串内容跳过——
+    插值内的定界符不参与配平（graceful miss：自愈与提示双双不触发，无改写
+    风险；本项目 fixer 规则 3-6 会主动把双引号选择器转反引号，模板字面量
+    常见，故列明）。
+    """
+    stack: list[str] = []
+    in_str: str | None = None
+    k = 0
+    n = len(code)
+    while k < n:
+        c = code[k]
+        if in_str:
+            if c == "\\":
+                k += 2
+                continue
+            if c == in_str:
+                in_str = None
+        elif c in "\"'`":
+            in_str = c
+        elif c == "\\":
+            # review5 #3：regex 字面量转义（\/ \] \)）——非字符串区成对跳过，
+            # 防 /https?:\/\//g 的被转义 / 与收尾 / 相邻被误判为行注释（那会让
+            # 正则之后的代码整体退出扫描，自愈与提示三路全灭）；裸 \ 在字符串/
+            # 正则外本就是非法 JS，成对跳过对启发式扫描无副作用
+            k += 2
+            continue
+        elif c == "/" and k + 1 < n and code[k + 1] == "/":
+            # 行注释：跳到行尾继续扫（review3 #2——直接 break 隐含单行代码假设，
+            # 多行 evaluate 的注释后行仍有可执行定界符会被整体跳过）
+            nl = code.find("\n", k)
+            if nl < 0:
+                break  # 行注释至代码末尾
+            k = nl + 1
+            continue
+        elif c in _CLOSE_OF:
+            stack.append(c)
+        elif c in ")]}":
+            if stack and _CLOSE_OF[stack[-1]] == c:
+                stack.pop()
+            else:
+                return stack, k  # 首个错位闭合（多余/错序）
+        k += 1
+    return stack, -1
+
+
+def _close_open_delims(stack: list[str]) -> str:
+    """按栈序逆置生成补全闭合串（``((`` → ``))``）。"""
+    return "".join(_CLOSE_OF[c] for c in reversed(stack))
+
+
+def _syntax_repair_candidates(
+    code: str, err_text: str, err_offset: int | None = None,
+) -> list[str]:
+    """P7 form_interaction 建议5 + issue #185-c2：按已知 SyntaxError 生成确定性修复候选（按序试跑）。
 
     2026-08-23 复盘（batch1 task-505 step 12 等，同类错误批次内 8 处）：
     - ``Illegal return statement``：LLM 写了顶层裸 return——Runtime.evaluate 按
@@ -516,10 +577,40 @@ def _syntax_repair_candidates(code: str, err_text: str) -> list[str]:
       一个 ``}`` 之前可修）；②连函数闭合括号也缺（去掉尾部 ``})()`` 再补
       ``}catch(...){...}})()`` 可修）。两个候选按序试跑，语法错误无副作用，试错安全。
 
+    issue #185-c2（C 轮 22/22 编译失败全为定界符失衡，主导形态 18 处原无候选——
+    首轮方案 §8 后置的平衡修复候选解除后置）：
+    - ``Unexpected end of input``（缺闭合，13 处）：栈序逆置补全——LLM 自以为
+      写对的程序即「全部闭合都在的前缀」，补全即其本意；另附仅补 ``)`` 的最小
+      修补候选（外层包裹括号漏配的最常见单字符形态，兼防扫描误计）。
+    - ``Unexpected token '}'/')'/']'``（多余闭合，5 处）：删除首个错位闭合符
+      （C 轮 699 真实样本：``…return 'not found'}})())`` 删首个错位 ``}`` 即
+      平衡）；候选②删前两个错位。
+    - 裸 return / 缺 catch **叠加失衡**（698/700 形态）：纯包裹/插 catch 候选在
+      失衡代码上必败——追加「内层补全闭合 + 包裹/插 catch」组合候选。
+
+    review5 #1：删除类候选是所有候选中唯一删改代码中段字符的，regex 字面量的
+    「幻影闭合符」（如 ``/[)]/g``）会让扫描器把错位报在 regex 内部——删除后
+    代码可能语法合法但语义已变（空字符类变 no-op），绕过编译试跑把关静默执行。
+    以 CDP exceptionDetails 的出错位置（单行载荷的 0-based 列偏移，
+    ``err_offset``）交叉验证：无错位、位置分叉、或**无位置证据（多行/字段
+    缺席）一律 fail-safe 放弃删除类候选**（探针实证
+    examples/debug_c2_exc_position_shape.py：Chrome 对多余闭合报的列偏移精确
+    指向真实错位 token，幻影场景下两者必然分叉；跳过验证的 fail-open 恰是
+    幻影防护要拦的方向——review6 #3）。
+
     其余错误返回空列表（不自愈，原样抛出）。
     """
     if "Illegal return statement" in err_text:
-        return ["(()=>{\n" + code + "\n})()"]
+        candidates = ["(()=>{\n" + code + "\n})()"]
+        # c2 + review10 #3：裸 return 叠加失衡——内层先补全闭合再包裹。仅 EOF
+        # 缺闭合形态（first_extra < 0）：_delimiter_scan 遇中段错位即提前返回，
+        # 其后文本（如尾部 () 调用）未入栈——此形态下追加闭合串不可能修复，
+        # 生成即注定失败的白耗 CDP 重试。
+        stack, first_extra = _delimiter_scan(code)
+        if stack and first_extra < 0:
+            candidates.append(
+                "(()=>{\n" + code + _close_open_delims(stack) + "\n})()")
+        return candidates
     if "Missing catch or finally after try" in err_text:
         catch = "catch(e){return 'Error: '+e.message}"
         candidates: list[str] = []
@@ -530,6 +621,52 @@ def _syntax_repair_candidates(code: str, err_text: str) -> list[str]:
         # 形态②：连函数闭合括号也缺 —— 去掉尾部 })() 重建闭合
         if code.endswith("})()"):
             candidates.append(code[:-4] + "}" + catch + "})()")
+        # c2 + review10 #4：缺 catch 叠加失衡——内层补全闭合后再插 catch。仅
+        # EOF 缺闭合形态（first_extra < 0）：中段错位时补全串被追加到尾部、
+        # catch 落在完整调用表达式之后（…})()catch(…)），必然编译失败；且插入
+        # 的 catch 文本定界符净值为零，不可能改变错位形态。
+        stack, first_extra = _delimiter_scan(code)
+        if stack and first_extra < 0:
+            balanced = code + _close_open_delims(stack)
+            j = balanced.rfind("}")
+            if j > 0:
+                candidates.append(balanced[:j] + catch + balanced[j:])
+        return candidates
+    if "Unexpected end of input" in err_text:
+        stack, _ = _delimiter_scan(code)
+        if not stack:
+            return []
+        completion = _close_open_delims(stack)
+        candidates = [code + completion]
+        if completion != ")":
+            candidates.append(code + ")")  # 最小修补：仅外层包裹括号漏配
+        return candidates
+    if "Unexpected token" in err_text:
+        # 多余闭合：删首个错位闭合符；候选②在①基础上再删下一个错位。
+        # review5 #1 + review6 #3：与 CDP 出错位置交叉验证——分叉即幻影（regex
+        # 内的误报错位）；**无位置证据（多行/字段缺席）时 fail-safe 同样放弃**：
+        # 跳过验证的实际效果是放行风险最高的操作而非放弃它（多行+regex+真错位
+        # 组合下候选②可在"删幻影+删真错位"后编译通过、regex 漂移为空字符类）。
+        # 补全类候选只追加尾部、失衡提示路径均不受影响。
+        _, first_extra = _delimiter_scan(code)
+        if first_extra < 0 or err_offset is None or err_offset != first_extra:
+            return []
+        candidates = []
+        work = code
+        for _ in range(2):
+            _, extra = _delimiter_scan(work)
+            if extra < 0:
+                break
+            if candidates:
+                # review7 #1：候选②无 CDP 位置证据——仅限与首个已验证错位连排的
+                # 同字符（}}/))/]] 双闭合笔误形态，删除后左移恰好占位）；regex
+                # 幻影闭合符与首删位必不相邻，按 review5 #1 同标准 fail-safe 放弃
+                #（首删验证后 regex 内的幻影错位会成为再扫描的首个错位，无此
+                # 门控即重演"删幻影→空字符类→编译通过→语义漂移"）。
+                if extra != first_extra or work[extra] != code[first_extra]:
+                    break
+            work = work[:extra] + work[extra + 1:]
+            candidates.append(work)
         return candidates
     return []
 
@@ -3615,11 +3752,29 @@ return (async function(){
             _desc = str(exc.get("exception", {}).get("description") or "")
             compile_time = _text == "Uncaught" and _desc.startswith("SyntaxError:")
             err_text = f"{_text} {_desc}" if compile_time else ""
+            # review5 #1：单行载荷（绝大多数 evaluate 代码）时 CDP 的
+            # lineNumber/columnNumber 即 0-based 字符偏移且精确指向错位 token
+            #（探针 examples/debug_c2_exc_position_shape.py 于 Chrome 153 实证）；
+            # 供删除类候选交叉验证否决 regex 幻影闭合符。多行/字段缺席 → None
+            #（review6 #3：候选函数对 None fail-safe——无位置证据不删中段字符）。
+            _ln = exc.get("lineNumber")
+            _col = exc.get("columnNumber")
+            err_offset = (
+                _col
+                if (isinstance(_ln, int) and _ln == 0
+                    and isinstance(_col, int) and 0 <= _col <= len(validated_code)
+                    # review8 #2：CDP 列偏移按 UTF-16 码元计，载荷含 astral 字符
+                    #（emoji 等，按钮文本断言常见）时与 Python 码点下标系统性错位
+                    # ——非 ASCII 一律视为无位置证据（fail-safe，防漂移量恰抵消时
+                    # 幻影错位被错误放行）
+                    and validated_code.isascii())
+                else None
+            )
             # P7 form_interaction 建议5：已知 SyntaxError 的确定性自愈（仅无输入路径——
             # args/elements 模式代码在函数体内，裸 return 合法，语法错误形态不同）。
             # 候选按序试跑（语法错误无副作用）；全部失败则抛原错误（附截断提示）。
             if not use_call_fn:
-                for candidate in _syntax_repair_candidates(validated_code, err_text):
+                for candidate in _syntax_repair_candidates(validated_code, err_text, err_offset):
                     retry = await self.client.send.Runtime.evaluate(
                         {
                             "expression": candidate,
@@ -3632,17 +3787,43 @@ return (async function(){
                     )
                     if (not retry.get("exceptionDetails")
                             and not retry.get("result", {}).get("wasThrown")):
-                        logger.info(
-                            "evaluate syntax self-heal applied (%s → retry succeeded)",
-                            err_text.splitlines()[0][:80],
-                        )
+                        if "Unexpected token" in err_text:
+                            # review5 #1(b)：删除类自愈删改代码中段字符——虽经位置
+                            # 交叉验证防幻影，语义漂移仍需可观测（warning + 候选片段）
+                            logger.warning(
+                                "evaluate deletion-candidate self-heal applied "
+                                "(%s; candidate head=%r) — verify semantics",
+                                err_text.splitlines()[0][:80], candidate[:120],
+                            )
+                        else:
+                            logger.info(
+                                "evaluate syntax self-heal applied (%s → retry succeeded)",
+                                err_text.splitlines()[0][:80],
+                            )
                         result = retry
                         break
             if result.get("exceptionDetails"):
                 msg = _format_eval_exception(result["exceptionDetails"], validated_code)
-                if "Unexpected end of input" in err_text:
-                    msg += ("\n⚠️ The code looks truncated — split it into shorter "
-                            "evaluate calls.")
+                # issue #185-c2：C 轮 22/22 编译失败全为定界符失衡——旧措辞
+                # "looks truncated" 与 agent 的"传输截断"误读共振（自评反复出现
+                # "truncated/mangled in transport" 叙事且被重开评论采纳）；按实测
+                # 语义纠偏，触发面扩到 token 闭合错误。review3 #1：仅当扫描确实
+                # 检出失衡才给失衡提示——"Unexpected token" 也覆盖非定界符语法错
+                #（双逗号/多余分号），无失衡时的断言性措辞是事实性误导。
+                _hint_stack, _hint_extra = _delimiter_scan(validated_code)
+                if (("Unexpected end of input" in err_text or "Unexpected token" in err_text)
+                        and (bool(_hint_stack) or _hint_extra >= 0)):
+                    # review4 #1：扫描有已知局限（regex 字面量幻影闭合符）且
+                    # max_tokens 截断同样产生 EOF+缺闭合栈——"not that text was
+                    # cut" 类绝对断言会事实性错误；按 review3 #1 的"无证据不
+                    # 断言"标准对称适用于有失衡时：盖然性表述 + 兜底建议。
+                    msg += ("\n⚠️ The code likely has unbalanced braces/parens "
+                            "(in measured history this V8 error almost always "
+                            "means delimiters never matched rather than transport "
+                            "truncation — but note regex literals can also trip "
+                            "this check). Verify an IIFE prefix `((function(){...` "
+                            "has its matching `))` / `)())` suffix; keep code under "
+                            "~300 chars or split into several evaluate calls.")
                 raise RuntimeError(msg)
         result_data = result.get("result", {})
         if result_data.get("wasThrown"):

@@ -1,0 +1,178 @@
+{
+  "status": "complete",
+  "llm": {
+    "model": "glm-5.3"
+  },
+  "message": "Review complete: 4 finding(s) across 5 selected item(s).",
+  "summary": {
+    "files_reviewed": 5,
+    "comments": 4,
+    "total_tokens": 789346,
+    "input_tokens": 693353,
+    "output_tokens": 95993,
+    "cache_read_tokens": 300480,
+    "elapsed": "15m18s"
+  },
+  "tool_calls": {
+    "total": 37,
+    "by_tool": {
+      "code_comment": 3,
+      "code_search": 12,
+      "file_find": 3,
+      "file_read": 18,
+      "file_read_diff": 1
+    },
+    "failure": 0,
+    "failure_by_tool": {},
+    "failure_details": []
+  },
+  "comments": [
+    {
+      "path": "tests/test_p7_form_interaction_fixes.py",
+      "content": "冗余局部导入：本次 diff 已将 `_delimiter_scan` 加入模块顶部导入（第 18 行），且同文件其他用例（如 `test_deletion_veto_on_position_mismatch`、`test_deletion_candidates_with_matching_position`）均直接使用该模块级名字。方法体内的局部 `from tree_walker.browser.session import _delimiter_scan` 属于遗留冗余，建议删除以保持风格一致。",
+      "suggestion_code": "        code = \"(function(){ // open modal\\nvar a=1;\\n})(\"",
+      "existing_code": "        from tree_walker.browser.session import _delimiter_scan\n        code = \"(function(){ // open modal\\nvar a=1;\\n})(\"",
+      "start_line": 361,
+      "end_line": 362,
+      "thinking": "I have the exact line numbers for the two local imports. Let me get their exact lines:\n\nLine ~355-360 area for `test_line_comment_skips_to_eol_not_eof`. From the diff:\n```python\n    def test_line_comment_skips_to_eol_not_eof(self):\n        \"\"\"review3 #2：多行代码中行注释只跳到行尾——直接 break 会把注释后\n        各行的可执行定界符整体跳过（EOF 分支因 stack 为空漏修）。\"\"\"\n        from tree_walker.browser.session import _delimiter_scan\n        code = \"(function(){ // open modal\\nvar a=1;\\n})(\"\n```\n\nAnd `test_regex_escaped_slash_not_line_comment` around line 366:\n```python\n    def test_regex_escaped_slash_not_line_comment(self):\n        \"\"\"review5 #3：/https?:\\/\\//g 的被转义 / 与收尾 / 相邻不得误判为行\n        注释——否则正则之后代码整体退出扫描，自愈候选与失衡提示三路全灭。\"\"\"\n        from tree_walker.browser.session import _delimiter_scan\n        bs92 = chr(92)\n```\n\nFor existing_code, I need to include enough surrounding context to disambiguate the identical import lines. For the first one, use:\n```\n        from tree_walker.browser.session import _delimiter_scan\n        code = \"(function(){ // open modal\\nvar a=1;\\n})(\"\n```\nFor the second:\n```\n        from tree_walker.browser.session import _delimiter_scan\n        bs92 = chr(92)\n```\n\nBoth are unique.\n\nNow finalize: only one issue to report — the redundant local imports (low severity, maintainability). Everything else verified correct:\n- All cross-file contracts verified against session.py implementation\n- All traced scan positions match assertions\n- No contradictory assertions in test_evaluate.py\n- No leftover \"truncated\" assertions on this path\n\nReport the comment, then task_done.",
+      "category": "maintainability",
+      "severity": "low"
+    },
+    {
+      "path": "tests/test_p7_form_interaction_fixes.py",
+      "content": "同上：`_delimiter_scan` 已在模块顶部导入，此处的局部导入冗余，建议删除。",
+      "suggestion_code": "        bs92 = chr(92)",
+      "existing_code": "        from tree_walker.browser.session import _delimiter_scan\n        bs92 = chr(92)",
+      "start_line": 369,
+      "end_line": 370,
+      "thinking": "I have the exact line numbers for the two local imports. Let me get their exact lines:\n\nLine ~355-360 area for `test_line_comment_skips_to_eol_not_eof`. From the diff:\n```python\n    def test_line_comment_skips_to_eol_not_eof(self):\n        \"\"\"review3 #2：多行代码中行注释只跳到行尾——直接 break 会把注释后\n        各行的可执行定界符整体跳过（EOF 分支因 stack 为空漏修）。\"\"\"\n        from tree_walker.browser.session import _delimiter_scan\n        code = \"(function(){ // open modal\\nvar a=1;\\n})(\"\n```\n\nAnd `test_regex_escaped_slash_not_line_comment` around line 366:\n```python\n    def test_regex_escaped_slash_not_line_comment(self):\n        \"\"\"review5 #3：/https?:\\/\\//g 的被转义 / 与收尾 / 相邻不得误判为行\n        注释——否则正则之后代码整体退出扫描，自愈候选与失衡提示三路全灭。\"\"\"\n        from tree_walker.browser.session import _delimiter_scan\n        bs92 = chr(92)\n```\n\nFor existing_code, I need to include enough surrounding context to disambiguate the identical import lines. For the first one, use:\n```\n        from tree_walker.browser.session import _delimiter_scan\n        code = \"(function(){ // open modal\\nvar a=1;\\n})(\"\n```\nFor the second:\n```\n        from tree_walker.browser.session import _delimiter_scan\n        bs92 = chr(92)\n```\n\nBoth are unique.\n\nNow finalize: only one issue to report — the redundant local imports (low severity, maintainability). Everything else verified correct:\n- All cross-file contracts verified against session.py implementation\n- All traced scan positions match assertions\n- No contradictory assertions in test_evaluate.py\n- No leftover \"truncated\" assertions on this path\n\nReport the comment, then task_done.",
+      "category": "maintainability",
+      "severity": "low"
+    },
+    {
+      "path": "src/tree_walker/browser/session.py",
+      "content": "删除类候选的位置交叉验证在 `err_offset=None`（多行载荷 `lineNumber!=0` 或字段缺席）时被跳过，但删除候选照旧生成并试跑——防护 fail-open。docstring 自述「删除中段字符语义漂移风险不可由编译试跑把关」（L591-593），注释又自称「保守跳过验证」（L597-598、调用点 L3741-3742），但跳过验证的实际效果是**放行**风险最高的操作而非放弃它，「保守」方向相反：多行 validated_code + regex 字面量（如 `/[)]/g`）+ 真实错位闭合的组合下，候选②（连删两处）可在「删 regex 内幻影 `)` + 删真实错位 `}`」后编译通过，regex 从「匹配 `)`」静默漂移为「永不匹配的空字符类」，错误结果返回 agent——恰是 review5 #1 声称要防、却仅单行路径被覆盖的场景（test_p7_form_interaction_fixes.py L393-395 将该 fail-open 行为固定为断言）。建议无位置证据时 fail-safe：放弃删除类候选（补全类只追加尾部无此风险，提示路径也不受影响），或对多行载荷按行起始偏移表把 `(lineNumber, columnNumber)` 映射为全局偏移后再验证；同步调整上述测试断言。",
+      "suggestion_code": "        _, first_extra = _delimiter_scan(code)\n        # fail-safe：无错位、位置分叉、或无位置证据（多行/字段缺席）时\n        # 一律放弃删除类候选——无证据时放行删除恰是幻影防护要拦的方向\n        #（补全类候选与失衡提示路径不受影响）\n        if first_extra \u003c 0 or err_offset is None or err_offset != first_extra:\n            return []",
+      "existing_code": "        _, first_extra = _delimiter_scan(code)\n        if err_offset is not None and first_extra \u003e= 0 and err_offset != first_extra:\n            return []",
+      "start_line": 642,
+      "end_line": 644,
+      "thinking": "确认了：`err_offset=None` 时候选照旧生成是被测试固定（393-395 行）的有意行为。但这确实是 fail-open 的安全方向问题——文档和注释自称\"保守跳过验证\"，实际是\"跳过验证（即放行删除）\"，与 docstring 591-593 行承认的\"语义漂移不可由编译试跑把关\"自相矛盾。\n\n我将以 medium 报告这个问题，位置在 session.py 643 行的验证条件处，附上建议代码（fail-safe 方向）并说明需要同步调整 test_p7 393-395 行的固定（那不在本次评审组，但可提及）。\n\n其他问题的最终决定：\n- 问题 2（补全掩盖截断）：不报——作者在 review4 #1 已知情权衡，issue 文档方向明确要求自愈解除后置，且提示措辞已盖然化；补全失败的截断场景仍会落入带兜底建议的提示。\n- 问题 3（测试导入）：不成立，第 32 行已有导入。\n- 问题 4（坐标系）：不成立，expression 即 validated_code 本体（3715 行），无额外改写层。\n- 问题 5（examples 脚本）：不报——docstring 自述临时脚本、examples 目录有大量同类先例、短生命周期脚本按 checklist 豁免。\n\n最终报告 1 个问题。写评论时要精确引用 diff 中的新增行。\n\nexisting_code 选：\n```python\n        _, first_extra = _delimiter_scan(code)\n        if err_offset is not None and first_extra \u003e= 0 and err_offset != first_extra:\n            return []\n```\n这是 diff 中的新增行（在 + 范围内）。核对 diff：\n```\n+        _, first_extra = _delimiter_scan(code)\n+        if err_offset is not None and first_extra \u003e= 0 and err_offset != first_extra:\n+            return []\n```\n是的，在 \"Unexpected token\" 分支。\n\nsuggestion_code：\n```python\n        _, first_extra = _delimiter_scan(code)\n        # fail-safe：无位置证据（多行/字段缺席）时与位置分叉同等对待——\n        # 放弃删除类候选（补全类与提示路径不受影响）\n        if first_extra \u003c 0 or err_offset is None or err_offset != first_extra:\n            return []\n```\n\n注意：first_extra \u003c 0 时原逻辑也等价返回空（循环 break），合并无害。但要在评论中说明需同步更新 test_p7_form_interaction_fixes.py 393-395 行对旧行为的固定断言。\n\n评论内容（中文，简洁专业）：\n- 描述：交叉验证在 err_offset=None（多行载荷或字段缺席）时被跳过但删除候选照旧生成——fail-open。docstring 自认\"删除中段字符语义漂移风险不可由编译试跑把关\"，且注释称\"保守跳过验证\"，但跳过验证的实际效果是放行风险最高的操作，\"保守\"方向反了。多行 validated_code + regex 字面量 + 真实错位闭合的组合下，候选②（连删两处）可在\"删幻影+删真实错位\"后编译通过，regex 语义漂移（/[)]/g → /[]/g 永不匹配）结果静默返回 agent——恰是 review5 #1 声称要防的场景，仅单行路径被覆盖。\n- 建议：无位置证据时返回 []（放弃删除类，保留补全类与提示路径），或对多行载荷按行起始偏移把 (lineNumber, columnNumber) 映射为全局偏移后再验证。需同步调整 test_p7_form_interaction_fixes.py 中\"候选照旧\"的固定断言。\n\nseverity: medium, category: bug（或 security？不是 security。bug 合适——防护逻辑覆盖缺口）。\n\n完成后调用 task_done。",
+      "category": "bug",
+      "severity": "medium"
+    },
+    {
+      "path": "tests/test_evaluate.py",
+      "content": "验收口径偏差：该测试类 docstring 自述对应 issue #185-c2 重开验收，但重开评论（docs/issue/185.md L78）明确的验收建议是\"\u003e500 字符含 regex 字面量与嵌套引号的表达式原样到达并执行\"——样本实测约 345 字符、断言仅 \u003e300，未达到该阈值档位。C 轮被指控\"传输层截断/改写\"的失败样本（544 的 replace 链、549 连续 3 次截断）都是长代码，对\"长表达式无损\"的正面证明应覆盖 \u003e500 档位，否则验收口径打折。建议把样本再扩一段（如追加一段 querySelectorAll/replace 链）并将断言同步为 \u003e500，或另补一条 \u003e500 字符的样本用例。",
+      "suggestion_code": "\t\tassert len(sample) \u003e 500  # issue #185 重开验收口径：\u003e500 字符含 regex 与嵌套引号（样本需同步扩长）",
+      "existing_code": "\t\tassert len(sample) \u003e 300  # 长样本（实测约 345 字符，覆盖嵌套引号/regex 形态）",
+      "start_line": 743,
+      "end_line": 743,
+      "thinking": "好，测试文件（另一组）已经锁定了 `_syntax_repair_candidates` 的行为契约。注意 390 行的注释：`assert 0 \u003c= phantom_extra != 50`——幻影位不是 50。\n\n现在让我最终确定我在本组要报告的问题。目前候选：\n\n1. 【test, low/medium】`tests/test_evaluate.py` 的重开验收测试样本 ~353 字符 \u003c issue #185 明确提出的 \"\u003e500 字符\" 验收建议阈值。\n\n让我再想想有没有遗漏的实质性问题。重新看一遍 evaluate 提示逻辑——**有一个点**我之前想过但需要再确认：\n\n```python\n_hint_stack, _hint_extra = _delimiter_scan(validated_code)\nif ((\"Unexpected end of input\" in err_text or \"Unexpected token\" in err_text)\n        and (bool(_hint_stack) or _hint_extra \u003e= 0)):\n```\n\n等等——**多行载荷的 \"Unexpected end of input\"**：多行代码第 1 行之后缺闭合，CDP lineNumber \u003e 0。err_offset=None（不影响提示）。提示条件不依赖 err_offset ✓。\n\n**一个之前没注意的**：**`use_call_fn=True` 路径的语法错误没有 err_offset/自愈/提示**——原设计（\"args/elements 模式代码在函数体内……语法错误形态不同\"）。✓ 一致。\n\n**再看 warning 的日志内容**——`candidate[:120]` 截断 ✓。\n\n**关于提示文案本身**（L3798-3804）：\"Verify an IIFE prefix `((function(){...` has its matching `))` / `)())` suffix\"——`)())` 作为 IIFE 后缀……对 `((function(){...})())` 是 `})())`。给的片段 `)())` 是去掉 `}` 的尾巴？有点粗糙但无碍。不报。\n\n现在让我认真决定是否报告那个测试长度问题。\n\n支持报告的证据：\n- 用户任务背景明确引用 docs/issue/185.md 65 行以后（即 zjordon 2026-09-17 的评论），其中明确写\"验收建议补一条：\u003e500 字符含 regex 字面量与嵌套引号的表达式原样到达并执行\"。\n- 新测试类 docstring 自称\"issue #185-c2 重开验收\"。\n- 样本实测约 353 字符（注释自述\"实测约 345 字符\"），断言仅 `\u003e 300`。\n- 这是本次变更对重开指控（\"传输层截断/改写长表达式\"）的直接验收物——issue 报告的失败案例都是长代码（\u003e500），测试没有覆盖到该长度档位。\n\n反驳报告的证据：\n- fixer 是无状态纯文本正则，长度不改变规则行为；345 vs 500 差异对结论无实质影响。\n- \"原样到达并执行\"需要端到端浏览器环境，单元测试只能测 fixer 无损。\n\n权衡：作为\"重开验收\"的正面证明测试，issue 作者明确给了 500 字符的数字标准，测试注释也自己记录了 345——这是一个客观的验收差距。报告为 test 类别、low 严重度是稳妥且精准的。我决定报告，severity: low。\n\n嗯，等等，我数一下实际长度。让我精确计算 sample：\n\n段1: \"((function(){var out=[];\" → 23 字符\n段2: \"document.querySelectorAll('.data-grid tbody tr').forEach(function(r){\" → 数一下：\n\"document.querySelectorAll(\" = 26\n\"'.data-grid tbody tr'\" = 21（含两个引号）→ 47\n\").forEach(function(r){\" = 22 → 69\n段3: \"out.push(r.innerText.replace(/\\n+/g,' | '))});\"\n\"out.push(r.innerText.replace(\" = 28\n\"/\\n+/g\" = 5（/\\ n + / g）→ 33\n\",' | ')\" = 7 → 40\n\"))});\" = 5 → 45\n段4: \"var b=[...document.querySelectorAll('button')]\" \n\"var b=[...document.querySelectorAll(\" = 36\n\"'button'\" = 8 → 44\n\")]\" = 2 → 46\n段5: \".find(x=\u003ex.textContent.trim()==='Edit Configurations' \u0026\u0026 x.title!=\\\"\\\");\"\n\".find(x=\u003ex.textContent.trim()===\" = 33\n\"'Edit Configurations'\" = 21 → 54\n\" \u0026\u0026 x.title!=\\\"\\\");\" = 17 → 71\n段6: \"return 'rows:'+out.length+' btn:\\\"'+(b?b.className:'none')+'\\\"'\"\n\"return 'rows:'+out.length+' btn:\" = 31... 让我粗算：约 62\n段7: \"+' sample:'+/$\\d+\\.!/g.source})()\"\n\"+' sample:'+/\" = 13\n\"$\\d+\\.!\" = 6 → 19\n\"/g.source})()\" = 12 → 31... \n\n总计约 23+69+45+46+71+62+31 ≈ 347。是的约 347，与注释\"约 345\"一致。\u003c 500。\n\n好，报告这个问题。\n\n还有别的吗？让我做最后一轮全面排查，特别针对我还没细看的角落：\n\n**A. `_delimiter_scan` 的 docstring 说\"返回 (未闭合栈——按开序, 首个错位闭合符的下标)\"——遇到错位闭合时返回的 stack 是截断时刻的栈。调用方\"Illegal return\"/\"Missing catch\" 分支用这个截断栈做补全**——嗯，等一下。这两个分支的 err_text 是 \"Illegal return statement\" / \"Missing catch\"。**如果代码同时有错位闭合（多余 }）**，扫描提前返回，栈是截断的。组合候选 `code + _close_open_delims(truncated_stack)` 可能：\n1. 语法错误 → 试跑失败 → 无害。\n2. 语法合法但语义漂移？补全只加尾部闭合。风险低。\n\n不报。\n\n**B. `_close_open_delims` 没有栈上字符校验**——stack 只可能含 \"([{\"（_delimiter_scan 只 push 这些）✓。\n\n**C. 3748 行 `0 \u003c= _col \u003c= len(validated_code)`**——CDP col 可以等于 len（EOF 后）。若 err 是 \"Unexpected end of input\"，err_offset=len(code) 也有效，但该分支不用 err_offset。✓。\n\n**D. 一个重要的复查——`_delimiter_scan` 遇到错位闭合提前 return 时 `in_str` 状态丢失**——无所谓，返回值只有 stack 和 extra。\n\n**E. 重看 388-395 行测试：`test_deletion_veto_on_position_mismatch` 断言 err_offset=50 时返回 []。code = \"(function(){var s='x'.replace(/[)]/g,'');return s}})()\"。真实错位 `}` 的下标：数一下……\"(function(){var s='x'.replace(/[)]/g,'');return s}\" —— `(`0 `f`1... 直接数：\"(function(){\" = 12（0-11），\"var s='x'.replace(\" = 18（12-29），\"/[)]/g\" = 5（30-34），\",');\" = 4（35-38），\"return s}\" = 9（39-47），\"}\"=48，\")\"=49，\"(\"=50……\n\n等等，测试注释说 \"CDP 实测报 50（真错位）\"。但真错位 `}` 是下标 48（第一个多余 `}`）？让我重新数：\n\ncode = `(function(){var s='x'.replace(/[)]/g,'');return s}})()`\n\n逐段：\n- `(function(){` — 12 字符，下标 0-11\n- `var s='x'.replace(` — 18 字符，下标 12-29\n- `/[)]/g` — 6 字符，下标 30-35\n- `,'');` — 6 字符，下标 36-41\n- `return s}` — 9 字符，下标 42-50\n- `}` — 1 字符，下标 51\n- `)()` — 3 字符，下标 52-54\n\n嗯我的分段有点乱。重数：\n- \"(function(){\" = 12 chars → [0,12)\n- \"var s='x'.replace(\" → v-a-r-space-s-=-'-x-'-.-r-e-p-l-a-c-e-( = 3+1+1+1+2+1+8+1 = \"var \"=4, \"s\"=1, \"=\"=1, \"'x'\"=3, \".replace\"=8, \"(\"=1 → 18 chars → [12,30)\n- \"/[)]/g\" = 6 → [30,36)\n- \",'');\" = 6 → [36,42)\n- \"return s\" = 8 → [42,50)\n- \"}\" = 1 → [50,51)\n- \"}\" = 1 → [51,52)\n- \")()\": [52,55)\n\n所以两个连续 `}` 在下标 50 和 51。第一个多余 `}` 在 50。测试断言 `0 \u003c= phantom_extra != 50`——扫描器因 regex `/[)]/` 里的 `)` 提前报错位（phantom_extra 是 regex 里 `)` 的下标，33 左右），而 CDP 真错位是 50。✓ 一致。\n\n而 `test_deletion_candidates_with_matching_position`：code = \"(function(){return 1}})()\"：\n- \"(function(){\" [0,12)\n- \"return 1\" 8 → [12,20)\n- \"}\" [20,21)\n- \"}\" [21,22)\n- \")()\" [22,26)\n\n真实错位：第一个 `}` 在 20 是合法闭合（function 体），第二个 `}` 在 21 是多余。扫描器：( push [0]，{ push [11]，} at 20 pop，} at 21 → 栈空 → 错位 return extra=21 ✓ 测试断言 21 ✓。err_offset=21 → 匹配 → 生成删除候选 [\"(function(){return 1})()\"] ✓。\n\n好，实现与测试一致。\n\n**F. 最后一个角度——session.py 中 `if \"Unexpected token\" in err_text:` 的 warning 分支在成功时记录 warning。但 retry 成功的候选可能不是删除类？**——已确认 Unexpected token 分支全部是删除类 ✓。\n\n**G. 还有一个值得再想的：`\"Unexpected token\" in err_text` 也匹配 \"Unexpected token ';'\"（分号错），此时 `_syntax_repair_candidates` 返回 []（first_extra=-1 → break → 空）……等等！err_offset=None（测试 310 行不传）→ 进入循环 → extra=-1 → break → candidates=[] → 返回 []。✓ 无 warning 路径。OK。\n\n但**如果 err_text=\"Unexpected token ';'\" 且代码碰巧有错位闭合**（无关的多余括号）——删除候选生成，试跑删除后……语义漂移？分号错误+多余括号删除候选编译还是失败 → 无害。若删后恰好合法……罕见组合。删除类风险已由已确认问题涵盖大方向。不重复。\n\n**H. 性能角度**：`_delimiter_scan` 在每次 evaluate 异常时跑 2-3 次 + 候选试跑 2 次 CDP 往返。低频错误路径。不报。\n\n**I. `examples` 两个脚本无实质缺陷（临时诊断脚本）。**\n\n最终决定：报告 1 个问题（test, low，验收阈值 500 未达）。\n\n……嗯，说实话，仅一个 low 有点少，但 review 原则\"favor precision over recall\"。让我做最后一次聚焦检查——**review_files 中我还没深挖的：examples/debug_c2_exc_position_shape.py 的 probes 之三**：\n\n```python\n(\"regex-then-extra\", \"(function(){var s='x'.replace(/[)]/g,'');return s}})()\"),\n```\n\n探针断言（无断言，只打印）。作者用它实证 CDP 对该形态报 50。✓ 与 session.py 的交叉验证假设一致。\n\n**以及 `debug_c2_eval_failure_shapes.py` 的 `err_pat` 只匹配 \"SyntaxError: (.+)\"**——日志行。OK。\n\n好。还有一个想法——**`test_evaluate.py` 新测试类的 `test_long_regex_nested_quotes_sample_untouched` 中 `assert len(sample) \u003e 300` 的注释说\"or-条件恒等价于 \u003e300\"（review3 #3）**——这说明早期版本有 bug 被修。当前 `\u003e 300` ✓。\n\n决定：报告 1 个 test 问题。\n\n再考虑一下 severity：这是测试覆盖/验收标准差距，不影响生产代码 → low。category: test。\n\n现有代码定位（用于 code_comment 的 existing_code）：\n\n```python\n\tdef test_long_regex_nested_quotes_sample_untouched(self):\n```\n或样本断言行：\n```python\n\t\tassert len(sample) \u003e 300  # 长样本（实测约 345 字符，覆盖嵌套引号/regex 形态）\n```\n\n用断言行更精确。\n\nsuggestion_code——建议样本扩到 \u003e500 或直接调整断言。我可以建议把样本加长（比如再拼一段）并断言 \u003e 500。给出示意：\n\n```python\n\t\tassert len(sample) \u003e 500  # issue #185 重开验收口径：\u003e500 字符含 regex 与嵌套引号\n```\n并说明需同步扩长样本（如再追加一段 querySelectorAll/replace 链）。\n\n好，写评论。\n\n内容：测试类自述对应 issue #185-c2 重开验收，而重开评论（docs/issue/185.md L78）明确的验收建议是\"\u003e500 字符含 regex 字面量与嵌套引号的表达式原样到达并执行\"；当前样本实测约 345-353 字符，断言仅 \u003e300，未达到该阈值档位。C 轮实测失败样本（544 的 replace 链等）都是长代码，验收测试应对齐该长度档位，否则对\"长表达式在传输层被截断/改写\"指控的无损性证明覆盖不足。建议把样本扩至 \u003e500（或补一条 \u003e500 的样本用例）并将断言同步为 \u003e500。\n\n嗯，等等——我要再确认一次\"345\"这个数字是注释里作者自己写的：\"# 长样本（实测约 345 字符，覆盖嵌套引号/regex 形态）\"。是的，作者自述 345。而验收建议是 \u003e500。差距明确。报告。\n\n评论的 existing_code 必须与 diff 中的新增行完全一致（含 tab 缩进——该文件用 tab）。diff 显示：\n\n```\n+\t\tassert len(sample) \u003e 300  # 长样本（实测约 345 字符，覆盖嵌套引号/regex 形态）\n```\n\n前面是 tab（测试文件用 tab 缩进）。我复制 diff 行。\n\n好，输出评论，然后 task_done。",
+      "category": "test",
+      "severity": "low"
+    }
+  ],
+  "groups": [
+    {
+      "label": "Browser session evaluate failure/exception shape handling with debug scripts and tests",
+      "files": [
+        "examples/debug_c2_eval_failure_shapes.py",
+        "examples/debug_c2_exc_position_shape.py",
+        "src/tree_walker/browser/session.py",
+        "tests/test_evaluate.py"
+      ]
+    },
+    {
+      "label": "P7 form interaction fix tests",
+      "files": [
+        "tests/test_p7_form_interaction_fixes.py"
+      ]
+    }
+  ],
+  "session_id": "0e0b4e9f-99f0-488c-8938-092b4112e5ee",
+  "manifest": {
+    "schema_version": "ocr.run-manifest/v1",
+    "run_id": "0e0b4e9f-99f0-488c-8938-092b4112e5ee",
+    "operation": "review",
+    "terminal_state": "complete",
+    "repository": {
+      "identity_sha256": "2868bcfb033292e0d47631dc911d0e36e5dcedaf9e0bcacffe6c4716bb93dfda"
+    },
+    "input": {
+      "mode": "range",
+      "requested_from": "master",
+      "requested_head": "fix/185-c2-balance-repair",
+      "resolved_base": "9ffe21c35645f2e3e4405b784b18391f0eacdcce",
+      "resolved_head": "4abf3f10b0d83cb162af66f4fe191b1ee9aa04b9",
+      "exact_range": "9ffe21c35645f2e3e4405b784b18391f0eacdcce..4abf3f10b0d83cb162af66f4fe191b1ee9aa04b9",
+      "source_artifact_sha256": "297e70629d3bd36fadbbc1752c85c58bb9f325878cf94151e36f3cb1d54c40f3"
+    },
+    "execution": {
+      "ocr_version": "v1.12.5",
+      "model": "glm-5.3",
+      "configured_concurrency": 8,
+      "rule_config_sha256": "ddb40005eb732cb8b37d8d3dc1acb82f3aa51fded408c899a092c10349c369c4",
+      "runtime_config_sha256": "841fe9ad288d2dd9efc84c443193c492ef06b26edf31ff5f5a1b01637fef2b0c"
+    },
+    "coverage": {
+      "selected": [
+        {
+          "item_id": "47bb311f983e86632bb1ff2240dee320d269694f7e78d415a572bc25cb3b91c4",
+          "path": "examples/debug_c2_exc_position_shape.py",
+          "fingerprint": "b0328122fa4539d02257298e558d85e4791d17308dba904e7f835b0112a7c6fc"
+        },
+        {
+          "item_id": "614508a236a8327d371cc12c9ced54da84022590ae9fac9d344d226ed0e6108a",
+          "path": "examples/debug_c2_eval_failure_shapes.py",
+          "fingerprint": "f095d12210730cffc6e5e2c4c6b2ac3efafb083836c8355594ade34afbfea99d"
+        },
+        {
+          "item_id": "6d1cd586e9b8ae0df91a1905ca93db387118eed5f0366496514c8e4211c01609",
+          "path": "tests/test_p7_form_interaction_fixes.py",
+          "fingerprint": "65e3b30373d5025f1fadd3b8b9622763d83c8397caee55fbb3c59e5ef145e85b"
+        },
+        {
+          "item_id": "9932efe4e9494be618ed91e3e77812ba901e8403cccfa6417c9da7c83e77bfbd",
+          "path": "src/tree_walker/browser/session.py",
+          "fingerprint": "9a850b70dfef0e3595483a7490a6e13abe84c5fdbedb60f7d1f8263ee585714b"
+        },
+        {
+          "item_id": "bcc98cc9330f01b09135ec4acd90994e962ac2fd65860f25a1d3040c9ed4fe30",
+          "path": "tests/test_evaluate.py",
+          "fingerprint": "445c2b3229fb41d5b909bc35e2749b5c24012d4ad708b6111f22df72bb456612"
+        }
+      ],
+      "completed": [
+        {
+          "item_id": "47bb311f983e86632bb1ff2240dee320d269694f7e78d415a572bc25cb3b91c4",
+          "path": "examples/debug_c2_exc_position_shape.py",
+          "fingerprint": "b0328122fa4539d02257298e558d85e4791d17308dba904e7f835b0112a7c6fc"
+        },
+        {
+          "item_id": "614508a236a8327d371cc12c9ced54da84022590ae9fac9d344d226ed0e6108a",
+          "path": "examples/debug_c2_eval_failure_shapes.py",
+          "fingerprint": "f095d12210730cffc6e5e2c4c6b2ac3efafb083836c8355594ade34afbfea99d"
+        },
+        {
+          "item_id": "6d1cd586e9b8ae0df91a1905ca93db387118eed5f0366496514c8e4211c01609",
+          "path": "tests/test_p7_form_interaction_fixes.py",
+          "fingerprint": "65e3b30373d5025f1fadd3b8b9622763d83c8397caee55fbb3c59e5ef145e85b"
+        },
+        {
+          "item_id": "9932efe4e9494be618ed91e3e77812ba901e8403cccfa6417c9da7c83e77bfbd",
+          "path": "src/tree_walker/browser/session.py",
+          "fingerprint": "9a850b70dfef0e3595483a7490a6e13abe84c5fdbedb60f7d1f8263ee585714b"
+        },
+        {
+          "item_id": "bcc98cc9330f01b09135ec4acd90994e962ac2fd65860f25a1d3040c9ed4fe30",
+          "path": "tests/test_evaluate.py",
+          "fingerprint": "445c2b3229fb41d5b909bc35e2749b5c24012d4ad708b6111f22df72bb456612"
+        }
+      ],
+      "reused": [],
+      "failed": [],
+      "waived": []
+    },
+    "elapsed_ms": 918128
+  }
+}

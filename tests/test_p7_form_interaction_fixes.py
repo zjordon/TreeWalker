@@ -15,6 +15,7 @@ import pytest
 
 from tree_walker.browser.session import (
     BrowserSession,
+    _delimiter_scan,
     _syntax_repair_candidates,
 )
 
@@ -52,9 +53,12 @@ class TestSyntaxRepairCandidates:
 
     def test_missing_catch_missing_brace_shape_rebuilds_suffix(self):
         # 形态②：连函数闭合括号也缺（504 s13 样本：...return 'not found';})()）
+        # issue #185-c2 + review10 #4：中段错位（first_extra>=0）形态下组合候选
+        # 必然失败（补全串在尾部、catch 落在完整调用表达式后），不再生成——
+        # 仅 EOF 缺闭合形态才有第 3 候选（见 test_missing_catch_plus_imbalance）
         code = "(function(){try{var b=1;if(b){return 'x';}return 'not found';})()"
         cands = _syntax_repair_candidates(code, "Uncaught SyntaxError: Missing catch or finally after try")
-        assert len(cands) == 2
+        assert len(cands) == 2  # 形态① + 形态②（组合候选被 first_extra<0 门控排除）
         rebuilt = cands[1]
         assert rebuilt.endswith("}catch(e){return 'Error: '+e.message}})()")
 
@@ -98,14 +102,89 @@ class TestEvaluateSelfHeal:
             await bs.evaluate("return 1")
 
     @pytest.mark.asyncio
-    async def test_truncation_error_gets_hint(self):
+    async def test_eof_error_gets_imbalance_hint(self):
+        """issue #185-c2（review3 #1/#5/#6 + review9 #3 修订）：失衡提示需扫描确证
+        + 真机可达路径——输入 `var x=(1+` 真机首错即 EOF（`+` 等操作数到行尾），
+        补全候选 `var x=(1+)` 因括号内尾随 `+` 仍败于 token 错；侧桩按调用次序
+        给真实形状，断言的抛错路径与真机一致。"""
+        bs = _make_session()
+        bs.client.send.Runtime.evaluate = AsyncMock(side_effect=[
+            {"exceptionDetails": {"text": "Uncaught", "exception": {
+                "description": "SyntaxError: Unexpected end of input"}}},
+            {"exceptionDetails": {"text": "Uncaught", "exception": {
+                "description": "SyntaxError: Unexpected token ')'"}}},  # 补全候选 var x=(1+) 仍败
+        ])
+        with pytest.raises(RuntimeError, match="unbalanced braces/parens"):
+            await bs.evaluate("var x=(1+")
+
+    @pytest.mark.asyncio
+    async def test_token_error_without_imbalance_gets_no_imbalance_hint(self):
+        """review3 #1 + review9 #1：token 错误但扫描无失衡——不得给失衡断言。
+        输入 `var x=(1;)` 真机实报 Unexpected token ';'（`;` 在括号内非法），
+        且定界符配平（注意 `var a=1;;` 的多余分号是合法空语句、真机不报错，
+        不可作此类输入）。"""
         bs = _make_session()
         bs.client.send.Runtime.evaluate = AsyncMock(return_value={
-            "exceptionDetails": {"text": "Uncaught", "exception": {
+            "exceptionDetails": {
+                "text": "Uncaught",
+                "exception": {"description": "SyntaxError: Unexpected token ';'"},
+            },
+        })
+        with pytest.raises(RuntimeError) as ei:
+            await bs.evaluate("var x=(1;)")
+        assert "unbalanced braces/parens" not in str(ei.value)
+
+    @pytest.mark.asyncio
+    async def test_token_error_with_imbalance_hint_real_machine_path(self):
+        """review3 #6 + review6 #3：删除候选带匹配位置证据且真机也必败的输入
+        （`};var x=;` 扫描错位=0=CDP 列偏移，候选 `;var x=;` 仍是语法错）——
+        带失衡提示的抛错路径真机可达（对照旧用例 `"}}"` 的空串候选在真机会
+        "自愈成功"返回 undefined，断言路径不可达）。"""
+        bs = _make_session()
+        bs.client.send.Runtime.evaluate = AsyncMock(side_effect=[
+            {"exceptionDetails": {"text": "Uncaught", "exception": {
+                "description": "SyntaxError: Unexpected token '}'"},
+                "lineNumber": 0, "columnNumber": 0}},
+            {"exceptionDetails": {"text": "Uncaught", "exception": {
+                "description": "SyntaxError: Unexpected token ';'"}}},  # 删除候选仍败
+        ])
+        with pytest.raises(RuntimeError, match="unbalanced braces/parens"):
+            await bs.evaluate("};var x=;")
+
+    @pytest.mark.asyncio
+    async def test_eof_missing_closer_candidate_heals(self):
+        """c2 端到端：EOF 缺闭合（C 轮 549 形态 `((function(){…})()`）——首个候选
+        补全闭合，重试成功。"""
+        bs = _make_session()
+        bs.client.send.Runtime.evaluate = AsyncMock(side_effect=[
+            {"exceptionDetails": {"text": "Uncaught", "exception": {
                 "description": "SyntaxError: Unexpected end of input"}}},
-        )
-        with pytest.raises(RuntimeError, match="truncated"):
-            await bs.evaluate("var a = 1;")
+            {"result": {"value": "ok"}},
+        ])
+        out = await bs.evaluate("((function(){return 'ok'})()")
+        assert out == "ok"
+        retry_expr = bs.client.send.Runtime.evaluate.call_args_list[1][0][0]["expression"]
+        assert retry_expr == "((function(){return 'ok'})())"
+
+    @pytest.mark.asyncio
+    async def test_extra_closer_candidate_heals(self):
+        """c2 端到端：多余闭合（C 轮 699 形态）——CDP 位置（列偏移 49=扫描
+        错位）交叉验证通过，删首个错位闭合符后重试成功（review6 #3：无位置
+        字段的桩在 fail-safe 下不再触发删除）。"""
+        bs = _make_session()
+        bs.client.send.Runtime.evaluate = AsyncMock(side_effect=[
+            {"exceptionDetails": {"text": "Uncaught", "exception": {
+                "description": "SyntaxError: Unexpected token '}'"},
+                "lineNumber": 0, "columnNumber": 49}},
+            {"result": {"value": "not found"}},
+        ])
+        out = await bs.evaluate(
+            "((function(){if(1){return 'x'}return 'not found'}})())")
+        assert out == "not found"
+        # review3 #4：单一错位的删除结果唯一确定——精确等值断言（负向子串拦不住
+        # "删错位置"的回归）
+        retry_expr = bs.client.send.Runtime.evaluate.call_args_list[1][0][0]["expression"]
+        assert retry_expr == "((function(){if(1){return 'x'}return 'not found'})())"
 
     @pytest.mark.asyncio
     async def test_missing_catch_second_candidate_succeeds(self):
@@ -221,3 +300,208 @@ class TestKickFrozenDataGrid:
         assert out["ready"] is True
         assert out["grid_kick"] is True
         assert out["grid_rows"] == 7
+
+
+# ── issue #185-c2：定界符平衡修复候选（纯函数边界） ─────────────────────
+
+
+class TestBalanceRepairCandidates:
+    """C 轮 22/22 编译失败全为定界符失衡；18 处主导形态原无候选——本轮解除
+    后置（docs/bug-fix/185-c2-balance-repair-impl-plan.md）。"""
+
+    def test_balanced_code_eof_branch_no_candidates(self):
+        # 已平衡代码不得产生补全候选（防误改）
+        assert _syntax_repair_candidates(
+            "(function(){return 1})()", "SyntaxError: Unexpected end of input",
+        ) == []
+
+    def test_non_closer_token_error_no_candidates(self):
+        # "Unexpected token ;" 这类真语法错（非多余闭合）——扫描找不到错位闭合
+        assert _syntax_repair_candidates("var x=;", "SyntaxError: Unexpected token ;") == []
+
+    def test_eof_completion_canonical_order(self):
+        # 栈 (( → 补 ))（栈序逆置）；附最小补 ) 候选
+        cands = _syntax_repair_candidates(
+            "((function(){var a=1;", "SyntaxError: Unexpected end of input")
+        assert cands[0] == "((function(){var a=1;}))"
+        assert cands[1] == "((function(){var a=1;)"
+
+    def test_extra_closer_two_candidates(self):
+        # 双错位：候选①删首个错位（仍剩一个），候选②再删到平衡。
+        # review6 #3：删除类候选须位置证据（扫描错位=21，CDP 同报 21）
+        cands = _syntax_repair_candidates(
+            "(function(){return 1}}})", "SyntaxError: Unexpected token '}'",
+            err_offset=21)
+        assert cands == [
+            "(function(){return 1}})",
+            "(function(){return 1})",
+        ]
+
+    def test_single_extra_closer_one_candidate(self):
+        # 单错位：删除后即平衡，不再产第二候选；无位置证据 → fail-safe 零候选
+        cands = _syntax_repair_candidates(
+            "(function(){return 1}})", "SyntaxError: Unexpected token '}'",
+            err_offset=21)
+        assert cands == ["(function(){return 1})"]
+        assert _syntax_repair_candidates(
+            "(function(){return 1}})", "SyntaxError: Unexpected token '}'") == []
+
+    def test_bare_return_plus_imbalance_composed_candidate(self):
+        # C 轮 698/700 形态：裸 return 叠加失衡——组合候选（补全+包裹）在后
+        cands = _syntax_repair_candidates(
+            "return document.title;", "SyntaxError: Illegal return statement")
+        assert cands[0] == "(()=>{\nreturn document.title;\n})()"  # 平衡主路径在前
+        # 叠加失衡样本：return x + 缺闭合
+        cands2 = _syntax_repair_candidates(
+            "return ((function(){var a=1;", "SyntaxError: Illegal return statement")
+        assert cands2[1].startswith("(()=>{\nreturn ((function(){var a=1;")
+        assert cands2[1].endswith("}))\n})()")
+
+    def test_missing_catch_plus_imbalance_composed_candidate(self):
+        # C 轮 698 形态：缺 catch 叠加失衡
+        cands = _syntax_repair_candidates(
+            "(function(){try{var b=1;", "SyntaxError: Missing catch or finally after try")
+        assert cands and cands[-1].endswith("catch(e){return 'Error: '+e.message}})")
+
+    def test_regex_bracket_limitation_tolerated(self):
+        """已知局限：regex 字面量内的 [] 被误计——候选允许无效，由编译试跑
+        兜底（此处只断言不崩溃且产出候选）。"""
+        cands = _syntax_repair_candidates(
+            "(function(){return 'a'.match(/[((/)", "SyntaxError: Unexpected end of input")
+        assert cands  # 误计产生的补全候选存在；合法性交 CDP 重试把关
+
+    def test_line_comment_skips_to_eol_not_eof(self):
+        """review3 #2：多行代码中行注释只跳到行尾——直接 break 会把注释后
+        各行的可执行定界符整体跳过（EOF 分支因 stack 为空漏修）。"""
+        code = "(function(){ // open modal\nvar a=1;\n})("
+        stack, extra = _delimiter_scan(code)
+        assert stack == ["("] and extra < 0
+
+    def test_regex_escaped_slash_not_line_comment(self):
+        """review5 #3：/https?:\/\//g 的被转义 / 与收尾 / 相邻不得误判为行
+        注释——否则正则之后代码整体退出扫描，自愈候选与失衡提示三路全灭。"""
+        bs92 = chr(92)
+        balanced = (
+            "(function(){var m='x'.match(/https?:" + bs92 + "/" + bs92
+            + "//g);return m})()"
+        )
+        assert _delimiter_scan(balanced) == ([], -1)
+        missing = (
+            "((function(){var m='x'.match(/https?:" + bs92 + "/" + bs92
+            + "//g);return m})()"
+        )
+        stack, extra = _delimiter_scan(missing)
+        assert stack == ["("] and extra < 0
+
+    def test_deletion_veto_on_position_mismatch(self):
+        """review5 #1：regex 幻影闭合符（/[)]/g 的 )）使扫描错位报在 regex 内
+        部——CDP 出错位置（探针实证精确指向真实错位 token）与扫描分叉时放弃
+        删除类候选：删 regex 内字符会得到语法合法但语义已变的代码（空字符类
+        no-op），绕过编译试跑把关。"""
+        code = "(function(){var s='x'.replace(/[)]/g,'');return s}})()"
+        phantom_stack, phantom_extra = _delimiter_scan(code)
+        assert 0 <= phantom_extra != 50  # 扫描报幻影位，CDP 实测报 50（真错位）
+        assert _syntax_repair_candidates(
+            code, "SyntaxError: Unexpected token '}'", err_offset=50) == []
+        # review6 #3：err_offset 缺失（多行/字段缺席）→ fail-safe 同样放弃——
+        # 无位置证据时放行删除恰是幻影防护要拦的方向
+        assert _syntax_repair_candidates(
+            code, "SyntaxError: Unexpected token '}'") == []
+
+    def test_deletion_candidates_with_matching_position(self):
+        code = "(function(){return 1}})()"
+        assert _delimiter_scan(code) == (["("], 21)  # 扫描错位=21，CDP 实测同为 21
+        assert _syntax_repair_candidates(
+            code, "SyntaxError: Unexpected token '}'", err_offset=21,
+        ) == ["(function(){return 1})()"]  # 删下标 21 的第二个 }，调用括号保留
+
+
+class TestDeletionPositionCrossValidation:
+    """review5 #1：删除类候选以 CDP exceptionDetails 出错位置交叉验证——
+    单行载荷的 lineNumber/columnNumber 即 0-based 字符偏移且精确指向错位
+    token（examples/debug_c2_exc_position_shape.py 于 Chrome 153 实证）。"""
+
+    @pytest.mark.asyncio
+    async def test_veto_on_position_mismatch_no_retry(self):
+        """regex 幻影场景：CDP 报 50（真错位），扫描报 ~31（/[)]/ 内的 )）
+        ——分叉即放弃删除候选（无重试），错误照常上抛并附失衡提示。"""
+        bs = _make_session()
+        bs.client.send.Runtime.evaluate = AsyncMock(return_value={
+            "exceptionDetails": {
+                "text": "Uncaught",
+                "exception": {"description": "SyntaxError: Unexpected token '}'"},
+                "lineNumber": 0, "columnNumber": 50,
+            },
+        })
+        with pytest.raises(RuntimeError, match="unbalanced braces/parens"):
+            await bs.evaluate("(function(){var s='x'.replace(/[)]/g,'');return s}})()")
+        assert bs.client.send.Runtime.evaluate.await_count == 1  # 无删除重试
+
+    @pytest.mark.asyncio
+    async def test_heal_with_matching_position(self):
+        """位置一致（扫描错位=CDP 列偏移=21）——删除候选放行并自愈成功。"""
+        bs = _make_session()
+        bs.client.send.Runtime.evaluate = AsyncMock(side_effect=[
+            {"exceptionDetails": {
+                "text": "Uncaught",
+                "exception": {"description": "SyntaxError: Unexpected token '}'"},
+                "lineNumber": 0, "columnNumber": 21}},
+            {"result": {"value": "1"}},
+        ])
+        out = await bs.evaluate("(function(){return 1}})()")
+        assert out == "1"
+
+    @pytest.mark.asyncio
+    async def test_position_absent_fails_safe_no_deletion(self):
+        """review6 #3：exceptionDetails 无位置字段（多行载荷/协议变体）——
+        fail-safe 放弃删除类候选（无重试），错误照常上抛并附失衡提示；
+        跳过验证的 fail-open 恰是幻影防护要拦的方向。"""
+        bs = _make_session()
+        bs.client.send.Runtime.evaluate = AsyncMock(return_value={
+            "exceptionDetails": {
+                "text": "Uncaught",
+                "exception": {"description": "SyntaxError: Unexpected token '}'"},
+            },
+        })
+        with pytest.raises(RuntimeError, match="unbalanced braces/parens"):
+            await bs.evaluate("(function(){return 1}})()")
+        assert bs.client.send.Runtime.evaluate.await_count == 1  # 无删除重试
+
+    def test_second_deletion_gated_on_adjacent_same_char(self):
+        """review7 #1：候选②绕过位置门禁的缺口——首删为已验证真错位、其后源码
+        存在含未配对闭合符的 regex（/[)]/g）时，再扫描会把幻影报为下一错位，
+        删之得合法空字符类、语义漂移。仅当第二错位与首删位连排同字符（}}/))
+        双闭合笔误，删除后左移恰好占位）才生成候选②。"""
+        code = "(function(){return 1}};var r=/[)]/g;)()"
+        assert _delimiter_scan(code) == (["("], 21)
+        # 首删（位置 21 经 CDP 验证）后的再扫描错位落在 regex 内（幻影）→ 门控
+        assert _syntax_repair_candidates(
+            code, "SyntaxError: Unexpected token '}'", err_offset=21,
+        ) == ["(function(){return 1};var r=/[)]/g;)()"]
+        # 对照：连排同字符双闭合笔误（}} 形态）候选②保留
+        assert _syntax_repair_candidates(
+            "(function(){return 1}}})", "SyntaxError: Unexpected token '}'",
+            err_offset=21,
+        ) == ["(function(){return 1}})", "(function(){return 1})"]
+
+    @pytest.mark.asyncio
+    async def test_non_ascii_payload_no_position_evidence(self):
+        """review8 #2 + review10 #2：CDP 列偏移按 UTF-16 码元计——含 astral 字符
+        （emoji）的载荷与 Python 码点下标系统性错位。桩值取码点下标 31（=扫描
+        first_extra，模拟漂移恰抵消、位置相等的放行风险形态）：isascii 门控
+        存在时 err_offset=None → 弃删（绿）；门控被移除时 31==first_extra →
+        删除候选放行触发重试，await_count 变 2、断言失败（红）——测试因此
+        具备对该 fail-safe 防护的回归鉴别力。"""
+        bs = _make_session()
+        bs.client.send.Runtime.evaluate = AsyncMock(return_value={
+            "exceptionDetails": {
+                "text": "Uncaught",
+                "exception": {"description": "SyntaxError: Unexpected token '}'"},
+                # 31 = 该载荷的码点错位下标（'😀' 单码点，return 1}} 的多余 }
+                # 在码点 31；真机 UTF-16 口径会报 32——正是错位方向）
+                "lineNumber": 0, "columnNumber": 31,
+            },
+        })
+        with pytest.raises(RuntimeError, match="unbalanced braces/parens"):
+            await bs.evaluate("var t='😀';(function(){return 1}})()")
+        assert bs.client.send.Runtime.evaluate.await_count == 1  # 无删除重试

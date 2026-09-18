@@ -1,0 +1,131 @@
+{
+  "status": "complete",
+  "llm": {
+    "model": "glm-5.3"
+  },
+  "message": "Review complete: 0 finding(s) across 5 selected item(s).",
+  "summary": {
+    "files_reviewed": 5,
+    "comments": 0,
+    "total_tokens": 572443,
+    "input_tokens": 501063,
+    "output_tokens": 71380,
+    "cache_read_tokens": 378176,
+    "elapsed": "9m54s"
+  },
+  "tool_calls": {
+    "total": 21,
+    "by_tool": {
+      "code_search": 12,
+      "file_read": 6,
+      "file_read_diff": 3
+    },
+    "failure": 0,
+    "failure_by_tool": {},
+    "failure_details": []
+  },
+  "comments": [],
+  "groups": [
+    {
+      "label": "C2 evaluate exception shape handling (debug examples, session implementation, tests)",
+      "files": [
+        "examples/debug_c2_eval_failure_shapes.py",
+        "examples/debug_c2_exc_position_shape.py",
+        "src/tree_walker/browser/session.py",
+        "tests/test_evaluate.py"
+      ]
+    },
+    {
+      "label": "P7 form interaction fix tests",
+      "files": [
+        "tests/test_p7_form_interaction_fixes.py"
+      ]
+    }
+  ],
+  "session_id": "5cbde8a3-ebce-4f72-ba84-48f49ab5a9db",
+  "manifest": {
+    "schema_version": "ocr.run-manifest/v1",
+    "run_id": "5cbde8a3-ebce-4f72-ba84-48f49ab5a9db",
+    "operation": "review",
+    "terminal_state": "complete",
+    "repository": {
+      "identity_sha256": "2868bcfb033292e0d47631dc911d0e36e5dcedaf9e0bcacffe6c4716bb93dfda"
+    },
+    "input": {
+      "mode": "range",
+      "requested_from": "master",
+      "requested_head": "fix/185-c2-balance-repair",
+      "resolved_base": "9ffe21c35645f2e3e4405b784b18391f0eacdcce",
+      "resolved_head": "5bb27250691019e5e252fcd1c234841d56171cb2",
+      "exact_range": "9ffe21c35645f2e3e4405b784b18391f0eacdcce..5bb27250691019e5e252fcd1c234841d56171cb2",
+      "source_artifact_sha256": "7c1d2f3735ecd5d9e1bf8aee1f3214033806b5bedb5b174e91ff1a4e09e8b1f4"
+    },
+    "execution": {
+      "ocr_version": "v1.12.5",
+      "model": "glm-5.3",
+      "configured_concurrency": 8,
+      "rule_config_sha256": "ddb40005eb732cb8b37d8d3dc1acb82f3aa51fded408c899a092c10349c369c4",
+      "runtime_config_sha256": "841fe9ad288d2dd9efc84c443193c492ef06b26edf31ff5f5a1b01637fef2b0c"
+    },
+    "coverage": {
+      "selected": [
+        {
+          "item_id": "47bb311f983e86632bb1ff2240dee320d269694f7e78d415a572bc25cb3b91c4",
+          "path": "examples/debug_c2_exc_position_shape.py",
+          "fingerprint": "b0328122fa4539d02257298e558d85e4791d17308dba904e7f835b0112a7c6fc"
+        },
+        {
+          "item_id": "614508a236a8327d371cc12c9ced54da84022590ae9fac9d344d226ed0e6108a",
+          "path": "examples/debug_c2_eval_failure_shapes.py",
+          "fingerprint": "b75bb3b9b6e80b6f332214ddba8b2ef42066629b2fc8f6a6cf015c60c0091b6a"
+        },
+        {
+          "item_id": "6d1cd586e9b8ae0df91a1905ca93db387118eed5f0366496514c8e4211c01609",
+          "path": "tests/test_p7_form_interaction_fixes.py",
+          "fingerprint": "b0c7975fc9fe3cf51a3d8a3a742fc6e5512abfe139222dd5780a0210eeca622b"
+        },
+        {
+          "item_id": "9932efe4e9494be618ed91e3e77812ba901e8403cccfa6417c9da7c83e77bfbd",
+          "path": "src/tree_walker/browser/session.py",
+          "fingerprint": "359b1f2634d74f3ef226f2723753954df57735f101890ef688da847617de0ca8"
+        },
+        {
+          "item_id": "bcc98cc9330f01b09135ec4acd90994e962ac2fd65860f25a1d3040c9ed4fe30",
+          "path": "tests/test_evaluate.py",
+          "fingerprint": "c3f37efcafe1ec8df05e0f90a430c3e91ed88cafdfbe7212bb0f0f0320210f31"
+        }
+      ],
+      "completed": [
+        {
+          "item_id": "47bb311f983e86632bb1ff2240dee320d269694f7e78d415a572bc25cb3b91c4",
+          "path": "examples/debug_c2_exc_position_shape.py",
+          "fingerprint": "b0328122fa4539d02257298e558d85e4791d17308dba904e7f835b0112a7c6fc"
+        },
+        {
+          "item_id": "614508a236a8327d371cc12c9ced54da84022590ae9fac9d344d226ed0e6108a",
+          "path": "examples/debug_c2_eval_failure_shapes.py",
+          "fingerprint": "b75bb3b9b6e80b6f332214ddba8b2ef42066629b2fc8f6a6cf015c60c0091b6a"
+        },
+        {
+          "item_id": "6d1cd586e9b8ae0df91a1905ca93db387118eed5f0366496514c8e4211c01609",
+          "path": "tests/test_p7_form_interaction_fixes.py",
+          "fingerprint": "b0c7975fc9fe3cf51a3d8a3a742fc6e5512abfe139222dd5780a0210eeca622b"
+        },
+        {
+          "item_id": "9932efe4e9494be618ed91e3e77812ba901e8403cccfa6417c9da7c83e77bfbd",
+          "path": "src/tree_walker/browser/session.py",
+          "fingerprint": "359b1f2634d74f3ef226f2723753954df57735f101890ef688da847617de0ca8"
+        },
+        {
+          "item_id": "bcc98cc9330f01b09135ec4acd90994e962ac2fd65860f25a1d3040c9ed4fe30",
+          "path": "tests/test_evaluate.py",
+          "fingerprint": "c3f37efcafe1ec8df05e0f90a430c3e91ed88cafdfbe7212bb0f0f0320210f31"
+        }
+      ],
+      "reused": [],
+      "failed": [],
+      "waived": []
+    },
+    "elapsed_ms": 594467
+  }
+}
