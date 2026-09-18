@@ -602,9 +602,12 @@ def _syntax_repair_candidates(
     """
     if "Illegal return statement" in err_text:
         candidates = ["(()=>{\n" + code + "\n})()"]
-        # c2：裸 return 叠加失衡——内层先补全闭合再包裹，一次到位
-        stack, _ = _delimiter_scan(code)
-        if stack:
+        # c2 + review10 #3：裸 return 叠加失衡——内层先补全闭合再包裹。仅 EOF
+        # 缺闭合形态（first_extra < 0）：_delimiter_scan 遇中段错位即提前返回，
+        # 其后文本（如尾部 () 调用）未入栈——此形态下追加闭合串不可能修复，
+        # 生成即注定失败的白耗 CDP 重试。
+        stack, first_extra = _delimiter_scan(code)
+        if stack and first_extra < 0:
             candidates.append(
                 "(()=>{\n" + code + _close_open_delims(stack) + "\n})()")
         return candidates
@@ -618,9 +621,12 @@ def _syntax_repair_candidates(
         # 形态②：连函数闭合括号也缺 —— 去掉尾部 })() 重建闭合
         if code.endswith("})()"):
             candidates.append(code[:-4] + "}" + catch + "})()")
-        # c2：缺 catch 叠加失衡——内层补全闭合后再走形态①的插 catch 位点
-        stack, _ = _delimiter_scan(code)
-        if stack:
+        # c2 + review10 #4：缺 catch 叠加失衡——内层补全闭合后再插 catch。仅
+        # EOF 缺闭合形态（first_extra < 0）：中段错位时补全串被追加到尾部、
+        # catch 落在完整调用表达式之后（…})()catch(…)），必然编译失败；且插入
+        # 的 catch 文本定界符净值为零，不可能改变错位形态。
+        stack, first_extra = _delimiter_scan(code)
+        if stack and first_extra < 0:
             balanced = code + _close_open_delims(stack)
             j = balanced.rfind("}")
             if j > 0:

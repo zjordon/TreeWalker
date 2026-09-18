@@ -53,10 +53,12 @@ class TestSyntaxRepairCandidates:
 
     def test_missing_catch_missing_brace_shape_rebuilds_suffix(self):
         # 形态②：连函数闭合括号也缺（504 s13 样本：...return 'not found';})()）
-        # issue #185-c2：失衡样本额外追加第 3 个「补全+插 catch」组合候选
+        # issue #185-c2 + review10 #4：中段错位（first_extra>=0）形态下组合候选
+        # 必然失败（补全串在尾部、catch 落在完整调用表达式后），不再生成——
+        # 仅 EOF 缺闭合形态才有第 3 候选（见 test_missing_catch_plus_imbalance）
         code = "(function(){try{var b=1;if(b){return 'x';}return 'not found';})()"
         cands = _syntax_repair_candidates(code, "Uncaught SyntaxError: Missing catch or finally after try")
-        assert len(cands) == 3  # 形态① + 形态② + c2 组合候选
+        assert len(cands) == 2  # 形态① + 形态②（组合候选被 first_extra<0 门控排除）
         rebuilt = cands[1]
         assert rebuilt.endswith("}catch(e){return 'Error: '+e.message}})()")
 
@@ -484,15 +486,20 @@ class TestDeletionPositionCrossValidation:
 
     @pytest.mark.asyncio
     async def test_non_ascii_payload_no_position_evidence(self):
-        """review8 #2：CDP 列偏移按 UTF-16 码元计——含 astral 字符（emoji）的
-        载荷与 Python 码点下标系统性错位，漂移量恰抵消时幻影错位可能被错误
-        放行——非 ASCII 一律视为无位置证据（fail-safe 弃删，仅余提示路径）。"""
+        """review8 #2 + review10 #2：CDP 列偏移按 UTF-16 码元计——含 astral 字符
+        （emoji）的载荷与 Python 码点下标系统性错位。桩值取码点下标 31（=扫描
+        first_extra，模拟漂移恰抵消、位置相等的放行风险形态）：isascii 门控
+        存在时 err_offset=None → 弃删（绿）；门控被移除时 31==first_extra →
+        删除候选放行触发重试，await_count 变 2、断言失败（红）——测试因此
+        具备对该 fail-safe 防护的回归鉴别力。"""
         bs = _make_session()
         bs.client.send.Runtime.evaluate = AsyncMock(return_value={
             "exceptionDetails": {
                 "text": "Uncaught",
                 "exception": {"description": "SyntaxError: Unexpected token '}'"},
-                "lineNumber": 0, "columnNumber": 24,
+                # 31 = 该载荷的码点错位下标（'😀' 单码点，return 1}} 的多余 }
+                # 在码点 31；真机 UTF-16 口径会报 32——正是错位方向）
+                "lineNumber": 0, "columnNumber": 31,
             },
         })
         with pytest.raises(RuntimeError, match="unbalanced braces/parens"):
