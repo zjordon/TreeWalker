@@ -101,23 +101,26 @@ class TestEvaluateSelfHeal:
 
     @pytest.mark.asyncio
     async def test_eof_error_gets_imbalance_hint(self):
-        """issue #185-c2（review3 #1/#5/#6 修订）：失衡提示需扫描确证 + 真机可达
-        路径——输入的补全候选在真机也必败（`var x=(1;)` 的 `(1;)` 仍是语法错），
-        侧桩按调用次序给真实形状，断言的抛错路径与真机一致。"""
+        """issue #185-c2（review3 #1/#5/#6 + review9 #3 修订）：失衡提示需扫描确证
+        + 真机可达路径——输入 `var x=(1+` 真机首错即 EOF（`+` 等操作数到行尾），
+        补全候选 `var x=(1+)` 因括号内尾随 `+` 仍败于 token 错；侧桩按调用次序
+        给真实形状，断言的抛错路径与真机一致。"""
         bs = _make_session()
         bs.client.send.Runtime.evaluate = AsyncMock(side_effect=[
             {"exceptionDetails": {"text": "Uncaught", "exception": {
                 "description": "SyntaxError: Unexpected end of input"}}},
             {"exceptionDetails": {"text": "Uncaught", "exception": {
-                "description": "SyntaxError: Unexpected token ';'"}}},  # 补全候选仍败
+                "description": "SyntaxError: Unexpected token ')'"}}},  # 补全候选 var x=(1+) 仍败
         ])
         with pytest.raises(RuntimeError, match="unbalanced braces/parens"):
-            await bs.evaluate("var x=(1;")
+            await bs.evaluate("var x=(1+")
 
     @pytest.mark.asyncio
     async def test_token_error_without_imbalance_gets_no_imbalance_hint(self):
-        """review3 #1：token 错误但扫描无失衡（如多余分号）——不得给失衡断言
-        （事实性误导），原错误照常上抛。"""
+        """review3 #1 + review9 #1：token 错误但扫描无失衡——不得给失衡断言。
+        输入 `var x=(1;)` 真机实报 Unexpected token ';'（`;` 在括号内非法），
+        且定界符配平（注意 `var a=1;;` 的多余分号是合法空语句、真机不报错，
+        不可作此类输入）。"""
         bs = _make_session()
         bs.client.send.Runtime.evaluate = AsyncMock(return_value={
             "exceptionDetails": {
@@ -126,7 +129,7 @@ class TestEvaluateSelfHeal:
             },
         })
         with pytest.raises(RuntimeError) as ei:
-            await bs.evaluate("var a=1;;")
+            await bs.evaluate("var x=(1;)")
         assert "unbalanced braces/parens" not in str(ei.value)
 
     @pytest.mark.asyncio
