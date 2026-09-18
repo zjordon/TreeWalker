@@ -15,6 +15,7 @@ import pytest
 
 from tree_walker.browser.session import (
     BrowserSession,
+    _delimiter_scan,
     _syntax_repair_candidates,
 )
 
@@ -361,3 +362,91 @@ class TestBalanceRepairCandidates:
         code = "(function(){ // open modal\nvar a=1;\n})("
         stack, extra = _delimiter_scan(code)
         assert stack == ["("] and extra < 0
+
+    def test_regex_escaped_slash_not_line_comment(self):
+        """review5 #3：/https?:\/\//g 的被转义 / 与收尾 / 相邻不得误判为行
+        注释——否则正则之后代码整体退出扫描，自愈候选与失衡提示三路全灭。"""
+        from tree_walker.browser.session import _delimiter_scan
+        bs92 = chr(92)
+        balanced = (
+            "(function(){var m='x'.match(/https?:" + bs92 + "/" + bs92
+            + "//g);return m})()"
+        )
+        assert _delimiter_scan(balanced) == ([], -1)
+        missing = (
+            "((function(){var m='x'.match(/https?:" + bs92 + "/" + bs92
+            + "//g);return m})()"
+        )
+        stack, extra = _delimiter_scan(missing)
+        assert stack == ["("] and extra < 0
+
+    def test_deletion_veto_on_position_mismatch(self):
+        """review5 #1：regex 幻影闭合符（/[)]/g 的 )）使扫描错位报在 regex 内
+        部——CDP 出错位置（探针实证精确指向真实错位 token）与扫描分叉时放弃
+        删除类候选：删 regex 内字符会得到语法合法但语义已变的代码（空字符类
+        no-op），绕过编译试跑把关。"""
+        code = "(function(){var s='x'.replace(/[)]/g,'');return s}})()"
+        phantom_stack, phantom_extra = _delimiter_scan(code)
+        assert 0 <= phantom_extra != 50  # 扫描报幻影位，CDP 实测报 50（真错位）
+        assert _syntax_repair_candidates(
+            code, "SyntaxError: Unexpected token '}'", err_offset=50) == []
+        # err_offset 缺失（多行/字段缺席）→ 保守跳过验证，候选照旧
+        assert _syntax_repair_candidates(
+            code, "SyntaxError: Unexpected token '}'") != []
+
+    def test_deletion_candidates_with_matching_position(self):
+        code = "(function(){return 1}})()"
+        assert _delimiter_scan(code) == (["("], 21)  # 扫描错位=21，CDP 实测同为 21
+        assert _syntax_repair_candidates(
+            code, "SyntaxError: Unexpected token '}'", err_offset=21,
+        ) == ["(function(){return 1})()"]  # 删下标 21 的第二个 }，调用括号保留
+
+
+class TestDeletionPositionCrossValidation:
+    """review5 #1：删除类候选以 CDP exceptionDetails 出错位置交叉验证——
+    单行载荷的 lineNumber/columnNumber 即 0-based 字符偏移且精确指向错位
+    token（examples/debug_c2_exc_position_shape.py 于 Chrome 153 实证）。"""
+
+    @pytest.mark.asyncio
+    async def test_veto_on_position_mismatch_no_retry(self):
+        """regex 幻影场景：CDP 报 50（真错位），扫描报 ~31（/[)]/ 内的 )）
+        ——分叉即放弃删除候选（无重试），错误照常上抛并附失衡提示。"""
+        bs = _make_session()
+        bs.client.send.Runtime.evaluate = AsyncMock(return_value={
+            "exceptionDetails": {
+                "text": "Uncaught",
+                "exception": {"description": "SyntaxError: Unexpected token '}'"},
+                "lineNumber": 0, "columnNumber": 50,
+            },
+        })
+        with pytest.raises(RuntimeError, match="unbalanced braces/parens"):
+            await bs.evaluate("(function(){var s='x'.replace(/[)]/g,'');return s}})()")
+        assert bs.client.send.Runtime.evaluate.await_count == 1  # 无删除重试
+
+    @pytest.mark.asyncio
+    async def test_heal_with_matching_position(self):
+        """位置一致（扫描错位=CDP 列偏移=21）——删除候选放行并自愈成功。"""
+        bs = _make_session()
+        bs.client.send.Runtime.evaluate = AsyncMock(side_effect=[
+            {"exceptionDetails": {
+                "text": "Uncaught",
+                "exception": {"description": "SyntaxError: Unexpected token '}'"},
+                "lineNumber": 0, "columnNumber": 21}},
+            {"result": {"value": "1"}},
+        ])
+        out = await bs.evaluate("(function(){return 1}})()")
+        assert out == "1"
+
+    @pytest.mark.asyncio
+    async def test_position_absent_still_tries_deletion(self):
+        """exceptionDetails 无位置字段（旧桩/协议变体）——保守跳过验证，
+        删除候选照旧生成（兼容既有行为）。"""
+        bs = _make_session()
+        bs.client.send.Runtime.evaluate = AsyncMock(side_effect=[
+            {"exceptionDetails": {"text": "Uncaught", "exception": {
+                "description": "SyntaxError: Unexpected token '}'"}}},
+            {"result": {"value": "1"}},
+        ])
+        out = await bs.evaluate("(function(){return 1}})()")
+        assert out == "1"
+        assert bs.client.send.Runtime.evaluate.await_count == 2
