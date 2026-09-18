@@ -1,0 +1,154 @@
+{
+  "status": "complete",
+  "llm": {
+    "model": "glm-5.3"
+  },
+  "message": "Review complete: 3 finding(s) across 4 selected item(s).",
+  "summary": {
+    "files_reviewed": 4,
+    "comments": 3,
+    "total_tokens": 716250,
+    "input_tokens": 660173,
+    "output_tokens": 56077,
+    "cache_read_tokens": 471872,
+    "elapsed": "14m38s"
+  },
+  "tool_calls": {
+    "total": 24,
+    "by_tool": {
+      "code_comment": 2,
+      "code_search": 15,
+      "file_read": 7
+    },
+    "failure": 0,
+    "failure_by_tool": {},
+    "failure_details": []
+  },
+  "comments": [
+    {
+      "path": "src/tree_walker/browser/session.py",
+      "content": "删除类候选可被 regex 字面量「幻影闭合符」误导，删除后代码语法合法但语义已变，绕过 CDP 试跑把关并静默执行。docstring 声明的安全论证「候选由 CDP 编译试跑把关，不合法即丢弃」只过滤语法非法候选——而本分支是所有候选中唯一删改代码中段字符的：当 regex 字符类（如 `/[)]/g`、`/[\\]]/g`）位于真实多余闭合符之前时，`_delimiter_scan` 报告的首个错位闭合符落在 regex 内部而非真实错位处。以 C 轮 699 形态叠加 regex 为例：`(function(){var s=inp.replace(/[)]/g,'');return s}})()` → 候选①删 regex 内的 `)` 得 `replace(/[]/g,'')`（空字符类，JS 合法但永不匹配），候选②再删尾部真实错位 `}` 后整体合法 → 重试\"成功\"，replace 静默变 no-op。建议：① 优先利用 CDP exceptionDetails 携带的出错位置（lineNumber/columnNumber）定位应删除的闭合符，与扫描器错位位置交叉验证，不一致时放弃删除类候选；② 至少把删除类自愈的日志从 info（3728 行）提级为 warning 并记录删除下标与前后代码片段，使语义漂移可观测。",
+      "existing_code": "            work = work[:extra] + work[extra + 1:]\n            candidates.append(work)",
+      "start_line": 624,
+      "end_line": 625,
+      "thinking": "Verified:\n- Rules 3-6 only convert DOUBLE-quoted selector args to backticks — single-quoted `querySelectorAll('.data-grid tbody tr')` untouched ✓. So the lossless tests should pass.\n- Rule 1: `\\\\\"` → `\"` — test `test_double_escaped_still_normalized` expectations consistent ✓.\n- Rule 7: `/([\\n\\t\\r])/` raw control chars — the lossless samples use chr(92)+'n' (two chars), no raw newline ✓ (test asserts `\"\\n\" not in sample`).\n\nNow check test_evaluate.py sample: does it contain `\\\\\"` anywhere? The long sample: `\"return 'rows:'+out.length+' btn:\\\"'+(b?b.className:'none')+'\\\"'\"` — Python source `\\\"` inside a double-quoted Python string → actual char `\"` — the JS has `btn:\"` inside single-quoted strings — rule 1 matches `\\\"` sequences (backslash followed by quote)? Actual JS chars: `btn:\"` — no backslash → rule 1 no-op ✓. Rule 3-6 need double-quoted args — the JS uses single quotes ✓. Rule 2 needs `\\\\` double backslash — sample has single `\\n` in regex (bs+\"n\") ✓ no match. Rule 7 needs raw control char — none ✓. Sample preserved ✓.\n\nAlso the last part: `+' sample:'+/'$\\d+.!'/g.source` — contains `$` `{`? No `{}`. The scanner isn't applied to samples here. Fine.\n\nNow finalize. Confirmed issues:\n\n**Issue 1 (medium, bug)** — deletion branch phantom-regex corruption risk. Anchor: the deletion loop in `_syntax_repair_candidates`.\n\n**Issue 2 (low, documentation)** — `_delimiter_scan` docstring limitation list omits template literal `${}` interpolation. Given rules 3-6 actively produce backtick literals in payloads, the blind spot is common. Graceful degradation (missed repair, no corruption) → low.\n\nWait — should I also double check the claim in issue 2 that backtick template literals matter? Rules 3-6 convert `\"...\"` args to backticks — but those are plain template literals without `${}` typically (selector strings). `${}` interpolation blind spot only matters when LLM code itself uses `${expr}` — plausible in evaluate payloads building strings. OK, still valid but lower. Keep low.\n\nAnything else worth raising? Let me re-scan the hint block for a subtle bug: `_delimiter_scan(validated_code)` is called on EVERY failure (even non-syntax runtime errors) — performance trivial. But the condition checks `\"Unexpected end of input\" in err_text` — err_text is \"\" for non-compile-time errors → condition False → skip ✓. For runtime SyntaxError from eval/new Function inside code (description \"Uncaught SyntaxError:...\" with prefix) → compile_time False → err_text \"\" → no hint ✓ (good, matches the documented concern).\n\nOne more: for `use_call_fn=True` path, no self-heal, but hint can still fire — fine, hint is just a message.\n\nNow also verify the deletion branch returns `candidates` possibly EMPTY when first scan finds no misplaced closer but error was \"Unexpected token '}'\"... e.g. `}}` — scan: `}` empty stack → misplaced index 0 → delete → `}` → rescan misplaced → delete → `` → candidates [`}`, ``]. Second candidate is EMPTY STRING — retrying evaluate with empty expression! What happens? CDP evaluates empty expression → returns undefined, no exception → \"self-heal applied\" → returns \"undefined\"!! Wait — is that reachable? Code `}}` with error \"Unexpected token '}'\". Hmm — would the original review3 #6 comment mention this? Yes! The diff comment says: 「对照旧用例 `\"}}\"` 的空串候选在真机会\"自愈成功\"返回 undefined，断言路径不可达」 — they're AWARE that `\"}}\"` produces an empty-string candidate that \"succeeds\" returning undefined on a real machine. They changed the test to use `};var x=;` instead because the `\"}}\"` test's raise-path was unreachable on real machines. So the empty-candidate behavior is KNOWN and acknowledged — the empty expression compiles and returns undefined, silently swallowing the failure as a \"successful\" evaluate returning \"undefined\".\n\nHmm, is that acceptable? For input `}}` (pure garbage), self-heal \"succeeds\" by evaluating empty string → returns \"undefined\" to the agent. The agent gets \"undefined\" instead of an error. That's... arguably intentional-ish (they knowingly changed the test to acknowledge it). But is it a defect? For code like `}}` the agent's code was garbage; returning \"undefined\" masks the error. But any deletion that results in balanced code does that by design. The C-round data shows this heuristic fixes real failures. The empty-string edge is degenerate but acknowledged in comments. However — there's a subtler variant: code with REAL content where deletion of 2 closers leaves a VALID non-empty prefix. E.g. `}document.title` — scan: `}` misplaced at 0 → delete → `document.title` → balanced → candidate1 = `document.title` valid → executes. Is that wrong? The original `}document.title` — intent probably `document.title` — fix is right. Hard to call a defect.\n\nBut wait — should I flag that `work` can become empty string and the retry loop treats empty-expression success as a heal, silently returning \"undefined\"? The team explicitly knows (comment). Since it's acknowledged in the test comments as accepted behavior, reporting it would be noise. Skip.\n\nOne more potential: **deletion candidate could be IDENTICAL to original code**? No, always one char shorter.\n\n**Completion branch**: `candidates = [code + completion]` — if code already ends with part of completion... harmless.\n\nOK also — the debug script's classify() `break` on `//` — the OLD session code had the same break bug which review3 #2 fixed in session.py but the debug script still has `break`. It's a temp script whose results are already collected; consistency nit only. Skip (temp script).\n\nNow — anchor lines for comments:\n\nIssue 1 anchor (session.py deletion branch):\n```python\n        _, extra = _delimiter_scan(work)\n            if extra \u003c 0:\n                break\n            work = work[:extra] + work[extra + 1:]\n            candidates.append(work)\n```\nPick minimal consecutive lines: \n```\n            work = work[:extra] + work[extra + 1:]\n            candidates.append(work)\n```\nIndentation must match diff exactly. From the diff:\n```\n+        _, extra = _delimiter_scan(work)\n+        if extra \u003c 0:\n+            break\n+        work = work[:extra] + work[extra + 1:]\n+            candidates.append(work)\n```\nWait let me re-read the diff hunk:\n\n```\n+    if \"Unexpected token\" in err_text:\n+        # 多余闭合：删首个错位闭合符；候选②在①基础上再删下一个错位\n+        candidates = []\n+        work = code\n+        for _ in range(2):\n+            _, extra = _delimiter_scan(work)\n+            if extra \u003c 0:\n+                break\n+            work = work[:extra] + work[extra + 1:]\n+            candidates.append(work)\n         return candidates\n```\n\nSo anchor:\n```\n            work = work[:extra] + work[extra + 1:]\n            candidates.append(work)\n```\n(12 spaces indent — inside for loop: `for _` at 8, body at 12.) Yes.\n\nIssue 2 anchor (docstring of _delimiter_scan):\n```\n+    样本无一含块注释）。\n+    \"\"\"\n```\nBetter anchor on the limitation sentence:\n```\n    （无害——候选由 CDP 编译试跑把关，不合法即丢弃）：regex 字面量内的\n    ``[](){}`` 会被误计入栈；块注释 ``/* */`` 不识别（C 轮 22 个真实失败\n```\nUse those lines (without + prefix since existing_code should be the new code lines as they exist in the file).\n\nNow severity calibration:\n- Issue 1: medium (bug — silent semantic corruption possible; requires regex+closing-error co-occurrence; CDP gate doesn't cover semantics). Given the whole feature's safety argument rests on \"试错安全\", and the specific hole is demonstrable, medium feels right. Could argue high... The probability is lowish (needs regex char class with closer before real stray closer, and deletion yielding valid code). Medium.\n\n- Issue 2: low (documentation).\n\nAlso — one more look at the hint block for a potential issue: hint fires based on scan of `validated_code` — but for the `use_call_fn` path... fine.\n\nAnd the debug script — skip all.\n\nTests — all expectations verified consistent with implementation logic (traced by hand). test_p7 assertions verified. test_evaluate assertions verified against actual rules 1-7. No test issues to report.\n\nShould I double check `_make_session` exists in test_p7? Existing tests in the same class use it (from diff context, test_evaluate_self_heal tests existed with `_make_session`). Safe.\n\nFinal: 2 comments via code_comment, then task_done.",
+      "category": "bug",
+      "severity": "medium"
+    },
+    {
+      "path": "src/tree_walker/browser/session.py",
+      "content": "已知局限清单遗漏模板字面量 `${}` 插值：扫描器把整个反引号串（含 `${...}` 插值表达式）当字符串内容跳过，插值内的定界符不参与配平——插值内缺闭合时 EOF 分支返回空候选、失衡提示条件也不触发，自愈与提示双双静默失效（graceful miss，无改写风险，但与 regex/块注释两项已列局限同源，应一并列出）。且 `_validate_and_fix_javascript` 规则 3-6 会把双引号选择器参数主动转为反引号，模板字面量在本项目 evaluate 载荷中常见，该盲区命中概率不低。建议在 docstring 局限清单补充一句；若要消除盲区，可在遇到 `` ` `` 时对 `${` 至 `}` 区间做一次递归 `_delimiter_scan`。",
+      "existing_code": "    （无害——候选由 CDP 编译试跑把关，不合法即丢弃）：regex 字面量内的\n    ``[](){}`` 会被误计入栈；块注释 ``/* */`` 不识别（C 轮 22 个真实失败\n    样本无一含块注释）。",
+      "start_line": 513,
+      "end_line": 515,
+      "thinking": "Verified:\n- Rules 3-6 only convert DOUBLE-quoted selector args to backticks — single-quoted `querySelectorAll('.data-grid tbody tr')` untouched ✓. So the lossless tests should pass.\n- Rule 1: `\\\\\"` → `\"` — test `test_double_escaped_still_normalized` expectations consistent ✓.\n- Rule 7: `/([\\n\\t\\r])/` raw control chars — the lossless samples use chr(92)+'n' (two chars), no raw newline ✓ (test asserts `\"\\n\" not in sample`).\n\nNow check test_evaluate.py sample: does it contain `\\\\\"` anywhere? The long sample: `\"return 'rows:'+out.length+' btn:\\\"'+(b?b.className:'none')+'\\\"'\"` — Python source `\\\"` inside a double-quoted Python string → actual char `\"` — the JS has `btn:\"` inside single-quoted strings — rule 1 matches `\\\"` sequences (backslash followed by quote)? Actual JS chars: `btn:\"` — no backslash → rule 1 no-op ✓. Rule 3-6 need double-quoted args — the JS uses single quotes ✓. Rule 2 needs `\\\\` double backslash — sample has single `\\n` in regex (bs+\"n\") ✓ no match. Rule 7 needs raw control char — none ✓. Sample preserved ✓.\n\nAlso the last part: `+' sample:'+/'$\\d+.!'/g.source` — contains `$` `{`? No `{}`. The scanner isn't applied to samples here. Fine.\n\nNow finalize. Confirmed issues:\n\n**Issue 1 (medium, bug)** — deletion branch phantom-regex corruption risk. Anchor: the deletion loop in `_syntax_repair_candidates`.\n\n**Issue 2 (low, documentation)** — `_delimiter_scan` docstring limitation list omits template literal `${}` interpolation. Given rules 3-6 actively produce backtick literals in payloads, the blind spot is common. Graceful degradation (missed repair, no corruption) → low.\n\nWait — should I also double check the claim in issue 2 that backtick template literals matter? Rules 3-6 convert `\"...\"` args to backticks — but those are plain template literals without `${}` typically (selector strings). `${}` interpolation blind spot only matters when LLM code itself uses `${expr}` — plausible in evaluate payloads building strings. OK, still valid but lower. Keep low.\n\nAnything else worth raising? Let me re-scan the hint block for a subtle bug: `_delimiter_scan(validated_code)` is called on EVERY failure (even non-syntax runtime errors) — performance trivial. But the condition checks `\"Unexpected end of input\" in err_text` — err_text is \"\" for non-compile-time errors → condition False → skip ✓. For runtime SyntaxError from eval/new Function inside code (description \"Uncaught SyntaxError:...\" with prefix) → compile_time False → err_text \"\" → no hint ✓ (good, matches the documented concern).\n\nOne more: for `use_call_fn=True` path, no self-heal, but hint can still fire — fine, hint is just a message.\n\nNow also verify the deletion branch returns `candidates` possibly EMPTY when first scan finds no misplaced closer but error was \"Unexpected token '}'\"... e.g. `}}` — scan: `}` empty stack → misplaced index 0 → delete → `}` → rescan misplaced → delete → `` → candidates [`}`, ``]. Second candidate is EMPTY STRING — retrying evaluate with empty expression! What happens? CDP evaluates empty expression → returns undefined, no exception → \"self-heal applied\" → returns \"undefined\"!! Wait — is that reachable? Code `}}` with error \"Unexpected token '}'\". Hmm — would the original review3 #6 comment mention this? Yes! The diff comment says: 「对照旧用例 `\"}}\"` 的空串候选在真机会\"自愈成功\"返回 undefined，断言路径不可达」 — they're AWARE that `\"}}\"` produces an empty-string candidate that \"succeeds\" returning undefined on a real machine. They changed the test to use `};var x=;` instead because the `\"}}\"` test's raise-path was unreachable on real machines. So the empty-candidate behavior is KNOWN and acknowledged — the empty expression compiles and returns undefined, silently swallowing the failure as a \"successful\" evaluate returning \"undefined\".\n\nHmm, is that acceptable? For input `}}` (pure garbage), self-heal \"succeeds\" by evaluating empty string → returns \"undefined\" to the agent. The agent gets \"undefined\" instead of an error. That's... arguably intentional-ish (they knowingly changed the test to acknowledge it). But is it a defect? For code like `}}` the agent's code was garbage; returning \"undefined\" masks the error. But any deletion that results in balanced code does that by design. The C-round data shows this heuristic fixes real failures. The empty-string edge is degenerate but acknowledged in comments. However — there's a subtler variant: code with REAL content where deletion of 2 closers leaves a VALID non-empty prefix. E.g. `}document.title` — scan: `}` misplaced at 0 → delete → `document.title` → balanced → candidate1 = `document.title` valid → executes. Is that wrong? The original `}document.title` — intent probably `document.title` — fix is right. Hard to call a defect.\n\nBut wait — should I flag that `work` can become empty string and the retry loop treats empty-expression success as a heal, silently returning \"undefined\"? The team explicitly knows (comment). Since it's acknowledged in the test comments as accepted behavior, reporting it would be noise. Skip.\n\nOne more potential: **deletion candidate could be IDENTICAL to original code**? No, always one char shorter.\n\n**Completion branch**: `candidates = [code + completion]` — if code already ends with part of completion... harmless.\n\nOK also — the debug script's classify() `break` on `//` — the OLD session code had the same break bug which review3 #2 fixed in session.py but the debug script still has `break`. It's a temp script whose results are already collected; consistency nit only. Skip (temp script).\n\nNow — anchor lines for comments:\n\nIssue 1 anchor (session.py deletion branch):\n```python\n        _, extra = _delimiter_scan(work)\n            if extra \u003c 0:\n                break\n            work = work[:extra] + work[extra + 1:]\n            candidates.append(work)\n```\nPick minimal consecutive lines: \n```\n            work = work[:extra] + work[extra + 1:]\n            candidates.append(work)\n```\nIndentation must match diff exactly. From the diff:\n```\n+        _, extra = _delimiter_scan(work)\n+        if extra \u003c 0:\n+            break\n+        work = work[:extra] + work[extra + 1:]\n+            candidates.append(work)\n```\nWait let me re-read the diff hunk:\n\n```\n+    if \"Unexpected token\" in err_text:\n+        # 多余闭合：删首个错位闭合符；候选②在①基础上再删下一个错位\n+        candidates = []\n+        work = code\n+        for _ in range(2):\n+            _, extra = _delimiter_scan(work)\n+            if extra \u003c 0:\n+                break\n+            work = work[:extra] + work[extra + 1:]\n+            candidates.append(work)\n         return candidates\n```\n\nSo anchor:\n```\n            work = work[:extra] + work[extra + 1:]\n            candidates.append(work)\n```\n(12 spaces indent — inside for loop: `for _` at 8, body at 12.) Yes.\n\nIssue 2 anchor (docstring of _delimiter_scan):\n```\n+    样本无一含块注释）。\n+    \"\"\"\n```\nBetter anchor on the limitation sentence:\n```\n    （无害——候选由 CDP 编译试跑把关，不合法即丢弃）：regex 字面量内的\n    ``[](){}`` 会被误计入栈；块注释 ``/* */`` 不识别（C 轮 22 个真实失败\n```\nUse those lines (without + prefix since existing_code should be the new code lines as they exist in the file).\n\nNow severity calibration:\n- Issue 1: medium (bug — silent semantic corruption possible; requires regex+closing-error co-occurrence; CDP gate doesn't cover semantics). Given the whole feature's safety argument rests on \"试错安全\", and the specific hole is demonstrable, medium feels right. Could argue high... The probability is lowish (needs regex char class with closer before real stray closer, and deletion yielding valid code). Medium.\n\n- Issue 2: low (documentation).\n\nAlso — one more look at the hint block for a potential issue: hint fires based on scan of `validated_code` — but for the `use_call_fn` path... fine.\n\nAnd the debug script — skip all.\n\nTests — all expectations verified consistent with implementation logic (traced by hand). test_p7 assertions verified. test_evaluate assertions verified against actual rules 1-7. No test issues to report.\n\nShould I double check `_make_session` exists in test_p7? Existing tests in the same class use it (from diff context, test_evaluate_self_heal tests existed with `_make_session`). Safe.\n\nFinal: 2 comments via code_comment, then task_done.",
+      "category": "documentation",
+      "severity": "low"
+    },
+    {
+      "path": "src/tree_walker/browser/session.py",
+      "content": "行注释判定会被 regex 字面量的转义斜杠伪造，正则之后的代码整体退出扫描。`\\/` 是 JS 正则转义 `/` 的标准写法，`/https?:\\/\\//g` 这类 URL 匹配正则（web agent evaluate 载荷高频形态，也是 issue #185 的 544 明确点名的 regex literal 形态）中，扫描器在非字符串区对 `\\` 无任何分支处理（直接 k+=1 落到被转义字符），于是被转义的 `/` 与正则收尾 `/` 相邻成 `//` → 误判为行注释起点 → 单行载荷 `nl \u003c 0` 直接 break，正则之后的所有定界符不再参与配平。后果与已确认的两项局限（regex 幻影闭合符误导删除、模板 `${}` 插值跳过）机制均不同：① EOF 分支栈被高估（正则后的闭合符没弹出），补全候选必被 CDP 丢弃，`+ \")`\" 最小候选也必败——自愈静默失效；② 真实错位闭合符位于正则之后时，删除分支扫不到 extra，不产候选；③ 失衡提示条件 `bool(stack) or extra \u003e= 0` 同样不触发——恰是该提示最需要的场景。docstring 的已知局限清单（regex 括号误计、块注释）未列此项。建议非字符串区对 `\\` 也成对跳过：合法的非字符串 `\\x` 只出现在 regex 字面量（`\\/` `\\]` `\\)` `\\d` 等），成对跳过恰好正确跨过转义字符，裸 `\\` 在字符串/正则外本就是非法 JS，对启发式扫描无副作用（还能顺带减少 `[\\]]` 类幻影括号误计）。",
+      "suggestion_code": "        elif c == \"\\\\\":\n            # regex 字面量转义（\\/ \\] \\)）：非字符串区成对跳过，\n            # 防 /https?:\\\\/\\\\//g 的被转义 / 与收尾 / 相邻被误判为行注释\n            k += 2\n            continue\n        elif c == \"/\" and k + 1 \u003c n and code[k + 1] == \"/\":\n            # 行注释：跳到行尾继续扫（review3 #2——直接 break 隐含单行代码假设，\n            # 多行 evaluate 的注释后行仍有可执行定界符会被整体跳过）\n            nl = code.find(\"\\n\", k)",
+      "existing_code": "        elif c == \"/\" and k + 1 \u003c n and code[k + 1] == \"/\":\n            # 行注释：跳到行尾继续扫（review3 #2——直接 break 隐含单行代码假设，\n            # 多行 evaluate 的注释后行仍有可执行定界符会被整体跳过）\n            nl = code.find(\"\\n\", k)",
+      "start_line": 531,
+      "end_line": 534,
+      "thinking": "No test covers escaped-slash regex. My analysis:\n\n- `/https?:\\/\\//g`（或更简单的 `/foo\\//`）——scanner 在非字符串区遇到 `\\` 时无任何分支处理（`k += 1` 落空跳过），随后第一个被转义的 `/` 与正则收尾 `/` 相邻 → `code[k+1] == \"/\"` 成立 → 误判为行注释 → `find(\"\\n\") \u003c 0` 时直接 break，正则之后的全部定界符不参与扫描。\n\n影响链路（都验证过）：\n1. `_syntax_repair_candidates` EOF 分支：栈高估 → 补全错误 → CDP 丢弃，自愈静默失效；最小 `)` 候选同样必败。\n2. `Unexpected token` 删除分支：真实错位闭合符在正则之后 → 扫不到 → 无候选。\n3. evaluate 提示路径：失衡全在正则之后 → stack 空、extra=-1 → 不给提示。\n4. docstring 已知局限清单未列。\n\n且这正是 issue #185 关注的「regex 字面量」载荷形态（C 轮 544 明确提到 regex literal），盲区命中概率不低。\n\n修复建议：非字符串区对 `\\` 也成对跳过。该建议安全性：字符串内已有同样处理；非字符串区合法的 `\\x` 只出现在 regex 字面量（`\\/` `\\]` `\\)` `\\d` 等），成对跳过恰好正确跨过转义字符，还能顺带减少 `[\\]]` 类幻影括号；裸 `\\` 在字符串/正则外本就非法 JS，跳过无副作用。\n\n报告为 medium / bug。",
+      "category": "bug",
+      "severity": "medium"
+    }
+  ],
+  "groups": [
+    {
+      "label": "Browser session JS evaluation and form interaction fixes (session changes, debug script, and tests)",
+      "files": [
+        "examples/debug_c2_eval_failure_shapes.py",
+        "src/tree_walker/browser/session.py",
+        "tests/test_evaluate.py",
+        "tests/test_p7_form_interaction_fixes.py"
+      ]
+    }
+  ],
+  "warnings": [
+    {
+      "file": "src/tree_walker/browser/session.py",
+      "message": "comment filed against examples/debug_c2_eval_failure_shapes.py,src/tree_walker/browser/session.py,tests/test_evaluate.py,tests/test_p7_form_interaction_fixes.py describes code in src/tree_walker/browser/session.py; re-filed",
+      "type": "comment_refiled"
+    }
+  ],
+  "session_id": "32ff7a06-dfe0-4347-8d33-1d0c86713b05",
+  "manifest": {
+    "schema_version": "ocr.run-manifest/v1",
+    "run_id": "32ff7a06-dfe0-4347-8d33-1d0c86713b05",
+    "operation": "review",
+    "terminal_state": "complete",
+    "repository": {
+      "identity_sha256": "2868bcfb033292e0d47631dc911d0e36e5dcedaf9e0bcacffe6c4716bb93dfda"
+    },
+    "input": {
+      "mode": "range",
+      "requested_from": "master",
+      "requested_head": "fix/185-c2-balance-repair",
+      "resolved_base": "9ffe21c35645f2e3e4405b784b18391f0eacdcce",
+      "resolved_head": "08782f3b3492b39d7a19d9a43ca027271ae4a787",
+      "exact_range": "9ffe21c35645f2e3e4405b784b18391f0eacdcce..08782f3b3492b39d7a19d9a43ca027271ae4a787",
+      "source_artifact_sha256": "651d39493eaacd51afa3d0932683446b11edb752316ee0a1196400725148588a"
+    },
+    "execution": {
+      "ocr_version": "v1.12.5",
+      "model": "glm-5.3",
+      "configured_concurrency": 8,
+      "rule_config_sha256": "ddb40005eb732cb8b37d8d3dc1acb82f3aa51fded408c899a092c10349c369c4",
+      "runtime_config_sha256": "841fe9ad288d2dd9efc84c443193c492ef06b26edf31ff5f5a1b01637fef2b0c"
+    },
+    "coverage": {
+      "selected": [
+        {
+          "item_id": "614508a236a8327d371cc12c9ced54da84022590ae9fac9d344d226ed0e6108a",
+          "path": "examples/debug_c2_eval_failure_shapes.py",
+          "fingerprint": "f095d12210730cffc6e5e2c4c6b2ac3efafb083836c8355594ade34afbfea99d"
+        },
+        {
+          "item_id": "6d1cd586e9b8ae0df91a1905ca93db387118eed5f0366496514c8e4211c01609",
+          "path": "tests/test_p7_form_interaction_fixes.py",
+          "fingerprint": "f0aacbf1ccf4629fb4141e5cb547c509e98a072f022434a1eaecba52e2e0d9f3"
+        },
+        {
+          "item_id": "9932efe4e9494be618ed91e3e77812ba901e8403cccfa6417c9da7c83e77bfbd",
+          "path": "src/tree_walker/browser/session.py",
+          "fingerprint": "0988d40965f90cd1916bb99457332d85fe9a4823343ba0936934b98fd04e806d"
+        },
+        {
+          "item_id": "bcc98cc9330f01b09135ec4acd90994e962ac2fd65860f25a1d3040c9ed4fe30",
+          "path": "tests/test_evaluate.py",
+          "fingerprint": "445c2b3229fb41d5b909bc35e2749b5c24012d4ad708b6111f22df72bb456612"
+        }
+      ],
+      "completed": [
+        {
+          "item_id": "614508a236a8327d371cc12c9ced54da84022590ae9fac9d344d226ed0e6108a",
+          "path": "examples/debug_c2_eval_failure_shapes.py",
+          "fingerprint": "f095d12210730cffc6e5e2c4c6b2ac3efafb083836c8355594ade34afbfea99d"
+        },
+        {
+          "item_id": "6d1cd586e9b8ae0df91a1905ca93db387118eed5f0366496514c8e4211c01609",
+          "path": "tests/test_p7_form_interaction_fixes.py",
+          "fingerprint": "f0aacbf1ccf4629fb4141e5cb547c509e98a072f022434a1eaecba52e2e0d9f3"
+        },
+        {
+          "item_id": "9932efe4e9494be618ed91e3e77812ba901e8403cccfa6417c9da7c83e77bfbd",
+          "path": "src/tree_walker/browser/session.py",
+          "fingerprint": "0988d40965f90cd1916bb99457332d85fe9a4823343ba0936934b98fd04e806d"
+        },
+        {
+          "item_id": "bcc98cc9330f01b09135ec4acd90994e962ac2fd65860f25a1d3040c9ed4fe30",
+          "path": "tests/test_evaluate.py",
+          "fingerprint": "445c2b3229fb41d5b909bc35e2749b5c24012d4ad708b6111f22df72bb456612"
+        }
+      ],
+      "reused": [],
+      "failed": [],
+      "waived": []
+    },
+    "elapsed_ms": 877899
+  }
+}
