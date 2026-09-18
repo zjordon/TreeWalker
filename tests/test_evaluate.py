@@ -729,7 +729,9 @@ class TestValidateAndFixJavascriptLossless:
 
 	def test_long_regex_nested_quotes_sample_untouched(self):
 		# 反斜杠一律 chr(92) 显式构造（review3 #3：裸 \d 触发 SyntaxWarning，
-		# 且 or-条件恒等价于 >300）——regex 均为单反斜杠（JSON 解码后的正确形态）
+		# 且 or-条件恒等价于 >300）——regex 均为单反斜杠（JSON 解码后的正确形态）。
+		# review6 #4：对齐重开验收口径">500 字符含 regex 与嵌套引号"——追加一段
+		# querySelectorAll/replace 链（C 轮被指控"传输截断"的 544/549 均为长代码）
 		bs = chr(92)
 		sample = (
 			"((function(){var out=[];"
@@ -737,10 +739,14 @@ class TestValidateAndFixJavascriptLossless:
 			"out.push(r.innerText.replace(/" + bs + "n+/g,' | '))});"
 			"var b=[...document.querySelectorAll('button')]"
 			".find(x=>x.textContent.trim()==='Edit Configurations' && x.title!=\"\");"
+			"var cells=[...document.querySelectorAll('td[data-column=\"qty\"]')]"
+			".map(function(c){return c.innerText.replace(/[" + bs + "s" + bs + "]/g,'')"
+			".replace(/" + bs + "d+" + bs + "." + bs + "d?/g,'N')});"
 			"return 'rows:'+out.length+' btn:\"'+(b?b.className:'none')+'\"'"
-			"+' sample:'+/'$" + bs + "d+" + bs + ".!'/g.source})()"
+			"+' sample:'+/'$" + bs + "d+" + bs + ".!'/g.source"
+			"+' cells:'+JSON.stringify(cells.slice(0,5))})()"
 		)
-		assert len(sample) > 300  # 长样本（实测约 345 字符，覆盖嵌套引号/regex 形态）
+		assert len(sample) > 500  # issue #185 重开验收口径：>500 字符含 regex 与嵌套引号
 		assert _validate_and_fix_javascript(sample) == sample
 
 	def test_single_quotes_containing_double_quotes_untouched(self):

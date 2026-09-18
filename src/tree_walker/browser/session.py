@@ -592,10 +592,11 @@ def _syntax_repair_candidates(
     「幻影闭合符」（如 ``/[)]/g``）会让扫描器把错位报在 regex 内部——删除后
     代码可能语法合法但语义已变（空字符类变 no-op），绕过编译试跑把关静默执行。
     以 CDP exceptionDetails 的出错位置（单行载荷的 0-based 列偏移，
-    ``err_offset``）交叉验证：与扫描器错位下标不一致时放弃全部删除类候选
-    （探针实证 examples/debug_c2_exc_position_shape.py：Chrome 对多余闭合报的
-    列偏移精确指向真实错位 token，幻影场景下两者必然分叉）。err_offset 缺失
-    （多行/字段缺席）时保守跳过验证。
+    ``err_offset``）交叉验证：无错位、位置分叉、或**无位置证据（多行/字段
+    缺席）一律 fail-safe 放弃删除类候选**（探针实证
+    examples/debug_c2_exc_position_shape.py：Chrome 对多余闭合报的列偏移精确
+    指向真实错位 token，幻影场景下两者必然分叉；跳过验证的 fail-open 恰是
+    幻影防护要拦的方向——review6 #3）。
 
     其余错误返回空列表（不自愈，原样抛出）。
     """
@@ -636,11 +637,13 @@ def _syntax_repair_candidates(
         return candidates
     if "Unexpected token" in err_text:
         # 多余闭合：删首个错位闭合符；候选②在①基础上再删下一个错位。
-        # review5 #1：先与 CDP 出错位置交叉验证——不一致即幻影（regex 内的
-        # 误报错位），放弃删除类候选（删除中段字符语义漂移风险不可由编译
-        # 试跑把关），仅保留提示路径。
+        # review5 #1 + review6 #3：与 CDP 出错位置交叉验证——分叉即幻影（regex
+        # 内的误报错位）；**无位置证据（多行/字段缺席）时 fail-safe 同样放弃**：
+        # 跳过验证的实际效果是放行风险最高的操作而非放弃它（多行+regex+真错位
+        # 组合下候选②可在"删幻影+删真错位"后编译通过、regex 漂移为空字符类）。
+        # 补全类候选只追加尾部、失衡提示路径均不受影响。
         _, first_extra = _delimiter_scan(code)
-        if err_offset is not None and first_extra >= 0 and err_offset != first_extra:
+        if first_extra < 0 or err_offset is None or err_offset != first_extra:
             return []
         candidates = []
         work = code
@@ -3739,7 +3742,7 @@ return (async function(){
             # lineNumber/columnNumber 即 0-based 字符偏移且精确指向错位 token
             #（探针 examples/debug_c2_exc_position_shape.py 于 Chrome 153 实证）；
             # 供删除类候选交叉验证否决 regex 幻影闭合符。多行/字段缺席 → None
-            #（保守跳过验证，候选照旧生成）。
+            #（review6 #3：候选函数对 None fail-safe——无位置证据不删中段字符）。
             _ln = exc.get("lineNumber")
             _col = exc.get("columnNumber")
             err_offset = (

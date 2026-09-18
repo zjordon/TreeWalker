@@ -131,13 +131,15 @@ class TestEvaluateSelfHeal:
 
     @pytest.mark.asyncio
     async def test_token_error_with_imbalance_hint_real_machine_path(self):
-        """review3 #6：删除候选在真机也必败的输入（`};var x=;` 的候选
-        `;var x=;` 仍是语法错）——带失衡提示的抛错路径真机可达（对照旧用例
-        `"}}"` 的空串候选在真机会"自愈成功"返回 undefined，断言路径不可达）。"""
+        """review3 #6 + review6 #3：删除候选带匹配位置证据且真机也必败的输入
+        （`};var x=;` 扫描错位=0=CDP 列偏移，候选 `;var x=;` 仍是语法错）——
+        带失衡提示的抛错路径真机可达（对照旧用例 `"}}"` 的空串候选在真机会
+        "自愈成功"返回 undefined，断言路径不可达）。"""
         bs = _make_session()
         bs.client.send.Runtime.evaluate = AsyncMock(side_effect=[
             {"exceptionDetails": {"text": "Uncaught", "exception": {
-                "description": "SyntaxError: Unexpected token '}'"}}},
+                "description": "SyntaxError: Unexpected token '}'"},
+                "lineNumber": 0, "columnNumber": 0}},
             {"exceptionDetails": {"text": "Uncaught", "exception": {
                 "description": "SyntaxError: Unexpected token ';'"}}},  # 删除候选仍败
         ])
@@ -161,11 +163,14 @@ class TestEvaluateSelfHeal:
 
     @pytest.mark.asyncio
     async def test_extra_closer_candidate_heals(self):
-        """c2 端到端：多余闭合（C 轮 699 形态）——删首个错位闭合符后重试成功。"""
+        """c2 端到端：多余闭合（C 轮 699 形态）——CDP 位置（列偏移 49=扫描
+        错位）交叉验证通过，删首个错位闭合符后重试成功（review6 #3：无位置
+        字段的桩在 fail-safe 下不再触发删除）。"""
         bs = _make_session()
         bs.client.send.Runtime.evaluate = AsyncMock(side_effect=[
             {"exceptionDetails": {"text": "Uncaught", "exception": {
-                "description": "SyntaxError: Unexpected token '}'"}}},
+                "description": "SyntaxError: Unexpected token '}'"},
+                "lineNumber": 0, "columnNumber": 49}},
             {"result": {"value": "not found"}},
         ])
         out = await bs.evaluate(
@@ -317,19 +322,24 @@ class TestBalanceRepairCandidates:
         assert cands[1] == "((function(){var a=1;)"
 
     def test_extra_closer_two_candidates(self):
-        # 双错位：候选①删首个错位（仍剩一个），候选②再删到平衡
+        # 双错位：候选①删首个错位（仍剩一个），候选②再删到平衡。
+        # review6 #3：删除类候选须位置证据（扫描错位=21，CDP 同报 21）
         cands = _syntax_repair_candidates(
-            "(function(){return 1}}})", "SyntaxError: Unexpected token '}'")
+            "(function(){return 1}}})", "SyntaxError: Unexpected token '}'",
+            err_offset=21)
         assert cands == [
             "(function(){return 1}})",
             "(function(){return 1})",
         ]
 
     def test_single_extra_closer_one_candidate(self):
-        # 单错位：删除后即平衡，不再产第二候选
+        # 单错位：删除后即平衡，不再产第二候选；无位置证据 → fail-safe 零候选
         cands = _syntax_repair_candidates(
-            "(function(){return 1}})", "SyntaxError: Unexpected token '}'")
+            "(function(){return 1}})", "SyntaxError: Unexpected token '}'",
+            err_offset=21)
         assert cands == ["(function(){return 1})"]
+        assert _syntax_repair_candidates(
+            "(function(){return 1}})", "SyntaxError: Unexpected token '}'") == []
 
     def test_bare_return_plus_imbalance_composed_candidate(self):
         # C 轮 698/700 形态：裸 return 叠加失衡——组合候选（补全+包裹）在后
@@ -358,7 +368,6 @@ class TestBalanceRepairCandidates:
     def test_line_comment_skips_to_eol_not_eof(self):
         """review3 #2：多行代码中行注释只跳到行尾——直接 break 会把注释后
         各行的可执行定界符整体跳过（EOF 分支因 stack 为空漏修）。"""
-        from tree_walker.browser.session import _delimiter_scan
         code = "(function(){ // open modal\nvar a=1;\n})("
         stack, extra = _delimiter_scan(code)
         assert stack == ["("] and extra < 0
@@ -366,7 +375,6 @@ class TestBalanceRepairCandidates:
     def test_regex_escaped_slash_not_line_comment(self):
         """review5 #3：/https?:\/\//g 的被转义 / 与收尾 / 相邻不得误判为行
         注释——否则正则之后代码整体退出扫描，自愈候选与失衡提示三路全灭。"""
-        from tree_walker.browser.session import _delimiter_scan
         bs92 = chr(92)
         balanced = (
             "(function(){var m='x'.match(/https?:" + bs92 + "/" + bs92
@@ -390,9 +398,10 @@ class TestBalanceRepairCandidates:
         assert 0 <= phantom_extra != 50  # 扫描报幻影位，CDP 实测报 50（真错位）
         assert _syntax_repair_candidates(
             code, "SyntaxError: Unexpected token '}'", err_offset=50) == []
-        # err_offset 缺失（多行/字段缺席）→ 保守跳过验证，候选照旧
+        # review6 #3：err_offset 缺失（多行/字段缺席）→ fail-safe 同样放弃——
+        # 无位置证据时放行删除恰是幻影防护要拦的方向
         assert _syntax_repair_candidates(
-            code, "SyntaxError: Unexpected token '}'") != []
+            code, "SyntaxError: Unexpected token '}'") == []
 
     def test_deletion_candidates_with_matching_position(self):
         code = "(function(){return 1}})()"
@@ -438,15 +447,17 @@ class TestDeletionPositionCrossValidation:
         assert out == "1"
 
     @pytest.mark.asyncio
-    async def test_position_absent_still_tries_deletion(self):
-        """exceptionDetails 无位置字段（旧桩/协议变体）——保守跳过验证，
-        删除候选照旧生成（兼容既有行为）。"""
+    async def test_position_absent_fails_safe_no_deletion(self):
+        """review6 #3：exceptionDetails 无位置字段（多行载荷/协议变体）——
+        fail-safe 放弃删除类候选（无重试），错误照常上抛并附失衡提示；
+        跳过验证的 fail-open 恰是幻影防护要拦的方向。"""
         bs = _make_session()
-        bs.client.send.Runtime.evaluate = AsyncMock(side_effect=[
-            {"exceptionDetails": {"text": "Uncaught", "exception": {
-                "description": "SyntaxError: Unexpected token '}'"}}},
-            {"result": {"value": "1"}},
-        ])
-        out = await bs.evaluate("(function(){return 1}})()")
-        assert out == "1"
-        assert bs.client.send.Runtime.evaluate.await_count == 2
+        bs.client.send.Runtime.evaluate = AsyncMock(return_value={
+            "exceptionDetails": {
+                "text": "Uncaught",
+                "exception": {"description": "SyntaxError: Unexpected token '}'"},
+            },
+        })
+        with pytest.raises(RuntimeError, match="unbalanced braces/parens"):
+            await bs.evaluate("(function(){return 1}})()")
+        assert bs.client.send.Runtime.evaluate.await_count == 1  # 无删除重试
