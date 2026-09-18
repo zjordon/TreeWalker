@@ -3756,7 +3756,12 @@ return (async function(){
             err_offset = (
                 _col
                 if (isinstance(_ln, int) and _ln == 0
-                    and isinstance(_col, int) and 0 <= _col <= len(validated_code))
+                    and isinstance(_col, int) and 0 <= _col <= len(validated_code)
+                    # review8 #2：CDP 列偏移按 UTF-16 码元计，载荷含 astral 字符
+                    #（emoji 等，按钮文本断言常见）时与 Python 码点下标系统性错位
+                    # ——非 ASCII 一律视为无位置证据（fail-safe，防漂移量恰抵消时
+                    # 幻影错位被错误放行）
+                    and validated_code.isascii())
                 else None
             )
             # P7 form_interaction 建议5：已知 SyntaxError 的确定性自愈（仅无输入路径——

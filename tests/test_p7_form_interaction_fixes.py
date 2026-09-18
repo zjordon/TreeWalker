@@ -478,3 +478,20 @@ class TestDeletionPositionCrossValidation:
             "(function(){return 1}}})", "SyntaxError: Unexpected token '}'",
             err_offset=21,
         ) == ["(function(){return 1}})", "(function(){return 1})"]
+
+    @pytest.mark.asyncio
+    async def test_non_ascii_payload_no_position_evidence(self):
+        """review8 #2：CDP 列偏移按 UTF-16 码元计——含 astral 字符（emoji）的
+        载荷与 Python 码点下标系统性错位，漂移量恰抵消时幻影错位可能被错误
+        放行——非 ASCII 一律视为无位置证据（fail-safe 弃删，仅余提示路径）。"""
+        bs = _make_session()
+        bs.client.send.Runtime.evaluate = AsyncMock(return_value={
+            "exceptionDetails": {
+                "text": "Uncaught",
+                "exception": {"description": "SyntaxError: Unexpected token '}'"},
+                "lineNumber": 0, "columnNumber": 24,
+            },
+        })
+        with pytest.raises(RuntimeError, match="unbalanced braces/parens"):
+            await bs.evaluate("var t='😀';(function(){return 1}})()")
+        assert bs.client.send.Runtime.evaluate.await_count == 1  # 无删除重试

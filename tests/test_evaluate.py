@@ -27,6 +27,7 @@ from pydantic import ValidationError
 
 from tree_walker.browser.session import (
 	BrowserSession,
+	_delimiter_scan,
 	_format_eval_exception,
 	_normalize_eval_result,
 	_validate_and_fix_javascript,
@@ -740,14 +741,17 @@ class TestValidateAndFixJavascriptLossless:
 			"var b=[...document.querySelectorAll('button')]"
 			".find(x=>x.textContent.trim()==='Edit Configurations' && x.title!=\"\");"
 			"var cells=[...document.querySelectorAll('td[data-column=\"qty\"]')]"
-			".map(function(c){return c.innerText.replace(/[" + bs + "s" + bs + "]/g,'')"
+			".map(function(c){return c.innerText.replace(/[" + bs + "s]/g,'')"
 			".replace(/" + bs + "d+" + bs + "." + bs + "d?/g,'N')});"
 			"return 'rows:'+out.length+' btn:\"'+(b?b.className:'none')+'\"'"
 			"+' sample:'+/'$" + bs + "d+" + bs + ".!'/g.source"
-			"+' cells:'+JSON.stringify(cells.slice(0,5))})()"
+			"+' cells:'+JSON.stringify(cells.slice(0,5))})())"
 		)
 		assert len(sample) > 500  # issue #185 重开验收口径：>500 字符含 regex 与嵌套引号
 		assert _validate_and_fix_javascript(sample) == sample
+		# review8 #1：样本须是可执行 JS（验收口径"原样到达并执行"）——定界符
+		# 平衡 + 已在真机 Chrome 编译执行验证（无异常，返回字符串）
+		assert _delimiter_scan(sample) == ([], -1)
 
 	def test_single_quotes_containing_double_quotes_untouched(self):
 		# 嵌套引号：单引号串内裸双引号（无反斜杠转义 → 不触规则1）
