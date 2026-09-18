@@ -3742,9 +3742,15 @@ return (async function(){
                 _hint_stack, _hint_extra = _delimiter_scan(validated_code)
                 if (("Unexpected end of input" in err_text or "Unexpected token" in err_text)
                         and (bool(_hint_stack) or _hint_extra >= 0)):
-                    msg += ("\n⚠️ The code has unbalanced braces/parens (this V8 "
-                            "error means delimiters never matched, not that text "
-                            "was cut). Check that an IIFE prefix `((function(){...` "
+                    # review4 #1：扫描有已知局限（regex 字面量幻影闭合符）且
+                    # max_tokens 截断同样产生 EOF+缺闭合栈——"not that text was
+                    # cut" 类绝对断言会事实性错误；按 review3 #1 的"无证据不
+                    # 断言"标准对称适用于有失衡时：盖然性表述 + 兜底建议。
+                    msg += ("\n⚠️ The code likely has unbalanced braces/parens "
+                            "(in measured history this V8 error almost always "
+                            "means delimiters never matched rather than transport "
+                            "truncation — but note regex literals can also trip "
+                            "this check). Verify an IIFE prefix `((function(){...` "
                             "has its matching `))` / `)())` suffix; keep code under "
                             "~300 chars or split into several evaluate calls.")
                 raise RuntimeError(msg)
