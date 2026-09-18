@@ -728,16 +728,19 @@ class TestValidateAndFixJavascriptLossless:
     样本取 C 轮真实代码形态：544 的 replace 链、549 的单双引号混排）。"""
 
     def test_long_regex_nested_quotes_sample_untouched(self):
+        # 反斜杠一律 chr(92) 显式构造（review3 #3：裸 \d 触发 SyntaxWarning，
+        # 且 or-条件恒等价于 >300）——regex 均为单反斜杠（JSON 解码后的正确形态）
+        bs = chr(92)
         sample = (
             "((function(){var out=[];"
             "document.querySelectorAll('.data-grid tbody tr').forEach(function(r){"
-            "out.push(r.innerText.replace(/\n+/g,' | '))});"
+            "out.push(r.innerText.replace(/" + bs + "n+/g,' | '))});"
             "var b=[...document.querySelectorAll('button')]"
             ".find(x=>x.textContent.trim()==='Edit Configurations' && x.title!=\"\");"
             "return 'rows:'+out.length+' btn:\"'+(b?b.className:'none')+'\"'"
-            "+' sample:'+/'$\d+\.!'/g.source})()"
+            "+' sample:'+/'$" + bs + "d+" + bs + ".!'/g.source})()"
         )
-        assert len(sample) > 500 or len(sample) > 300  # 长样本（>500 需拼接，>300 已覆盖嵌套形态）
+        assert len(sample) > 300  # 长样本（实测约 345 字符，覆盖嵌套引号/regex 形态）
         assert _validate_and_fix_javascript(sample) == sample
 
     def test_single_quotes_containing_double_quotes_untouched(self):

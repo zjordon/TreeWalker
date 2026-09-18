@@ -99,32 +99,49 @@ class TestEvaluateSelfHeal:
             await bs.evaluate("return 1")
 
     @pytest.mark.asyncio
-    async def test_truncation_error_gets_hint(self):
-        """issue #185-c2：提示按实测语义纠偏——V8 的 EOF/token 错误在本仓证据里
-        100% 意味着定界符失衡，不是文本被砍（旧 "looks truncated" 措辞助长 agent
-        的"传输截断"误读）。"""
+    async def test_eof_error_gets_imbalance_hint(self):
+        """issue #185-c2（review3 #1/#5/#6 修订）：失衡提示需扫描确证 + 真机可达
+        路径——输入的补全候选在真机也必败（`var x=(1;)` 的 `(1;)` 仍是语法错），
+        侧桩按调用次序给真实形状，断言的抛错路径与真机一致。"""
         bs = _make_session()
-        bs.client.send.Runtime.evaluate = AsyncMock(return_value={
-            "exceptionDetails": {
-                "text": "Uncaught",
-                "exception": {"description": "SyntaxError: Unexpected end of input"},
-            },
-        })
+        bs.client.send.Runtime.evaluate = AsyncMock(side_effect=[
+            {"exceptionDetails": {"text": "Uncaught", "exception": {
+                "description": "SyntaxError: Unexpected end of input"}}},
+            {"exceptionDetails": {"text": "Uncaught", "exception": {
+                "description": "SyntaxError: Unexpected token ';'"}}},  # 补全候选仍败
+        ])
         with pytest.raises(RuntimeError, match="unbalanced braces/parens"):
-            await bs.evaluate("var a = 1;")
+            await bs.evaluate("var x=(1;")
 
     @pytest.mark.asyncio
-    async def test_token_error_also_gets_imbalance_hint(self):
-        """c2：触发面扩到 Unexpected token（多余闭合形态）。"""
+    async def test_token_error_without_imbalance_gets_no_imbalance_hint(self):
+        """review3 #1：token 错误但扫描无失衡（如多余分号）——不得给失衡断言
+        （事实性误导），原错误照常上抛。"""
         bs = _make_session()
         bs.client.send.Runtime.evaluate = AsyncMock(return_value={
             "exceptionDetails": {
                 "text": "Uncaught",
-                "exception": {"description": "SyntaxError: Unexpected token '}'"},
+                "exception": {"description": "SyntaxError: Unexpected token ';'"},
             },
         })
+        with pytest.raises(RuntimeError) as ei:
+            await bs.evaluate("var a=1;;")
+        assert "unbalanced braces/parens" not in str(ei.value)
+
+    @pytest.mark.asyncio
+    async def test_token_error_with_imbalance_hint_real_machine_path(self):
+        """review3 #6：删除候选在真机也必败的输入（`};var x=;` 的候选
+        `;var x=;` 仍是语法错）——带失衡提示的抛错路径真机可达（对照旧用例
+        `"}}"` 的空串候选在真机会"自愈成功"返回 undefined，断言路径不可达）。"""
+        bs = _make_session()
+        bs.client.send.Runtime.evaluate = AsyncMock(side_effect=[
+            {"exceptionDetails": {"text": "Uncaught", "exception": {
+                "description": "SyntaxError: Unexpected token '}'"}}},
+            {"exceptionDetails": {"text": "Uncaught", "exception": {
+                "description": "SyntaxError: Unexpected token ';'"}}},  # 删除候选仍败
+        ])
         with pytest.raises(RuntimeError, match="unbalanced braces/parens"):
-            await bs.evaluate("}}")
+            await bs.evaluate("};var x=;")
 
     @pytest.mark.asyncio
     async def test_eof_missing_closer_candidate_heals(self):
@@ -153,8 +170,10 @@ class TestEvaluateSelfHeal:
         out = await bs.evaluate(
             "((function(){if(1){return 'x'}return 'not found'}})())")
         assert out == "not found"
+        # review3 #4：单一错位的删除结果唯一确定——精确等值断言（负向子串拦不住
+        # "删错位置"的回归）
         retry_expr = bs.client.send.Runtime.evaluate.call_args_list[1][0][0]["expression"]
-        assert "}})()" not in retry_expr  # 首个错位 } 已删
+        assert retry_expr == "((function(){if(1){return 'x'}return 'not found'})())"
 
     @pytest.mark.asyncio
     async def test_missing_catch_second_candidate_succeeds(self):
@@ -334,3 +353,11 @@ class TestBalanceRepairCandidates:
         cands = _syntax_repair_candidates(
             "(function(){return 'a'.match(/[((/)", "SyntaxError: Unexpected end of input")
         assert cands  # 误计产生的补全候选存在；合法性交 CDP 重试把关
+
+    def test_line_comment_skips_to_eol_not_eof(self):
+        """review3 #2：多行代码中行注释只跳到行尾——直接 break 会把注释后
+        各行的可执行定界符整体跳过（EOF 分支因 stack 为空漏修）。"""
+        from tree_walker.browser.session import _delimiter_scan
+        code = "(function(){ // open modal\nvar a=1;\n})("
+        stack, extra = _delimiter_scan(code)
+        assert stack == ["("] and extra < 0

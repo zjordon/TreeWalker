@@ -529,7 +529,13 @@ def _delimiter_scan(code: str) -> tuple[list[str], int]:
         elif c in "\"'`":
             in_str = c
         elif c == "/" and k + 1 < n and code[k + 1] == "/":
-            break  # 行注释：其后无更多可执行定界符
+            # 行注释：跳到行尾继续扫（review3 #2——直接 break 隐含单行代码假设，
+            # 多行 evaluate 的注释后行仍有可执行定界符会被整体跳过）
+            nl = code.find("\n", k)
+            if nl < 0:
+                break  # 行注释至代码末尾
+            k = nl + 1
+            continue
         elif c in _CLOSE_OF:
             stack.append(c)
         elif c in ")]}":
@@ -3730,8 +3736,12 @@ return (async function(){
                 # issue #185-c2：C 轮 22/22 编译失败全为定界符失衡——旧措辞
                 # "looks truncated" 与 agent 的"传输截断"误读共振（自评反复出现
                 # "truncated/mangled in transport" 叙事且被重开评论采纳）；按实测
-                # 语义纠偏，触发面扩到 token 闭合错误。
-                if "Unexpected end of input" in err_text or "Unexpected token" in err_text:
+                # 语义纠偏，触发面扩到 token 闭合错误。review3 #1：仅当扫描确实
+                # 检出失衡才给失衡提示——"Unexpected token" 也覆盖非定界符语法错
+                #（双逗号/多余分号），无失衡时的断言性措辞是事实性误导。
+                _hint_stack, _hint_extra = _delimiter_scan(validated_code)
+                if (("Unexpected end of input" in err_text or "Unexpected token" in err_text)
+                        and (bool(_hint_stack) or _hint_extra >= 0)):
                     msg += ("\n⚠️ The code has unbalanced braces/parens (this V8 "
                             "error means delimiters never matched, not that text "
                             "was cut). Check that an IIFE prefix `((function(){...` "
