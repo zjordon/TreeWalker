@@ -461,3 +461,20 @@ class TestDeletionPositionCrossValidation:
         with pytest.raises(RuntimeError, match="unbalanced braces/parens"):
             await bs.evaluate("(function(){return 1}})()")
         assert bs.client.send.Runtime.evaluate.await_count == 1  # 无删除重试
+
+    def test_second_deletion_gated_on_adjacent_same_char(self):
+        """review7 #1：候选②绕过位置门禁的缺口——首删为已验证真错位、其后源码
+        存在含未配对闭合符的 regex（/[)]/g）时，再扫描会把幻影报为下一错位，
+        删之得合法空字符类、语义漂移。仅当第二错位与首删位连排同字符（}}/))
+        双闭合笔误，删除后左移恰好占位）才生成候选②。"""
+        code = "(function(){return 1}};var r=/[)]/g;)()"
+        assert _delimiter_scan(code) == (["("], 21)
+        # 首删（位置 21 经 CDP 验证）后的再扫描错位落在 regex 内（幻影）→ 门控
+        assert _syntax_repair_candidates(
+            code, "SyntaxError: Unexpected token '}'", err_offset=21,
+        ) == ["(function(){return 1};var r=/[)]/g;)()"]
+        # 对照：连排同字符双闭合笔误（}} 形态）候选②保留
+        assert _syntax_repair_candidates(
+            "(function(){return 1}}})", "SyntaxError: Unexpected token '}'",
+            err_offset=21,
+        ) == ["(function(){return 1}})", "(function(){return 1})"]

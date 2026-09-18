@@ -651,6 +651,14 @@ def _syntax_repair_candidates(
             _, extra = _delimiter_scan(work)
             if extra < 0:
                 break
+            if candidates:
+                # review7 #1：候选②无 CDP 位置证据——仅限与首个已验证错位连排的
+                # 同字符（}}/))/]] 双闭合笔误形态，删除后左移恰好占位）；regex
+                # 幻影闭合符与首删位必不相邻，按 review5 #1 同标准 fail-safe 放弃
+                #（首删验证后 regex 内的幻影错位会成为再扫描的首个错位，无此
+                # 门控即重演"删幻影→空字符类→编译通过→语义漂移"）。
+                if extra != first_extra or work[extra] != code[first_extra]:
+                    break
             work = work[:extra] + work[extra + 1:]
             candidates.append(work)
         return candidates
