@@ -1,0 +1,153 @@
+{
+  "status": "complete",
+  "llm": {
+    "model": "glm-5.3"
+  },
+  "message": "Review complete: 0 finding(s) across 7 selected item(s).",
+  "summary": {
+    "files_reviewed": 7,
+    "comments": 0,
+    "total_tokens": 641054,
+    "input_tokens": 601787,
+    "output_tokens": 39267,
+    "cache_read_tokens": 364800,
+    "elapsed": "6m10s"
+  },
+  "tool_calls": {
+    "total": 26,
+    "by_tool": {
+      "code_search": 14,
+      "file_find": 1,
+      "file_read": 11
+    },
+    "failure": 0,
+    "failure_by_tool": {},
+    "failure_details": []
+  },
+  "comments": [],
+  "groups": [
+    {
+      "label": "Issue 193 code review documentation",
+      "files": [
+        "docs/bug-fix/code-review/review-issue-193-1.json",
+        "docs/bug-fix/code-review/review-issue-193-2.json",
+        "docs/bug-fix/code-review/review-issue-193-3.json"
+      ]
+    },
+    {
+      "label": "Grid totals fix: tools, models, prompt, and debug example",
+      "files": [
+        "examples/debug_read_grid_totals.py",
+        "src/tree_walker/prompts/system_prompt.py",
+        "src/tree_walker/tools/actions.py",
+        "src/tree_walker/tools/models.py"
+      ]
+    }
+  ],
+  "session_id": "d395a94c-9b8f-4d86-a44d-cdefc1751469",
+  "manifest": {
+    "schema_version": "ocr.run-manifest/v1",
+    "run_id": "d395a94c-9b8f-4d86-a44d-cdefc1751469",
+    "operation": "review",
+    "terminal_state": "complete",
+    "repository": {
+      "identity_sha256": "2868bcfb033292e0d47631dc911d0e36e5dcedaf9e0bcacffe6c4716bb93dfda"
+    },
+    "input": {
+      "mode": "range",
+      "requested_from": "master",
+      "requested_head": "fix/193-table-read-verification",
+      "resolved_base": "6be5a963c60fe0ee941bc60ec67f8afa076e08b8",
+      "resolved_head": "263ab160be24924781fca7e608f9e23fc91e46bc",
+      "exact_range": "6be5a963c60fe0ee941bc60ec67f8afa076e08b8..263ab160be24924781fca7e608f9e23fc91e46bc",
+      "source_artifact_sha256": "ef21c2521837686e1f2a841d2d3e195f3b0160fc324bdcf2f4262feb9cd385f2"
+    },
+    "execution": {
+      "ocr_version": "v1.12.7",
+      "model": "glm-5.3",
+      "configured_concurrency": 8,
+      "rule_config_sha256": "ddb40005eb732cb8b37d8d3dc1acb82f3aa51fded408c899a092c10349c369c4",
+      "runtime_config_sha256": "841fe9ad288d2dd9efc84c443193c492ef06b26edf31ff5f5a1b01637fef2b0c"
+    },
+    "coverage": {
+      "selected": [
+        {
+          "item_id": "102ddb85ec832fa28af84cda4c3ddac1e83fd4a836adee089ed2342759711f70",
+          "path": "src/tree_walker/tools/models.py",
+          "fingerprint": "e9652b405eec1d281a00db960a490b51b0503d0de3648b22cb95eb99557a7c8e"
+        },
+        {
+          "item_id": "1e17eebc642ada8a9491c46cc68c41d6b5792d8784e04b3fff61016dd9e65fe4",
+          "path": "docs/bug-fix/code-review/review-issue-193-3.json",
+          "fingerprint": "08269f8dc90854e5c37db9887244a173fb94797ffef10a47a9e76242ffcaea12"
+        },
+        {
+          "item_id": "505a3fb9b1a34dddbcee9bc45ffddea95b5d888e590304d0cc5e0e3d873b527e",
+          "path": "src/tree_walker/prompts/system_prompt.py",
+          "fingerprint": "e0b05c732dec16d12877b0a4481dee75d33c244d02ff12682a196f5a2b60707a"
+        },
+        {
+          "item_id": "8fe2dd2fac968406f7b8ee5656fceda98526251cb1b8c21e3f86fd9e0c2bd2b5",
+          "path": "docs/bug-fix/code-review/review-issue-193-2.json",
+          "fingerprint": "d2f86491eae887fcae407da495599ad93158af2921dd3d8f310581811a1e876b"
+        },
+        {
+          "item_id": "9648d199d9f92dffd0c60bfea16fe64f3695bbfe963292e7b7fb964cc92c21b1",
+          "path": "src/tree_walker/tools/actions.py",
+          "fingerprint": "e3fd54ca574478a1edd323425049c364e43b38c5c218775a6e799de40827c30b"
+        },
+        {
+          "item_id": "b3d0799f9f9c2ec39f04f61c388ef3bafbd07459f6114ff808accfe2032c61aa",
+          "path": "examples/debug_read_grid_totals.py",
+          "fingerprint": "53055e24455c6f3a06f0eb2414c14044173f92eacead58bd9ccf8652f0fdef8a"
+        },
+        {
+          "item_id": "b817a377fb9e1460990a8877c5ae00f5bae2595a580608d8fedce3710b8fe9c6",
+          "path": "docs/bug-fix/code-review/review-issue-193-1.json",
+          "fingerprint": "4c565fc84090fadc133e734ddacde7bc6c427f5325ee38b053dc078da339f54b"
+        }
+      ],
+      "completed": [
+        {
+          "item_id": "102ddb85ec832fa28af84cda4c3ddac1e83fd4a836adee089ed2342759711f70",
+          "path": "src/tree_walker/tools/models.py",
+          "fingerprint": "e9652b405eec1d281a00db960a490b51b0503d0de3648b22cb95eb99557a7c8e"
+        },
+        {
+          "item_id": "1e17eebc642ada8a9491c46cc68c41d6b5792d8784e04b3fff61016dd9e65fe4",
+          "path": "docs/bug-fix/code-review/review-issue-193-3.json",
+          "fingerprint": "08269f8dc90854e5c37db9887244a173fb94797ffef10a47a9e76242ffcaea12"
+        },
+        {
+          "item_id": "505a3fb9b1a34dddbcee9bc45ffddea95b5d888e590304d0cc5e0e3d873b527e",
+          "path": "src/tree_walker/prompts/system_prompt.py",
+          "fingerprint": "e0b05c732dec16d12877b0a4481dee75d33c244d02ff12682a196f5a2b60707a"
+        },
+        {
+          "item_id": "8fe2dd2fac968406f7b8ee5656fceda98526251cb1b8c21e3f86fd9e0c2bd2b5",
+          "path": "docs/bug-fix/code-review/review-issue-193-2.json",
+          "fingerprint": "d2f86491eae887fcae407da495599ad93158af2921dd3d8f310581811a1e876b"
+        },
+        {
+          "item_id": "9648d199d9f92dffd0c60bfea16fe64f3695bbfe963292e7b7fb964cc92c21b1",
+          "path": "src/tree_walker/tools/actions.py",
+          "fingerprint": "e3fd54ca574478a1edd323425049c364e43b38c5c218775a6e799de40827c30b"
+        },
+        {
+          "item_id": "b3d0799f9f9c2ec39f04f61c388ef3bafbd07459f6114ff808accfe2032c61aa",
+          "path": "examples/debug_read_grid_totals.py",
+          "fingerprint": "53055e24455c6f3a06f0eb2414c14044173f92eacead58bd9ccf8652f0fdef8a"
+        },
+        {
+          "item_id": "b817a377fb9e1460990a8877c5ae00f5bae2595a580608d8fedce3710b8fe9c6",
+          "path": "docs/bug-fix/code-review/review-issue-193-1.json",
+          "fingerprint": "4c565fc84090fadc133e734ddacde7bc6c427f5325ee38b053dc078da339f54b"
+        }
+      ],
+      "reused": [],
+      "failed": [],
+      "waived": []
+    },
+    "elapsed_ms": 370294
+  }
+}
