@@ -1,9 +1,9 @@
 # issue #193 实施方案：表格取值路由 read_grid + 合计行捕获与列加和交叉校验
 
 - 日期：2026-09-19；分支 `fix/193-table-read-verification`（自 master `6be5a96`）
-- **状态（2026-09-19）：A/B/C/D 已实施 + review 轮一 9 findings 全修**——
-  2781 测试全过、两 JS 模板 node --check 过；待真机探针（D3）与 107 场景
-  回放验收
+- **状态（2026-09-19）：A/B/C/D 已实施 + review 四轮收敛（9→2→3→0，
+  14 findings 全修）+ 真机验收通过（用户确认）**——2785 测试全过、两 JS
+  模板 node --check 过
 - **review 轮一**（`docs/bug-fix/code-review/review-issue-193-1.json`，9 条
   全 CONFIRMED）：①footer 行级角色过滤——只与 Total/Grand Total/合计/总计
   基准行比对，Subtotal/小计/Tax/Shipping 跳过（分组小计当基准=稳定假 ✗）；
