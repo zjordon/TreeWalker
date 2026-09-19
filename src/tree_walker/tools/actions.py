@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from typing import Any
 import logging
 import mimetypes
@@ -466,7 +467,62 @@ _JS_PAGE_MESSAGES = """
 # 探针实证（examples/p7_probe_grid_channels.py C 段）：legacy ExtJS 网格
 # （评论网格）window.<x>GridJsObject 持 {url, pageVar, sortVar, dirVar}，
 # url + '?isAjax=true&limit=N' 返回含行 HTML 片段可 DOMParser 解析。
-_LEGACY_GRID_READ_JS = """
+#
+# issue #193 A：表体/合计行读取共享核心——legacy（DOMParser 文档）与 DOM（活
+# document）两条通道共用，防两份手写逻辑漂移（先例：诊断脚本 import 复用生产
+# 函数防分叉）。要点：
+# - 单元格按表头文本配对（row[header]=cell）——相邻数值列不混淆（C111 四月
+#   混列的根因是快照扁平文本流无数格子）；
+# - 合计行（tfoot 全部 + tbody 首格为 Total/合计 的行）挪出 rows 进 footer——
+#   不剔除则 Python 侧 column_sums 把合计行再加一遍，交叉校验必假警报；
+# - 首格全字匹配（非子串）保守判定；合计行落 tfoot 还是 tbody 未真机确认
+#   （Magento 报表），两类都接住，实现不赌。
+_TABLE_ROWS_CORE_JS = """
+function _gridIsTotalLabel(s) {
+    var t = s.toLowerCase().trim();
+    // review2#1：'subtotal' 必须与 '小计' 对称——英文小计行不挪出 rows 会被
+    // column_sums 双计（Python 侧 _GRID_FOOTER_SKIP_LABELS 挪进 footer 后
+    // 按 'subtotal' 跳过比对）。
+    return t === 'total' || t === 'totals' || t === 'grand total'
+        || t === 'subtotal' || t === '合计' || t === '总计' || t === '小计';
+}
+function _gridReadRow(tr, heads, p) {
+    var cells = tr.querySelectorAll('td,th');
+    var row = {}, col = 0;
+    for (var c = 0; c < cells.length; c++) {
+        var key = (col < heads.length && heads[col]) ? heads[col] : ('col' + col);
+        // 注意：fields 过滤只跳过取值，列游标照常推进（被过滤的列仍占位）。
+        if (!(p.fields && p.fields.length && p.fields.indexOf(key) < 0)) {
+            row[key] = (cells[c].innerText || cells[c].textContent || '').trim();
+        }
+        // review#2：colspan 折算——合计行常见 <th colspan=N> 形态，按格索引
+        // 配对会把数值格绑到错误表头（假 ✗ 或相邻列合计恰等时假 ✓）。
+        col += (cells[c].colSpan || 1);
+    }
+    return row;
+}
+function _gridReadTable(root, heads, p) {
+    var rows = [], footer = [];
+    var trs = root.querySelectorAll('tbody tr');
+    for (var k = 0; k < trs.length; k++) {
+        if (!trs[k].querySelectorAll('td').length) { continue; }
+        // review#3：判定取首格（td,th）——合计标签写在 <th> 时首 td 是数值，
+        // 漏检会让 Total 行留在 rows 里被双计。
+        var cell0 = trs[k].querySelector('td,th');
+        var first = (cell0.innerText || cell0.textContent || '').trim();
+        if (_gridIsTotalLabel(first)) { footer.push(_gridReadRow(trs[k], heads, p)); continue; }
+        rows.push(_gridReadRow(trs[k], heads, p));
+    }
+    var ftrs = root.querySelectorAll('tfoot tr');
+    for (var f = 0; f < ftrs.length; f++) {
+        var fr = _gridReadRow(ftrs[f], heads, p);
+        if (Object.keys(fr).length) { footer.push(fr); }
+    }
+    return { rows: rows, footer: footer };
+}
+"""
+
+_LEGACY_GRID_READ_JS = _TABLE_ROWS_CORE_JS + """
 return (async function(){
     var p = a[0];
     try {
@@ -497,25 +553,12 @@ return (async function(){
         var heads = [];
         var ths = doc.querySelectorAll('thead tr th');
         for (var i = 0; i < ths.length; i++) { heads.push((ths[i].innerText || ths[i].textContent || '').trim()); }
-        var rows = [];
-        var trs = doc.querySelectorAll('tbody tr');
-        for (var j = 0; j < trs.length; j++) {
-            var cells = trs[j].querySelectorAll('td');
-            if (!cells.length) { continue; }
-            var row = {};
-            for (var c = 0; c < cells.length; c++) {
-                var key = (c < heads.length && heads[c]) ? heads[c] : ('col' + c);
-                var val = (cells[c].innerText || cells[c].textContent || '').trim();
-                if (p.fields && p.fields.length && p.fields.indexOf(key) < 0) { continue; }
-                row[key] = val;
-            }
-            rows.push(row);
-        }
+        var out = _gridReadTable(doc, heads, p);
         var info = doc.querySelector('.admin__data-grid-info');
         return JSON.stringify({
             channel: 'legacy_ajax', namespace: (g.containerId || ''),
-            rows: rows, rows_returned: rows.length,
-            headers: heads,
+            rows: out.rows, rows_returned: out.rows.length,
+            headers: heads, footer: out.footer,
             info: info ? info.textContent.trim().slice(0, 80) : null,
             applied: { sorting: p.sorting || null,
                 page_size: p.paging ? p.paging.pageSize : 200,
@@ -528,7 +571,8 @@ return (async function(){
 
 # 通道 3：DOM 表格兜底（通用站点）。只读当前页可见行——无服务端排序/翻页，
 # KO 冻结页行文本可能为空（settle 后 kick 已自动解锁，这里不再重复 kick）。
-_DOM_TABLE_READ_JS = """
+# issue #193 A：接共享核心 _TABLE_ROWS_CORE_JS（表头配对 + 合计行进 footer）。
+_DOM_TABLE_READ_JS = _TABLE_ROWS_CORE_JS + """
 return (async function(){
     var p = a[0];
     try {
@@ -542,22 +586,10 @@ return (async function(){
         var heads = [];
         var ths = best.querySelectorAll('thead th');
         for (var j = 0; j < ths.length; j++) { heads.push((ths[j].innerText || ths[j].textContent || '').trim()); }
-        var rows = [];
-        var trs = best.querySelectorAll('tbody tr');
-        for (var k = 0; k < trs.length; k++) {
-            var cells = trs[k].querySelectorAll('td');
-            if (!cells.length) { continue; }
-            var row = {};
-            for (var c = 0; c < cells.length; c++) {
-                var key = (c < heads.length && heads[c]) ? heads[c] : ('col' + c);
-                if (p.fields && p.fields.length && p.fields.indexOf(key) < 0) { continue; }
-                row[key] = (cells[c].innerText || cells[c].textContent || '').trim();
-            }
-            rows.push(row);
-        }
+        var out = _gridReadTable(best, heads, p);
         return JSON.stringify({
-            channel: 'dom_table', namespace: null, rows: rows, rows_returned: rows.length,
-            headers: heads,
+            channel: 'dom_table', namespace: null, rows: out.rows, rows_returned: out.rows.length,
+            headers: heads, footer: out.footer,
             applied: null, active_before: null, partial: false,
             note: 'DOM channel: current-page visible rows only; no server-side sorting/paging'
         });
@@ -584,6 +616,80 @@ _NAVIGATE_NET_ERROR_MARKERS = (
     "ERR_TUNNEL_CONNECTION_FAILED",
     "net::",
 )
+
+# issue #193 B：合计交叉校验的数值解析。'$1,234.56'→1234.56、'67'→67.0、
+# '12.5%'→12.5、'-$67.50'→-67.5；空/非数值→None。两端剥离货币符/百分号/
+# NBSP（Magento 报表格式）。含逗号时只接受标准千分位形态（review#7：
+# '12,50'/'1.234,56' 这类欧陆小数逗号格式裸去逗号会解析成 1250/1.23456
+# ——rows 与 footer 同解析器还可能自洽，totals-check 回显 totals-ok 把
+# 100× 失真值"自信验证"出去，恰是 #193 要修的形态；保守契约=其余返回
+# None，宁可漏和不可错和）。会计负数 "(1,234)" 不认（同理保守）。
+# review3#1：前导 +/- 在剥两端货币符**之前**摘出（"-$67.50" 的 '-' 会挡住
+# 其后的 '$'；"-1,234.56" 也要进千分位分支）。review3#3：float() 接受
+# 'NaN'/'Infinity'/'1_000'——nan 入列后 sum() 为 nan，abs(nan-x)<=tol 恒
+# False 整列必然 ✗；isfinite 复核 + 下划线拒识。
+_GRID_NUM_STRIP_ENDS = " \t\r\n\xa0$€£¥%"
+_GRID_THOUSANDS_RE = re.compile(r"^\d{1,3}(,\d{3})+(\.\d+)?$")
+
+
+def _parse_grid_number(value: Any) -> float | None:
+    """报表/网格单元格值 → float；不可解析返回 None（None 安全，不抛）。"""
+    if value is None:
+        return None
+    if isinstance(value, bool):  # bool 是 int 子类——'true' 格不是数值
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip()
+    neg = False
+    if s[:1] in ("-", "+"):
+        neg = s[0] == "-"
+        s = s[1:].strip()
+    s = s.strip(_GRID_NUM_STRIP_ENDS)
+    if not s or "_" in s:
+        return None
+    if "," in s:
+        if not _GRID_THOUSANDS_RE.match(s):
+            return None
+        s = s.replace(",", "")
+    try:
+        n = float(s)
+    except ValueError:
+        return None
+    if not math.isfinite(n):
+        return None
+    return -n if neg else n
+
+
+# issue #193 review#1：footer 行角色。合计行捕获（JS）把 tfoot 全部 + tbody
+# Total/小计 行都收进 footer，但只有 Total 类行才是"全列和基准"——分组小计
+# （Subtotal/小计）与单项行（Tax/Shipping/Discount）的值与全列和必然不等，
+# 拿来比对=稳定假 ✗ 误导 agent 重读。标签取行内任一格的全字文本（首格
+# colspan/fields 过滤后不保证标签在首位）；skip 优先于 base（一行不会同时
+# 是两者，防御性取 skip）。
+_GRID_FOOTER_BASE_LABELS = frozenset(
+    {"total", "totals", "grand total", "合计", "总计"})
+_GRID_FOOTER_SKIP_LABELS = frozenset(
+    {"subtotal", "小计", "tax", "shipping", "discount", "discounts", "freight"})
+
+
+def _grid_footer_row_role(frow: dict) -> str | None:
+    """"base"（全列和基准）/ "skip"（中间合计/单项行）/ None（无已知标签）。"""
+    base = False
+    for v in frow.values():
+        t = str(v).strip().lower()
+        if t in _GRID_FOOTER_SKIP_LABELS:
+            return "skip"
+        if t in _GRID_FOOTER_BASE_LABELS:
+            base = True
+    return "base" if base else None
+
+
+# review3#2：非可加列（均值/比率/百分比）的 Total 行格是全表均值或比率而非
+# 列加和——Magento Orders 报表的 Avg. Orders / Avg. Sales Items 即此形态，
+# 比对必然 ✗ 且重读消不掉（行语义过滤只防了小计行，这是列语义维度）。
+# 表头含这些子串的列跳过比对，仅在 totals-check 尾部以信息行回显。
+_GRID_NON_ADDITIVE_HEADER_MARKERS = ("avg", "average", "rate", "ratio", "percent", "%")
 
 
 class Tools:
@@ -2826,6 +2932,100 @@ class Tools:
                 gc_line += (" — ⚠️ field not present in returned rows; check the "
                             "field name (legacy/DOM channels use display-name headers)")
 
+        # issue #193 方向 2：Total 行交叉校验——只在 footer（合计行）非空时计算
+        # （uiregistry 通道无 footer，零行为变化；无合计行可比时逐列求和只是
+        # 噪声，entity_id 之类字段尤甚）。算术代码化，镜像 group_count 哲学
+        # （#185 D：计数不交给上下文 tally——加和同理不交给 LLM 心算。C107
+        # 断言 "total 67 matching sum of counts" 而实加 130；C111 算出 175
+        # 却未与 Total 行 94 比对）。列内所有非空值可解析才参与求和（混入
+        # 'N/A'/名字即整列跳过——宁可不算不可错算）；空格跳过但计数（漏行
+        # 信号随 mismatch 一起回显）。footer 与 rows 同键（表头文本），只与
+        # Total 类基准行比对（review#1：小计/Subtotal/Tax 等中间合计行与全列
+        # 和必然不等，全当基准=稳定误报误导重读）；容差按行数缩放（review#5：
+        # 各行显示值舍入到分、footer 按未舍入值求和再舍入，|Σround−round(Σ)|
+        # 最坏 ~n×半分钱）。
+        # 注意：本行不进 notes——notes 渲染统一加 ⚠️ 前缀，会把 ✓ 一致的列
+        # 也误标成警告；✗/✓ 自带在行内。
+        total_check_line: str | None = None
+        total_check_ok: bool | None = None
+        footer_rows = result.get("footer") or []
+        if footer_rows:
+            col_vals: dict[str, list[float]] = {}
+            col_broken: set[str] = set()
+            col_empty: dict[str, int] = {}
+            for r in result.get("rows") or []:
+                for k, v in r.items():
+                    if k in col_broken:
+                        continue
+                    n = _parse_grid_number(v)
+                    if n is not None:
+                        col_vals.setdefault(k, []).append(n)
+                    elif v is None or not str(v).strip():
+                        col_empty[k] = col_empty.get(k, 0) + 1
+                    else:
+                        col_broken.add(k)
+                        col_vals.pop(k, None)
+            # review#1：行级角色过滤。全部 footer 行都无已知标签时退化为
+            # 「单行=基准」（fields 过滤会把标签格滤掉，单行 Total 形态仍须
+            # 校验；多行无标签无法区分总计/中间行，保守全跳过）。
+            # review2#2：回退只在角色为 None（无任何已知标签）时生效——单行
+            # 被明确判定 skip（Subtotal/小计/Tax…）时不得静默升级为 base，
+            # 否则部分小计值当全列和基准=稳定假 ✗，与「skip 优先」相悖。
+            roles = [_grid_footer_row_role(f) for f in footer_rows]
+            if len(footer_rows) == 1 and roles[0] is None:
+                roles = ["base"]
+            check_parts: list[str] = []
+            has_mismatch = False
+            # review3#2：非可加列跳过比对（均值/比率列的 Total 格不是列和）
+            non_additive = sorted(
+                k for k in col_vals
+                if any(m in k.lower() for m in _GRID_NON_ADDITIVE_HEADER_MARKERS)
+            )
+            for frow, role in zip(footer_rows, roles):
+                if role != "base":
+                    continue
+                for k, vals in col_vals.items():
+                    if not vals or k in non_additive:
+                        continue
+                    s = sum(vals)
+                    fcell = _parse_grid_number(frow.get(k))
+                    if fcell is None:
+                        continue
+                    tol = 0.005 * (len(vals) + 1)
+                    ok = abs(s - fcell) <= tol
+                    entry = f"{k}: sum {s:g} {'==' if ok else '≠'} footer {fcell:g}"
+                    if not ok:
+                        has_mismatch = True
+                        entry += " ✗"
+                        if col_empty.get(k):
+                            entry += f" ({col_empty[k]} empty cells skipped)"
+                    check_parts.append(entry)
+            if check_parts:
+                total_check_ok = not has_mismatch
+                total_check_line = "totals-check: " + " | ".join(check_parts)
+                if has_mismatch:
+                    # review#4：legacy/dom 通道 page-local——多页表可见行加和
+                    # ≠ 全量 footer 是结构性必然，指引必须给分页出路，否则
+                    # 重读同一页永远消不掉 ✗；legacy 顶到 page_size 上限时
+                    # 明示疑似截断。
+                    total_check_line += (
+                        " — a column sum that ≠ its Total-row cell means wrong "
+                        "column or missing rows, OR a paginated table (this read "
+                        "is page-local): page through all rows before concluding; "
+                        "if it still mismatches, re-check the column binding"
+                    )
+                    if (result.get("channel") == "legacy_ajax"
+                            and (result.get("rows_returned") or 0) >= page_size):
+                        total_check_line += (
+                            " (rows hit the page_size cap — the read is likely "
+                            "truncated; raise page_size and re-read)"
+                        )
+                if non_additive:
+                    total_check_line += (
+                        " (non-additive columns skipped — Total cell is a mean/"
+                        f"ratio, not a sum: {', '.join(non_additive)})"
+                    )
+
         if saved_to:
             visible = (f"read_grid [{' | '.join(meta_bits)}] full result ({len(text)} chars) "
                        f"saved to {saved_to}. Preview: {text[:300]}...")
@@ -2833,11 +3033,16 @@ class Tools:
             visible = f"read_grid [{' | '.join(meta_bits)}] {text[:tr.eval_result_max_chars]}"
         if gc_line:
             visible = f"{gc_line} | {visible}"
+        if total_check_line:
+            # 193：校验结论前置（gc_line 之前——对账结果是本次读取的行动要点）
+            visible = f"{total_check_line} | {visible}"
         for n in notes:
             visible += f"  ⚠️ {n}"
         memory = "read_grid: " + ", ".join(meta_bits) + (f", saved={saved_to}" if saved_to else "")
         if group_counts is not None:
             memory += f", group_count({group_field})={len(group_counts)} values"
+        if total_check_ok is not None:
+            memory += ", totals-ok" if total_check_ok else ", totals-mismatch"
         # issue #186-c2 形态②：查询总计结构化旁路——零结果降级 nudge 的信号源
         #（query_desc 由 tracker 侧 _query_key 从 params 统一推导，单一事实源，
         # review7 #2）。total 口径：total_records（legacy/DOM 通道可能 None）→

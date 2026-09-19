@@ -775,12 +775,19 @@ ACTION_DEFINITIONS: dict[str, tuple[type[BaseModel], str, bool]] = {
     "read_grid": (
         ReadGridParams,
         (
-            "Read structured rows from the page's data grid (KO/UI-component grids, "
-            "legacy grids, or plain HTML tables) — bypasses row-render freezes and "
-            "returns JSON rows plus metadata (total_records, sorting, active filters). "
-            "Pass sorting='field desc' for top-N/latest queries — never assume row "
-            "order. Read-only data channel: does NOT update the page UI (filter chips) "
-            "— tasks graded on visible filter state must use the Filters panel."
+            "Read structured rows from the page's tables and data grids — UI-component "
+            "grids, legacy AJAX grids, plain HTML tables, and report result tables. "
+            "Rows come back keyed by column header (plain/report tables and legacy "
+            "grids) or by data-source field name (UI-component grids — check the "
+            "returned keys before passing fields). For tables, adjacent numeric "
+            "columns cannot be confused — use this instead of reading table values "
+            "off the DOM snapshot by cell position. When the table has a Total/合计 "
+            "row, it is returned as footer together with computed per-column sums "
+            "(totals-check) for cross-checking. Bypasses row-render freezes; returns "
+            "JSON rows plus metadata (total_records, sorting, active filters). Pass "
+            "sorting='field desc' for top-N/latest queries — never assume row order. "
+            "Read-only data channel: does NOT update the page UI (filter chips) — "
+            "tasks graded on visible filter state must use the Filters panel."
         ),
         True,
     ),
