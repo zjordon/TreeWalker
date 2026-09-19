@@ -7,11 +7,17 @@ from typing import Any
 import asyncio
 import os
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
-from anthropic import APIError, AuthenticationError, RateLimitError
+from anthropic import (
+    APIConnectionError,
+    APIError,
+    AuthenticationError,
+    RateLimitError,
+)
 
 from tree_walker.config import FallbackLLMSettings, LLMSettings
 from tree_walker.llm.client import LLMClient
@@ -380,14 +386,19 @@ class TestGetActionIntegration:
         assert call_count == 2
 
     def test_no_fallback_raises(self):
-        """get_action raises RateLimitError when no fallback configured."""
+        """get_action raises RateLimitError when no fallback configured.
+
+        issue #194 L2：无 fallback 时 create 前多了 _create_with_backoff 的
+        退避重试（2+4+8+16+30=60s 真等）——sleep 必须打桩，终点异常类型
+        不变（RateLimitError 原样 re-raise）。
+        """
         client = LLMClient(LLMSettings(api_key="test-key"))
 
         with patch.object(client.client.messages, "create", side_effect=RateLimitError(
             message="rate limited",
             response=MagicMock(status_code=429),
             body=None,
-        )):
+        )), patch("tree_walker.llm.client.asyncio.sleep", new_callable=AsyncMock):
             with pytest.raises(RateLimitError):
                 asyncio.run(
                     client.get_action("sys", [], {"name": "tool"}),
@@ -661,3 +672,207 @@ class TestExtractCallSamplingPassthrough:
                 asyncio.run(client._extract_call(
                     call_timeout=0.05, model="m", max_tokens=1, messages=[],
                 ))
+
+
+# ── issue #194：_create_with_backoff 退避重试（L2）────────────────────
+
+
+def _rl(response: MagicMock | None = None) -> RateLimitError:
+    """RateLimitError 桩——沿用既有构造形状（response MagicMock / body None）。"""
+    return RateLimitError(
+        message="rate limited",
+        response=response or MagicMock(status_code=429),
+        body=None,
+    )
+
+
+def _conn_err() -> APIConnectionError:
+    return APIConnectionError(request=httpx.Request("POST", "http://test"))
+
+
+def _sleep_await_seconds(mock_sleep: AsyncMock) -> list[float]:
+    """AsyncMock sleep 的 await 秒数序列（断言退避节奏用）。"""
+    return [c.args[0] for c in mock_sleep.await_args_list if c.args]
+
+
+class TestCreateWithBackoff:
+    """限流/网络传输错误的 client 层退避重试（issue #194 L2）。
+
+    桩值纪律：退避 sleep 全程 mock（不让真实等待拖慢测试）；retry-after 桩
+    用真实协议形状（response.headers dict + str 值）。
+    """
+
+    def setup_method(self):
+        self.client = LLMClient(LLMSettings(api_key="test-key"))
+
+    def _ok_response(self) -> MagicMock:
+        return MagicMock(content=[], usage=None)
+
+    def test_rate_limit_backoff_then_success(self):
+        """429×2 后成功：指数退避 2s/4s，共 3 次请求。"""
+        mock_sleep = AsyncMock()
+        with patch.object(
+            self.client.client.messages, "create",
+            side_effect=[_rl(), _rl(), self._ok_response()],
+        ) as mock_create, patch(
+            "tree_walker.llm.client.asyncio.sleep", mock_sleep,
+        ):
+            result = asyncio.run(self.client._create_with_backoff(messages=[]))
+        assert result is not None
+        assert mock_create.call_count == 3
+        assert _sleep_await_seconds(mock_sleep) == [2.0, 4.0]
+
+    def test_rate_limit_budget_exhausted_raises(self):
+        """永远 429：重试 5 次（2,4,8,16,30）后以 RateLimitError 终结。"""
+        mock_sleep = AsyncMock()
+        with patch.object(
+            self.client.client.messages, "create", side_effect=_rl(),
+        ) as mock_create, patch(
+            "tree_walker.llm.client.asyncio.sleep", mock_sleep,
+        ):
+            with pytest.raises(RateLimitError):
+                asyncio.run(self.client._create_with_backoff(messages=[]))
+        assert mock_create.call_count == 6
+        assert _sleep_await_seconds(mock_sleep) == [2.0, 4.0, 8.0, 16.0, 30.0]
+
+    def test_retry_after_header_overrides_exponential(self):
+        """retry-after=7 覆盖指数值（首退避本应 2s）。"""
+        resp = MagicMock(status_code=429)
+        resp.headers = {"retry-after": "7"}
+        mock_sleep = AsyncMock()
+        with patch.object(
+            self.client.client.messages, "create",
+            side_effect=[_rl(resp), self._ok_response()],
+        ), patch("tree_walker.llm.client.asyncio.sleep", mock_sleep):
+            asyncio.run(self.client._create_with_backoff(messages=[]))
+        assert _sleep_await_seconds(mock_sleep) == [7.0]
+
+    def test_retry_after_capped(self):
+        """retry-after=300 封顶 60s（防 proxy 报超大值）。"""
+        resp = MagicMock(status_code=429)
+        resp.headers = {"retry-after": "300"}
+        mock_sleep = AsyncMock()
+        with patch.object(
+            self.client.client.messages, "create",
+            side_effect=[_rl(resp), self._ok_response()],
+        ), patch("tree_walker.llm.client.asyncio.sleep", mock_sleep):
+            asyncio.run(self.client._create_with_backoff(messages=[]))
+        assert _sleep_await_seconds(mock_sleep) == [60.0]
+
+    def test_retry_after_garbage_falls_back_exponential(self):
+        """retry-after 不可解析（"soon"）→ 回落指数 2s（proxy 行为容错）。"""
+        resp = MagicMock(status_code=429)
+        resp.headers = {"retry-after": "soon"}
+        mock_sleep = AsyncMock()
+        with patch.object(
+            self.client.client.messages, "create",
+            side_effect=[_rl(resp), self._ok_response()],
+        ), patch("tree_walker.llm.client.asyncio.sleep", mock_sleep):
+            asyncio.run(self.client._create_with_backoff(messages=[]))
+        assert _sleep_await_seconds(mock_sleep) == [2.0]
+
+    def test_backoff_total_budget_bounds_waits(self):
+        """retry-after 恒 60：总预算 90s → 第二次退避(60+60>90)前即 raise，
+        终点类型保持 RateLimitError（不变形为外层 llm_timeout 的
+        TimeoutError——L3 按类型分罪依赖这一点）。"""
+        resp = MagicMock(status_code=429)
+        resp.headers = {"retry-after": "60"}
+        mock_sleep = AsyncMock()
+        with patch.object(
+            self.client.client.messages, "create", side_effect=_rl(resp),
+        ) as mock_create, patch(
+            "tree_walker.llm.client.asyncio.sleep", mock_sleep,
+        ):
+            with pytest.raises(RateLimitError):
+                asyncio.run(self.client._create_with_backoff(messages=[]))
+        assert mock_create.call_count == 2
+        assert _sleep_await_seconds(mock_sleep) == [60.0]
+
+    def test_fallback_switch_does_not_consume_backoff(self):
+        """主 429 一次 → fallback 成功：切换不占退避预算（零 sleep）。
+
+        主/备两个 client 的 create 都要打桩——切换后 self.client 指向
+        _fallback_client，漏打桩会打到真 SDK（缺参 TypeError）。
+        """
+        client = LLMClient(LLMSettings(
+            model="main-model", api_key="main-key",
+            fallback=FallbackLLMSettings(model="fallback-model", api_key="fb-key"),
+        ))
+        mock_sleep = AsyncMock()
+        ok = self._ok_response()
+
+        def main_side_effect(*args, **kwargs):
+            raise _rl()
+
+        with patch.object(
+            client.client.messages, "create", side_effect=main_side_effect,
+        ) as mock_main, patch.object(
+            client._fallback_client.messages, "create", return_value=ok,
+        ) as mock_fb, patch(
+            "tree_walker.llm.client.asyncio.sleep", mock_sleep,
+        ):
+            result = asyncio.run(client._create_with_backoff(messages=[]))
+        assert result is ok
+        assert mock_main.call_count == 1
+        assert mock_fb.call_count == 1
+        assert client._using_fallback is True
+        mock_sleep.assert_not_awaited()
+
+    def test_cancelled_error_propagates(self):
+        """退避 sleep 被取消 → CancelledError 穿透（不吞、不再重试）。"""
+        mock_sleep = AsyncMock(side_effect=asyncio.CancelledError())
+        with patch.object(
+            self.client.client.messages, "create", side_effect=_rl(),
+        ) as mock_create, patch(
+            "tree_walker.llm.client.asyncio.sleep", mock_sleep,
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                asyncio.run(self.client._create_with_backoff(messages=[]))
+        assert mock_create.call_count == 1
+
+    def test_authentication_error_not_retried(self):
+        """401（AuthenticationError）非 infra：不退避，无 fallback 即 raise
+        ——既有 fallback-切换语义在外层 get_action 维持（另一测试锚定）。"""
+        mock_sleep = AsyncMock()
+        with patch.object(
+            self.client.client.messages, "create",
+            side_effect=AuthenticationError(
+                message="bad key", response=MagicMock(status_code=401), body=None,
+            ),
+        ) as mock_create, patch(
+            "tree_walker.llm.client.asyncio.sleep", mock_sleep,
+        ):
+            with pytest.raises(AuthenticationError):
+                asyncio.run(self.client._create_with_backoff(messages=[]))
+        assert mock_create.call_count == 1
+        mock_sleep.assert_not_awaited()
+
+    def test_api_connection_error_same_treatment(self):
+        """APIConnectionError（网络传输）与 429 同待遇（同一 infra 谓词）。"""
+        mock_sleep = AsyncMock()
+        with patch.object(
+            self.client.client.messages, "create",
+            side_effect=[_conn_err(), self._ok_response()],
+        ) as mock_create, patch(
+            "tree_walker.llm.client.asyncio.sleep", mock_sleep,
+        ):
+            result = asyncio.run(self.client._create_with_backoff(messages=[]))
+        assert result is not None
+        assert mock_create.call_count == 2
+        assert _sleep_await_seconds(mock_sleep) == [2.0]
+
+    def test_get_action_rate_limit_still_reaches_step_layer_after_budget(self):
+        """get_action 全链：退避预算耗尽后 RateLimitError 原类型 re-raise
+        （step 层 Branch 2.5 按类型分罪的入口保证）。"""
+        mock_sleep = AsyncMock()
+        with patch.object(
+            self.client.client.messages, "create", side_effect=_rl(),
+        ) as mock_create, patch(
+            "tree_walker.llm.client.asyncio.sleep", mock_sleep,
+        ):
+            with pytest.raises(RateLimitError):
+                asyncio.run(self.client.get_action(
+                    "sys", [{"role": "user", "content": "hi"}], {"name": "t"},
+                ))
+        # get_action 外层 except 不再吞：fallback 缺位 → False → raise
+        assert mock_create.call_count == 6

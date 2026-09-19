@@ -80,6 +80,12 @@ class Agent(StepPipeline, RerunMixin):
         self._truncation = _settings.truncation
         self.max_steps = _settings.max_steps
         self.max_failures = _settings.max_failures
+        # issue #194：LLM 基建失败（限流/网络）连续上限（与能力止损分罪，见
+        # _handle_step_error Branch 2.5）
+        self.max_infra_failures = _settings.max_infra_failures
+        # issue #194：infra 步豁免 n_steps 递增的标记（Branch 2.5 置位、_step
+        # finally 消费并复位；getattr 守卫兼容 FakeAgent 桩）
+        self._skip_step_increment = False
         self.llm_timeout = _settings.llm_timeout
         self.action_timeout = _settings.action_timeout
         self.reconnect_timeout = _settings.reconnect_timeout
@@ -314,6 +320,16 @@ class Agent(StepPipeline, RerunMixin):
                     logger.warning(
                         "Max consecutive failures (%d) reached",
                         self.state.consecutive_failures,
+                    )
+                    break
+
+                # issue #194：基建预算检查——infra 步不递增 n_steps（防 livelock
+                # 的界从步数递增移交至此），连续限流/网络失败达上限按基建死法
+                # 终止，与能力止损（上方 max_failures）分罪。
+                if self.state.infra_failures >= self.max_infra_failures:
+                    logger.error(
+                        "Max infra failures (%d) reached — API unreachable, stopping",
+                        self.state.infra_failures,
                     )
                     break
 
