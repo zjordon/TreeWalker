@@ -529,3 +529,192 @@ class TestReadUiGridSession:
 			return json.dumps({"channel": "uiregistry", "rows": []})
 		result = await self._session(ok).read_ui_grid({"fresh": True})
 		assert result["channel"] == "uiregistry"
+
+
+# ── issue #193：footer（合计行）捕获 + column_sums 交叉校验 ──────────────────
+
+
+class TestFooterTotals:
+	"""193 方向 2：有 Total/合计行时逐列求和并与 footer 对账（算术代码化）。
+
+	JS 不真跑（evaluate mock 回 channel dict，footer 是 JS 返回体字段）——
+	Python 侧逻辑全可测；JS 行为（tfoot/tbody 落点、Total 行剔除）由结构
+	断言 + examples/debug_read_grid_totals.py 真机探针把关。
+	背景：C107 断言 "total 67 matching" 实加 130（假校验）；C111 算出 175
+	未与 Total 行比对。
+	"""
+
+	def _dom_result(self, rows, footer, **over):
+		base = {
+			"channel": "dom_table", "namespace": None,
+			"rows": rows, "rows_returned": len(rows),
+			"headers": list({k for r in rows for k in r}),
+			"footer": footer,
+			"applied": None, "active_before": None, "partial": False,
+		}
+		base.update(over)
+		return base
+
+	@pytest.mark.asyncio
+	async def test_footer_match_note(self):
+		"""107 场景（读对列）：Orders 8 列值加和 67 == footer 67，无 ✗。"""
+		rows = [
+			{"Interval": "5/2022", "Orders": "8", "Sales Items": "25"},
+			{"Interval": "6/2022", "Orders": "13", "Sales Items": "34"},
+			{"Interval": "7/2022", "Orders": "9", "Sales Items": "28"},
+			{"Interval": "8/2022", "Orders": "8", "Sales Items": "18"},
+			{"Interval": "9/2022", "Orders": "10", "Sales Items": "31"},
+			{"Interval": "10/2022", "Orders": "4", "Sales Items": "11"},
+			{"Interval": "11/2022", "Orders": "5", "Sales Items": "15"},
+			{"Interval": "12/2022", "Orders": "10", "Sales Items": "37"},
+		]
+		footer = [{"Interval": "Total", "Orders": "67", "Sales Items": "199"}]
+		browser = _FakeBrowser(evaluate_side_effects=[
+			json.dumps({"channel_error": "no-legacy-grid"}),
+			json.dumps(self._dom_result(rows, footer)),
+		])
+		result = await Tools().execute("read_grid", {}, browser)
+		assert not result.error
+		assert "totals-check:" in result.extracted_content
+		assert "Orders: sum 67 == footer 67" in result.extracted_content
+		assert "✗" not in result.extracted_content
+		assert "totals-ok" in result.long_term_memory
+
+	@pytest.mark.asyncio
+	async def test_footer_mismatch_note(self):
+		"""错列/漏行形态：rows 加和 130 ≠ footer 67 → ✗ + 重读指引。"""
+		rows = [
+			{"Interval": "5/2022", "Orders": "25"},
+			{"Interval": "6/2022", "Orders": "28"},
+			{"Interval": "7/2022", "Orders": "18"},
+			{"Interval": "8/2022", "Orders": "11"},
+			{"Interval": "9/2022", "Orders": "15"},
+			{"Interval": "10/2022", "Orders": "10"},
+			{"Interval": "11/2022", "Orders": "13"},
+			{"Interval": "12/2022", "Orders": "10"},
+		]
+		footer = [{"Interval": "Total", "Orders": "67"}]
+		browser = _FakeBrowser(evaluate_side_effects=[
+			json.dumps({"channel_error": "no-legacy-grid"}),
+			json.dumps(self._dom_result(rows, footer)),
+		])
+		result = await Tools().execute("read_grid", {}, browser)
+		assert not result.error
+		assert "Orders: sum 130 ≠ footer 67 ✗" in result.extracted_content
+		assert "re-read before answering" in result.extracted_content
+		assert "totals-mismatch" in result.long_term_memory
+
+	@pytest.mark.asyncio
+	async def test_no_footer_no_totals_line(self):
+		"""uiregistry 通道无 footer → 零 totals-check（零回归锚点）。"""
+		browser = _FakeBrowser(ui_result=_ui_result())
+		result = await Tools().execute("read_grid", {}, browser)
+		assert not result.error
+		assert "totals-check" not in result.extracted_content
+		assert "totals-" not in result.long_term_memory
+
+	@pytest.mark.asyncio
+	async def test_currency_and_thousands_parsing(self):
+		"""'$1,234.56' + '8' vs footer '$1,242.56'——货币/千分位两端剥离、
+		内部逗号整体移除（strip 只削两端）。"""
+		rows = [{"Product": "A", "Price": "$1,234.56"}, {"Product": "B", "Price": "8"}]
+		footer = [{"Product": "Total", "Price": "$1,242.56"}]
+		browser = _FakeBrowser(evaluate_side_effects=[
+			json.dumps({"channel_error": "no-legacy-grid"}),
+			json.dumps(self._dom_result(rows, footer)),
+		])
+		result = await Tools().execute("read_grid", {}, browser)
+		assert not result.error
+		assert "Price: sum 1242.56 == footer 1242.56" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_non_numeric_column_excluded(self):
+		"""列内混非数值（名字/N-A）→ 整列不参与求和；数值列照常对账。"""
+		rows = [
+			{"Name": "Ida Pant", "Qty": "4"},
+			{"Name": "Duffle", "Qty": "3"},
+		]
+		footer = [{"Name": "Total", "Qty": "7"}]
+		browser = _FakeBrowser(evaluate_side_effects=[
+			json.dumps({"channel_error": "no-legacy-grid"}),
+			json.dumps(self._dom_result(rows, footer)),
+		])
+		result = await Tools().execute("read_grid", {}, browser)
+		assert not result.error
+		assert "Qty: sum 7 == footer 7" in result.extracted_content
+		assert "Name: sum" not in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_empty_cells_skipped(self):
+		"""列内空格跳过仍求和；mismatch 时回显 skipped 计数（漏行信号）。"""
+		rows = [
+			{"Interval": "5/2022", "Orders": "8"},
+			{"Interval": "6/2022", "Orders": ""},  # 空单元格：跳过但计数
+			{"Interval": "7/2022", "Orders": "9"},
+		]
+		footer = [{"Interval": "Total", "Orders": "30"}]  # 8+9=17 ≠ 30
+		browser = _FakeBrowser(evaluate_side_effects=[
+			json.dumps({"channel_error": "no-legacy-grid"}),
+			json.dumps(self._dom_result(rows, footer)),
+		])
+		result = await Tools().execute("read_grid", {}, browser)
+		assert not result.error
+		assert "Orders: sum 17 ≠ footer 30 ✗ (1 empty cells skipped)" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_multiple_footer_rows(self):
+		"""tfoot + tbody 双合计行（异常形态）：每行都比，输出稳定不炸。"""
+		rows = [{"Interval": "5/2022", "Orders": "8"}]
+		footer = [
+			{"Interval": "Total", "Orders": "8"},
+			{"Interval": "Grand Total", "Orders": "8"},
+		]
+		browser = _FakeBrowser(evaluate_side_effects=[
+			json.dumps({"channel_error": "no-legacy-grid"}),
+			json.dumps(self._dom_result(rows, footer)),
+		])
+		result = await Tools().execute("read_grid", {}, browser)
+		assert not result.error
+		assert result.extracted_content.count("Orders: sum 8 == footer 8") == 2
+		assert "✗" not in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_footer_all_non_numeric_no_line(self):
+		"""footer 无任何可比数值格 → 不产 totals-check（无噪声）。"""
+		rows = [{"Name": "A", "Note": "ok"}]
+		footer = [{"Name": "Total", "Note": "—"}]
+		browser = _FakeBrowser(evaluate_side_effects=[
+			json.dumps({"channel_error": "no-legacy-grid"}),
+			json.dumps(self._dom_result(rows, footer)),
+		])
+		result = await Tools().execute("read_grid", {}, browser)
+		assert not result.error
+		assert "totals-check" not in result.extracted_content
+
+	def test_js_templates_capture_footer(self):
+		"""结构断言（先例：test_falls_back_to_legacy_ajax 断言 JS 含
+		GridJsObject）：两模板接共享核心、含 tfoot 捕获与 Total 行剔除。"""
+		from tree_walker.tools.actions import (
+			_DOM_TABLE_READ_JS, _LEGACY_GRID_READ_JS, _TABLE_ROWS_CORE_JS,
+		)
+		for js in (_LEGACY_GRID_READ_JS, _DOM_TABLE_READ_JS):
+			assert "_gridReadTable(" in js
+			assert "footer.push" in js
+		for frag in ("tfoot tr", "_gridIsTotalLabel", "querySelector('td')"):
+			assert frag in _TABLE_ROWS_CORE_JS
+		# 无反斜杠家规（模板注释 ：463-464）——本改动不引入
+		assert "\\" not in _TABLE_ROWS_CORE_JS
+
+	@pytest.mark.asyncio
+	async def test_footer_non_numeric_cell_skipped(self):
+		"""footer 里与求和列同键的格非数值（'—'/'n/a'）→ 该列不比对不误报。"""
+		rows = [{"Interval": "5/2022", "Orders": "8"}]
+		footer = [{"Interval": "Total", "Orders": "n/a"}]
+		browser = _FakeBrowser(evaluate_side_effects=[
+			json.dumps({"channel_error": "no-legacy-grid"}),
+			json.dumps(self._dom_result(rows, footer)),
+		])
+		result = await Tools().execute("read_grid", {}, browser)
+		assert not result.error
+		assert "totals-check" not in result.extracted_content
+		assert "✗" not in result.extracted_content

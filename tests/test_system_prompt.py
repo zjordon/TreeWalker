@@ -88,6 +88,40 @@ class TestTaskCompletionRules:
         assert "max_steps" in prompt
         assert "ABSOLUTELY IMPOSSIBLE" in prompt
 
+    def test_prompt_contains_table_value_routing_rule(self):
+        """issue #193 方向 1：Rules 第 8 条——表格取值路由 read_grid（行按
+        表头绑定），禁止在扁平快照里按单元格位置目测取值（C111 四月混列：
+        相邻数值列 Orders/Sales Items 不可分）。"""
+        prompt = build_system_prompt(
+            action_descriptions=_default_action_descriptions(),
+            task="Test task",
+        )
+        assert "read the table with `read_grid`" in prompt
+        assert "keyed by column header" in prompt
+        assert "adjacent numeric columns are indistinguishable" in prompt
+
+    def test_prompt_contains_real_arithmetic_rule(self):
+        """issue #193 方向 2：Task Completion 第 9 条——算术/验证必须来自工具
+        输出（C107 断言 "total 67 matching" 实加 130 的假校验）。"""
+        prompt = build_system_prompt(
+            action_descriptions=_default_action_descriptions(),
+            task="Test task",
+        )
+        assert "Real arithmetic, real verification" in prompt
+        assert "per-column sums" in prompt
+        assert "the SAME column" in prompt
+        assert 'Never state "verified" about numbers' in prompt
+
+    def test_prompt_contains_list_completeness_rule(self):
+        """issue #193 方向 3（防复发件）：第 2 条——列举型答案与工具返回的
+        行数对账、并列要说明。"""
+        prompt = build_system_prompt(
+            action_descriptions=_default_action_descriptions(),
+            task="Test task",
+        )
+        assert "rows_returned/total_records" in prompt
+        assert "state ties explicitly" in prompt
+
 
 class TestDoneParamsDescription:
     def test_done_params_text_field_description(self):

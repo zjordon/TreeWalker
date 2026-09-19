@@ -466,7 +466,52 @@ _JS_PAGE_MESSAGES = """
 # 探针实证（examples/p7_probe_grid_channels.py C 段）：legacy ExtJS 网格
 # （评论网格）window.<x>GridJsObject 持 {url, pageVar, sortVar, dirVar}，
 # url + '?isAjax=true&limit=N' 返回含行 HTML 片段可 DOMParser 解析。
-_LEGACY_GRID_READ_JS = """
+#
+# issue #193 A：表体/合计行读取共享核心——legacy（DOMParser 文档）与 DOM（活
+# document）两条通道共用，防两份手写逻辑漂移（先例：诊断脚本 import 复用生产
+# 函数防分叉）。要点：
+# - 单元格按表头文本配对（row[header]=cell）——相邻数值列不混淆（C111 四月
+#   混列的根因是快照扁平文本流无数格子）；
+# - 合计行（tfoot 全部 + tbody 首格为 Total/合计 的行）挪出 rows 进 footer——
+#   不剔除则 Python 侧 column_sums 把合计行再加一遍，交叉校验必假警报；
+# - 首格全字匹配（非子串）保守判定；合计行落 tfoot 还是 tbody 未真机确认
+#   （Magento 报表），两类都接住，实现不赌。
+_TABLE_ROWS_CORE_JS = """
+function _gridIsTotalLabel(s) {
+    var t = s.toLowerCase().trim();
+    return t === 'total' || t === 'totals' || t === 'grand total'
+        || t === '合计' || t === '总计' || t === '小计';
+}
+function _gridReadRow(tr, heads, p) {
+    var cells = tr.querySelectorAll('td,th');
+    var row = {};
+    for (var c = 0; c < cells.length; c++) {
+        var key = (c < heads.length && heads[c]) ? heads[c] : ('col' + c);
+        if (p.fields && p.fields.length && p.fields.indexOf(key) < 0) { continue; }
+        row[key] = (cells[c].innerText || cells[c].textContent || '').trim();
+    }
+    return row;
+}
+function _gridReadTable(root, heads, p) {
+    var rows = [], footer = [];
+    var trs = root.querySelectorAll('tbody tr');
+    for (var k = 0; k < trs.length; k++) {
+        if (!trs[k].querySelectorAll('td').length) { continue; }
+        var td0 = trs[k].querySelector('td');
+        var first = (td0.innerText || td0.textContent || '').trim();
+        if (_gridIsTotalLabel(first)) { footer.push(_gridReadRow(trs[k], heads, p)); continue; }
+        rows.push(_gridReadRow(trs[k], heads, p));
+    }
+    var ftrs = root.querySelectorAll('tfoot tr');
+    for (var f = 0; f < ftrs.length; f++) {
+        var fr = _gridReadRow(ftrs[f], heads, p);
+        if (Object.keys(fr).length) { footer.push(fr); }
+    }
+    return { rows: rows, footer: footer };
+}
+"""
+
+_LEGACY_GRID_READ_JS = _TABLE_ROWS_CORE_JS + """
 return (async function(){
     var p = a[0];
     try {
@@ -497,25 +542,12 @@ return (async function(){
         var heads = [];
         var ths = doc.querySelectorAll('thead tr th');
         for (var i = 0; i < ths.length; i++) { heads.push((ths[i].innerText || ths[i].textContent || '').trim()); }
-        var rows = [];
-        var trs = doc.querySelectorAll('tbody tr');
-        for (var j = 0; j < trs.length; j++) {
-            var cells = trs[j].querySelectorAll('td');
-            if (!cells.length) { continue; }
-            var row = {};
-            for (var c = 0; c < cells.length; c++) {
-                var key = (c < heads.length && heads[c]) ? heads[c] : ('col' + c);
-                var val = (cells[c].innerText || cells[c].textContent || '').trim();
-                if (p.fields && p.fields.length && p.fields.indexOf(key) < 0) { continue; }
-                row[key] = val;
-            }
-            rows.push(row);
-        }
+        var out = _gridReadTable(doc, heads, p);
         var info = doc.querySelector('.admin__data-grid-info');
         return JSON.stringify({
             channel: 'legacy_ajax', namespace: (g.containerId || ''),
-            rows: rows, rows_returned: rows.length,
-            headers: heads,
+            rows: out.rows, rows_returned: out.rows.length,
+            headers: heads, footer: out.footer,
             info: info ? info.textContent.trim().slice(0, 80) : null,
             applied: { sorting: p.sorting || null,
                 page_size: p.paging ? p.paging.pageSize : 200,
@@ -528,7 +560,8 @@ return (async function(){
 
 # 通道 3：DOM 表格兜底（通用站点）。只读当前页可见行——无服务端排序/翻页，
 # KO 冻结页行文本可能为空（settle 后 kick 已自动解锁，这里不再重复 kick）。
-_DOM_TABLE_READ_JS = """
+# issue #193 A：接共享核心 _TABLE_ROWS_CORE_JS（表头配对 + 合计行进 footer）。
+_DOM_TABLE_READ_JS = _TABLE_ROWS_CORE_JS + """
 return (async function(){
     var p = a[0];
     try {
@@ -542,22 +575,10 @@ return (async function(){
         var heads = [];
         var ths = best.querySelectorAll('thead th');
         for (var j = 0; j < ths.length; j++) { heads.push((ths[j].innerText || ths[j].textContent || '').trim()); }
-        var rows = [];
-        var trs = best.querySelectorAll('tbody tr');
-        for (var k = 0; k < trs.length; k++) {
-            var cells = trs[k].querySelectorAll('td');
-            if (!cells.length) { continue; }
-            var row = {};
-            for (var c = 0; c < cells.length; c++) {
-                var key = (c < heads.length && heads[c]) ? heads[c] : ('col' + c);
-                if (p.fields && p.fields.length && p.fields.indexOf(key) < 0) { continue; }
-                row[key] = (cells[c].innerText || cells[c].textContent || '').trim();
-            }
-            rows.push(row);
-        }
+        var out = _gridReadTable(best, heads, p);
         return JSON.stringify({
-            channel: 'dom_table', namespace: null, rows: rows, rows_returned: rows.length,
-            headers: heads,
+            channel: 'dom_table', namespace: null, rows: out.rows, rows_returned: out.rows.length,
+            headers: heads, footer: out.footer,
             applied: null, active_before: null, partial: false,
             note: 'DOM channel: current-page visible rows only; no server-side sorting/paging'
         });
@@ -584,6 +605,29 @@ _NAVIGATE_NET_ERROR_MARKERS = (
     "ERR_TUNNEL_CONNECTION_FAILED",
     "net::",
 )
+
+# issue #193 B：合计交叉校验的数值解析。'$1,234.56'→1234.56、'67'→67.0、
+# '12.5%'→12.5；空/非数值→None。两端剥离货币符/百分号/NBSP（Magento 报表
+# 格式），内部逗号整体移除（strip 只削两端，"1,234.56" 的逗号在内）。
+# 会计负数 "(1,234)" 不认（保守：宁可漏和不可错和）。
+_GRID_NUM_STRIP_ENDS = " \t\r\n\xa0$€£¥%"
+
+
+def _parse_grid_number(value: Any) -> float | None:
+    """报表/网格单元格值 → float；不可解析返回 None（None 安全，不抛）。"""
+    if value is None:
+        return None
+    if isinstance(value, bool):  # bool 是 int 子类——'true' 格不是数值
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip().strip(_GRID_NUM_STRIP_ENDS).replace(",", "").strip(_GRID_NUM_STRIP_ENDS)
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
 
 
 class Tools:
@@ -2826,6 +2870,60 @@ class Tools:
                 gc_line += (" — ⚠️ field not present in returned rows; check the "
                             "field name (legacy/DOM channels use display-name headers)")
 
+        # issue #193 方向 2：Total 行交叉校验——只在 footer（合计行）非空时计算
+        # （uiregistry 通道无 footer，零行为变化；无合计行可比时逐列求和只是
+        # 噪声，entity_id 之类字段尤甚）。算术代码化，镜像 group_count 哲学
+        # （#185 D：计数不交给上下文 tally——加和同理不交给 LLM 心算。C107
+        # 断言 "total 67 matching sum of counts" 而实加 130；C111 算出 175
+        # 却未与 Total 行 94 比对）。列内所有非空值可解析才参与求和（混入
+        # 'N/A'/名字即整列跳过——宁可不算不可错算）；空格跳过但计数（漏行
+        # 信号随 mismatch 一起回显）。footer 与 rows 同键（表头文本），逐列
+        # 与自己的 footer 格比对（tolerance 半分钱）。
+        # 注意：本行不进 notes——notes 渲染统一加 ⚠️ 前缀，会把 ✓ 一致的列
+        # 也误标成警告；✗/✓ 自带在行内。
+        total_check_line: str | None = None
+        total_check_ok: bool | None = None
+        footer_rows = result.get("footer") or []
+        if footer_rows:
+            col_vals: dict[str, list[float]] = {}
+            col_broken: set[str] = set()
+            col_empty: dict[str, int] = {}
+            for r in result.get("rows") or []:
+                for k, v in r.items():
+                    if k in col_broken:
+                        continue
+                    n = _parse_grid_number(v)
+                    if n is not None:
+                        col_vals.setdefault(k, []).append(n)
+                    elif v is None or not str(v).strip():
+                        col_empty[k] = col_empty.get(k, 0) + 1
+                    else:
+                        col_broken.add(k)
+                        col_vals.pop(k, None)
+            sums = {k: sum(v) for k, v in col_vals.items() if v}
+            check_parts: list[str] = []
+            for frow in footer_rows:
+                for k, s in sums.items():
+                    fcell = _parse_grid_number(frow.get(k))
+                    if fcell is None:
+                        continue
+                    ok = abs(s - fcell) < 0.005
+                    entry = f"{k}: sum {s:g} {'==' if ok else '≠'} footer {fcell:g}"
+                    if not ok:
+                        entry += " ✗"
+                        if col_empty.get(k):
+                            entry += f" ({col_empty[k]} empty cells skipped)"
+                    check_parts.append(entry)
+            if check_parts:
+                total_check_ok = all(" ✗" not in p for p in check_parts)
+                total_check_line = "totals-check: " + " | ".join(check_parts)
+                if not total_check_ok:
+                    total_check_line += (
+                        " — a column sum that ≠ its Total-row cell means wrong "
+                        "column or missing/extra rows (this read is page-local); "
+                        "re-read before answering"
+                    )
+
         if saved_to:
             visible = (f"read_grid [{' | '.join(meta_bits)}] full result ({len(text)} chars) "
                        f"saved to {saved_to}. Preview: {text[:300]}...")
@@ -2833,11 +2931,16 @@ class Tools:
             visible = f"read_grid [{' | '.join(meta_bits)}] {text[:tr.eval_result_max_chars]}"
         if gc_line:
             visible = f"{gc_line} | {visible}"
+        if total_check_line:
+            # 193：校验结论前置（gc_line 之前——对账结果是本次读取的行动要点）
+            visible = f"{total_check_line} | {visible}"
         for n in notes:
             visible += f"  ⚠️ {n}"
         memory = "read_grid: " + ", ".join(meta_bits) + (f", saved={saved_to}" if saved_to else "")
         if group_counts is not None:
             memory += f", group_count({group_field})={len(group_counts)} values"
+        if total_check_ok is not None:
+            memory += ", totals-ok" if total_check_ok else ", totals-mismatch"
         # issue #186-c2 形态②：查询总计结构化旁路——零结果降级 nudge 的信号源
         #（query_desc 由 tracker 侧 _query_key 从 params 统一推导，单一事实源，
         # review7 #2）。total 口径：total_records（legacy/DOM 通道可能 None）→
