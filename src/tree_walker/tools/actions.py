@@ -479,8 +479,11 @@ _JS_PAGE_MESSAGES = """
 _TABLE_ROWS_CORE_JS = """
 function _gridIsTotalLabel(s) {
     var t = s.toLowerCase().trim();
+    // review2#1：'subtotal' 必须与 '小计' 对称——英文小计行不挪出 rows 会被
+    // column_sums 双计（Python 侧 _GRID_FOOTER_SKIP_LABELS 挪进 footer 后
+    // 按 'subtotal' 跳过比对）。
     return t === 'total' || t === 'totals' || t === 'grand total'
-        || t === '合计' || t === '总计' || t === '小计';
+        || t === 'subtotal' || t === '合计' || t === '总计' || t === '小计';
 }
 function _gridReadRow(tr, heads, p) {
     var cells = tr.querySelectorAll('td,th');
@@ -2945,8 +2948,11 @@ class Tools:
             # review#1：行级角色过滤。全部 footer 行都无已知标签时退化为
             # 「单行=基准」（fields 过滤会把标签格滤掉，单行 Total 形态仍须
             # 校验；多行无标签无法区分总计/中间行，保守全跳过）。
+            # review2#2：回退只在角色为 None（无任何已知标签）时生效——单行
+            # 被明确判定 skip（Subtotal/小计/Tax…）时不得静默升级为 base，
+            # 否则部分小计值当全列和基准=稳定假 ✗，与「skip 优先」相悖。
             roles = [_grid_footer_row_role(f) for f in footer_rows]
-            if "base" not in roles and len(footer_rows) == 1:
+            if len(footer_rows) == 1 and roles[0] is None:
                 roles = ["base"]
             check_parts: list[str] = []
             has_mismatch = False

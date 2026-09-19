@@ -17,6 +17,13 @@
   自洽会把 100× 失真值 totals-ok 出去）⑨⑧Rule 8 与描述键口径限定（列头=
   表格/legacy 通道，字段名=uiregistry 通道）。回归用例 6 条新增
   （`test_subtotal_rows_not_used_as_base` 等）。
+- **review 轮二**（`review-issue-193-2.json`，2 条全 CONFIRMED）：
+  ①`_gridIsTotalLabel` 补 `'subtotal'`——JS 捕获名单与 Python skip 集在
+  英文小计上不对称，英文 Subtotal 行不挪出 rows 会被 column_sums 双计
+  （中文'小计'原本就对称）；②单行=基准回退条件收严为 `roles[0] is None`
+  ——原 `"base" not in roles` 会把明确判定 skip 的单行 footer 静默升级为
+  base（部分小计值当全列和基准=稳定假 ✗，与「skip 优先」相悖）。
+  回归用例 +2，2783 passed。
 - 依据：`docs/bug-fix/193-table-read-header-binding-analysis.md`（证据核验/三层
   根因/方向对比；含 204 证据勘误——方向 3 降级为防复发件）
 - 范围：A 工具层 JS（合计行捕获）+ B 工具层 Python（column_sums 与交叉校验

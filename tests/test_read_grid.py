@@ -810,3 +810,27 @@ class TestFooterTotals:
 		assert _parse_grid_number("12,50 €") is None
 		assert _parse_grid_number("(1,234)") is None  # 会计负数不认
 		assert _parse_grid_number("1.234.567") is None  # 多点格式不认
+
+	# ── review-issue-193-2 修复的回归用例 ────────────────────────────────
+
+	@pytest.mark.asyncio
+	async def test_single_skip_footer_row_not_promoted(self):
+		"""review2#2：唯一 footer 行被明确判定 skip（Subtotal/小计）时，
+		回退不得把它静默升级为 base——部分小计值当全列和基准=稳定假 ✗；
+		应无 totals-check。"""
+		rows = [{"Interval": "5/2022", "Orders": "8"}]
+		footer = [{"Interval": "Subtotal", "Orders": "21"}]
+		browser = _FakeBrowser(evaluate_side_effects=[
+			json.dumps({"channel_error": "no-legacy-grid"}),
+			json.dumps(self._dom_result(rows, footer)),
+		])
+		result = await Tools().execute("read_grid", {}, browser)
+		assert not result.error
+		assert "totals-check" not in result.extracted_content
+		assert "totals-" not in result.long_term_memory
+
+	def test_js_captures_english_subtotal(self):
+		"""review2#1：JS 捕获名单含 'subtotal'（与 Python skip 集对称）——
+		英文小计行不挪出 rows 会被 column_sums 双计。"""
+		from tree_walker.tools.actions import _TABLE_ROWS_CORE_JS
+		assert "'subtotal'" in _TABLE_ROWS_CORE_JS
