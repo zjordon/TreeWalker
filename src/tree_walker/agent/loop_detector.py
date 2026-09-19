@@ -272,18 +272,26 @@ class ZeroResultStreakTracker:
 
     @staticmethod
     def _query_key(name: str, params: dict) -> tuple[str, str] | None:
-        """归一化查询身份——返回 (key, query_desc) 或 None（非查询类动作）。"""
-        import json as _json
+        """归一化查询身份——返回 (key, query_desc) 或 None（非查询类动作）。
 
+        review7 #3：按值真值判定部件是否参与键（旧 ``endswith("=")`` 后缀启发
+        在值以 = 结尾时误丢部件，使不同查询坍缩同键）；review7 #10：json 用
+        模块顶导入（本模块已有）。
+        """
         if name == "read_grid":
             ns = params.get("namespace") or ""
             search = params.get("search") or ""
             filters = params.get("filters") or {}
-            try:
-                filters_repr = _json.dumps(filters, sort_keys=True, ensure_ascii=False)
-            except (TypeError, ValueError):
-                filters_repr = str(sorted(filters.items(), key=str))
-            parts = [p for p in (f"ns={ns}", f"search={search}", f"filters={filters_repr}") if not p.endswith("=")]
+            parts = []
+            if ns:
+                parts.append(f"ns={ns}")
+            if search:
+                parts.append(f"search={search}")
+            if filters:
+                try:
+                    parts.append(f"filters={json.dumps(filters, sort_keys=True, ensure_ascii=False)}")
+                except (TypeError, ValueError):
+                    parts.append(f"filters={sorted(filters.items(), key=str)}")
             key = f"read_grid|{'|'.join(parts) or 'default'}"
             desc_bits = []
             if filters:

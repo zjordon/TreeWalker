@@ -1441,8 +1441,19 @@ class StepPipeline:
             # （序列截断）不执行不记录。
             self.failure_streak.record(action_name, bool(result.error))
             # issue #186-c2 形态②：零结果降级跟踪——查询类动作经 metadata
-            # query_total 旁路（零结果是 soft-miss，与工具失败两通道）
-            self.zero_result_streak.record(action_name, action_params, result)
+            # query_total 旁路（零结果是 soft-miss，与工具失败两通道）。
+            # review7 #7：record 前过同一 _flatten_params——LLM 嵌套包裹形态
+            #（{"read_grid": {...}}）不归一则顶层取不到 selector/query/filters，
+            # 包裹发射下跟踪整体静默失效或跨查询串染（与 _validate_action_params
+            # 同款，保证 schema/校验/执行/跟踪四方一致）。getattr 容缺：测试
+            # 的鸭子类型桩（_RecordingTools 等）不带该方法，跳过归一直透原始
+            # params（生产 Tools 恒有——真实路径不降级）。
+            _flatten = getattr(self.tools, "_flatten_params", None)
+            self.zero_result_streak.record(
+                action_name,
+                _flatten(action_params, action_name) if _flatten else action_params,
+                result,
+            )
 
             duration = time.time() - tool_start
             if self._obs_bus and tool_call_id:

@@ -10,7 +10,6 @@ Selena vs 目录 Selene 拼写不一致，agent 按产品名精确过滤评论�
 
 from __future__ import annotations
 
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -20,11 +19,12 @@ from tree_walker.agent.views import ActionResult
 from tree_walker.tools.actions import Tools
 
 
-def _qr(total: int, desc: str = "query 'x'") -> ActionResult:
-	"""带 query_total 旁路的成功 ActionResult（模拟查询类动作返回）。"""
+def _qr(total: int) -> ActionResult:
+	"""带 query_total 旁路的成功 ActionResult（模拟查询类动作返回；
+	query_desc 由 tracker 侧 _query_key 从 params 推导，旁路只承载数字）。"""
 	return ActionResult(
 		extracted_content="echo", long_term_memory="m",
-		metadata={"query_total": total, "query_desc": desc},
+		metadata={"query_total": total},
 	)
 
 
@@ -79,8 +79,8 @@ class TestZeroResultStreakTracker:
 
 	def test_different_query_keys_independent(self):
 		t = ZeroResultStreakTracker()
-		t.record("find_elements", {"selector": ".btn"}, _qr(0, "selector '.btn'"))
-		t.record("search_page", {"query": "x"}, _qr(0, "query 'x'"))
+		t.record("find_elements", {"selector": ".btn"}, _qr(0))
+		t.record("search_page", {"query": "x"}, _qr(0))
 		assert t.peek_nudge() is None  # 各自 streak=1
 
 	def test_non_query_actions_ignored(self):
@@ -100,7 +100,7 @@ class TestZeroResultStreakTracker:
 		t = ZeroResultStreakTracker()
 		params = {"selector": ".missing"}
 		for _ in range(5):
-			t.record("find_elements", params, _qr(0, "selector '.missing'"))
+			t.record("find_elements", params, _qr(0))
 		c1 = t.peek_nudge()
 		assert c1 is not None
 		t.ack_nudge(c1[0])
@@ -154,13 +154,11 @@ class TestQueryTotalMetadata:
 	@pytest.mark.asyncio
 	async def test_read_grid_zero_and_nonzero_totals(self):
 		from tests.test_read_grid import _FakeBrowser, _ui_result
-		import json as _json
 		# total_records=0
 		browser = _FakeBrowser(ui_result=_ui_result(rows=[], total_records=0))
 		r = await Tools().execute("read_grid", {"filters": {"name": "X"}}, browser)
 		assert r.error is None
 		assert r.metadata["query_total"] == 0
-		assert "name" in r.metadata["query_desc"]
 		# total_records=308 → query_total=308
 		browser2 = _FakeBrowser(ui_result=_ui_result(rows=[{"a": 1}], total_records=308))
 		r2 = await Tools().execute("read_grid", {}, browser2)
@@ -182,18 +180,18 @@ class TestQueryTotalMetadata:
 	@pytest.mark.asyncio
 	async def test_find_elements_zero_sets_metadata(self):
 		browser = MagicMock()
-		browser.find_elements = AsyncMock(return_value={"total": 0, "results": []})
+		# review7 #9：mock 键名对齐真实契约 {elements, total, ...}（非 "results"）
+		browser.find_elements = AsyncMock(return_value={"total": 0, "elements": []})
 		r = await Tools().execute(
 			"find_elements", {"selector": ".missing"}, browser)
 		assert r.error is None
 		assert r.metadata["query_total"] == 0
-		assert ".missing" in r.metadata["query_desc"]
 
 	@pytest.mark.asyncio
 	async def test_find_elements_nonzero_sets_metadata(self):
 		browser = MagicMock()
 		browser.find_elements = AsyncMock(return_value={
-			"total": 3, "results": [
+			"total": 3, "elements": [
 				{"tag": "button", "text": "a"},
 				{"tag": "button", "text": "b"},
 				{"tag": "button", "text": "c"},
@@ -211,6 +209,7 @@ class TestQueryTotalMetadata:
 
 	@pytest.mark.asyncio
 	async def test_search_page_zero_and_nonzero(self):
+		# review7 #9：matches 条目键名对齐 formatter 实读（context/element_path）
 		browser = MagicMock()
 		browser.search_page = AsyncMock(return_value={
 			"total": 0, "matches": [], "attribute_matches": []})
@@ -219,8 +218,110 @@ class TestQueryTotalMetadata:
 		assert r.metadata["query_total"] == 0
 		browser.search_page = AsyncMock(return_value={
 			"total": 2, "matches": [
-				{"text": "zzz", "context": "", "path": ""},
-				{"text": "zzz", "context": "", "path": ""},
+				{"text": "zzz", "context": "ctx", "element_path": "body/p"},
+				{"text": "zzz", "context": "ctx", "element_path": "body/p"},
 			], "attribute_matches": []})
 		r2 = await Tools().execute("search_page", {"query": "zzz"}, browser)
 		assert r2.metadata["query_total"] == 2
+
+	@pytest.mark.asyncio
+	async def test_search_page_attr_hits_not_counted_as_zero(self):
+		"""review7 #1/#8：total==0 但 attr_total>0（search_attributes=True 搜属性）
+		——查询并非空手而归（对齐零结果分支判定），合并计数防 tracker 把命中
+		记成 miss、两次后注入与 extracted_content 自相矛盾的降级 nudge。"""
+		browser = MagicMock()
+		browser.search_page = AsyncMock(return_value={
+			"total": 0, "matches": [],
+			"attribute_matches": [{"attr": "href", "value": "x"}],
+			"attribute_total": 1})
+		r = await Tools().execute("search_page", {"query": "zzz"}, browser)
+		assert r.error is None  # 走成功分支（非零结果 soft-miss 路径）
+		assert r.metadata["query_total"] == 1  # 合并计数=0+1，非 0
+
+
+class TestStepWiring:
+	"""review7 #6：step 层接线回归保护——实施方案 §4 验收项「连续两次同过滤
+	0 结果 → 下一步 state message 含降级文案；改过滤重置；LLM 失败步不 ack
+	→ 首报重发」此前无覆盖（漏 ack → 每步重复注入 / 漏并入 nudge → 特性
+	静默失效，两种接线回归现有测试全绿）。"""
+
+	def _pipeline(self):
+		"""免构造 StepPipeline——只挂 _prepare_context/_ack 所需最小属性集。"""
+		from tree_walker.agent.loop_detector import ActionLoopDetector
+		from tree_walker.agent.step import StepPipeline
+		p = StepPipeline.__new__(StepPipeline)
+		p.loop_detector = ActionLoopDetector()
+		p.failure_streak = ZeroResultStreakTracker.__mro__[0]  # 占位，下面逐个设
+		from tree_walker.agent.loop_detector import FailureStreakTracker
+		p.failure_streak = FailureStreakTracker()
+		p.zero_result_streak = ZeroResultStreakTracker()
+		p._pending_streak_nudge = None
+		p._pending_zero_result_nudge = None
+		p._enable_planning = False
+		p.plan_manager = None
+		p._enable_page_stats = False
+		p._enable_grid_meta = False
+		p._enable_sensitive_description = False
+		p._enable_skill_injection = False
+		p._current_task_skill_text = lambda: None
+		p._obs_bus = None
+		p._compactor = None
+		p._track_downloads = False
+		p._enable_message_typing = True
+		p.messages = []
+		p.browser = MagicMock()
+		p.tools = MagicMock()
+		from tree_walker.browser.views import BrowserStateSummary, SerializedDOMState
+		state = BrowserStateSummary(
+			url="https://example.com", title="t",
+			dom_state=SerializedDOMState(_root=None, selector_map={}, element_tree_text="dom"),
+		)
+		return p, state
+
+	def test_nudge_injected_into_state_message_after_two_zeroes(self):
+		"""两次同过滤 0 结果 → _prepare_context 产出的 state message 含降级文案。"""
+		from tree_walker.prompts.system_prompt import build_state_message
+		p, bs = self._pipeline()
+		params = {"filters": {"name": "Selena Yoga Hoodie"}}
+		p.zero_result_streak.record("read_grid", params, _qr(0))
+		p.zero_result_streak.record("read_grid", params, _qr(0))
+		nudge = p.zero_result_streak.peek_nudge()
+		assert nudge is not None
+		msg = build_state_message(bs, task="t", nudge_message=nudge[1])
+		assert "0 results 2 times" in msg
+		assert "substring/partial filter" in msg
+
+	def test_ack_clears_pending_no_reinjection(self):
+		"""ack 提交后同 streak 不再产出候选（去抖），state message 不再含文案。"""
+		p, _ = self._pipeline()
+		params = {"selector": ".miss"}
+		for _ in range(2):
+			p.zero_result_streak.record("find_elements", params, _qr(0))
+		c = p.zero_result_streak.peek_nudge()
+		p._pending_zero_result_nudge = c
+		p._ack_pending_streak_nudge()  # 同一方法处理两类 nudge 的 ack
+		assert p._pending_zero_result_nudge is None
+		assert p.zero_result_streak.peek_nudge() is None  # 去抖：已通知不重报
+
+	def test_unacked_nudge_repeeked_next_step(self):
+		"""LLM 失败步不 ack → 下步 peek 返回同一候选（首报重发不丢）。"""
+		p, _ = self._pipeline()
+		params = {"query": "zz"}
+		for _ in range(2):
+			p.zero_result_streak.record("search_page", params, _qr(0))
+		c1 = p.zero_result_streak.peek_nudge()
+		p._pending_zero_result_nudge = c1  # 暂存但未 ack（模拟 LLM 调用失败）
+		c2 = p.zero_result_streak.peek_nudge()
+		assert c2 == c1  # 同候选可重取
+
+	def test_flattened_params_tracked(self):
+		"""review7 #7：LLM 嵌套包裹形态 {"read_grid": {...}} 经 _flatten_params
+		归一后仍正确取到 filters（record 侧展平由 step.py 接线保证）。"""
+		from tree_walker.tools.actions import Tools
+		wrapped = {"read_grid": {"filters": {"name": "X"}}}
+		flat = Tools()._flatten_params(wrapped, "read_grid")
+		k = ZeroResultStreakTracker._query_key("read_grid", flat)
+		assert k is not None and "name" in k[1]
+		k_direct = ZeroResultStreakTracker._query_key(
+			"read_grid", {"filters": {"name": "X"}})
+		assert k[0] == k_direct[0]  # 归一后同键（不坍缩不串染）
