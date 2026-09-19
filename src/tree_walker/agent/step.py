@@ -47,7 +47,11 @@ from tree_walker.prompts.system_prompt import build_state_blocks, build_state_me
 
 if TYPE_CHECKING:
     from tree_walker.config import TruncationSettings
-    from tree_walker.agent.loop_detector import ActionLoopDetector, FailureStreakTracker
+    from tree_walker.agent.loop_detector import (
+        ActionLoopDetector,
+        FailureStreakTracker,
+        ZeroResultStreakTracker,
+    )
     from tree_walker.agent.message_compactor import MessageCompactor
     from tree_walker.agent.plan_manager import PlanManager
     from tree_walker.browser.session import BrowserSession
@@ -145,6 +149,9 @@ class StepPipeline:
     loop_detector: ActionLoopDetector
     # issue #186 现象①：失败感知连败跟踪（agent.py 实例化，见 FailureStreakTracker）
     failure_streak: FailureStreakTracker
+    # issue #186-c2 形态②：同类查询连续零结果跟踪（见 ZeroResultStreakTracker）
+    zero_result_streak: ZeroResultStreakTracker
+    _pending_zero_result_nudge: tuple[str, str] | None
     # issue #186 现象②：done(success=True) 不确定标记门禁开关（AGENT_DONE_GATE）
     _enable_done_gate: bool
     _compactor: MessageCompactor | None
@@ -340,6 +347,13 @@ class StepPipeline:
         if streak_nudge:
             logger.info("Failure-streak nudge staged: %s", streak_nudge[:100])
             nudge = "\n\n".join(x for x in (nudge, streak_nudge) if x)
+        # issue #186-c2 形态②：零结果降级 nudge——同 peek/ack 语义（查询不
+        # 消费；C 轮 544：精确名过滤 0 结果 ×N 不换策略）
+        zero_candidate = self.zero_result_streak.peek_nudge()
+        self._pending_zero_result_nudge = zero_candidate
+        if zero_candidate:
+            logger.info("Zero-result nudge staged: %s", zero_candidate[1][:100])
+            nudge = "\n\n".join(x for x in (nudge, zero_candidate[1]) if x)
 
         # 4b. Check for new downloads
         download_notice: str | None = None
@@ -574,6 +588,11 @@ class StepPipeline:
         if pending is not None:
             self.failure_streak.ack_nudge(pending[0], pending[1])
             self._pending_streak_nudge = None
+        # issue #186-c2 形态②：零结果降级 nudge 同 ack 语义
+        pending_zr = getattr(self, "_pending_zero_result_nudge", None)
+        if pending_zr is not None:
+            self.zero_result_streak.ack_nudge(pending_zr[0])
+            self._pending_zero_result_nudge = None
 
     def _set_state_message(self, content: str | list[dict[str, Any]]) -> None:
         """设置当前步状态消息，并保留上一份 state 供 LLM 前后对比。
@@ -1421,6 +1440,9 @@ class StepPipeline:
             # 且会被后续成功步重置）；该动作成功即清零；done 豁免。跳过的动作
             # （序列截断）不执行不记录。
             self.failure_streak.record(action_name, bool(result.error))
+            # issue #186-c2 形态②：零结果降级跟踪——查询类动作经 metadata
+            # query_total 旁路（零结果是 soft-miss，与工具失败两通道）
+            self.zero_result_streak.record(action_name, action_params, result)
 
             duration = time.time() - tool_start
             if self._obs_bus and tool_call_id:

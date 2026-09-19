@@ -1641,7 +1641,9 @@ class Tools:
             # aligns with find_text / search_page / browser-use.
             msg = f'No elements found matching "{selector}"'
             logger.info(msg)
-            return ActionResult(extracted_content=msg, long_term_memory=msg)
+            # issue #186-c2 形态②：零结果结构化旁路（降级 nudge 信号源）
+            return ActionResult(extracted_content=msg, long_term_memory=msg,
+                                metadata={"query_total": 0, "query_desc": f"selector '{selector}'"})
         formatted = formatter(data, selector)
         # 大结果分级落盘（镜像 _action_search_page / _action_extract；OSError 不失败只 warning）
         tr = self._truncation
@@ -1665,7 +1667,9 @@ class Tools:
         if saved_to:
             memory += f" Results saved: {saved_to}"
         logger.info(memory)
-        return ActionResult(extracted_content=visible, long_term_memory=memory)
+        # issue #186-c2 形态②：非零结果同样走结构化旁路（降级 nudge 的重置信号）
+        return ActionResult(extracted_content=visible, long_term_memory=memory,
+                            metadata={"query_total": total, "query_desc": f"selector '{selector}'"})
 
     async def _action_find_text(self, params: dict, browser: BrowserSession) -> ActionResult:
         text = params["text"]
@@ -2773,7 +2777,21 @@ class Tools:
         memory = "read_grid: " + ", ".join(meta_bits) + (f", saved={saved_to}" if saved_to else "")
         if group_counts is not None:
             memory += f", group_count({group_field})={len(group_counts)} values"
-        return ActionResult(extracted_content=visible, long_term_memory=memory)
+        # issue #186-c2 形态②：查询总计结构化旁路——零结果降级 nudge 的信号源。
+        # total 口径：total_records（legacy/DOM 通道可能 None）→ 行数兜底；
+        # __str__ 不渲染 metadata，零 token 成本。
+        _qt = result.get("total_records")
+        if not isinstance(_qt, int):
+            _qt = len(result.get("rows") or [])
+        _qd_bits = []
+        if filters:
+            _qd_bits.append(f"filters={filters}")
+        if search:
+            _qd_bits.append(f"search='{search}'")
+        return ActionResult(
+            extracted_content=visible, long_term_memory=memory,
+            metadata={"query_total": _qt, "query_desc": "read_grid " + (" ".join(_qd_bits) or "(unfiltered)")},
+        )
 
     async def _eval_grid_channel(
         self, browser: BrowserSession, js: str, payload: dict,
@@ -2818,7 +2836,9 @@ class Tools:
             # return extracted_content, not error, on a miss).
             msg = f"No matches for '{query}'"
             logger.info(msg)
-            return ActionResult(extracted_content=msg, long_term_memory=msg)
+            # issue #186-c2 形态②：零结果结构化旁路（降级 nudge 信号源）
+            return ActionResult(extracted_content=msg, long_term_memory=msg,
+                                metadata={"query_total": 0, "query_desc": f"query '{query}'"})
         formatted = _format_search_results(data, query)
         # 大结果分级落盘（镜像 _action_extract；OSError 不失败只 warning）
         tr = self._truncation
@@ -2843,7 +2863,9 @@ class Tools:
         if saved_to:
             memory += f" Results saved: {saved_to}"
         logger.info(memory)
-        return ActionResult(extracted_content=visible, long_term_memory=memory)
+        # issue #186-c2 形态②：非零结果同样走结构化旁路（降级 nudge 的重置信号）
+        return ActionResult(extracted_content=visible, long_term_memory=memory,
+                            metadata={"query_total": total, "query_desc": f"query '{query}'"})
 
     async def _action_done(self, params: dict, browser: BrowserSession) -> ActionResult:
         # success 默认值（PR #174 review4 #1）：text/data 任一「存在」才默认 True——

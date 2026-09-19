@@ -121,9 +121,12 @@ class _LadderAgent(StepPipeline):
 		self.max_actions_per_step = 5
 		self._save_conversation_path = None
 		# issue #186：_execute_actions 的连败记录点与 done 门禁所需属性
-		from tree_walker.agent.loop_detector import FailureStreakTracker
+		from tree_walker.agent.loop_detector import FailureStreakTracker, ZeroResultStreakTracker
 		self.failure_streak = FailureStreakTracker()
 		self._enable_done_gate = False  # 门禁另测（test_done_uncertainty_gate.py）
+		# issue #186-c2：零结果降级跟踪所需属性
+		self.zero_result_streak = ZeroResultStreakTracker()
+		self._pending_zero_result_nudge = None
 
 	def _trim_messages(self) -> list[dict[str, Any]]:
 		return list(self.messages)
