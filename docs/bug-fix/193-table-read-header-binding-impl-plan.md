@@ -1,8 +1,22 @@
 # issue #193 实施方案：表格取值路由 read_grid + 合计行捕获与列加和交叉校验
 
 - 日期：2026-09-19；分支 `fix/193-table-read-verification`（自 master `6be5a96`）
-- **状态（2026-09-19）：A/B/C/D 已实施**——2775 测试全过、总覆盖 90%、两 JS
-  模板 node --check 过；待真机探针（D3）与 107 场景回放验收
+- **状态（2026-09-19）：A/B/C/D 已实施 + review 轮一 9 findings 全修**——
+  2781 测试全过、两 JS 模板 node --check 过；待真机探针（D3）与 107 场景
+  回放验收
+- **review 轮一**（`docs/bug-fix/code-review/review-issue-193-1.json`，9 条
+  全 CONFIRMED）：①footer 行级角色过滤——只与 Total/Grand Total/合计/总计
+  基准行比对，Subtotal/小计/Tax/Shipping 跳过（分组小计当基准=稳定假 ✗）；
+  全部行无标签时退化为"单行=基准"（fields 过滤会滤掉标签格）②`_gridReadRow`
+  colspan 列游标（fields 过滤只跳取值、游标照常推进）③合计行判定取首格
+  `td,th`（标签写 `<th>` 时首 td 是数值，漏检=Total 行留 rows 双计）
+  ④mismatch 指引补分页出路 + legacy 顶 page_size 上限明示疑似截断⑤容差
+  `0.005×(n+1)` 按行数缩放（舍入累积 |Σround−round(Σ)| 最坏 ~n×半分钱）
+  ⑥聚合结构化 bool（去 " ✗" 字符串耦合）⑦`_parse_grid_number` 千分位正则
+  严格化（`'12,50'`/`'1.234,56'` 欧陆格式拒识 None——rows/footer 同解析器
+  自洽会把 100× 失真值 totals-ok 出去）⑨⑧Rule 8 与描述键口径限定（列头=
+  表格/legacy 通道，字段名=uiregistry 通道）。回归用例 6 条新增
+  （`test_subtotal_rows_not_used_as_base` 等）。
 - 依据：`docs/bug-fix/193-table-read-header-binding-analysis.md`（证据核验/三层
   根因/方向对比；含 204 证据勘误——方向 3 降级为防复发件）
 - 范围：A 工具层 JS（合计行捕获）+ B 工具层 Python（column_sums 与交叉校验

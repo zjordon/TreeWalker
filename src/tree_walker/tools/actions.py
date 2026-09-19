@@ -484,11 +484,16 @@ function _gridIsTotalLabel(s) {
 }
 function _gridReadRow(tr, heads, p) {
     var cells = tr.querySelectorAll('td,th');
-    var row = {};
+    var row = {}, col = 0;
     for (var c = 0; c < cells.length; c++) {
-        var key = (c < heads.length && heads[c]) ? heads[c] : ('col' + c);
-        if (p.fields && p.fields.length && p.fields.indexOf(key) < 0) { continue; }
-        row[key] = (cells[c].innerText || cells[c].textContent || '').trim();
+        var key = (col < heads.length && heads[col]) ? heads[col] : ('col' + col);
+        // 注意：fields 过滤只跳过取值，列游标照常推进（被过滤的列仍占位）。
+        if (!(p.fields && p.fields.length && p.fields.indexOf(key) < 0)) {
+            row[key] = (cells[c].innerText || cells[c].textContent || '').trim();
+        }
+        // review#2：colspan 折算——合计行常见 <th colspan=N> 形态，按格索引
+        // 配对会把数值格绑到错误表头（假 ✗ 或相邻列合计恰等时假 ✓）。
+        col += (cells[c].colSpan || 1);
     }
     return row;
 }
@@ -497,8 +502,10 @@ function _gridReadTable(root, heads, p) {
     var trs = root.querySelectorAll('tbody tr');
     for (var k = 0; k < trs.length; k++) {
         if (!trs[k].querySelectorAll('td').length) { continue; }
-        var td0 = trs[k].querySelector('td');
-        var first = (td0.innerText || td0.textContent || '').trim();
+        // review#3：判定取首格（td,th）——合计标签写在 <th> 时首 td 是数值，
+        // 漏检会让 Total 行留在 rows 里被双计。
+        var cell0 = trs[k].querySelector('td,th');
+        var first = (cell0.innerText || cell0.textContent || '').trim();
         if (_gridIsTotalLabel(first)) { footer.push(_gridReadRow(trs[k], heads, p)); continue; }
         rows.push(_gridReadRow(trs[k], heads, p));
     }
@@ -608,9 +615,13 @@ _NAVIGATE_NET_ERROR_MARKERS = (
 
 # issue #193 B：合计交叉校验的数值解析。'$1,234.56'→1234.56、'67'→67.0、
 # '12.5%'→12.5；空/非数值→None。两端剥离货币符/百分号/NBSP（Magento 报表
-# 格式），内部逗号整体移除（strip 只削两端，"1,234.56" 的逗号在内）。
-# 会计负数 "(1,234)" 不认（保守：宁可漏和不可错和）。
+# 格式）。含逗号时只接受标准千分位形态（review#7：'12,50'/'1.234,56' 这类
+# 欧陆小数逗号格式裸去逗号会解析成 1250/1.23456——rows 与 footer 同解析器
+# 还可能自洽，totals-check 回显 totals-ok 把 100× 失真值"自信验证"出去，
+# 恰是 #193 要修的形态；保守契约=其余返回 None，宁可漏和不可错和）。
+# 会计负数 "(1,234)" 不认（同理保守）。
 _GRID_NUM_STRIP_ENDS = " \t\r\n\xa0$€£¥%"
+_GRID_THOUSANDS_RE = re.compile(r"^\d{1,3}(,\d{3})+(\.\d+)?$")
 
 
 def _parse_grid_number(value: Any) -> float | None:
@@ -621,13 +632,41 @@ def _parse_grid_number(value: Any) -> float | None:
         return None
     if isinstance(value, (int, float)):
         return float(value)
-    s = str(value).strip().strip(_GRID_NUM_STRIP_ENDS).replace(",", "").strip(_GRID_NUM_STRIP_ENDS)
+    s = str(value).strip().strip(_GRID_NUM_STRIP_ENDS)
     if not s:
         return None
+    if "," in s:
+        if not _GRID_THOUSANDS_RE.match(s):
+            return None
+        s = s.replace(",", "")
     try:
         return float(s)
     except ValueError:
         return None
+
+
+# issue #193 review#1：footer 行角色。合计行捕获（JS）把 tfoot 全部 + tbody
+# Total/小计 行都收进 footer，但只有 Total 类行才是"全列和基准"——分组小计
+# （Subtotal/小计）与单项行（Tax/Shipping/Discount）的值与全列和必然不等，
+# 拿来比对=稳定假 ✗ 误导 agent 重读。标签取行内任一格的全字文本（首格
+# colspan/fields 过滤后不保证标签在首位）；skip 优先于 base（一行不会同时
+# 是两者，防御性取 skip）。
+_GRID_FOOTER_BASE_LABELS = frozenset(
+    {"total", "totals", "grand total", "合计", "总计"})
+_GRID_FOOTER_SKIP_LABELS = frozenset(
+    {"subtotal", "小计", "tax", "shipping", "discount", "discounts", "freight"})
+
+
+def _grid_footer_row_role(frow: dict) -> str | None:
+    """"base"（全列和基准）/ "skip"（中间合计/单项行）/ None（无已知标签）。"""
+    base = False
+    for v in frow.values():
+        t = str(v).strip().lower()
+        if t in _GRID_FOOTER_SKIP_LABELS:
+            return "skip"
+        if t in _GRID_FOOTER_BASE_LABELS:
+            base = True
+    return "base" if base else None
 
 
 class Tools:
@@ -2877,8 +2916,11 @@ class Tools:
         # 断言 "total 67 matching sum of counts" 而实加 130；C111 算出 175
         # 却未与 Total 行 94 比对）。列内所有非空值可解析才参与求和（混入
         # 'N/A'/名字即整列跳过——宁可不算不可错算）；空格跳过但计数（漏行
-        # 信号随 mismatch 一起回显）。footer 与 rows 同键（表头文本），逐列
-        # 与自己的 footer 格比对（tolerance 半分钱）。
+        # 信号随 mismatch 一起回显）。footer 与 rows 同键（表头文本），只与
+        # Total 类基准行比对（review#1：小计/Subtotal/Tax 等中间合计行与全列
+        # 和必然不等，全当基准=稳定误报误导重读）；容差按行数缩放（review#5：
+        # 各行显示值舍入到分、footer 按未舍入值求和再舍入，|Σround−round(Σ)|
+        # 最坏 ~n×半分钱）。
         # 注意：本行不进 notes——notes 渲染统一加 ⚠️ 前缀，会把 ✓ 一致的列
         # 也误标成警告；✗/✓ 自带在行内。
         total_check_line: str | None = None
@@ -2900,29 +2942,53 @@ class Tools:
                     else:
                         col_broken.add(k)
                         col_vals.pop(k, None)
-            sums = {k: sum(v) for k, v in col_vals.items() if v}
+            # review#1：行级角色过滤。全部 footer 行都无已知标签时退化为
+            # 「单行=基准」（fields 过滤会把标签格滤掉，单行 Total 形态仍须
+            # 校验；多行无标签无法区分总计/中间行，保守全跳过）。
+            roles = [_grid_footer_row_role(f) for f in footer_rows]
+            if "base" not in roles and len(footer_rows) == 1:
+                roles = ["base"]
             check_parts: list[str] = []
-            for frow in footer_rows:
-                for k, s in sums.items():
+            has_mismatch = False
+            for frow, role in zip(footer_rows, roles):
+                if role != "base":
+                    continue
+                for k, vals in col_vals.items():
+                    if not vals:
+                        continue
+                    s = sum(vals)
                     fcell = _parse_grid_number(frow.get(k))
                     if fcell is None:
                         continue
-                    ok = abs(s - fcell) < 0.005
+                    tol = 0.005 * (len(vals) + 1)
+                    ok = abs(s - fcell) <= tol
                     entry = f"{k}: sum {s:g} {'==' if ok else '≠'} footer {fcell:g}"
                     if not ok:
+                        has_mismatch = True
                         entry += " ✗"
                         if col_empty.get(k):
                             entry += f" ({col_empty[k]} empty cells skipped)"
                     check_parts.append(entry)
             if check_parts:
-                total_check_ok = all(" ✗" not in p for p in check_parts)
+                total_check_ok = not has_mismatch
                 total_check_line = "totals-check: " + " | ".join(check_parts)
-                if not total_check_ok:
+                if has_mismatch:
+                    # review#4：legacy/dom 通道 page-local——多页表可见行加和
+                    # ≠ 全量 footer 是结构性必然，指引必须给分页出路，否则
+                    # 重读同一页永远消不掉 ✗；legacy 顶到 page_size 上限时
+                    # 明示疑似截断。
                     total_check_line += (
                         " — a column sum that ≠ its Total-row cell means wrong "
-                        "column or missing/extra rows (this read is page-local); "
-                        "re-read before answering"
+                        "column or missing rows, OR a paginated table (this read "
+                        "is page-local): page through all rows before concluding; "
+                        "if it still mismatches, re-check the column binding"
                     )
+                    if (result.get("channel") == "legacy_ajax"
+                            and (result.get("rows_returned") or 0) >= page_size):
+                        total_check_line += (
+                            " (rows hit the page_size cap — the read is likely "
+                            "truncated; raise page_size and re-read)"
+                        )
 
         if saved_to:
             visible = (f"read_grid [{' | '.join(meta_bits)}] full result ({len(text)} chars) "

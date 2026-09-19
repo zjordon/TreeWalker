@@ -34,8 +34,9 @@ and aggregates client-side** over paginating or reading rows step by step — le
 pages as soon as the data is captured.
 8. When a task answer depends on specific values shown in a table (counts, prices, \
 quantities, per-row names), read the table with `read_grid` instead of copying values \
-off the DOM snapshot — rows come back keyed by column header, and adjacent numeric \
-columns are indistinguishable in the flattened snapshot tree.
+off the DOM snapshot — rows come back keyed by column header (report/plain tables) or \
+data-source field name (UI-component grids; use the keys the tool returns), and \
+adjacent numeric columns are indistinguishable in the flattened snapshot tree.
 
 ## Multi-action Rules
 

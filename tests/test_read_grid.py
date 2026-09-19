@@ -601,7 +601,9 @@ class TestFooterTotals:
 		result = await Tools().execute("read_grid", {}, browser)
 		assert not result.error
 		assert "Orders: sum 130 ≠ footer 67 ✗" in result.extracted_content
-		assert "re-read before answering" in result.extracted_content
+		# review#4 后指引含分页出路（完整文案断言在
+		# test_mismatch_guidance_mentions_pagination）
+		assert "re-check the column binding" in result.extracted_content
 		assert "totals-mismatch" in result.long_term_memory
 
 	@pytest.mark.asyncio
@@ -700,7 +702,9 @@ class TestFooterTotals:
 		for js in (_LEGACY_GRID_READ_JS, _DOM_TABLE_READ_JS):
 			assert "_gridReadTable(" in js
 			assert "footer.push" in js
-		for frag in ("tfoot tr", "_gridIsTotalLabel", "querySelector('td')"):
+		for frag in ("tfoot tr", "_gridIsTotalLabel", "querySelector('td,th')",
+		             "colSpan"):
+			# review#2 colspan 折算 / review#3 首格判定取 td,th
 			assert frag in _TABLE_ROWS_CORE_JS
 		# 无反斜杠家规（模板注释 ：463-464）——本改动不引入
 		assert "\\" not in _TABLE_ROWS_CORE_JS
@@ -718,3 +722,91 @@ class TestFooterTotals:
 		assert not result.error
 		assert "totals-check" not in result.extracted_content
 		assert "✗" not in result.extracted_content
+
+	# ── review-issue-193-1 修复的回归用例 ────────────────────────────────
+
+	@pytest.mark.asyncio
+	async def test_subtotal_rows_not_used_as_base(self):
+		"""review#1：分组小计/Subtotal/Tax 行不作为全列和基准——与全列和
+		必然不等，全当基准=稳定假 ✗；只有 Total/Grand Total 行参与比对。"""
+		rows = [
+			{"Interval": "5/2022", "Orders": "8"},
+			{"Interval": "6/2022", "Orders": "13"},
+		]
+		footer = [
+			{"Interval": "Subtotal (Q2)", "Orders": "21"},
+			{"Interval": "Tax", "Orders": "0"},
+			{"Interval": "Total", "Orders": "21"},
+		]
+		browser = _FakeBrowser(evaluate_side_effects=[
+			json.dumps({"channel_error": "no-legacy-grid"}),
+			json.dumps(self._dom_result(rows, footer)),
+		])
+		result = await Tools().execute("read_grid", {}, browser)
+		assert not result.error
+		# 只有 Total 行被比对（一次 ==），Subtotal/Tax 行不产生比对项
+		assert "Orders: sum 21 == footer 21" in result.extracted_content
+		assert "✗" not in result.extracted_content
+		assert "totals-ok" in result.long_term_memory
+
+	@pytest.mark.asyncio
+	async def test_unlabeled_single_footer_row_still_checked(self):
+		"""review#1 退化分支：fields 过滤会把标签格滤掉——单行无标签 footer
+		仍须校验（单行=基准），多行无标签保守全跳过。"""
+		rows = [{"Orders": "8"}, {"Orders": "13"}]
+		footer = [{"Orders": "21"}]  # fields=['Orders'] 后标签格被滤掉
+		browser = _FakeBrowser(evaluate_side_effects=[
+			json.dumps({"channel_error": "no-legacy-grid"}),
+			json.dumps(self._dom_result(rows, footer)),
+		])
+		result = await Tools().execute("read_grid", {}, browser)
+		assert not result.error
+		assert "Orders: sum 21 == footer 21" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_mismatch_guidance_mentions_pagination(self):
+		"""review#4：legacy/dom 通道 page-local——多页表可见行加和 ≠ 全量
+		footer 结构性必然，mismatch 指引必须给分页出路。"""
+		rows = [{"Interval": "5/2022", "Orders": "25"}]
+		footer = [{"Interval": "Total", "Orders": "67"}]
+		browser = _FakeBrowser(evaluate_side_effects=[
+			json.dumps({"channel_error": "no-legacy-grid"}),
+			json.dumps(self._dom_result(rows, footer)),
+		])
+		result = await Tools().execute("read_grid", {}, browser)
+		assert not result.error
+		assert "paginated table" in result.extracted_content
+		assert "page-local" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_rounding_accumulation_tolerance(self):
+		"""review#5：各行显示值舍入到分、footer 按未舍入值求和再舍入——
+		|Σround−round(Σ)| 可达 ~n×半分钱，固定半分钱容差会假 ✗；容差按
+		参与求和的行数缩放（0.005×(n+1)）。"""
+		rows = [
+			{"Interval": "r1", "Amount": "0.125"},
+			{"Interval": "r2", "Amount": "0.125"},
+			{"Interval": "r3", "Amount": "0.125"},
+		]  # Σ=0.375，footer 舍入显示 0.38：|差|=0.005，旧固定容差判 ✗
+		footer = [{"Interval": "Total", "Amount": "0.38"}]
+		browser = _FakeBrowser(evaluate_side_effects=[
+			json.dumps({"channel_error": "no-legacy-grid"}),
+			json.dumps(self._dom_result(rows, footer)),
+		])
+		result = await Tools().execute("read_grid", {}, browser)
+		assert not result.error
+		assert "Amount: sum 0.375 == footer 0.38" in result.extracted_content
+		assert "✗" not in result.extracted_content
+
+	def test_parse_grid_number_thousands_and_decimal_comma(self):
+		"""review#7：含逗号只接受标准千分位；欧陆小数逗号（'12,50'/
+		'1.234,56'）裸去逗号会解析成 1250/1.23456——rows 与 footer 同解析器
+		还可能自洽 totals-ok（100× 失真值被自信验证），保守拒识返回 None。"""
+		from tree_walker.tools.actions import _parse_grid_number
+		assert _parse_grid_number("$1,234.56") == 1234.56
+		assert _parse_grid_number("1,234,567") == 1234567.0
+		assert _parse_grid_number("12,50") is None
+		assert _parse_grid_number("1.234,56") is None
+		assert _parse_grid_number("12,50 €") is None
+		assert _parse_grid_number("(1,234)") is None  # 会计负数不认
+		assert _parse_grid_number("1.234.567") is None  # 多点格式不认
