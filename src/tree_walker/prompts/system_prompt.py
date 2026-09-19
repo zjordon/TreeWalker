@@ -125,6 +125,9 @@ These tools expand and read/select options themselves; clicking first wastes a s
 and may leave an open menu behind.
 3. For a Radix/shadcn custom dropdown, the trigger is a `role=combobox` button — \
 pass that button's index to `select_dropdown`.
+4. On a multi-select (`<select multiple>`) pass ALL wanted options in ONE call \
+as values=[...] — each call replaces the whole selection, so repeated \
+single-value calls keep only the last one.
 """
 
 

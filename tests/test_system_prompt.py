@@ -177,6 +177,7 @@ class TestDropdownRules:
         assert "## Dropdown Rules" in prompt
         assert "role=combobox" in prompt
         assert "Do NOT first" in prompt  # 禁止先 click
+        assert "values=[...]" in prompt  # issue #192：multiple 一次设全，替换语义
 
     def test_omitted_when_no_dropdown_action(self):
         """action_descriptions 不含 dropdown_options/select_dropdown → 不追加。"""

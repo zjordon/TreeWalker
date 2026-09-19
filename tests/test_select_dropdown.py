@@ -4,7 +4,9 @@ success echo, option-not-found soft echo, error mapping, and output format.
 Covers the action layer (Tools._action_select_dropdown), mirroring
 tests/test_dropdown_options.py. The session layer (set_select_option, incl.
 readback-verify + click fallback) is mocked — these tests assert the action
-shell, not the CDP/JS internals.
+shell, not the CDP/JS internals. issue #192 adds multi-select coverage:
+TestSetSelectOptionMulti (session) / TestSelectDropdownMultiAction (action) /
+TestSelectDropdownParams (value/values xor validator).
 """
 
 from __future__ import annotations
@@ -12,8 +14,9 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from pydantic import ValidationError
 
-from tree_walker.browser.session import BrowserSession
+from tree_walker.browser.session import BrowserSession, _SELECT_OPTION_MULTI_JS
 from tree_walker.browser.views import (
 	BrowserStateSummary,
 	EnhancedDOMTreeNode,
@@ -21,6 +24,7 @@ from tree_walker.browser.views import (
 	SerializedDOMState,
 )
 from tree_walker.tools.actions import Tools
+from tree_walker.tools.models import SelectDropdownParams
 
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
@@ -58,13 +62,14 @@ def _make_state(selector_map: dict[int, EnhancedDOMTreeNode]) -> BrowserStateSum
 	)
 
 
-def _make_browser(*, returns=None, raises=None, select=None, combo=None, dropdown=None, custom=None) -> MagicMock:
+def _make_browser(*, returns=None, raises=None, select=None, combo=None, dropdown=None, custom=None, multi=None) -> MagicMock:
 	"""Stub BrowserSession for action-layer tests (does NOT touch CDP).
 
 	P0 native path calls set_select_option (``returns``/``raises``, or ``select`` for
 	explicit clarity); P1 combobox path calls set_combobox_option (``combo``); the multi-type
-	write dispatcher path calls set_dropdown_option (``dropdown``). ``returns`` aliases
-	``select`` for backward compat with the P0 action-layer tests.
+	write dispatcher path calls set_dropdown_option (``dropdown``); issue #192 multi path
+	calls set_select_option_multi (``multi``). ``returns`` aliases ``select`` for backward
+	compat with the P0 action-layer tests.
 	"""
 	bs = MagicMock()
 	if raises is not None:
@@ -73,6 +78,7 @@ def _make_browser(*, returns=None, raises=None, select=None, combo=None, dropdow
 		bs.set_select_option = AsyncMock(
 			return_value=(select if select is not None else (returns if returns is not None else {}))
 		)
+	bs.set_select_option_multi = AsyncMock(return_value=multi or {})
 	bs.set_combobox_option = AsyncMock(return_value=combo or {})
 	bs.set_dropdown_option = AsyncMock(return_value=dropdown or {})
 	bs.set_custom_dropdown_option = AsyncMock(return_value=custom or {})
@@ -732,3 +738,325 @@ class TestSelectDropdownDispatch:
 		assert result.error is not None
 		assert "Failed to select option" in result.error
 		assert "CDP detached" in result.error
+
+
+# ── issue #192: <select multiple> values path (session layer) ─────────────────
+
+
+class TestSetSelectOptionMulti:
+	"""Session-level coverage for BrowserSession.set_select_option_multi.
+
+	Mirrors TestSetSelectOption / TestSetSelectOptionLazyLoadRetry: mocks the CDP
+	boundary and asserts the arguments shape (values as ONE JSON-array argument),
+	all-or-nothing miss, G11 reuse via _lazy_select_call, and NO click fallback
+	（multi 首版不做回退——回读失败原样返回结构化 error 保持可见）.
+	"""
+
+	def _make_session(self, call_results):
+		s = BrowserSession.__new__(BrowserSession)
+		s.current_session_id = "sid"
+		client = MagicMock()
+		client.send.DOM.resolveNode = AsyncMock(return_value={"object": {"objectId": "obj-1"}})
+		if isinstance(call_results, list):
+			client.send.Runtime.callFunctionOn = AsyncMock(
+				side_effect=[{"result": {"value": r}} for r in call_results]
+			)
+		else:
+			client.send.Runtime.callFunctionOn = AsyncMock(
+				return_value={"result": {"value": call_results}},
+			)
+		s.client = client
+		return s, client
+
+	@pytest.mark.asyncio
+	async def test_success_passes_values_list_as_single_argument(self):
+		s, client = self._make_session({
+			"success": True,
+			"message": "Selected 3 options: General, Wholesale, Retailer",
+			"values": ["1", "2", "3"],
+		})
+		result = await s.set_select_option_multi(99, ["General", "Wholesale", "Retailer"])
+		assert result["success"] is True
+		# 范围绑定：resolveNode 用目标 backendNodeId
+		client.send.DOM.resolveNode.assert_awaited_once_with(
+			{"backendNodeId": 99}, session_id="sid",
+		)
+		# values 以单个 CDP argument（JSON 数组）经 arguments 传入（非字符串拼接）
+		assert client.send.Runtime.callFunctionOn.await_count == 1
+		sent = client.send.Runtime.callFunctionOn.await_args.args[0]
+		assert sent["arguments"] == [{"value": ["General", "Wholesale", "Retailer"]}]
+		assert sent["functionDeclaration"] == _SELECT_OPTION_MULTI_JS
+
+	@pytest.mark.asyncio
+	async def test_partial_miss_all_or_nothing_single_call(self):
+		# all-or-nothing：miss 返回 missed + availableOptions 供软回显；availableOptions
+		# 非全空（有真实选项）→ 不触发 G11 重试；multi 无 click fallback → 仅 1 次调用。
+		# 桩值纪律（#185 durable）：missed 含真实存在的组名——若 all-or-nothing 防护
+		# 被删（半写态放行），该用例的 success=False 断言恰好失败。
+		s, client = self._make_session({
+			"success": False,
+			"error": "Options not found: retailer2",
+			"missed": ["retailer2"],
+			"availableOptions": [
+				{"text": "General", "value": "1"},
+				{"text": "Retailer", "value": "3"},
+			],
+		})
+		result = await s.set_select_option_multi(7, ["General", "retailer2"])
+		assert result["success"] is False
+		assert result["missed"] == ["retailer2"]
+		assert len(result["availableOptions"]) == 2
+		assert client.send.Runtime.callFunctionOn.await_count == 1
+
+	@pytest.mark.asyncio
+	async def test_all_empty_triggers_g11_lazy_retry(self, monkeypatch):
+		sleeps = []
+		async def fake_sleep(t): sleeps.append(t)
+		monkeypatch.setattr("tree_walker.browser.session.asyncio.sleep", fake_sleep)
+		s, client = self._make_session([
+			{"success": False, "availableOptions": [{"text": "", "value": ""}]},
+			{},   # focus 调用（同一 mock，消耗一项；返回值不消费）
+			{"success": True, "message": "Selected 1 options: X", "values": ["x"]},
+		])
+		out = await s.set_select_option_multi(7, ["X"])
+		assert out["success"] is True
+		assert 1.0 in sleeps                                     # G11 重试前 sleep 1.0s
+		assert client.send.Runtime.callFunctionOn.await_count == 3  # select + focus + retry
+
+	@pytest.mark.asyncio
+	async def test_reverted_readback_returns_error_without_click_fallback(self):
+		# 回读失败（框架回退）：multi 不做 click fallback，原样返回结构化 error（可见性优先）
+		s, client = self._make_session({
+			"success": False,
+			"error": "Selection was set but reverted by page framework.",
+			"availableOptions": [{"text": "General", "value": "1", "selected": False}],
+		})
+		result = await s.set_select_option_multi(7, ["General"])
+		assert result["success"] is False
+		assert "reverted" in result["error"]
+		assert client.send.Runtime.callFunctionOn.await_count == 1   # 不触发 fallback
+
+	@pytest.mark.asyncio
+	async def test_non_multiple_guard_error_passthrough(self):
+		# JS 守卫：单选 select 误用 values → 明确纠错（LLM 一步自纠安全网）
+		s, _ = self._make_session({
+			"success": False,
+			"error": "Element is not a multi-select (no multiple attribute); pass a single value= instead",
+		})
+		result = await s.set_select_option_multi(7, ["General"])
+		assert result["success"] is False
+		assert "not a multi-select" in result["error"]
+
+	@pytest.mark.asyncio
+	async def test_empty_values_guard_error(self):
+		# JS 守卫（action 层守卫的前置防线）：空列表拒绝——不做「清空全部」语义
+		s, _ = self._make_session({
+			"success": False, "error": "values must be a non-empty list",
+		})
+		result = await s.set_select_option_multi(7, [])
+		assert result["success"] is False
+		assert "non-empty list" in result["error"]
+
+
+# ── issue #192: <select multiple> values path (action layer) ──────────────────
+
+
+class TestSelectDropdownMultiAction:
+	"""issue #192：values 多选的 action 层路由/回显/守卫。
+
+	守卫四类（同传/皆无/空列表/畸形元素）不碰任何 setter；multi miss 提示语
+	独立于单选（单选 endswith value=...) 有既有断言，不得共用）。
+	"""
+
+	@pytest.mark.asyncio
+	async def test_select_with_values_routes_to_multi_setter(self):
+		entry = _make_entry(backend_node_id=7, attributes={"aria-label": "Customer Groups"})
+		state = _make_state({3: entry})
+		browser = _make_browser(multi={
+			"success": True,
+			"message": "Selected 3 options: General, Wholesale, Retailer",
+			"values": ["1", "2", "3"],
+		})
+
+		result = await Tools().execute(
+			"select_dropdown", {"index": 3, "values": ["General", "Wholesale", "Retailer"]},
+			browser, browser_state=state,
+		)
+
+		# 路由：multi setter（backend_node_id + values），单选链/其余 setter 全不碰
+		browser.set_select_option_multi.assert_awaited_once_with(
+			7, ["General", "Wholesale", "Retailer"],
+		)
+		browser.set_select_option.assert_not_awaited()
+		browser.set_dropdown_option.assert_not_awaited()
+		browser.set_combobox_option.assert_not_awaited()
+		assert result.error is None
+		# 成功 message 进 extracted；memory 带 json 编码 values + [SELECT] + index
+		assert "General, Wholesale, Retailer" in result.extracted_content
+		assert '["General", "Wholesale", "Retailer"]' in result.long_term_memory
+		assert "[SELECT]" in result.long_term_memory
+		assert "index 3" in result.long_term_memory
+
+	@pytest.mark.asyncio
+	async def test_multi_miss_soft_echoes_missed_and_options_with_values_hint(self):
+		entry = _make_entry(backend_node_id=7)
+		state = _make_state({3: entry})
+		browser = _make_browser(multi={
+			"success": False,
+			"error": "Options not found: retailer2",
+			"missed": ["retailer2"],
+			"availableOptions": [
+				{"text": "General", "value": "1"},
+				{"text": 'Retailer "Pro"', "value": "3"},
+			],
+		})
+
+		result = await Tools().execute(
+			"select_dropdown", {"index": 3, "values": ["General", "retailer2"]},
+			browser, browser_state=state,
+		)
+
+		# 软回显：missed 头行 + availableOptions 行 + values 提示语（不抛 error）
+		assert result.error is None
+		assert result.extracted_content.startswith("Options not found: retailer2")
+		assert "0: text=" in result.extracted_content
+		assert '"Retailer \\"Pro\\""' in result.extracted_content   # json 编码保留双引号
+		assert result.extracted_content.rstrip().endswith(
+			"Use the values in select_dropdown(index=3, values=[...])"
+		)
+		assert "Couldn't select" in result.long_term_memory
+
+	@pytest.mark.asyncio
+	async def test_multi_reverted_soft_echo_surfaces_error_and_selected_state(self):
+		# review1：reverted（missed 空 + error + availableOptions 带 selected）不得吞掉
+		# error——LLM 传的值本就合法，只看到选项列表+重试提示会无诊断盲目重试循环；
+		# memory 也须带真实原因（误导性 "not all options available" 已废弃）
+		entry = _make_entry(backend_node_id=7)
+		state = _make_state({3: entry})
+		browser = _make_browser(multi={
+			"success": False,
+			"error": "Selection was set but reverted by page framework.",
+			"availableOptions": [
+				{"text": "General", "value": "1", "selected": False},
+				{"text": "Retailer", "value": "3", "selected": True},
+			],
+		})
+
+		result = await Tools().execute(
+			"select_dropdown", {"index": 3, "values": ["General", "Retailer"]},
+			browser, browser_state=state,
+		)
+
+		assert result.error is None
+		assert result.extracted_content.startswith("Selection was set but reverted by page framework.")
+		assert '"Retailer"' in result.extracted_content
+		assert "(selected)" in result.extracted_content   # JS 附带的 selected 状态上抛（镜像读侧格式）
+		assert result.extracted_content.rstrip().endswith(
+			"Use the values in select_dropdown(index=3, values=[...])"
+		)
+		assert "reverted" in result.long_term_memory
+
+	@pytest.mark.asyncio
+	async def test_multi_bare_error_maps_to_action_error(self):
+		entry = _make_entry(backend_node_id=7)
+		state = _make_state({3: entry})
+		browser = _make_browser(multi={
+			"success": False,
+			"error": "Element is not a multi-select (no multiple attribute); pass a single value= instead",
+		})
+
+		result = await Tools().execute(
+			"select_dropdown", {"index": 3, "values": ["General"]}, browser, browser_state=state,
+		)
+
+		assert result.error is not None
+		assert "not a multi-select" in result.error
+		assert result.extracted_content is None   # 无 availableOptions 泄漏
+
+	@pytest.mark.asyncio
+	async def test_non_select_with_values_returns_error_without_setters(self):
+		entry = _make_entry(tag="UL", backend_node_id=7, attributes={"role": "listbox"})
+		state = _make_state({3: entry})
+		browser = _make_browser()
+
+		result = await Tools().execute(
+			"select_dropdown", {"index": 3, "values": ["a"]}, browser, browser_state=state,
+		)
+
+		assert result.error is not None
+		assert "only supported for native" in result.error
+		browser.set_select_option_multi.assert_not_awaited()
+		browser.set_dropdown_option.assert_not_awaited()
+		browser.set_combobox_option.assert_not_awaited()
+
+	@pytest.mark.asyncio
+	async def test_value_and_values_both_passed_returns_error(self):
+		entry = _make_entry(backend_node_id=7)
+		state = _make_state({3: entry})
+		browser = _make_browser()
+
+		result = await Tools().execute(
+			"select_dropdown", {"index": 3, "value": "a", "values": ["a"]},
+			browser, browser_state=state,
+		)
+
+		assert result.error is not None
+		assert "not both" in result.error
+		browser.set_select_option.assert_not_awaited()
+		browser.set_select_option_multi.assert_not_awaited()
+
+	@pytest.mark.asyncio
+	async def test_neither_value_nor_values_returns_error(self):
+		# registry 不校验 execute 路径：handler 守卫兜住 KeyError（params["value"] 旧写法会炸）
+		entry = _make_entry(backend_node_id=7)
+		state = _make_state({3: entry})
+		browser = _make_browser()
+
+		result = await Tools().execute(
+			"select_dropdown", {"index": 3}, browser, browser_state=state,
+		)
+
+		assert result.error is not None
+		assert "requires value" in result.error
+		browser.set_select_option.assert_not_awaited()
+
+	@pytest.mark.asyncio
+	async def test_malformed_values_return_error_without_setter(self):
+		entry = _make_entry(backend_node_id=7)
+		state = _make_state({3: entry})
+		browser = _make_browser()
+
+		for bad in ([], ["a", ""], ["a", 2], "a"):
+			result = await Tools().execute(
+				"select_dropdown", {"index": 3, "values": bad}, browser, browser_state=state,
+			)
+			assert result.error is not None, f"bad values {bad!r} should be rejected"
+			assert "non-empty list" in result.error
+
+		browser.set_select_option_multi.assert_not_awaited()
+
+
+# ── issue #192: SelectDropdownParams value/values xor (direct construction) ───
+
+
+class TestSelectDropdownParams:
+	"""value/values 二选一 validator（直接构造/schema 侧；execute 路径由 action 层
+	运行时守卫兜底——registry 不用 param_model 校验是已知架构）。"""
+
+	def test_value_only_ok(self):
+		p = SelectDropdownParams(index=3, value="ca")
+		assert p.value == "ca"
+		assert p.values is None
+
+	def test_values_only_ok(self):
+		p = SelectDropdownParams(index=3, values=["General", "Wholesale"])
+		assert p.values == ["General", "Wholesale"]
+		assert p.value is None
+
+	def test_both_raises(self):
+		with pytest.raises(ValidationError):
+			SelectDropdownParams(index=3, value="a", values=["a"])
+
+	def test_neither_raises(self):
+		with pytest.raises(ValidationError):
+			SelectDropdownParams(index=3)

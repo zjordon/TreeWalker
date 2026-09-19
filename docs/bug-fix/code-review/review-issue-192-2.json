@@ -1,0 +1,194 @@
+{
+  "status": "complete",
+  "llm": {
+    "model": "glm-5.3"
+  },
+  "message": "Review complete: 0 finding(s) across 8 selected item(s).",
+  "summary": {
+    "files_reviewed": 8,
+    "comments": 0,
+    "total_tokens": 895806,
+    "input_tokens": 871906,
+    "output_tokens": 23900,
+    "cache_read_tokens": 796544,
+    "elapsed": "8m12s"
+  },
+  "tool_calls": {
+    "total": 18,
+    "by_tool": {
+      "code_search": 9,
+      "file_read": 9
+    },
+    "failure": 0,
+    "failure_by_tool": {},
+    "failure_details": []
+  },
+  "comments": [],
+  "groups": [
+    {
+      "label": "Issue 192 multi-select dropdown fix: browser session, tools, prompt, tests, docs and debug example",
+      "files": [
+        "docs/bug-fix/code-review/review-issue-192-1.json",
+        "examples/debug_192_select_multiple.py",
+        "src/tree_walker/browser/session.py",
+        "src/tree_walker/prompts/system_prompt.py",
+        "src/tree_walker/tools/actions.py",
+        "src/tree_walker/tools/models.py",
+        "tests/test_select_dropdown.py",
+        "tests/test_system_prompt.py"
+      ]
+    }
+  ],
+  "session_id": "48333f9f-4eac-4afb-9232-326db5771d7e",
+  "manifest": {
+    "schema_version": "ocr.run-manifest/v1",
+    "run_id": "48333f9f-4eac-4afb-9232-326db5771d7e",
+    "operation": "review",
+    "terminal_state": "complete",
+    "repository": {
+      "identity_sha256": "2868bcfb033292e0d47631dc911d0e36e5dcedaf9e0bcacffe6c4716bb93dfda"
+    },
+    "input": {
+      "mode": "range",
+      "requested_from": "master",
+      "requested_head": "fix/192-select-multiple",
+      "resolved_base": "3b9d55aa6c2728f39ed00c8ca5d512ddcf8022dd",
+      "resolved_head": "be7dab76e9d1d4643b02cd373a20f32b293f0e73",
+      "exact_range": "3b9d55aa6c2728f39ed00c8ca5d512ddcf8022dd..be7dab76e9d1d4643b02cd373a20f32b293f0e73",
+      "source_artifact_sha256": "ed7fecd3d8b1cf81b607ea81b8111286768aea0d9f6fa44b4f5f9f66280336e0"
+    },
+    "execution": {
+      "ocr_version": "v1.12.6",
+      "model": "glm-5.3",
+      "configured_concurrency": 8,
+      "rule_config_sha256": "ddb40005eb732cb8b37d8d3dc1acb82f3aa51fded408c899a092c10349c369c4",
+      "runtime_config_sha256": "841fe9ad288d2dd9efc84c443193c492ef06b26edf31ff5f5a1b01637fef2b0c"
+    },
+    "coverage": {
+      "selected": [
+        {
+          "item_id": "102ddb85ec832fa28af84cda4c3ddac1e83fd4a836adee089ed2342759711f70",
+          "path": "src/tree_walker/tools/models.py",
+          "fingerprint": "338683f5642e9e8e8ff841c71601d8361e0091d966c13ab5f23b99872cb5b8cd"
+        },
+        {
+          "item_id": "3def8553320876b95aaf32b728d20e3b2b08e7c0314e772c13e101c77dc15710",
+          "path": "docs/bug-fix/code-review/review-issue-192-1.json",
+          "fingerprint": "485b0787b532b2af9765c3f80c46138d42ec5bf801859129a75a5bb60b504d94"
+        },
+        {
+          "item_id": "453a7637f615ea59f5d4e7b6296141727ff6ae0b421b03ddab30d91ab2f8bbbb",
+          "path": "tests/test_select_dropdown.py",
+          "fingerprint": "f6097c84f56503bc80a588b83fb31452aa72eadb884234f0acb1dce67d84f37e"
+        },
+        {
+          "item_id": "505a3fb9b1a34dddbcee9bc45ffddea95b5d888e590304d0cc5e0e3d873b527e",
+          "path": "src/tree_walker/prompts/system_prompt.py",
+          "fingerprint": "1779e4c7136df7037d2fb413a05957f961b085a01e81eeb750c84e0fbaa58d70"
+        },
+        {
+          "item_id": "706fe1f68446580d57ef07311ec7f82021231889737b59aa39de414f7201bdd0",
+          "path": "examples/debug_192_select_multiple.py",
+          "fingerprint": "abadd4252ff5060e9a8abec243f871a29436ca534a16862383af525773fe64b2"
+        },
+        {
+          "item_id": "9648d199d9f92dffd0c60bfea16fe64f3695bbfe963292e7b7fb964cc92c21b1",
+          "path": "src/tree_walker/tools/actions.py",
+          "fingerprint": "46a3af56a3d4301bfea415c94d7ef9cbc8aa2dfaa450b2d8213bf6e676c06085"
+        },
+        {
+          "item_id": "9932efe4e9494be618ed91e3e77812ba901e8403cccfa6417c9da7c83e77bfbd",
+          "path": "src/tree_walker/browser/session.py",
+          "fingerprint": "1444844c60235c951dccb2e644be7a71fd9dd6378dab287ea644080a1a49b729"
+        },
+        {
+          "item_id": "d218659241df029aaf21404ac607db919a1881cc32f366476161159c56ef9967",
+          "path": "tests/test_system_prompt.py",
+          "fingerprint": "a9064a780b2d44783f79a4382a428e1e0547afdba2661a793d671334ce99fce0"
+        }
+      ],
+      "completed": [
+        {
+          "item_id": "102ddb85ec832fa28af84cda4c3ddac1e83fd4a836adee089ed2342759711f70",
+          "path": "src/tree_walker/tools/models.py",
+          "fingerprint": "338683f5642e9e8e8ff841c71601d8361e0091d966c13ab5f23b99872cb5b8cd"
+        },
+        {
+          "item_id": "3def8553320876b95aaf32b728d20e3b2b08e7c0314e772c13e101c77dc15710",
+          "path": "docs/bug-fix/code-review/review-issue-192-1.json",
+          "fingerprint": "485b0787b532b2af9765c3f80c46138d42ec5bf801859129a75a5bb60b504d94"
+        },
+        {
+          "item_id": "453a7637f615ea59f5d4e7b6296141727ff6ae0b421b03ddab30d91ab2f8bbbb",
+          "path": "tests/test_select_dropdown.py",
+          "fingerprint": "f6097c84f56503bc80a588b83fb31452aa72eadb884234f0acb1dce67d84f37e"
+        },
+        {
+          "item_id": "505a3fb9b1a34dddbcee9bc45ffddea95b5d888e590304d0cc5e0e3d873b527e",
+          "path": "src/tree_walker/prompts/system_prompt.py",
+          "fingerprint": "1779e4c7136df7037d2fb413a05957f961b085a01e81eeb750c84e0fbaa58d70"
+        },
+        {
+          "item_id": "706fe1f68446580d57ef07311ec7f82021231889737b59aa39de414f7201bdd0",
+          "path": "examples/debug_192_select_multiple.py",
+          "fingerprint": "abadd4252ff5060e9a8abec243f871a29436ca534a16862383af525773fe64b2"
+        },
+        {
+          "item_id": "9648d199d9f92dffd0c60bfea16fe64f3695bbfe963292e7b7fb964cc92c21b1",
+          "path": "src/tree_walker/tools/actions.py",
+          "fingerprint": "46a3af56a3d4301bfea415c94d7ef9cbc8aa2dfaa450b2d8213bf6e676c06085"
+        },
+        {
+          "item_id": "9932efe4e9494be618ed91e3e77812ba901e8403cccfa6417c9da7c83e77bfbd",
+          "path": "src/tree_walker/browser/session.py",
+          "fingerprint": "1444844c60235c951dccb2e644be7a71fd9dd6378dab287ea644080a1a49b729"
+        },
+        {
+          "item_id": "d218659241df029aaf21404ac607db919a1881cc32f366476161159c56ef9967",
+          "path": "tests/test_system_prompt.py",
+          "fingerprint": "a9064a780b2d44783f79a4382a428e1e0547afdba2661a793d671334ce99fce0"
+        }
+      ],
+      "reused": [],
+      "failed": [],
+      "waived": []
+    },
+    "elapsed_ms": 491640
+  },
+  "retry_report": {
+    "schema_version": "ocr.llm-retry-report/v1",
+    "total_requests": 17,
+    "retried_requests": 1,
+    "total_retries": 1,
+    "recovered_requests": 1,
+    "failed_requests": 0,
+    "cancelled_requests": 0,
+    "requests": [
+      {
+        "logical_request_id": "4d3d024fef0407333f80ace16cb4815cb5f36879d9dc206ca690cf78791f225b",
+        "provider": "",
+        "model": "glm-5.3",
+        "file_path": "docs/bug-fix/code-review/review-issue-192-1.json,examples/debug_192_select_multiple.py,src/tree_walker/browser/session.py,src/tree_walker/prompts/system_prompt.py,src/tree_walker/tools/actions.py,src/tree_walker/tools/models.py,tests/test_select_dropdown.py,tests/test_system_prompt.py",
+        "task_type": "plan_task",
+        "request_no": 1,
+        "outcome": "recovered",
+        "attempts": [
+          {
+            "attempt": 1,
+            "outcome": "error",
+            "error_class": "network",
+            "failure_phase": "response_decode",
+            "duration_to_headers_ms": 149215
+          },
+          {
+            "attempt": 2,
+            "outcome": "success",
+            "status_code": 200,
+            "observed_backoff_ms": 428,
+            "duration_to_headers_ms": 220493
+          }
+        ]
+      }
+    ]
+  }
+}
