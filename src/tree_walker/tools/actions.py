@@ -1875,12 +1875,33 @@ class Tools:
         # matching setter. Tag guard widened from P0's "tag != SELECT hard-reject".
         tag = (getattr(entry, "tag_name", "") or "").upper()
         backend_id = getattr(entry, "backend_node_id", None)
-        value = params["value"]
+        # issue #192 运行时守卫（registry 不校验 execute 路径，param_model 只护 schema/直接
+        # 构造——双层防线与 replace_file 的 min_length + `if not old` 同型）：value/values
+        # 二选一；values 仅 native <select multiple>（multi JS 另有非-multiple 守卫兜底）。
+        value = params.get("value")
+        values = params.get("values")
+        if value is not None and values is not None:
+            return ActionResult(error="Pass either value (single option) or values (multi-select), not both")
+        if value is None and values is None:
+            return ActionResult(error="select_dropdown requires value (single option) or values (multi-select list)")
+        if values is not None and (
+            not isinstance(values, list) or not values or not all(isinstance(v, str) and v for v in values)
+        ):
+            return ActionResult(error="values must be a non-empty list of non-empty strings")
+        if values is not None and tag != "SELECT":
+            return ActionResult(
+                error="values (multi-select) is only supported for native <select multiple>; "
+                "for this element use value= (single option)"
+            )
         is_combo, _ = self._is_autocomplete_field(entry)
         attrs = getattr(entry, "attributes", {}) or {}
 
         try:
-            if tag == "SELECT":
+            if values is not None:
+                # multi（<select multiple>，issue #192）：一次设全——单选链三连写对 multiple
+                # 全是替换语义，多次单值调用只剩最后一个（699 三组只剩 Retailer 的根因）。
+                result = await browser.set_select_option_multi(backend_id, values)
+            elif tag == "SELECT":
                 # native <select>：P0 路径零改动
                 result = await browser.set_select_option(backend_id, value)
             elif is_combo and (attrs.get("aria-controls") or attrs.get("aria-owns")):
@@ -1898,6 +1919,28 @@ class Tools:
 
         # Success echo (short/long split, mirrors _describe_dropdown + json.dumps).
         desc = self._describe_dropdown(entry, index)
+        if values is not None:
+            # issue #192 multi echo：独立格式（单选提示语有测试断言 endswith value=...)，不共用）。
+            if result.get("success"):
+                message = result.get("message", f"Selected options: {values}")
+                memory = f"Selected {json.dumps(values)} in {desc}"
+                return ActionResult(extracted_content=message, long_term_memory=memory)
+            available = result.get("availableOptions") or []
+            if available:
+                lines = [
+                    f"{i}: text={json.dumps(o.get('text', ''))}, value={json.dumps(o.get('value', ''))}"
+                    for i, o in enumerate(available)
+                ]
+                missed = result.get("missed") or []
+                head = f"Options not found: {', '.join(missed)}\n" if missed else ""
+                extracted = (
+                    head + "\n".join(lines) + "\n"
+                    + f"Use the values in select_dropdown(index={index}, values=[...])"
+                )
+                memory = f"Couldn't select {json.dumps(values)} in {desc} (not all options available)"
+                return ActionResult(extracted_content=extracted, long_term_memory=memory)
+            err = result.get("error", f"Failed to select options: {values}")
+            return ActionResult(error=err)
         if result.get("success"):
             message = result.get("message", f"Selected option: {value}")
             memory = f"Selected {json.dumps(value)} in {desc}"

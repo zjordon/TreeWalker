@@ -267,7 +267,25 @@ class DropdownOptionsParams(BaseModel):
 class SelectDropdownParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
     index: int = Field(description="ID of the select element, shown in brackets in the DOM tree")
-    value: str = Field(description="Option value to select")
+    value: str | None = Field(
+        default=None,
+        description="Option value to select (single option). Each call REPLACES the selection.",
+    )
+    values: list[str] | None = Field(
+        default=None,
+        description=(
+            "For <select multiple> only: ALL wanted option values in ONE call — "
+            "replaces the whole selection (repeated single-value calls keep only the last one)"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _value_xor_values(self):
+        # issue #192：单选/多选二选一（validator 只护直接构造/schema 侧；execute 路径由
+        # _action_select_dropdown 运行时守卫兜底——registry 不用 param_model 校验）。
+        if (self.value is None) == (self.values is None):
+            raise ValueError("pass exactly one of value (single) or values (multi-select)")
+        return self
 
 
 class UploadFileParams(BaseModel):
@@ -697,7 +715,8 @@ ACTION_DEFINITIONS: dict[str, tuple[type[BaseModel], str, bool]] = {
         SelectDropdownParams,
         "Select an option in a dropdown element (native <select>, role=combobox, "
         "role=listbox, or custom dropdown). Pass the dropdown's index — do not "
-        "click it first",
+        "click it first. For <select multiple>, pass all wanted options at once "
+        "as values=[...]",
         False,
     ),
     "upload_file": (UploadFileParams, "Upload a file to a file input element. Do NOT click the input or an upload button first — upload_file sets the file directly without opening the OS file picker", False),

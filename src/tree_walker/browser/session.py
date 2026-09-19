@@ -945,6 +945,75 @@ function(targetText) {
 }
 """
 
+# Multi-select write script (issue #192). The single-select script's three writes
+# (element.value= / option.selected= / element.selectedIndex=) are ALL replace
+# semantics on <select multiple> — per HTML spec the value and selectedIndex
+# setters deselect every option first, so repeated single-value calls keep only
+# the last one. This script sets the WHOLE selection via option.selected only:
+# matched options -> selected, everything else -> deselected (idempotent,
+# independent of prior state). All-or-nothing: any target without a matching
+# option writes nothing and echoes missed + availableOptions. Readback verifies
+# the selected SET (element.value only reflects the first selected option on
+# multiple). Non-multiple guard gives the LLM a one-step self-correction echo.
+_SELECT_OPTION_MULTI_JS = """
+function(targetTexts) {
+    const element = this;
+    if (!element || element.tagName.toLowerCase() !== 'select') {
+        return { success: false, error: 'Element is not a <select>' };
+    }
+    if (!element.multiple) {
+        return { success: false, error: 'Element is not a multi-select (no multiple attribute); pass a single value= instead' };
+    }
+    if (!Array.isArray(targetTexts) || targetTexts.length === 0) {
+        return { success: false, error: 'values must be a non-empty list' };
+    }
+    const targets = [];
+    const seen = {};
+    for (const t of targetTexts) {
+        const k = (t || '').toLowerCase();
+        if (k && !seen[k]) { seen[k] = 1; targets.push(k); }
+    }
+    const options = Array.from(element.options);
+    const matches = function(o) {
+        const textLower = (o.text || '').trim().toLowerCase();
+        const valueLower = (o.value || '').toLowerCase();
+        return targets.indexOf(textLower) !== -1 || targets.indexOf(valueLower) !== -1;
+    };
+    const missed = targets.filter(function(t) {
+        return !options.some(function(o) {
+            return (o.text || '').trim().toLowerCase() === t || (o.value || '').toLowerCase() === t;
+        });
+    });
+    if (missed.length > 0) {
+        return {
+            success: false,
+            error: 'Options not found: ' + missed.join(', '),
+            missed: missed,
+            availableOptions: options.map(o => ({ text: (o.text || '').trim(), value: o.value })),
+        };
+    }
+    const matched = options.filter(matches);
+    element.focus();
+    for (const o of options) o.selected = matches(o);
+    element.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+    element.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+    element.blur();
+    const selectedNow = options.filter(o => o.selected);
+    if (!(matched.every(o => o.selected) && selectedNow.length === matched.length)) {
+        return {
+            success: false,
+            error: 'Selection was set but reverted by page framework.',
+            availableOptions: options.map(o => ({ text: (o.text || '').trim(), value: o.value, selected: o.selected })),
+        };
+    }
+    return {
+        success: true,
+        message: 'Selected ' + matched.length + ' options: ' + matched.map(o => (o.text || '').trim()).join(', '),
+        values: matched.map(o => o.value),
+    };
+}
+"""
+
 # Click fallback script (ported from browser-use default_action_watchdog.py:3556-3607).
 # Run only when selectionReverted=true: simulates a full gesture
 # mousedown/click-on-option/mouseup/change to bypass frameworks that intercept
@@ -4282,6 +4351,53 @@ return (async function(){
         value = result.get("result", {}).get("value")
         return value if isinstance(value, list) else []
 
+    async def _lazy_select_call(
+        self, object_id: str, function_declaration: str, arguments: list[dict],
+    ) -> dict:
+        """callFunctionOn + G11 空选项懒加载重试（set_select_option / set_select_option_multi 共用）。
+
+        G11：select 有 option 但全部为空（text 与 value 都空白）→ option 多半异步填充。
+        focus() + sleep 1.0s + 重跑同一 JS 一次（仅 native，镜像 browser-use
+        default_action_watchdog.py:3509-3547；重试先于任何回退——懒加载是比框架回退更
+        廉价的假设）。全空谓词：success=False 且 availableOptions 非空列表且每项
+        text/value 都空白。返回该 JS 的 dict 结果。CDP/JS 异常上抛（caller 包装）。
+        """
+        async def _call() -> dict:
+            result = await self.client.send.Runtime.callFunctionOn(
+                {
+                    "objectId": object_id,
+                    "functionDeclaration": function_declaration,
+                    "arguments": arguments,
+                    "returnByValue": True,
+                },
+                session_id=self.current_session_id,
+            )
+            return result.get("result", {}).get("value", {}) or {}
+
+        selection = await _call()
+        avail = selection.get("availableOptions") or []
+        all_empty = (
+            not selection.get("success")
+            and isinstance(avail, list)
+            and len(avail) > 0
+            and all(
+                not (o.get("text") or "").strip() and not (o.get("value") or "").strip()
+                for o in avail
+            )
+        )
+        if all_empty:
+            await self.client.send.Runtime.callFunctionOn(
+                {
+                    "objectId": object_id,
+                    "functionDeclaration": "function(){ try{ this.focus(); } catch(e){} }",
+                    "returnByValue": True,
+                },
+                session_id=self.current_session_id,
+            )
+            await asyncio.sleep(1.0)
+            selection = await _call()
+        return selection
+
     async def set_select_option(self, backend_node_id: int, value: str) -> dict:
         """Set the option of the <select> identified by backendNodeId.
 
@@ -4305,52 +4421,9 @@ return (async function(){
         )
         object_id = resolve["object"]["objectId"]
 
-        result = await self.client.send.Runtime.callFunctionOn(
-            {
-                "objectId": object_id,
-                "functionDeclaration": _SELECT_OPTION_JS,
-                "arguments": [{"value": value}],
-                "returnByValue": True,
-            },
-            session_id=self.current_session_id,
+        selection = await self._lazy_select_call(
+            object_id, _SELECT_OPTION_JS, [{"value": value}],
         )
-        selection = result.get("result", {}).get("value", {}) or {}
-
-        # G11 懒加载重试：select 有 option 但全部为空（text 与 value 都空白）→ option
-        # 多半异步填充。focus() + sleep 1.0s + 重跑 _SELECT_OPTION_JS 一次（仅 native，
-        # 镜像 browser-use default_action_watchdog.py:3509-3547）。重试先于点击回退
-        # （懒加载是比框架回退更廉价的假设）。全空谓词：success=False 且 availableOptions
-        # 非空列表且每项 text/value 都空白。
-        avail = selection.get("availableOptions") or []
-        all_empty = (
-            not selection.get("success")
-            and isinstance(avail, list)
-            and len(avail) > 0
-            and all(
-                not (o.get("text") or "").strip() and not (o.get("value") or "").strip()
-                for o in avail
-            )
-        )
-        if all_empty:
-            await self.client.send.Runtime.callFunctionOn(
-                {
-                    "objectId": object_id,
-                    "functionDeclaration": "function(){ try{ this.focus(); } catch(e){} }",
-                    "returnByValue": True,
-                },
-                session_id=self.current_session_id,
-            )
-            await asyncio.sleep(1.0)
-            retry = await self.client.send.Runtime.callFunctionOn(
-                {
-                    "objectId": object_id,
-                    "functionDeclaration": _SELECT_OPTION_JS,
-                    "arguments": [{"value": value}],
-                    "returnByValue": True,
-                },
-                session_id=self.current_session_id,
-            )
-            selection = retry.get("result", {}).get("value", {}) or {}
 
         # Framework reverted the programmatic value set -> click fallback
         # (mirrors browser-use default_action_watchdog.py:3550-3617).
@@ -4372,6 +4445,32 @@ return (async function(){
             # structured error (carries availableOptions for the action layer
             # to echo back to the LLM).
         return selection
+
+    async def set_select_option_multi(self, backend_node_id: int, values: list[str]) -> dict:
+        """Set the whole selection of a <select multiple> identified by backendNodeId.
+
+        issue #192：单选链的三连写（element.value= / option.selected= /
+        element.selectedIndex=）对 multiple 全是替换语义（value/selectedIndex 的
+        setter 会先取消全部 option）——多次单值调用只剩最后一个。本方法走
+        _SELECT_OPTION_MULTI_JS：只用 option.selected 整组设置（目标选中、其余取消），
+        一次设全（幂等、与调用前状态无关）。all-or-nothing：任一值无匹配 option
+        不写值，回显 missed + availableOptions。回读验证比对选中集（multiple 的
+        element.value 只返回第一项）。不做 click fallback（multiple 的框架回退场景
+        未证实存在，回读失败返回结构化 error 保持可见）。
+
+        Returns a dict shaped like set_select_option's (multi flavor):
+          success: True|False, message?, values?, missed?, availableOptions?, error?
+        Raises on CDP/JS error (caller wraps with a friendly message).
+        """
+        resolve = await self.client.send.DOM.resolveNode(
+            {"backendNodeId": backend_node_id},
+            session_id=self.current_session_id,
+        )
+        object_id = resolve["object"]["objectId"]
+
+        return await self._lazy_select_call(
+            object_id, _SELECT_OPTION_MULTI_JS, [{"value": values}],
+        )
 
     async def _call_setter_on_node(
         self, backend_node_id: int, function_declaration: str, value: str,
