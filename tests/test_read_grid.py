@@ -834,3 +834,42 @@ class TestFooterTotals:
 		英文小计行不挪出 rows 会被 column_sums 双计。"""
 		from tree_walker.tools.actions import _TABLE_ROWS_CORE_JS
 		assert "'subtotal'" in _TABLE_ROWS_CORE_JS
+
+	# ── review-issue-193-3 修复的回归用例 ────────────────────────────────
+
+	@pytest.mark.asyncio
+	async def test_non_additive_columns_skipped(self):
+		"""review3#2：均值/比率列的 Total 格是全表均值不是列和（Magento
+		Orders 报表的 Avg. Orders / Avg. Sales Items 即此形态）——比对必然
+		假 ✗ 且重读消不掉；跳过比对，尾部信息行回显。"""
+		rows = [
+			{"Interval": "5/2022", "Orders": "8", "Avg. Orders": "0.26"},
+			{"Interval": "6/2022", "Orders": "13", "Avg. Orders": "0.43"},
+		]
+		footer = [{"Interval": "Total", "Orders": "21", "Avg. Orders": "0.35"}]
+		browser = _FakeBrowser(evaluate_side_effects=[
+			json.dumps({"channel_error": "no-legacy-grid"}),
+			json.dumps(self._dom_result(rows, footer)),
+		])
+		result = await Tools().execute("read_grid", {}, browser)
+		assert not result.error
+		assert "Orders: sum 21 == footer 21" in result.extracted_content
+		assert "Avg. Orders: sum" not in result.extracted_content  # 不比对
+		assert "non-additive columns skipped" in result.extracted_content
+		assert "✗" not in result.extracted_content
+		assert "totals-ok" in result.long_term_memory
+
+	def test_parse_grid_number_negative_and_special_forms(self):
+		"""review3#1/#3：负数金额（符号在剥货币符前摘出、负号进千分位
+		分支）；nan/inf/下划线形态拒识。"""
+		from tree_walker.tools.actions import _parse_grid_number
+		assert _parse_grid_number("-$67.50") == -67.5
+		assert _parse_grid_number("-1,234.56") == -1234.56
+		assert _parse_grid_number("-12.5%") == -12.5
+		assert _parse_grid_number("+$8") == 8.0
+		assert _parse_grid_number("-") is None
+		assert _parse_grid_number("(1,234)") is None  # 会计负数继续不认
+		assert _parse_grid_number("NaN") is None
+		assert _parse_grid_number("Infinity") is None
+		assert _parse_grid_number("-Infinity") is None
+		assert _parse_grid_number("1_000") is None

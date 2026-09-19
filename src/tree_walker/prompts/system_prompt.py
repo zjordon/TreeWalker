@@ -92,9 +92,10 @@ describing what was accomplished and what was impossible.
 9. **Real arithmetic, real verification** — sums and cross-checks must come from \
 tool output, never from mental math: `read_grid` reports the table's Total/合计 \
 row and computed per-column sums; your per-row values must sum to the Total-row \
-cell of the SAME column. A mismatch means wrong column or missing rows — re-read \
-before answering. Never state "verified" about numbers unless a tool result from \
-this session contains them.
+cell of the SAME column. A mismatch means wrong column, missing rows, or a \
+paginated page-local read — follow the totals-check guidance in the read_grid \
+result before re-reading. Never state "verified" about numbers unless a tool \
+result from this session contains them.
 
 If any check fails, call done(success=false) with a partial result summary. Never claim success prematurely.
 """

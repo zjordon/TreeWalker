@@ -24,6 +24,18 @@
   ——原 `"base" not in roles` 会把明确判定 skip 的单行 footer 静默升级为
   base（部分小计值当全列和基准=稳定假 ✗，与「skip 优先」相悖）。
   回归用例 +2，2783 passed。
+- **review 轮三**（`review-issue-193-3.json`，3 条全 CONFIRMED）：
+  ①`_parse_grid_number` 负数形态——前导 +/- 在剥两端货币符**之前**摘出
+  （"-$67.50" 的 '-' 挡住 '$'；"-1,234.56" 无负号分支进不了千分位），
+  退款/折扣列整列 broken 使 totals-check 静默消失；②非可加列语义过滤
+  ——表头含 avg/average/rate/ratio/percent/% 的列跳过比对（其 Total 格是
+  全表均值/比率不是列和，比对必然假 ✗ 且重读消不掉；**Magento Orders
+  报表的 Avg. Orders/Avg. Sales Items 即此形态，正中 107 目标页面**），
+  尾部信息行回显跳过清单；prompt 第 9 条 mismatch 归因同步软化
+  （wrong column/missing rows/paginated——按工具 totals-check 指引行动）；
+  ③float() 接受 'NaN'/'Infinity'/'1_000'——nan 入列 sum 为 nan、
+  abs(nan-x)<=tol 恒 False 整列必然 ✗；math.isfinite 复核 + 下划线拒识。
+  回归用例 +2，2785 passed。
 - 依据：`docs/bug-fix/193-table-read-header-binding-analysis.md`（证据核验/三层
   根因/方向对比；含 204 证据勘误——方向 3 降级为防复发件）
 - 范围：A 工具层 JS（合计行捕获）+ B 工具层 Python（column_sums 与交叉校验

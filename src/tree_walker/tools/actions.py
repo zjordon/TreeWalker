@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from typing import Any
 import logging
 import mimetypes
@@ -617,12 +618,16 @@ _NAVIGATE_NET_ERROR_MARKERS = (
 )
 
 # issue #193 B：合计交叉校验的数值解析。'$1,234.56'→1234.56、'67'→67.0、
-# '12.5%'→12.5；空/非数值→None。两端剥离货币符/百分号/NBSP（Magento 报表
-# 格式）。含逗号时只接受标准千分位形态（review#7：'12,50'/'1.234,56' 这类
-# 欧陆小数逗号格式裸去逗号会解析成 1250/1.23456——rows 与 footer 同解析器
-# 还可能自洽，totals-check 回显 totals-ok 把 100× 失真值"自信验证"出去，
-# 恰是 #193 要修的形态；保守契约=其余返回 None，宁可漏和不可错和）。
-# 会计负数 "(1,234)" 不认（同理保守）。
+# '12.5%'→12.5、'-$67.50'→-67.5；空/非数值→None。两端剥离货币符/百分号/
+# NBSP（Magento 报表格式）。含逗号时只接受标准千分位形态（review#7：
+# '12,50'/'1.234,56' 这类欧陆小数逗号格式裸去逗号会解析成 1250/1.23456
+# ——rows 与 footer 同解析器还可能自洽，totals-check 回显 totals-ok 把
+# 100× 失真值"自信验证"出去，恰是 #193 要修的形态；保守契约=其余返回
+# None，宁可漏和不可错和）。会计负数 "(1,234)" 不认（同理保守）。
+# review3#1：前导 +/- 在剥两端货币符**之前**摘出（"-$67.50" 的 '-' 会挡住
+# 其后的 '$'；"-1,234.56" 也要进千分位分支）。review3#3：float() 接受
+# 'NaN'/'Infinity'/'1_000'——nan 入列后 sum() 为 nan，abs(nan-x)<=tol 恒
+# False 整列必然 ✗；isfinite 复核 + 下划线拒识。
 _GRID_NUM_STRIP_ENDS = " \t\r\n\xa0$€£¥%"
 _GRID_THOUSANDS_RE = re.compile(r"^\d{1,3}(,\d{3})+(\.\d+)?$")
 
@@ -635,17 +640,25 @@ def _parse_grid_number(value: Any) -> float | None:
         return None
     if isinstance(value, (int, float)):
         return float(value)
-    s = str(value).strip().strip(_GRID_NUM_STRIP_ENDS)
-    if not s:
+    s = str(value).strip()
+    neg = False
+    if s[:1] in ("-", "+"):
+        neg = s[0] == "-"
+        s = s[1:].strip()
+    s = s.strip(_GRID_NUM_STRIP_ENDS)
+    if not s or "_" in s:
         return None
     if "," in s:
         if not _GRID_THOUSANDS_RE.match(s):
             return None
         s = s.replace(",", "")
     try:
-        return float(s)
+        n = float(s)
     except ValueError:
         return None
+    if not math.isfinite(n):
+        return None
+    return -n if neg else n
 
 
 # issue #193 review#1：footer 行角色。合计行捕获（JS）把 tfoot 全部 + tbody
@@ -670,6 +683,13 @@ def _grid_footer_row_role(frow: dict) -> str | None:
         if t in _GRID_FOOTER_BASE_LABELS:
             base = True
     return "base" if base else None
+
+
+# review3#2：非可加列（均值/比率/百分比）的 Total 行格是全表均值或比率而非
+# 列加和——Magento Orders 报表的 Avg. Orders / Avg. Sales Items 即此形态，
+# 比对必然 ✗ 且重读消不掉（行语义过滤只防了小计行，这是列语义维度）。
+# 表头含这些子串的列跳过比对，仅在 totals-check 尾部以信息行回显。
+_GRID_NON_ADDITIVE_HEADER_MARKERS = ("avg", "average", "rate", "ratio", "percent", "%")
 
 
 class Tools:
@@ -2956,11 +2976,16 @@ class Tools:
                 roles = ["base"]
             check_parts: list[str] = []
             has_mismatch = False
+            # review3#2：非可加列跳过比对（均值/比率列的 Total 格不是列和）
+            non_additive = sorted(
+                k for k in col_vals
+                if any(m in k.lower() for m in _GRID_NON_ADDITIVE_HEADER_MARKERS)
+            )
             for frow, role in zip(footer_rows, roles):
                 if role != "base":
                     continue
                 for k, vals in col_vals.items():
-                    if not vals:
+                    if not vals or k in non_additive:
                         continue
                     s = sum(vals)
                     fcell = _parse_grid_number(frow.get(k))
@@ -2995,6 +3020,11 @@ class Tools:
                             " (rows hit the page_size cap — the read is likely "
                             "truncated; raise page_size and re-read)"
                         )
+                if non_additive:
+                    total_check_line += (
+                        " (non-additive columns skipped — Total cell is a mean/"
+                        f"ratio, not a sum: {', '.join(non_additive)})"
+                    )
 
         if saved_to:
             visible = (f"read_grid [{' | '.join(meta_bits)}] full result ({len(text)} chars) "
