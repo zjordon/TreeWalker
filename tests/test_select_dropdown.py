@@ -927,6 +927,36 @@ class TestSelectDropdownMultiAction:
 		assert "Couldn't select" in result.long_term_memory
 
 	@pytest.mark.asyncio
+	async def test_multi_reverted_soft_echo_surfaces_error_and_selected_state(self):
+		# review1：reverted（missed 空 + error + availableOptions 带 selected）不得吞掉
+		# error——LLM 传的值本就合法，只看到选项列表+重试提示会无诊断盲目重试循环；
+		# memory 也须带真实原因（误导性 "not all options available" 已废弃）
+		entry = _make_entry(backend_node_id=7)
+		state = _make_state({3: entry})
+		browser = _make_browser(multi={
+			"success": False,
+			"error": "Selection was set but reverted by page framework.",
+			"availableOptions": [
+				{"text": "General", "value": "1", "selected": False},
+				{"text": "Retailer", "value": "3", "selected": True},
+			],
+		})
+
+		result = await Tools().execute(
+			"select_dropdown", {"index": 3, "values": ["General", "Retailer"]},
+			browser, browser_state=state,
+		)
+
+		assert result.error is None
+		assert result.extracted_content.startswith("Selection was set but reverted by page framework.")
+		assert '"Retailer"' in result.extracted_content
+		assert "(selected)" in result.extracted_content   # JS 附带的 selected 状态上抛（镜像读侧格式）
+		assert result.extracted_content.rstrip().endswith(
+			"Use the values in select_dropdown(index=3, values=[...])"
+		)
+		assert "reverted" in result.long_term_memory
+
+	@pytest.mark.asyncio
 	async def test_multi_bare_error_maps_to_action_error(self):
 		entry = _make_entry(backend_node_id=7)
 		state = _make_state({3: entry})

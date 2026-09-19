@@ -70,7 +70,12 @@ async def main() -> None:
 	obj = await send("Runtime.evaluate", {
 		"expression": "document.querySelector('select[name=\"customer_group_ids\"]')",
 	})
-	object_id = obj["result"]["objectId"]
+	object_id = obj.get("result", {}).get("objectId")
+	if not object_id:
+		page_url = (await send("Runtime.evaluate", {
+			"expression": "location.href", "returnByValue": True,
+		})).get("result", {}).get("value")
+		raise SystemExit(f"customer_group_ids select 不在 DOM（当前 URL: {page_url}）——KO 表单未就绪或字段名变化")
 	call = await send("Runtime.callFunctionOn", {
 		"objectId": object_id,
 		"functionDeclaration": _SELECT_OPTION_MULTI_JS,
@@ -93,9 +98,10 @@ async def main() -> None:
 	print(f"readback selected values: {selected}")
 	assert selected == ["1", "2", "3"], f"回读非三组: {selected}"
 
-	# 4) Save（整页跳转回列表页）
+	# 4) Save（整页跳转回列表页）——先择一元素再 click：?.click() 恒返回 undefined，
+	#    || 右侧总会再执行，两选择器同时命中会双击（重复提交污染 DB 硬校验）
 	await send("Runtime.evaluate", {
-		"expression": "document.querySelector('#save')?.click() || document.querySelector('button[title=\"Save\"]')?.click()",
+		"expression": "(document.querySelector('#save') || document.querySelector('button[title=\"Save\"]'))?.click()",
 		"returnByValue": True,
 	})
 	await asyncio.sleep(4.0)

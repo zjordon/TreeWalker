@@ -968,10 +968,17 @@ function(targetTexts) {
         return { success: false, error: 'values must be a non-empty list' };
     }
     const targets = [];
-    const seen = {};
+    // Set 去重（review1：普通对象做集合会被原型链污染——"constructor"/"toString"/
+    // "__proto__" 等键取到继承值恒 truthy，目标被静默丢弃不进 missed → 漏选仍报
+    // success，极端时清空全部选中）。空串目标过滤后 targets 仍须非空，否则
+    // 整组 selected=false 会清空既有选中并误报 "Selected 0 options"。
+    const seen = new Set();
     for (const t of targetTexts) {
         const k = (t || '').toLowerCase();
-        if (k && !seen[k]) { seen[k] = 1; targets.push(k); }
+        if (k && !seen.has(k)) { seen.add(k); targets.push(k); }
+    }
+    if (targets.length === 0) {
+        return { success: false, error: 'values must be a non-empty list' };
     }
     const options = Array.from(element.options);
     const matches = function(o) {

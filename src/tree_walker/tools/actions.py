@@ -1927,17 +1927,35 @@ class Tools:
                 return ActionResult(extracted_content=message, long_term_memory=memory)
             available = result.get("availableOptions") or []
             if available:
+                # 行格式带 selected 状态（镜像 _format_options_result；reverted 场景 JS 特意
+                # 附带 selected 字段，丢了就没有「哪些还在选中」的诊断信息）
                 lines = [
-                    f"{i}: text={json.dumps(o.get('text', ''))}, value={json.dumps(o.get('value', ''))}"
+                    "{}: text={}, value={}{}".format(
+                        i,
+                        json.dumps(o.get("text", "")),
+                        json.dumps(o.get("value", "")),
+                        " (selected)" if o.get("selected") else "",
+                    )
                     for i, o in enumerate(available)
                 ]
+                # 失败原因三态：missed（选项不存在）/ error（写入被框架回退等——session
+                # 层明言该 error 要保持可见，吞掉会让 LLM 拿合法值盲目重试）/ 无
                 missed = result.get("missed") or []
-                head = f"Options not found: {', '.join(missed)}\n" if missed else ""
+                if missed:
+                    reason = f"Options not found: {', '.join(missed)}"
+                elif result.get("error"):
+                    reason = str(result["error"])
+                else:
+                    reason = ""
+                head = f"{reason}\n" if reason else ""
                 extracted = (
                     head + "\n".join(lines) + "\n"
                     + f"Use the values in select_dropdown(index={index}, values=[...])"
                 )
-                memory = f"Couldn't select {json.dumps(values)} in {desc} (not all options available)"
+                memory = (
+                    f"Couldn't select {json.dumps(values)} in {desc}"
+                    + (f" ({reason})" if reason else "")
+                )
                 return ActionResult(extracted_content=extracted, long_term_memory=memory)
             err = result.get("error", f"Failed to select options: {values}")
             return ActionResult(error=err)
