@@ -2781,12 +2781,21 @@ class Tools:
         #（query_desc 由 tracker 侧 _query_key 从 params 统一推导，单一事实源，
         # review7 #2）。total 口径：total_records（legacy/DOM 通道可能 None）→
         # 行数兜底；__str__ 不渲染 metadata，零 token 成本。
+        # review8 #2：信号只对「查询确实被通道应用」发射——legacy/dom_table
+        # 从不应用 filters/search（仅 uiregistry 主通道 ds.set('params.filters')，
+        # session.py read_ui_grid），它们 0 行是「通道无数据」而非「查询零命中」；
+        # 行数兜底会把前者按请求的 filters 键记 miss，两次即注入与零行 note
+        #（"filters/search were NOT applied"）自相矛盾、且建议的换子串过滤在
+        # 该通道根本无效的降级 nudge（review7 #1 attr_total 的同类不对称）。
+        # 无信号 = 不计 miss 也不重置（语义中性）。
         _qt = result.get("total_records")
         if not isinstance(_qt, int):
             _qt = len(result.get("rows") or [])
+        if (filters or search) and result.get("channel") != "uiregistry":
+            _qt = None
         return ActionResult(
             extracted_content=visible, long_term_memory=memory,
-            metadata={"query_total": _qt},
+            metadata={"query_total": _qt} if isinstance(_qt, int) else None,
         )
 
     async def _eval_grid_channel(

@@ -10,12 +10,19 @@ Selena vs 目录 Selene 拼写不一致，agent 按产品名精确过滤评论�
 
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from tree_walker.agent.loop_detector import ZeroResultStreakTracker
+from tree_walker.agent.loop_detector import (
+	ActionLoopDetector,
+	FailureStreakTracker,
+	ZeroResultStreakTracker,
+)
 from tree_walker.agent.views import ActionResult
+from tree_walker.browser.views import BrowserStateSummary, SerializedDOMState
 from tree_walker.tools.actions import Tools
 
 
@@ -168,10 +175,9 @@ class TestQueryTotalMetadata:
 	async def test_read_grid_error_path_no_metadata(self):
 		"""三通道全灭 → ActionResult.error → 无 query_total（错误归 streak 通道）。"""
 		from tests.test_read_grid import _FakeBrowser
-		import json as _json
 		browser = _FakeBrowser(evaluate_side_effects=[
-			_json.dumps({"channel_error": "no-legacy-grid"}),
-			_json.dumps({"channel_error": "no-table"}),
+			json.dumps({"channel_error": "no-legacy-grid"}),
+			json.dumps({"channel_error": "no-table"}),
 		])
 		r = await Tools().execute("read_grid", {"filters": {"name": "X"}}, browser)
 		assert r.error is not None
@@ -238,6 +244,46 @@ class TestQueryTotalMetadata:
 		assert r.error is None  # 走成功分支（非零结果 soft-miss 路径）
 		assert r.metadata["query_total"] == 1  # 合并计数=0+1，非 0
 
+	@pytest.mark.asyncio
+	async def test_read_grid_legacy_channel_filters_not_applied_no_signal(self):
+		"""review8 #2：legacy_ajax 不应用 filters/search——0 行是「通道无数据」
+		而非「查询零命中」，不得按请求 filters 键记 miss（nudge 会与零行 note
+		"filters NOT applied" 矛盾，换子串过滤建议在该通道也无效）→ 无信号
+		（语义中性：不计 miss 也不重置）。"""
+		browser = MagicMock()
+		browser.read_ui_grid = AsyncMock(return_value={"channel_error": "no-requirejs"})
+		legacy = {"channel": "legacy_ajax", "rows": [], "rows_returned": 0,
+			"headers": ["Name"], "applied": {"page_size": 200, "page": 1}}
+		browser.evaluate = AsyncMock(return_value=json.dumps(legacy))
+		r = await Tools().execute("read_grid", {"filters": {"name": "X"}}, browser)
+		assert r.error is None
+		assert (r.metadata or {}).get("query_total") is None
+
+	@pytest.mark.asyncio
+	async def test_read_grid_legacy_channel_unfiltered_counts_rows(self):
+		"""无 filters/search 的 legacy 读取不受门控——行数兜底照常发信号。"""
+		browser = MagicMock()
+		browser.read_ui_grid = AsyncMock(return_value={"channel_error": "no-requirejs"})
+		legacy = {"channel": "legacy_ajax", "rows": [{"Name": "a"}, {"Name": "b"}],
+			"rows_returned": 2, "headers": ["Name"]}
+		browser.evaluate = AsyncMock(return_value=json.dumps(legacy))
+		r = await Tools().execute("read_grid", {}, browser)
+		assert r.error is None
+		assert r.metadata["query_total"] == 2
+
+	@pytest.mark.asyncio
+	async def test_read_grid_uiregistry_filters_zero_still_signals(self):
+		"""uiregistry 主通道确实应用 filters（session.py read_ui_grid
+		ds.set('params.filters')）——带 filters 的 0 结果仍是真查询零命中，
+		信号照发（门控不过度抑制 544 目标场景）。"""
+		browser = MagicMock()
+		browser.read_ui_grid = AsyncMock(return_value={
+			"channel": "uiregistry", "namespace": "review_grid",
+			"rows": [], "rows_returned": 0, "total_records": 0})
+		r = await Tools().execute("read_grid", {"filters": {"name": "X"}}, browser)
+		assert r.error is None
+		assert r.metadata["query_total"] == 0
+
 
 class TestStepWiring:
 	"""review7 #6：step 层接线回归保护——实施方案 §4 验收项「连续两次同过滤
@@ -246,13 +292,12 @@ class TestStepWiring:
 	静默失效，两种接线回归现有测试全绿）。"""
 
 	def _pipeline(self):
-		"""免构造 StepPipeline——只挂 _prepare_context/_ack 所需最小属性集。"""
-		from tree_walker.agent.loop_detector import ActionLoopDetector
+		"""免构造 StepPipeline——挂真跑 ``_prepare_context`` 全链所需最小属性集
+		（review8 #4：驱动真实接线 peek→暂存→并入 nudge→state message，而非
+		手工复刻链条——step.py 删掉接线 hunk 时本类必须红）。"""
 		from tree_walker.agent.step import StepPipeline
 		p = StepPipeline.__new__(StepPipeline)
 		p.loop_detector = ActionLoopDetector()
-		p.failure_streak = ZeroResultStreakTracker.__mro__[0]  # 占位，下面逐个设
-		from tree_walker.agent.loop_detector import FailureStreakTracker
 		p.failure_streak = FailureStreakTracker()
 		p.zero_result_streak = ZeroResultStreakTracker()
 		p._pending_streak_nudge = None
@@ -269,27 +314,50 @@ class TestStepWiring:
 		p._track_downloads = False
 		p._enable_message_typing = True
 		p.messages = []
-		p.browser = MagicMock()
 		p.tools = MagicMock()
-		from tree_walker.browser.views import BrowserStateSummary, SerializedDOMState
 		state = BrowserStateSummary(
 			url="https://example.com", title="t",
 			dom_state=SerializedDOMState(_root=None, selector_map={}, element_tree_text="dom"),
 		)
+		# _prepare_context 直达桩：get_state 回真状态、邻接 mixin 方法（_last/
+		# history/schema 构建）不在本类射程——lambda 桩绕开，nudge 接线保持真实
+		p.browser = MagicMock()
+		p.browser.get_state = AsyncMock(return_value=state)
+		p.browser.current_target_id = None
+		p.state = SimpleNamespace(last_result=None, n_steps=0, consecutive_failures=0)
+		p.max_steps = 10
+		p.max_failures = 3
+		p._safe_task = "t"
+		p._use_vision = False  # 视觉门关：不触 llm/截图路径
+		p._last = lambda key: None
+		p._build_agent_history_description = lambda: None
+		p._update_action_models_for_page = lambda url: None
 		return p, state
 
-	def test_nudge_injected_into_state_message_after_two_zeroes(self):
-		"""两次同过滤 0 结果 → _prepare_context 产出的 state message 含降级文案。"""
-		from tree_walker.prompts.system_prompt import build_state_message
-		p, bs = self._pipeline()
+	@pytest.mark.asyncio
+	async def test_nudge_injected_into_state_message_after_two_zeroes(self):
+		"""两次同过滤 0 结果 → 真跑 _prepare_context：产出的 state message 含
+		降级文案、候选已暂存 _pending_zero_result_nudge（接线回归保护主用例）。"""
+		p, _ = self._pipeline()
 		params = {"filters": {"name": "Selena Yoga Hoodie"}}
 		p.zero_result_streak.record("read_grid", params, _qr(0))
 		p.zero_result_streak.record("read_grid", params, _qr(0))
-		nudge = p.zero_result_streak.peek_nudge()
-		assert nudge is not None
-		msg = build_state_message(bs, task="t", nudge_message=nudge[1])
+		_, msg = await p._prepare_context()
 		assert "0 results 2 times" in msg
 		assert "substring/partial filter" in msg
+		assert p._pending_zero_result_nudge is not None
+		assert p._pending_zero_result_nudge[0].startswith("read_grid|")
+		# state 消息已落位（带 _type 标记），nudge 随消息进入对话
+		assert "0 results 2 times" in p.messages[-1]["content"]
+
+	@pytest.mark.asyncio
+	async def test_no_streak_state_message_has_no_nudge(self):
+		"""无零结果 streak → _prepare_context 正常返回且不注入降级文案
+		（防「恒注入」类反向接线回归）。"""
+		p, _ = self._pipeline()
+		_, msg = await p._prepare_context()
+		assert "0 results" not in msg
+		assert p._pending_zero_result_nudge is None
 
 	def test_ack_clears_pending_no_reinjection(self):
 		"""ack 提交后同 streak 不再产出候选（去抖），state message 不再含文案。"""

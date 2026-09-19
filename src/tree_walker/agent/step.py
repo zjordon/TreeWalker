@@ -1449,9 +1449,19 @@ class StepPipeline:
             # 的鸭子类型桩（_RecordingTools 等）不带该方法，跳过归一直透原始
             # params（生产 Tools 恒有——真实路径不降级）。
             _flatten = getattr(self.tools, "_flatten_params", None)
+            # review8 #3：展平前先查注册表（与 Tools.execute /
+            # _validate_action_params 两个既有调用点同款守卫）——
+            # _flatten_params 单 dict 值分支裸下标 registry.actions[name]，
+            # 未知名（校验梯耗尽 "proceeding anyway" / 旁路 LLM）+ 单 dict 值
+            # params（read_grid 拼写错名 + 正常 {"filters": {...}}）会 KeyError；
+            # record 在 per-action try 之外，会把 execute 已优雅返回的
+            # Unknown action error 降级成整步崩溃。未知名跳过展平直透原始
+            # params（record 对未知名无 query_total 信号本就早退，零语义损失）。
+            _known = action_name in getattr(
+                getattr(self.tools, "registry", None), "actions", ())
             self.zero_result_streak.record(
                 action_name,
-                _flatten(action_params, action_name) if _flatten else action_params,
+                _flatten(action_params, action_name) if _flatten and _known else action_params,
                 result,
             )
 
