@@ -12,7 +12,11 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from tree_walker.agent.loop_detector import ActionLoopDetector, FailureStreakTracker
+from tree_walker.agent.loop_detector import (
+    ActionLoopDetector,
+    FailureStreakTracker,
+    ZeroResultStreakTracker,
+)
 from tree_walker.agent.message_compactor import MessageCompactor
 from tree_walker.agent.plan_manager import PlanManager
 from tree_walker.agent.rerun import RerunMixin
@@ -121,6 +125,10 @@ class Agent(StepPipeline, RerunMixin):
         # review2 #5：_prepare_context peek 暂存、LLM 响应取得后 _step ack——
         # 查询即消费会在 LLM 调用失败时把首报静默吞掉。
         self._pending_streak_nudge: tuple[str, int, str] | None = None
+        # issue #186-c2 形态②：同类查询连续零结果跟踪（检索降级 nudge）——
+        # 与 failure_streak 同 peek/ack 语义。
+        self.zero_result_streak = ZeroResultStreakTracker()
+        self._pending_zero_result_nudge: tuple[str, str] | None = None
         # issue #186 现象②：done(success=True) 不确定标记门禁开关（默认开；
         # 评测口径隔离可 AGENT_DONE_GATE=0 关闭——软干预，非红线项）。
         self._enable_done_gate = _settings.done_uncertainty_gate

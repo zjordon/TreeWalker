@@ -242,3 +242,116 @@ class FailureStreakTracker:
         name, streak, message = candidate
         self.ack_nudge(name, streak)
         return message
+
+
+class ZeroResultStreakTracker:
+    """issue #186-c2 形态②：同一精确查询连续零结果跟踪——检索降级 nudge 源。
+
+    与 ``FailureStreakTracker`` 同构但信号相反：那边看工具失败，这里看工具
+    「成功但查询空手而归」（C 轮 544：任务名 Selena vs 目录 Selene 拼写不一致，
+    精确过滤 0 结果 ×N 不换策略，25/29 步耗尽）。零结果是 soft-miss（正确的
+    工具语义），不进 ``consecutive_failures``/``FailureStreakTracker``。
+
+    信号经 ``ActionResult.metadata['query_total']`` 结构化旁路（三个查询类
+    动作的成功路径设置；``__str__`` 不渲染 metadata，零 token 成本）。查询
+    身份 = 动作名 + 归一化查询键（read_grid: namespace+search+filters；
+    find_elements: selector；search_page: query）——改查询即重置。
+    通知去抖与 peek/ack 语义同 ``FailureStreakTracker``（查询不消费：
+    LLM 失败步不 ack，下步重发）。
+    """
+
+    NUDGE_AT = 2
+
+    def __init__(self) -> None:
+        # key -> streak 计数；key 形如 "read_grid|ns=sales_order_grid|search=WH12"
+        self._streaks: dict[str, int] = {}
+        # key -> 是否已通知（去抖：同键只报一次，非零结果重置）
+        self._notified: set[str] = set()
+        # key -> query_desc（文案引用）
+        self._descs: dict[str, str] = {}
+
+    @staticmethod
+    def _query_key(name: str, params: dict) -> tuple[str, str] | None:
+        """归一化查询身份——返回 (key, query_desc) 或 None（非查询类动作）。
+
+        review7 #3：按值真值判定部件是否参与键（旧 ``endswith("=")`` 后缀启发
+        在值以 = 结尾时误丢部件，使不同查询坍缩同键）；review7 #10：json 用
+        模块顶导入（本模块已有）。
+        """
+        if name == "read_grid":
+            ns = params.get("namespace") or ""
+            search = params.get("search") or ""
+            filters = params.get("filters") or {}
+            parts = []
+            if ns:
+                parts.append(f"ns={ns}")
+            if search:
+                parts.append(f"search={search}")
+            if filters:
+                try:
+                    parts.append(f"filters={json.dumps(filters, sort_keys=True, ensure_ascii=False)}")
+                except (TypeError, ValueError):
+                    parts.append(f"filters={sorted(filters.items(), key=str)}")
+            key = f"read_grid|{'|'.join(parts) or 'default'}"
+            desc_bits = []
+            if filters:
+                desc_bits.append(f"filters={filters}")
+            if search:
+                desc_bits.append(f"search='{search}'")
+            return key, "read_grid " + (" ".join(desc_bits) or "(unfiltered)")
+        if name == "find_elements":
+            selector = str(params.get("selector") or "")
+            if not selector:
+                return None
+            return f"find_elements|{selector}", f"selector '{selector}'"
+        if name == "search_page":
+            query = str(params.get("query") or "")
+            if not query:
+                return None
+            return f"search_page|{query}", f"query '{query}'"
+        return None
+
+    def record(self, name: str, params: dict, result) -> None:
+        """从 ActionResult.metadata 读 query_total 并更新 streak（无信号直接返回）。"""
+        metadata = getattr(result, "metadata", None) or {}
+        total = metadata.get("query_total")
+        if not isinstance(total, int):
+            return  # 非查询类动作 / 错误路径（无 query_total）不参与
+        ident = self._query_key(name, params or {})
+        if ident is None:
+            return
+        key, desc = ident
+        if total > 0:
+            self._streaks.pop(key, None)
+            self._notified.discard(key)
+            self._descs.pop(key, None)
+        else:
+            self._streaks[key] = self._streaks.get(key, 0) + 1
+            self._descs[key] = desc
+
+    def peek_nudge(self) -> tuple[str, str] | None:
+        """（只读）返回已达阈值且未通知的 (key, message)；查询不消费——
+        ack 前重复 peek 返回同一候选（LLM 失败步不 ack，下步重发）。"""
+        for key, streak in self._streaks.items():
+            if streak >= self.NUDGE_AT and key not in self._notified:
+                desc = self._descs.get(key, key)
+                return key, (
+                    f"Exact-match query returned 0 results {streak} times in a row "
+                    f"({desc}). The name may be misspelled or partially different — "
+                    "switch to a substring/partial filter, list candidate rows "
+                    "unfiltered, or browse the catalog and match by similarity."
+                )
+        return None
+
+    def ack_nudge(self, key: str) -> None:
+        """提交通知（与 peek 配对）——LLM 响应取得后由 step 侧调用。"""
+        self._notified.add(key)
+
+    def nudge(self) -> str | None:
+        """peek + ack 便捷组合（单测与简单场景用）。"""
+        candidate = self.peek_nudge()
+        if candidate is None:
+            return None
+        key, message = candidate
+        self.ack_nudge(key)
+        return message

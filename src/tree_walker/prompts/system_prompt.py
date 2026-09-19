@@ -64,7 +64,11 @@ Verify ALL of the following:
 
 1. **Re-read the user's original task** — list every specific requirement.
 2. **Check each requirement** — are all items found? Are counts correct? Are filters applied?
-3. **Verify actions actually completed** — did the page confirm the form was submitted / the file was downloaded?
+3. **Verify actions actually completed** — did the page confirm the form was submitted \
+/ the file was downloaded? Verification must use a channel INDEPENDENT of the write: \
+re-enter/reload the page and read back, check a URL/ID change, or server state. \
+Reading back values you just injected via the same JS/evaluate channel proves nothing \
+(self-certification).
 4. **Verify data sources** — all URLs, names, and values must come from tool outputs or the page in this session. Never fabricate data.
 5. **Check for blocking errors** — unresolved issues (login failure, payment error) → set success=false.
 6. **Any unmet requirement** → set success=false and describe what was accomplished and what failed.
@@ -73,6 +77,11 @@ If your evaluation or memory still contains unresolved markers (a value with `?`
 an unread gap, a partial tally, an unverified assumption), resolve them with tools \
 first, or call done(success=false) stating exactly what is missing. Verifying only \
 a shortlist derived from partial data does NOT establish completeness.
+8. **Unattainable values** — if a required value does not exist in the system \
+(e.g. an attribute option/enum value that was never defined) and creating it \
+requires metadata administration, abandon that clause: complete the gradeable \
+base fields first, and report the unmet clause honestly in done(success=false) \
+describing what was accomplished and what was impossible.
 
 If any check fails, call done(success=false) with a partial result summary. Never claim success prematurely.
 """

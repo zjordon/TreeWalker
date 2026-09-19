@@ -49,6 +49,29 @@ class TestTaskCompletionRules:
         assert "unread gap" in prompt
         assert "shortlist derived from partial data does NOT establish completeness" in prompt
 
+    def test_prompt_contains_independent_channel_verification(self):
+        """issue #186-c2 形态③：第 3 条强化——验证须独立于写值通道，同 JS
+        通道回读 = self-certification 无效（C 轮 700/701：注入后同 evaluate
+        回读自证保存成功）。"""
+        prompt = build_system_prompt(
+            action_descriptions=_default_action_descriptions(),
+            task="Test task",
+        )
+        assert "INDEPENDENT of the write" in prompt
+        assert "self-certification" in prompt
+
+    def test_prompt_contains_unattainable_values_rule(self):
+        """issue #186-c2 形态①：第 8 条 Unattainable values——需创建元数据的
+        子句放弃保基础字段（C 轮 698：运行时造属性选项陪葬基础字段；B 轮对照
+        组早放弃得 1.0）。"""
+        prompt = build_system_prompt(
+            action_descriptions=_default_action_descriptions(),
+            task="Test task",
+        )
+        assert "Unattainable values" in prompt
+        assert "abandon that clause" in prompt
+        assert "gradeable base fields first" in prompt
+
     def test_prompt_contains_success_false_guidance(self):
         prompt = build_system_prompt(
             action_descriptions=_default_action_descriptions(),

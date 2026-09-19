@@ -121,9 +121,12 @@ class _LadderAgent(StepPipeline):
 		self.max_actions_per_step = 5
 		self._save_conversation_path = None
 		# issue #186：_execute_actions 的连败记录点与 done 门禁所需属性
-		from tree_walker.agent.loop_detector import FailureStreakTracker
+		from tree_walker.agent.loop_detector import FailureStreakTracker, ZeroResultStreakTracker
 		self.failure_streak = FailureStreakTracker()
 		self._enable_done_gate = False  # 门禁另测（test_done_uncertainty_gate.py）
+		# issue #186-c2：零结果降级跟踪所需属性
+		self.zero_result_streak = ZeroResultStreakTracker()
+		self._pending_zero_result_nudge = None
 
 	def _trim_messages(self) -> list[dict[str, Any]]:
 		return list(self.messages)
@@ -458,3 +461,37 @@ class TestResponseFieldClarificationCopy:
 		mgr = PlanManager()
 		assert "response field, not an action" in mgr.build_replan_nudge(3, 3, [PlanItem(text="A")])
 		assert "response field, not an action" in mgr.build_exploration_nudge(5, 5, None)
+
+
+# ── 5. review8 #3（#186-c2）：record 前展平的未注册名 KeyError 防护 ──────
+
+
+class TestUnknownNameRecordFlattenGuard:
+	"""_execute_actions 里 zero_result_streak.record 前的展平调用必须先守卫
+	注册表——真实 ``Tools._flatten_params`` 单 dict 值分支裸下标
+	``registry.actions[name]``（actions.py:2976），未知名（校验梯耗尽
+	"proceeding anyway" / 旁路 LLM）+ 单 dict 值 params（read_grid 拼写错 +
+	正常 ``{"filters": {...}}``）命中该分支；record 在 per-action try 之外，
+	KeyError 会把 execute 已优雅返回的 Unknown action error 降级成整步崩溃。
+	"""
+
+	@pytest.mark.asyncio
+	async def test_unknown_name_with_dict_param_no_crash(self):
+		from tree_walker.tools.actions import Tools as RealTools
+		agent = _LadderAgent([])
+		agent.tools = RealTools()  # 真实 registry：read_gird 未注册、展平会裸下标
+		response = {
+			"action": {"name": "read_gird", "params": {"filters": {"name": "X"}}},
+			"actions": [{"name": "read_gird", "params": {"filters": {"name": "X"}}}],
+		}
+		results = await StepPipeline._execute_actions(agent, response, _browser_state())
+		assert len(results) == 1
+		assert "Unknown action" in (results[0].error or "")  # 优雅失败，不崩溃
+
+	def test_flatten_params_unknown_name_dict_param_raises(self):
+		"""动机锚点：未知名 + 单 dict 值 params 对 _flatten_params 裸调确实
+		KeyError（调用方守卫约定的存在理由——两个既有调用点 execute/
+		_validate_action_params 均先查注册表）。"""
+		from tree_walker.tools.actions import Tools as RealTools
+		with pytest.raises(KeyError):
+			RealTools()._flatten_params({"filters": {"a": 1}}, "read_gird")
