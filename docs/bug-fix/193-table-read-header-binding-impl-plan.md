@@ -36,6 +36,8 @@
   ③float() 接受 'NaN'/'Infinity'/'1_000'——nan 入列 sum 为 nan、
   abs(nan-x)<=tol 恒 False 整列必然 ✗；math.isfinite 复核 + 下划线拒识。
   回归用例 +2，2785 passed。
+- **review 轮四**（`review-issue-193-4.json`）：**0 findings（7 项全查），
+  review 收敛**。四轮累计 9 → 2 → 3 → 0，共 14 findings 全 CONFIRMED 全修。
 - 依据：`docs/bug-fix/193-table-read-header-binding-analysis.md`（证据核验/三层
   根因/方向对比；含 204 证据勘误——方向 3 降级为防复发件）
 - 范围：A 工具层 JS（合计行捕获）+ B 工具层 Python（column_sums 与交叉校验
