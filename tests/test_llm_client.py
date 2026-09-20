@@ -772,9 +772,10 @@ class TestCreateWithBackoff:
         assert _sleep_await_seconds(mock_sleep) == [2.0]
 
     def test_backoff_total_budget_bounds_waits(self):
-        """retry-after 恒 60：总预算 90s → 第二次退避(60+60>90)前即 raise，
+        """retry-after 恒 60：墙钟预算 90s → 第二次退避(60+60>90)前即 raise，
         终点类型保持 RateLimitError（不变形为外层 llm_timeout 的
-        TimeoutError——L3 按类型分罪依赖这一点）。"""
+        TimeoutError——L3 按类型分罪依赖这一点）。_mono 假时钟推进——mock
+        sleep 不走真实墙钟，不冻结则 deadline 永不触发。"""
         resp = MagicMock(status_code=429)
         resp.headers = {"retry-after": "60"}
         mock_sleep = AsyncMock()
@@ -782,17 +783,41 @@ class TestCreateWithBackoff:
             self.client.client.messages, "create", side_effect=_rl(resp),
         ) as mock_create, patch(
             "tree_walker.llm.client.asyncio.sleep", mock_sleep,
+        ), patch(
+            "tree_walker.llm.client._mono", side_effect=[0.0, 0.0, 60.0],
         ):
             with pytest.raises(RateLimitError):
                 asyncio.run(self.client._create_with_backoff(messages=[]))
         assert mock_create.call_count == 2
         assert _sleep_await_seconds(mock_sleep) == [60.0]
 
+    def test_budget_counts_request_wall_time(self):
+        """review #1：预算是墙钟（含请求耗时）——首次失败时已耗 40s 的慢请求，
+        下一次退避 60s 会越过 90s deadline → 不 sleep 直接 raise（只计 sleep 的
+        首版此场景会继续等，把外层 wait_for 拖成 TimeoutError 掉回能力分支）。"""
+        resp = MagicMock(status_code=429)
+        resp.headers = {"retry-after": "60"}
+        mock_sleep = AsyncMock()
+        with patch.object(
+            self.client.client.messages, "create", side_effect=_rl(resp),
+        ) as mock_create, patch(
+            "tree_walker.llm.client.asyncio.sleep", mock_sleep,
+        ), patch(
+            "tree_walker.llm.client._mono", side_effect=[0.0, 40.0],
+        ):
+            with pytest.raises(RateLimitError):
+                asyncio.run(self.client._create_with_backoff(messages=[]))
+        assert mock_create.call_count == 1
+        mock_sleep.assert_not_awaited()
+
     def test_fallback_switch_does_not_consume_backoff(self):
         """主 429 一次 → fallback 成功：切换不占退避预算（零 sleep）。
 
         主/备两个 client 的 create 都要打桩——切换后 self.client 指向
         _fallback_client，漏打桩会打到真 SDK（缺参 TypeError）。
+        review #4：切换后重试必须带 fallback 的 model/max_tokens——
+        create_kwargs 在调用点绑定主模型名，不刷新会把主模型名发给
+        fallback 端点。
         """
         client = LLMClient(LLMSettings(
             model="main-model", api_key="main-key",
@@ -811,12 +836,19 @@ class TestCreateWithBackoff:
         ) as mock_fb, patch(
             "tree_walker.llm.client.asyncio.sleep", mock_sleep,
         ):
-            result = asyncio.run(client._create_with_backoff(messages=[]))
+            result = asyncio.run(client._create_with_backoff(
+                model="main-model", max_tokens=1024, messages=[],
+            ))
         assert result is ok
         assert mock_main.call_count == 1
         assert mock_fb.call_count == 1
         assert client._using_fallback is True
         mock_sleep.assert_not_awaited()
+        # review #4 回归锁：fallback 请求带的是切换后的 model/max_tokens，
+        # 不是调用点绑定的主模型名（fallback 默认 max_tokens=16384 ≠ 1024）
+        assert mock_main.call_args.kwargs["model"] == "main-model"
+        assert mock_fb.call_args.kwargs["model"] == "fallback-model"
+        assert mock_fb.call_args.kwargs["max_tokens"] == 16384
 
     def test_cancelled_error_propagates(self):
         """退避 sleep 被取消 → CancelledError 穿透（不吞、不再重试）。"""

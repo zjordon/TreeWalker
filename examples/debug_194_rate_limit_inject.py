@@ -28,9 +28,9 @@ import asyncio
 import json
 import logging
 import sys
-from urllib.parse import urlsplit
+from pathlib import Path
 
-sys.path.insert(0, f"{__file__}/../src")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from aiohttp import ClientSession, web
 
@@ -97,6 +97,9 @@ async def run_task(settings, ws_url: str, base_url: str, max_steps: int, tag: st
 	"""跑一遍任务，返回终态摘要 dict（n_steps/history/连败/infra）。"""
 	llm_settings = settings.llm.model_copy()
 	llm_settings.base_url = base_url
+	# 验收口径隔离（review #6）：环境配置了 fallback（FALLBACK_LLM_MODEL）时
+	# 首 429 即切走——fallback base_url 不经代理，注入耗不尽、两趟模型不一致
+	llm_settings.fallback = None
 	llm = LLMClient(llm_settings)
 	browser_settings = settings.browser.model_copy()
 	browser_settings.ws_url = ws_url
@@ -230,12 +233,17 @@ async def main() -> None:
 	check("no rate-limit step burned budget",
 		injected["n_steps"] <= clean["n_steps"] + 1,
 		f"injected n_steps={injected['n_steps']} vs clean={clean['n_steps']}")
+	check("effective steps (history) identical",
+		injected["history_len"] <= clean["history_len"] + 1,
+		f"injected history_len={injected['history_len']} vs clean={clean['history_len']}")
 	check("no capability streak poisoned",
 		injected["consecutive_failures"] == 0,
 		f"consecutive_failures={injected['consecutive_failures']}")
-	check("infra counted separately",
-		injected["infra_failures"] >= 0,
-		f"infra_failures={injected['infra_failures']}（client 层 L2 吸收时应为 0）")
+	# review #2：恒真断言（>= 0）无判别力——默认注入量下 L2 全吸收（总 sleep
+	# ~10s << 90s 预算），Branch 2.5 不触发，infra_failures 必须为 0
+	check("infra absorbed by client-layer L2",
+		injected["infra_failures"] == 0,
+		f"infra_failures={injected['infra_failures']}（L2 吸收时应为 0；>0 说明注入量超过 L2 预算，需调 --inject-count 解读）")
 	print(f"\nRESULT: {'ALL PASS' if ok else 'FAILED'}")
 	sys.exit(0 if ok else 1)
 

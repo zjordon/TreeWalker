@@ -1569,6 +1569,12 @@ class StepPipeline:
         #   - multi-action step (any failure, partial or all) → do NOT count;
         #     loop_detector + replan nudges handle recovery instead
         #   - any non-counted step → reset counter if previously > 0
+        # issue #194 review2：infra 清零须在单动作失败 early return **之前**——
+        # 到达 _post_process 即证明 LLM 可达（model_output 非空、动作已执行），
+        # 能力失败步同样解除基建嫌疑；否则被能力失败步隔开的两个限流窗口
+        # 会叠加判死，违背「连续基建失败才累积」的语义。
+        if self.state.infra_failures > 0:
+            self.state.infra_failures = 0
         if results and len(results) == 1 and results[-1].error:
             self.state.consecutive_failures += 1
             logger.debug("Consecutive failures: %d", self.state.consecutive_failures)
@@ -1585,10 +1591,6 @@ class StepPipeline:
         # Non-counted step (success or multi-action failure) → reset counter
         if self.state.consecutive_failures > 0:
             self.state.consecutive_failures = 0
-        # issue #194：infra 计数同语义清零——连续基建失败才累积（两个独立窗口
-        # 各中两枪不应叠加判死），任何成功步即解除基建嫌疑。
-        if self.state.infra_failures > 0:
-            self.state.infra_failures = 0
 
         # Completion result logging (aligned to browser-use service.py:1232-1244):
         # 统一标签 "📄 Final Result:"，绿/红靠 ANSI 颜色区分；随后输出 attachments。

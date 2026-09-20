@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from typing import Any
 
 from anthropic import Anthropic, APIConnectionError, APIError, RateLimitError
@@ -48,15 +49,22 @@ _TEXT_RETRY_MAX = 2
 # issue #194：限流/网络传输类基建错误的 client 层退避（L2）。B 轮 task_550
 # 证据链：SDK 默认 max_retries=2 亚秒退避挡不住几十秒级 429 窗口 →
 # RateLimitError 直穿 get_action → step 层当能力失败计连败，20 秒内 5 连发
-# 触发 max_failures 死刑。预算取值对齐 llm_timeout=120s：退避总预算 90s +
-# 请求时间后仍留余量，保证限流的终点异常类型恒为 RateLimitError/
+# 触发 max_failures 死刑。预算取值对齐 llm_timeout=120s：墙钟总预算 90s
+# （含请求耗时）保证限流的终点异常类型恒为 RateLimitError/
 # APIConnectionError（L3 的 is_llm_infra_error 按类型分罪依赖这一点），不会
 # 变形为外层 wait_for 的 TimeoutError 掉进能力失败分支。
 _RATE_LIMIT_RETRY_MAX = 5        # 退避重试次数上限（含首呼共 6 次请求）
 _RATE_LIMIT_BACKOFF_BASE = 2.0   # 首次退避秒数（2, 4, 8, 16, 30）
 _RATE_LIMIT_BACKOFF_CAP = 30.0   # 指数退避单次上限
 _RETRY_AFTER_CAP = 60.0          # retry-after 头的单次上限（防 proxy 报超大值）
-_RATE_LIMIT_BUDGET_MAX = 90.0    # 退避总预算（见上）
+# 退避总预算（**墙钟**，含 6 次 create 的请求耗时，review #1：只计 sleep 的
+# 首版在网络分区下——单次 create 含 SDK 内部重试可达十余秒——累计可把外层
+# wait_for 拖过 llm_timeout 变形为 TimeoutError，掉回能力失败分支）
+_RATE_LIMIT_BUDGET_MAX = 90.0
+
+# 单调时钟的模块级间接引用——deadline 预算可被单测冻结/推进（mock sleep 不
+# 走真实墙钟，不冻结时钟则 deadline 永不触发）
+_mono = time.monotonic
 
 
 def is_llm_infra_error(error: Exception) -> bool:
@@ -151,14 +159,15 @@ class LLMClient:
           预算；_try_switch 单向锁，至多切一次），无 fallback/已切换 →
           指数退避重试，_RATE_LIMIT_RETRY_MAX 次为限；
         - retry-after 头可解析 → 覆盖指数值（_infra_backoff_delay）；
-        - 退避累计超过 _RATE_LIMIT_BUDGET_MAX → 立即 raise 最后错误——保证
-          终点异常类型不被外层 llm_timeout 的 wait_for 变形为 TimeoutError；
+        - 墙钟（含请求耗时，_mono deadline）超过 _RATE_LIMIT_BUDGET_MAX →
+          立即 raise 最后错误——保证终点异常类型不被外层 llm_timeout 的
+          wait_for 变形为 TimeoutError；
         - 退避在 async 侧 await asyncio.sleep（create 仍在 asyncio.to_thread
           里，issue #163 的事件循环可服务性不变）；CancelledError 穿透不吞
           （except 元组不含它，#186 教训：取消必须 re-raise）。
         """
         messages = create_kwargs.get("messages")
-        waited = 0.0
+        deadline = _mono() + _RATE_LIMIT_BUDGET_MAX
         last_error: Exception | None = None
         for attempt in range(_RATE_LIMIT_RETRY_MAX + 1):
             try:
@@ -168,6 +177,14 @@ class LLMClient:
             except (RateLimitError, APIConnectionError) as e:
                 last_error = e
                 if self._try_switch_to_fallback(e):
+                    # review #4（issue #194 review 轮）：create_kwargs 在调用点
+                    # 已绑定主模型名/max_tokens——切换后 self.* 已指向 fallback，
+                    # 必须刷新，否则把主模型名发给 fallback 端点（不认识时 4xx
+                    # 非 infra → 穿透 step 层 Branch 3 又计能力连败，恰是 #194
+                    # 要消除的死法；同端点接受时"切换"静默失效，继续打刚被
+                    # 限流的主模型。旧递归 get_action 路径天然重取这两个参数）。
+                    create_kwargs["model"] = self.model
+                    create_kwargs["max_tokens"] = self.max_tokens
                     # 阶段二（§2.5 边界 2）：fallback 无视觉滤 image block
                     # （原 get_action 行为搬入；messages 就地原地滤）
                     if not model_supports_vision(self.model) and messages is not None:
@@ -176,14 +193,13 @@ class LLMClient:
                 if attempt >= _RATE_LIMIT_RETRY_MAX:
                     raise
                 delay = _infra_backoff_delay(attempt, e)
-                if waited + delay > _RATE_LIMIT_BUDGET_MAX:
+                if _mono() + delay > deadline:
                     logger.warning(
-                        "LLM infra backoff budget (%.0fs) exhausted after "
-                        "%d retry(ies) — raising %s",
+                        "LLM infra backoff budget (%.0fs wall-clock incl. "
+                        "requests) exhausted after %d retry(ies) — raising %s",
                         _RATE_LIMIT_BUDGET_MAX, attempt, type(e).__name__,
                     )
                     raise
-                waited += delay
                 logger.warning(
                     "LLM %s (retry %d/%d) — backing off %.1fs",
                     type(e).__name__, attempt + 1, _RATE_LIMIT_RETRY_MAX, delay,

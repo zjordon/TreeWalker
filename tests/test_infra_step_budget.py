@@ -136,6 +136,36 @@ class TestInfraStepBudget:
 		assert agent.state.n_steps == 2
 
 	@pytest.mark.asyncio
+	async def test_capability_error_step_resets_infra_streak(self):
+		"""review2：到达 _post_process 即证明 LLM 可达——单动作能力失败步
+		（early return 路径）同样清零 infra：被能力失败步隔开的两个限流窗口
+		不叠加判死（「连续基建失败才累积」语义）。"""
+		agent = _loop_agent()
+		agent._prepare_context = AsyncMock(return_value=(_browser_state(), "state msg"))
+		agent._get_next_action = AsyncMock(side_effect=[
+			_rl(), _rl(),                        # 限流窗口 1（infra 2 连）
+			_ok_output(),                        # 能力失败步（单动作 error → early return）
+			_rl(),                              # 限流窗口 2 首枪
+		])
+		agent._execute_actions = AsyncMock(side_effect=[
+			[ActionResult(error="boom")],        # 能力失败步
+			[ActionResult()],                   # 窗口 2 不会执行到动作（infra 在 LLM 层失败）
+		])
+
+		with patch("tree_walker.agent.step.asyncio.sleep", new_callable=AsyncMock):
+			await StepPipeline._step(agent)  # infra
+			await StepPipeline._step(agent)  # infra
+		assert agent.state.infra_failures == 2
+
+		await StepPipeline._step(agent)  # 单动作能力失败 → early return 前清零
+		assert agent.state.consecutive_failures == 1
+		assert agent.state.infra_failures == 0  # ← review2 回归锁
+
+		with patch("tree_walker.agent.step.asyncio.sleep", new_callable=AsyncMock):
+			await StepPipeline._step(agent)  # 窗口 2 首枪——从 1 重新计
+		assert agent.state.infra_failures == 1
+
+	@pytest.mark.asyncio
 	async def test_step_consumption_identical_with_injected_rate_limit(self):
 		"""issue 验收原文编码：注入 RateLimit×2 的 run 与干净 run 终态的
 		有效步数消耗完全一致（n_steps / history / consecutive_failures）。"""
