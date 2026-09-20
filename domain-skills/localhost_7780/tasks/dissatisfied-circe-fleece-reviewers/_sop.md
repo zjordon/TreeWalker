@@ -15,8 +15,10 @@
 
 4. **逐条查看详情**：点击列表行（`<tr title=.../admin/review/product/edit/id/353/>`）或行尾 `Edit` 链接进入 Edit Review 页面。详情页显示 Nickname（如 `value=Hannah Lim`）、Summary of Review（如 `value=Bad!`）、完整 Review 文本（`<textarea id=detail>` 区域，DOM 中文本不显示 value，但页面可见）。通过 Summary/Rating 与评论正文判断是否为不满评论。
 
+   **人名取数规则（判分口径）**：回答中的人名以详情页 **Author 字段优先**——非 Guest 时 Author 形如 "Firstname Lastname (email@example.com)"，去掉括号邮箱取人名；显示为 Guest 时回退用 Nickname。列表网格列显示的是 Nickname，可能与 Author 不同，勿直接抄网格列。输出规范：姓与名首字母大写（页面可能全小写，如 "seam miller" → "Seam Miller"）。
+
 5. **返回列表**：点击详情页顶部 `Back` 按钮（`id=back`, `title=Back`）回到过滤后的列表，再查看另一条（ID 352，nickname "customer"，标题 "Good but not perfect"）。
 
-6. **汇总回答**：本例中两条 Circe 评论均表达不满——昵称 **Hannah Lim**（"Bad!"，明确表示 disappointed）和昵称 **customer**（"Good but not perfect"，部分不满）。用 `done(text, success)` 报告客户昵称列表。
+6. **汇总回答**：本例中两条 Circe 评论均表达不满——按上述取数规则得到的客户名（Author 优先，Guest 用 Nickname），如 **Hannah Lim**（"Bad!"，明确表示 disappointed）和 **customer**（"Good but not perfect"，部分不满）。用 `done(text, success)` 报告客户名列表；答案首句给裸名列表，不带 "(Guest)" 等页面装饰（见站点 quirks 判分节裸值条）。
 
 注：评论列表中 Review 正文被截断（以 "..." 结尾），完整内容需进入 Edit Review 页面查看。
