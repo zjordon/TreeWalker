@@ -119,6 +119,11 @@ class LLMClient:
         self.model = s.model
         self.max_tokens = s.max_tokens
         self.output_mode = s.output_mode
+        # issue #194 review3：步级共享退避窗口——step 层在 asyncio.wait_for 起点
+        # 经 set_llm_window 登记（deadline + 按 llm_timeout 派生的单次预算上限）。
+        # None = 未登记（独立调用/测试），退避预算回落模块默认 90s。
+        self._llm_window_deadline: float | None = None
+        self._rate_limit_budget_cap: float | None = None
 
         # Fallback LLM support
         self._fallback_client: Anthropic | None = None
@@ -149,6 +154,20 @@ class LLMClient:
         )
         return True
 
+    def set_llm_window(self, llm_timeout: float) -> None:
+        """issue #194 review3 #1/#2：step 层在 asyncio.wait_for 起点调用。
+
+        - 步级共享 deadline（now + llm_timeout）：澄清重试/R4 递归/done-gate
+          重试等梯子内的**所有** get_action→_create_with_backoff 共用同一
+          deadline——单次调用各自重置预算会把外层 wait_for 拖过期，终点异常
+          变形为 TimeoutError 掉回 Branch 3 能力失败（#194 死法复活）；
+        - 单次预算上限按 llm_timeout 派生（max(30, 0.75×t)）：预算硬编码 90s
+          只在默认 120s 下成立，AGENT_LLM_TIMEOUT 调低时余量消失；派生后
+          结构性留 25% 给末次 create 耗时（deadline 只 gate sleep 起点）。
+        """
+        self._llm_window_deadline = _mono() + float(llm_timeout)
+        self._rate_limit_budget_cap = max(30.0, float(llm_timeout) * 0.75)
+
     async def _create_with_backoff(self, **create_kwargs: Any) -> Any:
         """messages.create + 基建错误退避重试（issue #194 L2）。
 
@@ -156,26 +175,36 @@ class LLMClient:
         其中 ``messages`` 同时供 fallback 切换时的滤图（就地原地滤）。
 
         - RateLimitError/APIConnectionError：先试 fallback 切换（不占退避
-          预算；_try_switch 单向锁，至多切一次），无 fallback/已切换 →
-          指数退避重试，_RATE_LIMIT_RETRY_MAX 次为限；
+          时间预算、也不占重试名额——review4 #3；_try_switch 单向锁，至多
+          切一次），无 fallback/已切换 → 指数退避重试，
+          _RATE_LIMIT_RETRY_MAX 次为限；
         - retry-after 头可解析 → 覆盖指数值（_infra_backoff_delay）；
-        - 墙钟（含请求耗时，_mono deadline）超过 _RATE_LIMIT_BUDGET_MAX →
-          立即 raise 最后错误——保证终点异常类型不被外层 llm_timeout 的
-          wait_for 变形为 TimeoutError；
+        - 墙钟（含请求耗时，_mono deadline）超过预算 → 立即 raise 最后
+          错误——保证终点异常类型不被外层 llm_timeout 的 wait_for 变形为
+          TimeoutError；
         - 退避在 async 侧 await asyncio.sleep（create 仍在 asyncio.to_thread
           里，issue #163 的事件循环可服务性不变）；CancelledError 穿透不吞
           （except 元组不含它，#186 教训：取消必须 re-raise）。
         """
         messages = create_kwargs.get("messages")
-        deadline = _mono() + _RATE_LIMIT_BUDGET_MAX
-        last_error: Exception | None = None
-        for attempt in range(_RATE_LIMIT_RETRY_MAX + 1):
+        # issue #194 review3：deadline = min(单次预算, 步级共享窗口)——窗口由
+        # set_llm_window 在外层 wait_for 起点登记，梯子内所有调用共享（防各
+        # 自重置预算拖过期）；预算上限按 llm_timeout 派生（防低超时配置下
+        # 不变量失效）。未登记（独立调用）时回落模块默认。
+        cap = self._rate_limit_budget_cap or _RATE_LIMIT_BUDGET_MAX
+        deadline = _mono() + cap
+        if self._llm_window_deadline is not None:
+            deadline = min(deadline, self._llm_window_deadline)
+        # review4 #3：显式重试计数器——fallback 切换的 continue 不递增（旧
+        # for-attempt 循环会消耗 6 次 create 名额之一，与"不占退避预算"的
+        # docstring 不符，fallback 可用重试数随切换时点漂移）
+        retries = 0
+        while True:
             try:
                 return await asyncio.to_thread(
                     self.client.messages.create, **create_kwargs,
                 )
             except (RateLimitError, APIConnectionError) as e:
-                last_error = e
                 if self._try_switch_to_fallback(e):
                     # review #4（issue #194 review 轮）：create_kwargs 在调用点
                     # 已绑定主模型名/max_tokens——切换后 self.* 已指向 fallback，
@@ -190,24 +219,22 @@ class LLMClient:
                     if not model_supports_vision(self.model) and messages is not None:
                         _strip_image_blocks(messages)
                     continue
-                if attempt >= _RATE_LIMIT_RETRY_MAX:
+                if retries >= _RATE_LIMIT_RETRY_MAX:
                     raise
-                delay = _infra_backoff_delay(attempt, e)
+                delay = _infra_backoff_delay(retries, e)
                 if _mono() + delay > deadline:
                     logger.warning(
                         "LLM infra backoff budget (%.0fs wall-clock incl. "
                         "requests) exhausted after %d retry(ies) — raising %s",
-                        _RATE_LIMIT_BUDGET_MAX, attempt, type(e).__name__,
+                        cap, retries, type(e).__name__,
                     )
                     raise
                 logger.warning(
                     "LLM %s (retry %d/%d) — backing off %.1fs",
-                    type(e).__name__, attempt + 1, _RATE_LIMIT_RETRY_MAX, delay,
+                    type(e).__name__, retries + 1, _RATE_LIMIT_RETRY_MAX, delay,
                 )
+                retries += 1
                 await asyncio.sleep(delay)
-        # 循环正常走完仍未 return：只可能是 raise 被绕过（不可达），防御性兜底
-        assert last_error is not None
-        raise last_error
 
     def _shorten_urls_in_messages(self, messages: list[dict[str, Any]]) -> dict[str, str]:
         """Replace URLs >=100 chars in messages with short [uN] markers.

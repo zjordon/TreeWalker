@@ -417,3 +417,33 @@ class TestHandleStepErrorInfraBranch:
         assert agent.state.infra_failures == 0
         # Branch 3 不豁免步数（getattr 守卫语义：未置位即递增）
         assert not getattr(agent, "_skip_step_increment", False)
+
+    @pytest.mark.asyncio
+    async def test_branch3_generic_error_clears_infra(self):
+        """review4 #2：Branch 3 结束的步不走 _post_process——入口清零，
+        被能力失败步隔开的限流窗口不叠加判死。"""
+        from tree_walker.agent.step import StepPipeline
+
+        agent = FakeAgent()
+        agent.max_infra_failures = 8
+        agent.state.infra_failures = 2  # 前置：前一限流窗口已累计
+
+        await StepPipeline._handle_step_error(agent, ValueError("some error"))
+
+        assert agent.state.consecutive_failures == 1
+        assert agent.state.infra_failures == 0  # ← review4 #2 回归锁
+
+    @pytest.mark.asyncio
+    async def test_branch2_connection_error_clears_infra(self):
+        """review4 #2：Branch 2（浏览器连接错误）路径同样清零 infra。"""
+        from tree_walker.agent.step import StepPipeline
+
+        agent = FakeAgent(reconnect_timeout=3)
+        agent.max_infra_failures = 8
+        agent.state.infra_failures = 2
+        agent.browser.reconnect = AsyncMock(return_value=True)
+
+        await StepPipeline._handle_step_error(agent, _make_connection_error())
+
+        assert agent.state.infra_failures == 0
+        assert agent.browser.reconnect.call_count == 1

@@ -792,6 +792,13 @@ class StepPipeline:
             ))
 
         try:
+            # issue #194 review3 #1/#2：wait_for 起点向 LLM client 登记步级退避
+            # 窗口——梯子内（澄清重试/R4 递归/done-gate）所有 L2 退避共享同一
+            # deadline、单次预算按 llm_timeout 派生，防终点异常变形为
+            # TimeoutError 掉回 Branch 3 能力失败。getattr 守卫兼容测试桩。
+            set_window = getattr(self.llm, "set_llm_window", None)
+            if set_window is not None:
+                set_window(self.llm_timeout)
             response = await asyncio.wait_for(
                 self._get_action_with_retry(trimmed),
                 timeout=self.llm_timeout,
@@ -1852,6 +1859,15 @@ class StepPipeline:
                 "backoff applied, no action executed this step"
             ))]
             return
+
+        # issue #194 review4 #2：走到这里 = 非 infra 失败（浏览器连接/能力失败
+        # 等）——同样解除基建嫌疑。Branch 2/3 结束的步不走 _post_process 的
+        # 清零路径，不清零则被这类步隔开的限流窗口叠加、提前按基建死法终止
+        # （B 轮正是 429+浏览器抖动并发的混合故障环境）。浏览器错误发生在 LLM
+        # 调用前时 LLM 可达性未证明，此重置偏宽——混合交替形态由 max_steps
+        # （Branch 2 步照常计步）/max_failures（Branch 3 步计连败）兜底有界。
+        if self.state.infra_failures > 0:
+            self.state.infra_failures = 0
 
         # Branch 2: Connection errors — attempt reconnect, stop on timeout
         if _is_connection_error(error):

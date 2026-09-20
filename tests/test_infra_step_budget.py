@@ -268,3 +268,19 @@ class TestInfraSettings:
 		with patch.dict(os.environ, env, clear=False):
 			os.environ.pop("AGENT_MAX_INFRA_FAILURES", None)
 			assert load_settings().agent.max_infra_failures == 8
+
+	def test_low_llm_timeout_warns_budget_window_risk(self, caplog):
+		"""review3 #1(b)：AGENT_LLM_TIMEOUT<60 时告警——退避预算派生余量
+		装不进超时窗口，终点异常会变形 TimeoutError 掉回能力失败计数。"""
+		import logging
+
+		from tree_walker.config import load_settings
+
+		env = {"ZHIPU_API_KEY": "test", "AGENT_LLM_TIMEOUT": "40"}
+		with patch.dict(os.environ, env, clear=False), \
+				caplog.at_level(logging.WARNING, logger="tree_walker.config"):
+			load_settings()
+		assert any(
+			"issue #194" in r.getMessage() and "AGENT_LLM_TIMEOUT=40" in r.getMessage()
+			for r in caplog.records
+		)

@@ -28,6 +28,7 @@ import asyncio
 import json
 import logging
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -94,17 +95,21 @@ class RateLimitProxy:
 
 
 async def run_task(settings, ws_url: str, base_url: str, max_steps: int, tag: str):
-	"""跑一遍任务，返回终态摘要 dict（n_steps/history/连败/infra）。"""
-	llm_settings = settings.llm.model_copy()
+	"""跑一遍任务，返回终态摘要 dict（n_steps/history/连败/infra）。
+
+	review4 #4：LLMSettings/BrowserSettings/AgentSettings 是 stdlib dataclass
+	（无 pydantic model_copy）——浅拷贝用 dataclasses.replace（仓库既有习语）。
+	"""
+	llm_settings = replace(settings.llm)
 	llm_settings.base_url = base_url
 	# 验收口径隔离（review #6）：环境配置了 fallback（FALLBACK_LLM_MODEL）时
 	# 首 429 即切走——fallback base_url 不经代理，注入耗不尽、两趟模型不一致
 	llm_settings.fallback = None
 	llm = LLMClient(llm_settings)
-	browser_settings = settings.browser.model_copy()
+	browser_settings = replace(settings.browser)
 	browser_settings.ws_url = ws_url
 	browser = BrowserSession(browser_settings)
-	agent_settings = settings.agent.model_copy()
+	agent_settings = replace(settings.agent)
 	agent_settings.max_steps = max_steps
 
 	agent = Agent(task=TASK, llm=llm, browser=browser, settings=agent_settings)
@@ -175,6 +180,10 @@ async def main() -> None:
 		format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 	)
 	settings = load_settings()
+	# review4 #4 冒烟：run_task 的浅拷贝习语（dataclasses.replace）必须在
+	# 真实 Settings 上可用——旧 pydantic model_copy 写法首跑 run_task 即
+	# AttributeError，且 --self-test 不经 run_task 掩盖了它
+	replace(settings.llm), replace(settings.browser), replace(settings.agent)
 
 	if args.self_test:
 		await self_test()

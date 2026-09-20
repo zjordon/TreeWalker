@@ -810,6 +810,50 @@ class TestCreateWithBackoff:
         assert mock_create.call_count == 1
         mock_sleep.assert_not_awaited()
 
+    def test_step_window_deadline_shared_not_reset_per_call(self):
+        """review3 #2：步级共享 deadline——梯子内第二次调用不重置预算。窗口只剩
+        5s 时 retry-after 60 的退避直接 raise（不 sleep、不把外层 wait_for 拖成
+        TimeoutError 变形）。旧实现（每次调用各自 90s）此场景会白睡到超时。"""
+        resp = MagicMock(status_code=429)
+        resp.headers = {"retry-after": "60"}
+        mock_sleep = AsyncMock()
+        self.client._rate_limit_budget_cap = 90.0
+        self.client._llm_window_deadline = 5.0  # _mono() 冻结在 0 → 窗口剩 5s
+        with patch.object(
+            self.client.client.messages, "create", side_effect=_rl(resp),
+        ) as mock_create, patch(
+            "tree_walker.llm.client.asyncio.sleep", mock_sleep,
+        ), patch(
+            "tree_walker.llm.client._mono", side_effect=[0.0, 0.0],
+        ):
+            with pytest.raises(RateLimitError):
+                asyncio.run(self.client._create_with_backoff(messages=[]))
+        assert mock_create.call_count == 1
+        mock_sleep.assert_not_awaited()
+
+    def test_budget_cap_derived_from_llm_timeout(self):
+        """review3 #1：单次预算上限按 llm_timeout 派生（max(30, 0.75t)）——
+        AGENT_LLM_TIMEOUT=40 时 cap=30，retry-after 60 的退避直接 raise，
+        预算不再硬编码 90s 只在默认 120s 下成立。"""
+        self.client.set_llm_window(40)
+        assert self.client._rate_limit_budget_cap == 30.0  # max(30, 0.75×40)
+        assert self.client._llm_window_deadline is not None
+
+        resp = MagicMock(status_code=429)
+        resp.headers = {"retry-after": "60"}
+        mock_sleep = AsyncMock()
+        with patch.object(
+            self.client.client.messages, "create", side_effect=_rl(resp),
+        ) as mock_create, patch(
+            "tree_walker.llm.client.asyncio.sleep", mock_sleep,
+        ), patch(
+            "tree_walker.llm.client._mono", side_effect=[0.0, 0.0],
+        ):
+            with pytest.raises(RateLimitError):
+                asyncio.run(self.client._create_with_backoff(messages=[]))
+        assert mock_create.call_count == 1
+        mock_sleep.assert_not_awaited()
+
     def test_fallback_switch_does_not_consume_backoff(self):
         """主 429 一次 → fallback 成功：切换不占退避预算（零 sleep）。
 
@@ -861,6 +905,41 @@ class TestCreateWithBackoff:
             with pytest.raises(asyncio.CancelledError):
                 asyncio.run(self.client._create_with_backoff(messages=[]))
         assert mock_create.call_count == 1
+
+    def test_fallback_switch_keeps_full_retry_allowance(self):
+        """review4 #3：fallback 切换不占重试名额——fallback 端点拿满
+        1+5 次尝试（旧 for-attempt 写法切换消耗一个名额，fallback 只剩 5 次）。"""
+        client = LLMClient(LLMSettings(
+            model="main-model", api_key="main-key",
+            fallback=FallbackLLMSettings(model="fallback-model", api_key="fb-key"),
+        ))
+        ok = MagicMock(content=[], usage=None)
+        calls = {"main": 0, "fb": 0}
+
+        def main_side_effect(*args, **kwargs):
+            calls["main"] += 1
+            raise _rl()
+
+        def fb_side_effect(*args, **kwargs):
+            calls["fb"] += 1
+            if calls["fb"] <= 5:
+                raise _rl()
+            return ok
+
+        with patch.object(
+            client.client.messages, "create", side_effect=main_side_effect,
+        ), patch.object(
+            client._fallback_client.messages, "create", side_effect=fb_side_effect,
+        ), patch(
+            "tree_walker.llm.client.asyncio.sleep", new_callable=AsyncMock,
+        ) as mock_sleep:
+            result = asyncio.run(client._create_with_backoff(
+                model="main-model", max_tokens=1024, messages=[],
+            ))
+        assert result is ok
+        assert calls["main"] == 1
+        assert calls["fb"] == 6  # 切换零消耗：初始 + 5 次退避重试
+        assert _sleep_await_seconds(mock_sleep) == [2.0, 4.0, 8.0, 16.0, 30.0]
 
     def test_authentication_error_not_retried(self):
         """401（AuthenticationError）非 infra：不退避，无 fallback 即 raise

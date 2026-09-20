@@ -640,6 +640,17 @@ def load_settings() -> Settings:
         ),
     )
 
+    # issue #194 review3 #1(b)：限流退避预算（max(30, 0.75×llm_timeout) 派生 +
+    # 末次请求耗时）须装进 llm_timeout 的 wait_for 窗口内，否则持续限流的
+    # 终点异常变形为 TimeoutError 掉回能力失败计数（#194 死法复现）。阈值
+    # 60s 以下派生余量不足，告警（不硬拦——极小值可能是刻意的紧超时配置）。
+    if agent.llm_timeout < 60:
+        logger.warning(
+            "AGENT_LLM_TIMEOUT=%ds 过小：限流退避预算与其余量可能装不进该 "
+            "超时窗口，持续限流时终点异常会变形为 TimeoutError 掉回能力失败"
+            "计数（issue #194）", agent.llm_timeout,
+        )
+
     return Settings(agent=agent, llm=llm, browser=browser)
 
 
