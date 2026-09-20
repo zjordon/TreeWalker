@@ -12,6 +12,7 @@ Magento 管理后台（http://localhost:7780/admin）。可配置商品（如 Ae
    - 点击该行 `Edit` 链接进入编辑页 `/admin/catalog/product/edit/id/<ID>/`。
    - 滚动（`scroll(1~2)`）使表单可见，找到 `Quantity` 输入框：`input name=product[quantity_and_stock_status][qty]`（每个商品编辑页其随机 id 不同，靠 name 定位）。
    - `input_text(index, text)` 写入新数量。到货语义 = 现有库存 + 到货数（本例每码数原 100，到货 378 → 填 478；各行原有数量可从列表的 Salable Quantity 列读取）。若是"set to N"语义则直接填 N。
+   - **补货任务必须同时检查 Stock Status**：若该变体原为 Out of Stock（尤其原 qty=0），只改 Quantity 不够——还需把 Stock Status 切回 `In Stock`（`product[quantity_and_stock_status][is_in_stock]`，页面上的库存开关/下拉），否则前台仍不可售、判分不过。原已 In Stock 的变体只需改 qty。
    - 点击 `button id=save-button`（Save）保存。
    - 点击 `button id=back`（Back）返回产品列表，重复下一行。返回列表后可能需 `scroll` 才能再次看到各行 Edit 链接。
 4. 全部尺码保存完成后 `done`。

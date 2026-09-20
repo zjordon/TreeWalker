@@ -11,5 +11,5 @@ Magento Admin (http://localhost:7780/admin/admin/dashboard/) 上用 Orders Repor
    - To：`input id=sales_report_to name=to`，输入 `12/31/22`。
    - Order Status：先 `select_dropdown` `select id=sales_report_show_order_statuses name=show_order_statuses` 设为 `Specified`，此时才会渲染出多选 `select id=sales_report_order_statuses name=order_statuses[]`，再对它 `select_dropdown(index, "Complete")`。
 3. 点击 `button id=filter_form_submit title="Show Report"`（可见文本 "Show Report"）。页面整页导航到 `/admin/reports/report_sales/sales/filter/<base64>/`。
-4. 读取结果表格（"records found" 下方）：每行 Interval（如 5/2022）+ Orders 列即该月完成订单数。2022年5–12月结果：05:25, 06:13, 07:28, 08:18, 09:10, 10:11, 11:15, 12:10（总计 67）。
+4. 读取结果表格（"records found" 下方）：每行 Interval（如 5/2022），取 **Orders 列（第 2 列）**——相邻的 Sales Items 列是销售件数不是订单数，两列数值量级相近，按位置裸读极易混列。读法：先按列头文本定位 Orders 列，再逐行取格；读后把各月值加和与表格 Total 行的 Orders 合计交叉校验，不一致 = 读错列，换列重读。2022 年 5–12 月 Orders 真值：05:8, 06:13, 07:9, 08:8, 09:10, 10:4, 11:5, 12:10（加和 67，与 Total 行一致）。卡外月份（如 2–4 月）须按同一列头规则自读，禁止沿用相邻列数值。
 5. `done` 以 MM:COUNT 格式输出结果。
