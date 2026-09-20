@@ -1,4 +1,4 @@
-﻿"""Tests for step error handling with reconnect."""
+"""Tests for step error handling with reconnect."""
 
 from __future__ import annotations
 
@@ -319,3 +319,131 @@ class TestHandleStepErrorBranches:
         assert not any(
             "failed to produce valid output" in r.getMessage() for r in caplog.records
         )
+
+
+# ── issue #194：Branch 2.5 infra 分罪（限流/网络 ≠ 能力失败）─────────
+
+
+def _make_rate_limit_error():
+    """anthropic RateLimitError 桩（真实协议形状，response MagicMock）。"""
+    from unittest.mock import MagicMock
+    from anthropic import RateLimitError
+
+    return RateLimitError(
+        message="rate limited",
+        response=MagicMock(status_code=429),
+        body=None,
+    )
+
+
+class TestHandleStepErrorInfraBranch:
+    """Branch 2.5：LLM 基建失败不进能力连败、不烧步数、真退避。"""
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_classified_infra(self):
+        """429 → infra_failures+1、consecutive_failures 不动、退避 5s、
+        步数豁免标记置位、last_result 说真话。"""
+        from tree_walker.agent.step import StepPipeline
+
+        agent = FakeAgent()
+        agent.max_infra_failures = 8
+        with patch("tree_walker.agent.step.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            await StepPipeline._handle_step_error(agent, _make_rate_limit_error())
+
+        assert agent.state.infra_failures == 1
+        assert agent.state.consecutive_failures == 0
+        assert agent._skip_step_increment is True
+        mock_sleep.assert_awaited_once_with(5.0)
+        assert "no action executed" in agent.state.last_result[0].error
+        assert "RateLimitError" in agent.state.last_result[0].error
+
+    @pytest.mark.asyncio
+    async def test_infra_backoff_escalates(self):
+        """连续 infra 失败退避指数升级：第 3 次 → 20s。"""
+        from tree_walker.agent.step import StepPipeline
+
+        agent = FakeAgent()
+        agent.max_infra_failures = 8
+        agent.state.infra_failures = 2  # 本次将是第 3 次
+        with patch("tree_walker.agent.step.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            await StepPipeline._handle_step_error(agent, _make_rate_limit_error())
+
+        mock_sleep.assert_awaited_once_with(20.0)
+
+    @pytest.mark.asyncio
+    async def test_infra_budget_exhausted_no_sleep(self, caplog):
+        """预算耗尽的终局步：不再退避（白等无益），ERROR 日志，仍豁免步数。"""
+        from tree_walker.agent.step import StepPipeline
+
+        agent = FakeAgent()
+        agent.max_infra_failures = 3
+        agent.state.infra_failures = 2  # 本次将达 3/3
+        with patch("tree_walker.agent.step.asyncio.sleep", new_callable=AsyncMock) as mock_sleep, \
+                caplog.at_level(logging.ERROR):
+            await StepPipeline._handle_step_error(agent, _make_rate_limit_error())
+
+        mock_sleep.assert_not_awaited()
+        assert agent.state.infra_failures == 3
+        assert agent._skip_step_increment is True
+        assert any("exhausted" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_builtin_connection_error_not_infra(self):
+        """builtin ConnectionError（浏览器侧）不属 infra——仍走 Branch 2
+        reconnect，infra_failures 不动。"""
+        from tree_walker.agent.step import StepPipeline
+
+        agent = FakeAgent(reconnect_timeout=3)
+        agent.max_infra_failures = 8
+        agent.browser.reconnect = AsyncMock(return_value=True)
+
+        await StepPipeline._handle_step_error(agent, _make_connection_error())
+
+        assert agent.state.infra_failures == 0
+        assert agent.state.consecutive_failures == 0
+        assert agent.browser.reconnect.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_generic_error_still_branch3(self):
+        """通用 ValueError 仍走 Branch 3（能力失败计数），infra 不动。"""
+        from tree_walker.agent.step import StepPipeline
+
+        agent = FakeAgent()
+        agent.max_infra_failures = 8
+
+        await StepPipeline._handle_step_error(agent, ValueError("some error"))
+
+        assert agent.state.consecutive_failures == 1
+        assert agent.state.infra_failures == 0
+        # Branch 3 不豁免步数（getattr 守卫语义：未置位即递增）
+        assert not getattr(agent, "_skip_step_increment", False)
+
+    @pytest.mark.asyncio
+    async def test_branch3_generic_error_clears_infra(self):
+        """review4 #2：Branch 3 结束的步不走 _post_process——入口清零，
+        被能力失败步隔开的限流窗口不叠加判死。"""
+        from tree_walker.agent.step import StepPipeline
+
+        agent = FakeAgent()
+        agent.max_infra_failures = 8
+        agent.state.infra_failures = 2  # 前置：前一限流窗口已累计
+
+        await StepPipeline._handle_step_error(agent, ValueError("some error"))
+
+        assert agent.state.consecutive_failures == 1
+        assert agent.state.infra_failures == 0  # ← review4 #2 回归锁
+
+    @pytest.mark.asyncio
+    async def test_branch2_connection_error_clears_infra(self):
+        """review4 #2：Branch 2（浏览器连接错误）路径同样清零 infra。"""
+        from tree_walker.agent.step import StepPipeline
+
+        agent = FakeAgent(reconnect_timeout=3)
+        agent.max_infra_failures = 8
+        agent.state.infra_failures = 2
+        agent.browser.reconnect = AsyncMock(return_value=True)
+
+        await StepPipeline._handle_step_error(agent, _make_connection_error())
+
+        assert agent.state.infra_failures == 0
+        assert agent.browser.reconnect.call_count == 1

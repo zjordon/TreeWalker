@@ -6,9 +6,10 @@ import asyncio
 import json
 import logging
 import re
+import time
 from typing import Any
 
-from anthropic import Anthropic, APIError, RateLimitError
+from anthropic import Anthropic, APIConnectionError, APIError, RateLimitError
 
 from tree_walker.action_shape import (
     honest_done_action,
@@ -45,6 +46,56 @@ def _strip_image_blocks(messages: list[dict[str, Any]]) -> None:
 # R4（P7 02 方案）：text-not-tool_use 重试上限——旧实现无限递归
 _TEXT_RETRY_MAX = 2
 
+# issue #194：限流/网络传输类基建错误的 client 层退避（L2）。B 轮 task_550
+# 证据链：SDK 默认 max_retries=2 亚秒退避挡不住几十秒级 429 窗口 →
+# RateLimitError 直穿 get_action → step 层当能力失败计连败，20 秒内 5 连发
+# 触发 max_failures 死刑。预算取值对齐 llm_timeout=120s：墙钟总预算 90s
+# （含请求耗时）保证限流的终点异常类型恒为 RateLimitError/
+# APIConnectionError（L3 的 is_llm_infra_error 按类型分罪依赖这一点），不会
+# 变形为外层 wait_for 的 TimeoutError 掉进能力失败分支。
+_RATE_LIMIT_RETRY_MAX = 5        # 退避重试次数上限（含首呼共 6 次请求）
+_RATE_LIMIT_BACKOFF_BASE = 2.0   # 首次退避秒数（2, 4, 8, 16, 30）
+_RATE_LIMIT_BACKOFF_CAP = 30.0   # 指数退避单次上限
+_RETRY_AFTER_CAP = 60.0          # retry-after 头的单次上限（防 proxy 报超大值）
+# 退避总预算（**墙钟**，含 6 次 create 的请求耗时，review #1：只计 sleep 的
+# 首版在网络分区下——单次 create 含 SDK 内部重试可达十余秒——累计可把外层
+# wait_for 拖过 llm_timeout 变形为 TimeoutError，掉回能力失败分支）
+_RATE_LIMIT_BUDGET_MAX = 90.0
+
+# 单调时钟的模块级间接引用——deadline 预算可被单测冻结/推进（mock sleep 不
+# 走真实墙钟，不冻结时钟则 deadline 永不触发）
+_mono = time.monotonic
+
+
+def is_llm_infra_error(error: Exception) -> bool:
+    """LLM 侧基建错误谓词（限流 429 / 网络传输）——L2 重试与 L3 分罪共用。
+
+    只认 anthropic 类型，不含 builtin ConnectionError（那是浏览器侧，走
+    _handle_step_error Branch 2 的 reconnect）。AuthenticationError/401/402/
+    5xx 不在其列：重试无益，维持既有 fallback-切换-否则-raise 语义。
+    """
+    return isinstance(error, (RateLimitError, APIConnectionError))
+
+
+def _infra_backoff_delay(attempt: int, error: Exception) -> float:
+    """退避秒数：指数（base × 2^attempt，封顶 CAP）；retry-after 头可解析则
+    min(retry-after, _RETRY_AFTER_CAP) 覆盖。只认 str/int/float 标量——
+    MagicMock response 的 headers.get() 返回 Mock（float(Mock) 会得到 1.0
+    的假值，首版实测踩过），非标量一律回落指数；response 缺失/无 headers/
+    非数字（GLM proxy 行为未知）同理容错。
+    """
+    delay = min(_RATE_LIMIT_BACKOFF_CAP, _RATE_LIMIT_BACKOFF_BASE * 2 ** attempt)
+    try:
+        headers = getattr(getattr(error, "response", None), "headers", None)
+        raw = headers.get("retry-after") if headers else None
+        if isinstance(raw, (str, int, float)):
+            retry_after = min(float(raw), _RETRY_AFTER_CAP)
+            if retry_after > 0:
+                return retry_after
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return delay
+
 
 class LLMClient:
     """Wraps Anthropic SDK with tool_use for the agent loop.
@@ -68,6 +119,11 @@ class LLMClient:
         self.model = s.model
         self.max_tokens = s.max_tokens
         self.output_mode = s.output_mode
+        # issue #194 review3：步级共享退避窗口——step 层在 asyncio.wait_for 起点
+        # 经 set_llm_window 登记（deadline + 按 llm_timeout 派生的单次预算上限）。
+        # None = 未登记（独立调用/测试），退避预算回落模块默认 90s。
+        self._llm_window_deadline: float | None = None
+        self._rate_limit_budget_cap: float | None = None
 
         # Fallback LLM support
         self._fallback_client: Anthropic | None = None
@@ -97,6 +153,88 @@ class LLMClient:
             self.model, type(error).__name__, error,
         )
         return True
+
+    def set_llm_window(self, llm_timeout: float) -> None:
+        """issue #194 review3 #1/#2：step 层在 asyncio.wait_for 起点调用。
+
+        - 步级共享 deadline（now + llm_timeout）：澄清重试/R4 递归/done-gate
+          重试等梯子内的**所有** get_action→_create_with_backoff 共用同一
+          deadline——单次调用各自重置预算会把外层 wait_for 拖过期，终点异常
+          变形为 TimeoutError 掉回 Branch 3 能力失败（#194 死法复活）；
+        - 单次预算上限按 llm_timeout 派生（max(30, 0.75×t)）：预算硬编码 90s
+          只在默认 120s 下成立，AGENT_LLM_TIMEOUT 调低时余量消失；派生后
+          结构性留 25% 给末次 create 耗时（deadline 只 gate sleep 起点）。
+        """
+        self._llm_window_deadline = _mono() + float(llm_timeout)
+        self._rate_limit_budget_cap = max(30.0, float(llm_timeout) * 0.75)
+
+    async def _create_with_backoff(self, **create_kwargs: Any) -> Any:
+        """messages.create + 基建错误退避重试（issue #194 L2）。
+
+        create_kwargs 即 messages.create 的参数（messages/system/model/…）；
+        其中 ``messages`` 同时供 fallback 切换时的滤图（就地原地滤）。
+
+        - RateLimitError/APIConnectionError：先试 fallback 切换（不占退避
+          时间预算、也不占重试名额——review4 #3；_try_switch 单向锁，至多
+          切一次），无 fallback/已切换 → 指数退避重试，
+          _RATE_LIMIT_RETRY_MAX 次为限；
+        - retry-after 头可解析 → 覆盖指数值（_infra_backoff_delay）；
+        - 墙钟（含请求耗时，_mono deadline）超过预算 → 立即 raise 最后
+          错误——保证终点异常类型不被外层 llm_timeout 的 wait_for 变形为
+          TimeoutError；
+        - 退避在 async 侧 await asyncio.sleep（create 仍在 asyncio.to_thread
+          里，issue #163 的事件循环可服务性不变）；CancelledError 穿透不吞
+          （except 元组不含它，#186 教训：取消必须 re-raise）。
+        """
+        messages = create_kwargs.get("messages")
+        # issue #194 review3：deadline = min(单次预算, 步级共享窗口)——窗口由
+        # set_llm_window 在外层 wait_for 起点登记，梯子内所有调用共享（防各
+        # 自重置预算拖过期）；预算上限按 llm_timeout 派生（防低超时配置下
+        # 不变量失效）。未登记（独立调用）时回落模块默认。
+        cap = self._rate_limit_budget_cap or _RATE_LIMIT_BUDGET_MAX
+        deadline = _mono() + cap
+        if self._llm_window_deadline is not None:
+            deadline = min(deadline, self._llm_window_deadline)
+        # review4 #3：显式重试计数器——fallback 切换的 continue 不递增（旧
+        # for-attempt 循环会消耗 6 次 create 名额之一，与"不占退避预算"的
+        # docstring 不符，fallback 可用重试数随切换时点漂移）
+        retries = 0
+        while True:
+            try:
+                return await asyncio.to_thread(
+                    self.client.messages.create, **create_kwargs,
+                )
+            except (RateLimitError, APIConnectionError) as e:
+                if self._try_switch_to_fallback(e):
+                    # review #4（issue #194 review 轮）：create_kwargs 在调用点
+                    # 已绑定主模型名/max_tokens——切换后 self.* 已指向 fallback，
+                    # 必须刷新，否则把主模型名发给 fallback 端点（不认识时 4xx
+                    # 非 infra → 穿透 step 层 Branch 3 又计能力连败，恰是 #194
+                    # 要消除的死法；同端点接受时"切换"静默失效，继续打刚被
+                    # 限流的主模型。旧递归 get_action 路径天然重取这两个参数）。
+                    create_kwargs["model"] = self.model
+                    create_kwargs["max_tokens"] = self.max_tokens
+                    # 阶段二（§2.5 边界 2）：fallback 无视觉滤 image block
+                    # （原 get_action 行为搬入；messages 就地原地滤）
+                    if not model_supports_vision(self.model) and messages is not None:
+                        _strip_image_blocks(messages)
+                    continue
+                if retries >= _RATE_LIMIT_RETRY_MAX:
+                    raise
+                delay = _infra_backoff_delay(retries, e)
+                if _mono() + delay > deadline:
+                    logger.warning(
+                        "LLM infra backoff budget (%.0fs wall-clock incl. "
+                        "requests) exhausted after %d retry(ies) — raising %s",
+                        cap, retries, type(e).__name__,
+                    )
+                    raise
+                logger.warning(
+                    "LLM %s (retry %d/%d) — backing off %.1fs",
+                    type(e).__name__, retries + 1, _RATE_LIMIT_RETRY_MAX, delay,
+                )
+                retries += 1
+                await asyncio.sleep(delay)
 
     def _shorten_urls_in_messages(self, messages: list[dict[str, Any]]) -> dict[str, str]:
         """Replace URLs >=100 chars in messages with short [uN] markers.
@@ -246,8 +384,10 @@ class LLMClient:
             # issue #163：Anthropic 同步客户端的 create 是阻塞调用——直接 await 会卡死整个
             # 事件循环（tw-web 期间所有 HTTP 端点无响应、0 CPU 等同步 socket）。经
             # asyncio.to_thread 丢线程池，事件循环保持可服务（SSE/控制端点/其他任务）。
-            response = await asyncio.to_thread(
-                self.client.messages.create,
+            # issue #194 L2：create 经 _create_with_backoff——限流/网络传输错误
+            # 在此层退避重试（fallback 切换 + 指数退避 + retry-after，预算封顶），
+            # 瞬态 429 窗口不再升级为 step 失败。
+            response = await self._create_with_backoff(
                 model=self.model,
                 max_tokens=self.max_tokens,
                 system=system_prompt,
@@ -261,6 +401,11 @@ class LLMClient:
             # RateLimitError (429), AuthenticationError (401) and APIStatusError
             # (5xx, 402, ...) are all subclasses of APIError, so this single
             # except is behaviorally equivalent to browser-use's explicit set.
+            # issue #194：RateLimit/APIConnection 成员到达此处 = _create_with_backoff
+            # 的退避预算已耗尽（fallback 也在那层试过）——_try_switch_to_fallback
+            # 必返 False，终点异常按原类型 re-raise（step 层 Branch 2.5 按类型
+            # 分罪依赖这一点）；其余 APIError 成员（401/402/5xx）维持既有
+            # fallback-切换-递归语义。
             if self._try_switch_to_fallback(e):
                 # 阶段二（§2.5 边界 2 + P0 发现）：fallback 模型无视觉时滤掉
                 # 历史 image block——端点对文本模型+图不报错（静默致盲），不滤

@@ -1,0 +1,198 @@
+{
+  "status": "complete",
+  "llm": {
+    "model": "glm-5.3"
+  },
+  "message": "Review complete: 1 finding(s) across 10 selected item(s).",
+  "summary": {
+    "files_reviewed": 10,
+    "comments": 1,
+    "total_tokens": 1295242,
+    "input_tokens": 1243267,
+    "output_tokens": 51975,
+    "cache_read_tokens": 737472,
+    "elapsed": "8m25s"
+  },
+  "tool_calls": {
+    "total": 33,
+    "by_tool": {
+      "code_comment": 1,
+      "code_search": 20,
+      "file_read": 12
+    },
+    "failure": 0,
+    "failure_by_tool": {},
+    "failure_details": []
+  },
+  "comments": [
+    {
+      "path": "docs/bug-fix/code-review/review-issue-194-3.json",
+      "content": "该 comment 对象缺少 `severity` 键：全文件 2 个 comment 中（行 36/47 各有一个 category），仅第一个（行 37）带 severity，本条只有 category 无 severity——四个 194 系列存档共 18 个 comment 对象中唯一违约者。本系列文件均声明 schema_version \"ocr.run-manifest/v1\" 且同目录 185/186/187/192/193 系列 30+ 个存档的每个 comment 都携带 severity，属既定键契约；此键缺失会破坏存档系列的统一结构，下游做严格 schema 校验或直接取 comment[\"severity\"] 的聚合/统计工具将在此记录上抛 KeyError/校验失败，severity 维度统计也会静默漏掉该条 finding。注：本 comment 的 thinking 字段末尾自述原始意图为 \"category bug, severity medium\"，可直接据此补回取值。",
+      "suggestion_code": "      \"category\": \"bug\",\n      \"severity\": \"medium\"\n    }\n  ],",
+      "existing_code": "      \"category\": \"bug\"\n    }\n  ],",
+      "start_line": 47,
+      "end_line": 49,
+      "thinking": "Confirmed. Line 47 is `\"category\": \"bug\"` followed by line 48 `}` and line 49 `],` — no `severity` key in this comment object. The first comment (line 36-37) has category + severity.\n\nAdditional supporting evidence from the comment's own `thinking` field (line 46): \"Content in Chinese, category bug, severity medium.\" — the original review run intended severity \"medium\" but the serialization dropped it.\n\nNow file the code_comment. Anchor:\n\n```\n      \"category\": \"bug\"\n    }\n  ],\n```\n\nThis is unique within the file (first comment ends with \"category\": \"bug\",\\n \"severity\": \"medium\"\\n },).\n\nSuggestion:\n```\n      \"category\": \"bug\",\n      \"severity\": \"medium\"\n    }\n  ],\n```\n\nCategory: documentation (docs archive file). Severity: medium — consistent with the review plan.\n\nAll four files reviewed:\n1. review-issue-194-1.json ✓ — all keys correctly spelled, 7/7 comments have category+severity\n2. review-issue-194-2.json ✓ — all keys correct, 5/5 comments complete\n3. review-issue-194-3.json — one missing severity key (report)\n4. review-issue-194-4.json ✓ — all keys correct, 4/4 comments complete\n\nFile the comment, then task_done.",
+      "category": "documentation",
+      "severity": "medium"
+    }
+  ],
+  "groups": [
+    {
+      "label": "Issue 194 code review documentation",
+      "files": [
+        "docs/bug-fix/code-review/review-issue-194-1.json",
+        "docs/bug-fix/code-review/review-issue-194-2.json",
+        "docs/bug-fix/code-review/review-issue-194-3.json",
+        "docs/bug-fix/code-review/review-issue-194-4.json"
+      ]
+    },
+    {
+      "label": "Rate limit retry fix implementation (agent, config, LLM client) with debug example",
+      "files": [
+        "examples/debug_194_rate_limit_inject.py",
+        "src/tree_walker/agent/agent.py",
+        "src/tree_walker/agent/step.py",
+        "src/tree_walker/agent/views.py",
+        "src/tree_walker/config.py",
+        "src/tree_walker/llm/client.py"
+      ]
+    }
+  ],
+  "session_id": "ada36520-effd-4194-b5fa-a546710d9a3d",
+  "manifest": {
+    "schema_version": "ocr.run-manifest/v1",
+    "run_id": "ada36520-effd-4194-b5fa-a546710d9a3d",
+    "operation": "review",
+    "terminal_state": "complete",
+    "repository": {
+      "identity_sha256": "2868bcfb033292e0d47631dc911d0e36e5dcedaf9e0bcacffe6c4716bb93dfda"
+    },
+    "input": {
+      "mode": "range",
+      "requested_from": "master",
+      "requested_head": "fix/194-rate-limit-infra-wait",
+      "resolved_base": "ab1f56fcd9c0edf2fa8cb599d124889420d21bed",
+      "resolved_head": "cd2fbb0c2183c507614f89c2b8edda072752954c",
+      "exact_range": "ab1f56fcd9c0edf2fa8cb599d124889420d21bed..cd2fbb0c2183c507614f89c2b8edda072752954c",
+      "source_artifact_sha256": "a7c01805bb62ba8d0fbe771af4ed84bb8e043d00c017f28eac9ddb070d9e164e"
+    },
+    "execution": {
+      "ocr_version": "v1.12.7",
+      "model": "glm-5.3",
+      "configured_concurrency": 8,
+      "rule_config_sha256": "ddb40005eb732cb8b37d8d3dc1acb82f3aa51fded408c899a092c10349c369c4",
+      "runtime_config_sha256": "841fe9ad288d2dd9efc84c443193c492ef06b26edf31ff5f5a1b01637fef2b0c"
+    },
+    "coverage": {
+      "selected": [
+        {
+          "item_id": "05ea6ae46e6e85c25d4aa676c4acbe6552aac167dbe772307f715d2fe273edaf",
+          "path": "src/tree_walker/agent/step.py",
+          "fingerprint": "8274df56e8fefbc7ca6ecc6074537bc01ea74105809d75084ae559d7dc735b37"
+        },
+        {
+          "item_id": "43c14cd781af742131d6635e7ed572d9bb36bb53bdce4a93c25381bc1b2ddc25",
+          "path": "src/tree_walker/agent/views.py",
+          "fingerprint": "7156d66538c837b6be3c65eb27877a9e26e7e7df6b77135fef882a957642c809"
+        },
+        {
+          "item_id": "645749dd08a3da1efa64bcb0ee80c0f477f0adbe5e3cf8f0cf211dd7d75f43ac",
+          "path": "docs/bug-fix/code-review/review-issue-194-3.json",
+          "fingerprint": "d225b038119a043ec4468b8c85b2253b6d5db8bad4348782973d66ab04a2089a"
+        },
+        {
+          "item_id": "688065a334063b8560930d765cc9d2c83d515fb99ea279c8dd67ec93a7de88fa",
+          "path": "docs/bug-fix/code-review/review-issue-194-2.json",
+          "fingerprint": "a86ecdeeb044f2e13eb503199b8aa82a4c03c8ca9bc23c7a0ce5d995d89a61d6"
+        },
+        {
+          "item_id": "6a76628ac06e3f4d449edde9f34e72b9f7aa80acd597c5a1f26c753dc9682808",
+          "path": "docs/bug-fix/code-review/review-issue-194-1.json",
+          "fingerprint": "1d4f8bb04ec54edb561802bc6ff5ae2ddde20d127058f9e0889900c038bd72a0"
+        },
+        {
+          "item_id": "82daffc9f57484aaefc183f4ffea0e3f0d8cba8e18924ea40532b585dc597c9e",
+          "path": "examples/debug_194_rate_limit_inject.py",
+          "fingerprint": "2fdf8ca9f226fce16cffbb43ab8aa8c585dfe4b9f3a644e9f5fa22a5e61edb88"
+        },
+        {
+          "item_id": "c44b39733f418ca9b2e0598365872efd8171e43d76fd0b4412f1200989a9cbd8",
+          "path": "src/tree_walker/config.py",
+          "fingerprint": "60f078013084bb1ab6de05d3984616d2e8e6ecd64efc031b1274c5820094818d"
+        },
+        {
+          "item_id": "cb7274497931d515fcc8b47397d482d50df1801e4e57fc45a534510b0c1b71e8",
+          "path": "docs/bug-fix/code-review/review-issue-194-4.json",
+          "fingerprint": "8a2a53ee8ed9f627e146ff9bfc73f56f629b989d23415f91e3d7b944913438c6"
+        },
+        {
+          "item_id": "ec73fcf5c68d65ca601aa361fbe04d8a72aa474e0af3d2ca60063099052bfced",
+          "path": "src/tree_walker/llm/client.py",
+          "fingerprint": "9867a801173377a77cd8860fd1b8d170093f2a12d6d20955e70cd20ba4d4b2cd"
+        },
+        {
+          "item_id": "fb114deba92ef927cdf263ba6759dc0ec2971e3a956aadba7ffe715262074817",
+          "path": "src/tree_walker/agent/agent.py",
+          "fingerprint": "973280fedc41d3dc19246fa21ad442892338f3b0340cc5c560924a84723ab02c"
+        }
+      ],
+      "completed": [
+        {
+          "item_id": "05ea6ae46e6e85c25d4aa676c4acbe6552aac167dbe772307f715d2fe273edaf",
+          "path": "src/tree_walker/agent/step.py",
+          "fingerprint": "8274df56e8fefbc7ca6ecc6074537bc01ea74105809d75084ae559d7dc735b37"
+        },
+        {
+          "item_id": "43c14cd781af742131d6635e7ed572d9bb36bb53bdce4a93c25381bc1b2ddc25",
+          "path": "src/tree_walker/agent/views.py",
+          "fingerprint": "7156d66538c837b6be3c65eb27877a9e26e7e7df6b77135fef882a957642c809"
+        },
+        {
+          "item_id": "645749dd08a3da1efa64bcb0ee80c0f477f0adbe5e3cf8f0cf211dd7d75f43ac",
+          "path": "docs/bug-fix/code-review/review-issue-194-3.json",
+          "fingerprint": "d225b038119a043ec4468b8c85b2253b6d5db8bad4348782973d66ab04a2089a"
+        },
+        {
+          "item_id": "688065a334063b8560930d765cc9d2c83d515fb99ea279c8dd67ec93a7de88fa",
+          "path": "docs/bug-fix/code-review/review-issue-194-2.json",
+          "fingerprint": "a86ecdeeb044f2e13eb503199b8aa82a4c03c8ca9bc23c7a0ce5d995d89a61d6"
+        },
+        {
+          "item_id": "6a76628ac06e3f4d449edde9f34e72b9f7aa80acd597c5a1f26c753dc9682808",
+          "path": "docs/bug-fix/code-review/review-issue-194-1.json",
+          "fingerprint": "1d4f8bb04ec54edb561802bc6ff5ae2ddde20d127058f9e0889900c038bd72a0"
+        },
+        {
+          "item_id": "82daffc9f57484aaefc183f4ffea0e3f0d8cba8e18924ea40532b585dc597c9e",
+          "path": "examples/debug_194_rate_limit_inject.py",
+          "fingerprint": "2fdf8ca9f226fce16cffbb43ab8aa8c585dfe4b9f3a644e9f5fa22a5e61edb88"
+        },
+        {
+          "item_id": "c44b39733f418ca9b2e0598365872efd8171e43d76fd0b4412f1200989a9cbd8",
+          "path": "src/tree_walker/config.py",
+          "fingerprint": "60f078013084bb1ab6de05d3984616d2e8e6ecd64efc031b1274c5820094818d"
+        },
+        {
+          "item_id": "cb7274497931d515fcc8b47397d482d50df1801e4e57fc45a534510b0c1b71e8",
+          "path": "docs/bug-fix/code-review/review-issue-194-4.json",
+          "fingerprint": "8a2a53ee8ed9f627e146ff9bfc73f56f629b989d23415f91e3d7b944913438c6"
+        },
+        {
+          "item_id": "ec73fcf5c68d65ca601aa361fbe04d8a72aa474e0af3d2ca60063099052bfced",
+          "path": "src/tree_walker/llm/client.py",
+          "fingerprint": "9867a801173377a77cd8860fd1b8d170093f2a12d6d20955e70cd20ba4d4b2cd"
+        },
+        {
+          "item_id": "fb114deba92ef927cdf263ba6759dc0ec2971e3a956aadba7ffe715262074817",
+          "path": "src/tree_walker/agent/agent.py",
+          "fingerprint": "973280fedc41d3dc19246fa21ad442892338f3b0340cc5c560924a84723ab02c"
+        }
+      ],
+      "reused": [],
+      "failed": [],
+      "waived": []
+    },
+    "elapsed_ms": 504666
+  }
+}

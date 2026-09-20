@@ -1,0 +1,187 @@
+{
+  "status": "complete",
+  "llm": {
+    "model": "glm-5.3"
+  },
+  "message": "Review complete: 2 finding(s) across 8 selected item(s).",
+  "summary": {
+    "files_reviewed": 8,
+    "comments": 2,
+    "total_tokens": 1481253,
+    "input_tokens": 1405463,
+    "output_tokens": 75790,
+    "cache_read_tokens": 1089984,
+    "elapsed": "15m2s"
+  },
+  "tool_calls": {
+    "total": 46,
+    "by_tool": {
+      "code_comment": 2,
+      "code_search": 23,
+      "file_read": 21
+    },
+    "failure": 0,
+    "failure_by_tool": {},
+    "failure_details": []
+  },
+  "comments": [
+    {
+      "path": "src/tree_walker/llm/client.py",
+      "content": "`_RATE_LIMIT_BUDGET_MAX = 90.0` 是硬编码常量，但它赖以成立的护栏 `llm_timeout`（step.py `_get_next_action` 的外层 `asyncio.wait_for`，默认 120s）可经 `AGENT_LLM_TIMEOUT` 环境变量配置（config.py load_settings）。若操作者将其调低到 ≤ 约 90-105s（对快模型收紧超时、或代理侧有更严格的 deadline 都属合理操作），持续 429/网络分区窗口下 L2 退避会把外层 wait_for 拖过期，终点异常重新变形为 `TimeoutError`（step.py:799-803 显式转换）→ 不满足 `is_llm_infra_error` → 掉进 Branch 3 计入 `consecutive_failures` —— 正是 #194 要消除的 max_failures 死法静默复现，且无任何告警。另外 deadline 检查只 gate sleep 起点（`_mono() + delay \u003e deadline`），最后一次 create 的耗时不占预算，即便默认 120s 下余量也仅约 30s（注释自述\"单次 create 含 SDK 内部重试可达十余秒\"），边际较薄。建议二选一：(a) 预算从配置的 llm_timeout 派生（如 `max(30.0, llm_timeout * 0.75)` 并为末次 create 预留耗时，经 LLMSettings/get_action 参数下传）；(b) 至少在 `load_settings` 校验 `llm_timeout` 与 90s 预算的关系并告警，同时在 `AGENT_LLM_TIMEOUT` 配置点注释写明该约束。",
+      "suggestion_code": "# 退避总预算（墙钟，含各次 create 的请求耗时）——与外层 AGENT_LLM_TIMEOUT\n# （wait_for 超时）强耦合：llm_timeout ≤ 预算+单次请求耗时时，持续限流的\n# 终点异常会变形为 TimeoutError 掉回能力失败分支（#194 死法复现）。\n# 建议由调用方按配置派生：max(30.0, llm_timeout * 0.75)，并在 load_settings\n# 对 llm_timeout 过小的配置告警。\n_RATE_LIMIT_BUDGET_MAX = 90.0",
+      "existing_code": "_RATE_LIMIT_BUDGET_MAX = 90.0",
+      "start_line": 63,
+      "end_line": 63,
+      "thinking": "Now I have the complete picture of get_action:\n\n```python\nexcept (RateLimitError, APIError) as e:\n    ...\n    if self._try_switch_to_fallback(e):\n        ...\n        return await self.get_action(...)  # recursion with FRESH budget\n    raise\n```\n\nWait — there's an important subtlety here. The claim in the comment (line 377-379): \"RateLimit/APIConnection 成员到达此处 = _create_with_backoff 的退避预算已耗尽（fallback 也在那层试过）——_try_switch_to_fallback 必返 False\".\n\nIs this airtight? `_create_with_backoff` raises RateLimitError/APIConnectionError in three cases:\n1. `attempt \u003e= _RATE_LIMIT_RETRY_MAX` → raise\n2. deadline exhausted → raise\n3. (defensive) loop end → raise last_error\n\nIn ALL cases within `_create_with_backoff`, the fallback was tried on the FIRST infra error (each except iteration calls `_try_switch_to_fallback` first). So by the time it raises, `_using_fallback` is True OR `_fallback_client` is None. Hence outer `_try_switch_to_fallback(e)` returns False. ✓ Airtight.\n\nBUT — wait, there's one more case: what if the infra error is raised... hmm, `_create_with_backoff` catches only (RateLimitError, APIConnectionError). RateLimitError is a subclass of APIError. So outer except `(RateLimitError, APIError)` catches it. `_try_switch_to_fallback` → False → `raise` at line 394. ✓ Propagates as-is to step layer → Branch 2.5. ✓\n\nAlso `APIConnectionError` — is it a subclass of APIError? In anthropic SDK: `APIConnectionError(APIError)` yes. And `RateLimitError(APIStatusError)` → APIError. ✓ So the outer except catches both.\n\nEdge: could `_create_with_backoff` raise an infra error BEFORE ever calling `_try_switch_to_fallback`? The first except iteration always calls it. So no.\n\nOne more subtlety in the recursion path (line 389): non-infra APIError (e.g., 500) → outer switch → recursive get_action → fresh `_create_with_backoff` with fresh 90s budget. If that then hits sustained 429 → up to 90s more. Total bounded by outer wait_for(llm_timeout) → at 120s, TimeoutError → step Branch 3 capability death. Under defaults: first call 500s fail fast (~seconds), recursion budget 90s → ~95s \u003c 120. OK marginal, consistent with the design margin. Fine — the coupling issue remains the main one.\n\nNow, let me also double-check the step-layer backoff message formatting: `logger.warning(\"Infra failure (%d/%d): %s — backing off %.0fs (step budget not consumed)\", ...)` — fine.\n\nAnd one more look at Branch 2.5's interplay with `max_steps` loop condition `while self.state.n_steps \u003c= self.max_steps`: infra steps don't increment → OK.\n\nNow, is there anything about **`_skip_step_increment` and the `done` / early-return paths**? Branch 2.5's `return` exits `_handle_step_error`, then `_step`'s except block returns False (line 245), finally consumes flag. ✓\n\n**What about `run()`'s `finalize_degraded_steps` check (line 348) happening before the done-break?** Not related.\n\nNow let me also verify **`_finalize` skip for infra steps**: `_finalize(browser_state=None, model_output=None, results=[])` — the comment at line 219-220 says \"_finalize 的 `if model_output is not None` 守卫会跳过历史写入\" — so infra steps don't enter history. The issue's acceptance criteria: \"有效步数消耗与无限流时一致\" — infra steps don't consume n_steps and don't enter history. ✓\n\n**One more potential issue: `self.state.last_result = [ActionResult(error=...)]` in Branch 2.5 vs `_step` line 215 `self.state.last_result = None`** — sequence: step N+1 starts, clears last_result... wait no. Branch 2.5 sets last_result at the END of step N (error path). Step N+1 line 214-215 clears it BEFORE the LLM call. So how does the model see the infra error message? The model sees it via the state message built from... `_prepare_context` reads last_result? No wait — line 211-215: \"Clear previous step state — must happen after prepare_context reads old values but before the LLM call\". So `_prepare_context` (line 205) reads old last_result values and builds them into state_message, THEN line 214-215 clears. ✓ The infra error message IS delivered to the next model call. ✓ Good.\n\nSo the final issue list:\n\n**Issue 1 (medium, bug)**: L2 预算 90s 硬编码与可配置的 `AGENT_LLM_TIMEOUT`（默认 120）耦合。当操作者设置 AGENT_LLM_TIMEOUT ≤ ~90-105 时，持续限流窗口的终点异常会再次变形为 TimeoutError → Branch 3 能力失败 → #194 死法复现，且无任何告警。建议：预算从实际 llm_timeout 派生（如 llm_timeout 的 75%），或在 load_settings 校验/告警，至少在 config.py 的 AGENT_LLM_TIMEOUT 注释里写明约束。\n\nAnchor: client.py `_RATE_LIMIT_BUDGET_MAX = 90.0` line.\n\nActually — should I anchor the comment in config.py too? One comment is enough; I'll anchor at client.py where the constant is defined, since that's where the assumption lives and where a fix (derive/clamp) would most naturally go. But the env knob is in config.py... The instruction says comments must address code within review_files — both files are in review_files. I could do one comment on client.py. Let me also consider a second low comment on config.py's llm_timeout documenting the constraint. Hmm — I'll do a single medium comment on client.py mentioning the config knob; that's cleaner.\n\n**Issue 2?**: Should I report the \"backoff applied\" message inaccuracy in is_final? As analyzed, in the final case the message is never consumed by a model (run breaks), so impact ≈ 0. Precision over recall → skip.\n\n**Issue 3?**: `_execute_actions` raising (InterruptedError / connection error) bypasses `_post_process` → infra_failures not cleared despite LLM reachable. Edge-of-edge; the raise paths are: InterruptedError (user pause/stop — pause then resume continues run) and browser connection errors (Branch 2 reconnect path — which has its own death semantics). Impact: interleaved [infra, browser-conn-error, infra...] accumulates infra_failures without \"consecutive\" infra failures. Real but unlikely; and one could argue a browser-conn-error step doesn't prove... no wait, it DOES prove LLM reachable (model_output non-None). Per the review2 rationale (\"能力失败步同样解除基建嫌疑\"), browser-conn steps should also clear. Hmm. But how likely is [infra-fail, browser-conn-fail, infra-fail, ...] × 8? Browser conn failures lead to Branch 2 reconnect; if reconnect fails → run stops. Each browser-conn-error step requires a successful reconnect to continue. 8 alternating cycles of rate-limit + browser-death... contrived. Precision over recall → skip. \n\nHmm, wait — actually, let me reconsider one more time whether there's a scenario where infra_failures accumulates wrongly in a REALISTIC flow: infra fail (1) → next step LLM OK, actions execute, one action fails → `_post_process` reached → reset. ✓. infra fail (1) → next step LLM OK, action raises connection error → Branch 2 → reconnect OK → infra stays 1 → later infra fail → 2. For this to matter needs 8 of these — contrived. Skip confirmed.\n\n**Issue 4?**: step-layer backoff `await asyncio.sleep(delay)` in `_handle_step_error` — during this sleep, is `state.paused` honored? If user pauses during infra backoff, the sleep continues up to 60s before the step returns and run() checks paused. Pre-existing pattern (Branch 2 reconnect also sleeps). Minor; skip.\n\n**Issue 5?**: In `_create_with_backoff`, the fallback-switch path does `continue` WITHOUT any delay — immediate retry against fallback. If fallback endpoint also returns 429 immediately (e.g., shared quota), attempt burns quickly; next iteration goes to backoff (switch already done). Fine.\n\n**Issue 6?**: `create_kwargs` mutation — `_create_with_backoff(**create_kwargs)` creates a NEW dict inside the function (kwargs). Mutating that dict is safe (caller's locals untouched). ✓\n\n**Issue 7?**: `_infra_backoff_delay` — `headers.get(\"retry-after\")` — httpx Headers are case-insensitive ✓; plain dict proxies with different case would miss → falls to exponential ✓. Numbers as str ✓. HTTP-date → ValueError → caught ✓.\n\n**Issue 8?**: `float(raw)` for bool → 1.0 — headers never have bools. Skip.\n\n**Issue 9?**: `_RATE_LIMIT_BUDGET_MAX` deadline check: `if _mono() + delay \u003e deadline: raise` — but it raises the CURRENT error even if retries remain; slightly aggressive but documented. Fine.\n\n**Issue 10?**: The agent.py log message \"Max infra failures (%d) reached — API unreachable, stopping\" — \"API unreachable\" inaccurate for 429 (reachable but refusing). Cosmetic. Skip per precision.\n\nHmm, let me also think about **thread-safety of `_mono`** — read-only module binding ✓.\n\n**What about `is_llm_infra_error` used in step.py Branch 2.5 while errors from `asyncio.TimeoutError` → converted to builtin `TimeoutError` at line 800 → not infra → Branch 3.** That's the designed behavior for genuine timeouts. ✓\n\n**One more: `views.py` AgentState.infra_failures — RerunMixin serializes state?** If state snapshots are persisted and reloaded... default 0 ✓.\n\n**config.py: `max_infra_failures` negative value via env?** e.g., AGENT_MAX_INFRA_FAILURES=-1 → run() check `-1 \u003e= -1`? infra_failures starts 0 → 0 \u003e= -1 True → instant break. Same as max_failures=-1 behavior. Pre-existing pattern; skip.\n\nOK — final decision: report ONE medium issue (the 90s budget vs configurable llm_timeout coupling). Everything else verified sound.\n\nHmm wait, let me reconsider the severity and whether it's truly worth being the only finding. The code's own comment says \"预算取值对齐 llm_timeout=120s\" — they KNOW it's coupled to 120. The env var `AGENT_LLM_TIMEOUT` exists (line 469). If someone tunes it down (a plausible operation — e.g., a fast model where 120s is too generous, or a proxy with strict deadlines), the failure is silent and reproduces the exact production death #194 was filed for. It's a genuine latent defect in new code with a clear fix (derive budget from the configured timeout or validate at load). Medium is right.\n\nSuggestion code for client.py: derive from settings — but client layer doesn't know llm_timeout (it's an AgentSettings field, step.py passes it... get_action doesn't receive timeout — the wait_for is in step.py). Options:\n1. In `load_settings` (config.py): validate `agent.llm_timeout \u003e 90` (or scale warning).\n2. Pass `budget_max` into LLMClient/get_action.\n3. Compute budget as fraction: `_RATE_LIMIT_BUDGET_MAX = max(30.0, llm_timeout * 0.75)` — needs plumbing.\n\nSimplest suggestion: at config load, warn/raise when `llm_timeout \u003c= 90 + margin`, or plumb the timeout into the client. I'll suggest in the comment text; provide suggestion code sketch for config.py validation since plumbing is invasive:\n\n```python\n# config.py load_settings\nif agent.llm_timeout \u003c= 90:\n    logger.warning(...)\n```\n\nHmm, config.py may not have a logger. Keep the suggestion textual with a small sketch anchored at client.py constant, e.g.:\n\n```python\ndef _rate_limit_budget(llm_timeout: float) -\u003e float:\n    return max(30.0, llm_timeout * 0.75)\n```\n...requires plumbing. Better to keep the suggestion simple: validate at load_settings and document at the env knob. I'll write the comment with the config-side validation sketch.\n\nWait, one more consideration — anchor placement. The most actionable anchor for the fix is config.py:469 (`llm_timeout=int(os.environ.get(\"AGENT_LLM_TIMEOUT\", \"120\"))`) — that's newly... no, it's NOT newly added (it's context, not in the diff). The instruction: \"Only return newly added code lines\" for existing_code. The new line in client.py is `_RATE_LIMIT_BUDGET_MAX = 90.0` — that IS in the diff (added). So anchor there:\n\n```python\n_RATE_LIMIT_BUDGET_MAX = 90.0\n```\n\nThe diff shows:\n```\n+# 退避总预算（**墙钟**，含 6 次 create 的请求耗时，review #1：只计 sleep 的\n+# 首版在网络分区下——单次 create 含 SDK 内部重试可达十余秒——累计可把外层\n+# wait_for 拖过 llm_timeout 变形为 TimeoutError，掉回能力失败分支）\n+_RATE_LIMIT_BUDGET_MAX = 90.0\n```\n\nSo existing_code = `_RATE_LIMIT_BUDGET_MAX = 90.0` — must match diff exactly. ✓\n\nContent (Chinese): explain coupling with AGENT_LLM_TIMEOUT; valid config \u003c 90+margin silently reintroduces #194 death mode (TimeoutError → Branch 3 → consecutive_failures); suggest deriving budget from configured llm_timeout or validating at load_settings with warning.\n\nCategory: bug. Severity: medium.\n\nShould I also flag the thin margin issue (deadline gates only sleep, final create unbounded)? Fold into the same comment as a secondary note — the suggestion \"budget = min(90, llm_timeout*0.75) 且预留最后一次请求耗时\" covers it.\n\nLet me now also double check whether there might be an issue with `_RATE_LIMIT_RETRY_MAX` semantics comment \"含首呼共 6 次请求\" — range(6) = 6 creates max ✓ delays: attempts 0-4 produce delays (2,4,8,16,30) ✓.\n\nAlso the step-layer `_INFRA_BACKOFF_*` constants placement AFTER `_is_connection_error` but BEFORE `_CONNECTION_ERROR_PATTERNS` — module level, fine.\n\nOne more scan of the agent.py diff for issues:\n```python\nif self.state.infra_failures \u003e= self.max_infra_failures:\n    logger.error(...)\n    break\n```\nPlaced between max_failures break and paused-wait. Consider: infra_failures could only be \u003e 0 via Branch 2.5. ✓. What if max_infra_failures misconfigured 0 → 0\u003e=0 break instantly (consistent with max_failures=0 idiom). Skip.\n\nAnd views.py:\n```python\ninfra_failures: int = 0\n```\n✓.\n\nconfig.py:\n```python\nmax_infra_failures: int = 8\n...\nmax_infra_failures=int(os.environ.get(\"AGENT_MAX_INFRA_FAILURES\", \"8\")),\n```\n✓ consistent with siblings.\n\nFinal answer: one code_comment (medium, bug) on client.py `_RATE_LIMIT_BUDGET_MAX = 90.0`, then task_done.\n\nLet me draft the comment:\n\n内容：`_RATE_LIMIT_BUDGET_MAX = 90.0` 是硬编码常量，而它赖以成立的护栏 `llm_timeout`（step.py `_get_next_action` 的外层 `asyncio.wait_for`，config.py:135/469）默认 120s 但可经 `AGENT_LLM_TIMEOUT` 配置。若操作者将其调到 ≤ ~90-105s（快模型/严格代理超时都是合理动机），持续 429 窗口下 L2 退避会拖过外层 wait_for，终点异常重新变形为 `TimeoutError`（step.py:799-803）→ 不满足 `is_llm_infra_error` → Branch 3 计入 `consecutive_failures` —— 正是 #194 要消除的 20 秒级 max_failures 死法，且全程无告警。另外 deadline 只 gate sleep（`_mono() + delay \u003e deadline`），最后一次 create 的耗时不占预算，默认 120s 下余量也仅约 30s（代码注释自述\"单次 create 含 SDK 内部重试可达十余秒\"）。建议：预算从配置的 llm_timeout 派生（如 `min(90, llm_timeout * 0.75)` 并预留末次请求耗时，经 LLMSettings/get_action 参数下传），或在 `load_settings` 校验 `llm_timeout` 与预算的关系并告警，至少在 `AGENT_LLM_TIMEOUT` 处注释写明\"须 \u003e 90s + 单次请求耗时\"的约束。\n\nCategory: bug, severity: medium.\n\nSuggestion code — keep it minimal, matching style. Perhaps:\n\n```python\n# 预算与外层 AGENT_LLM_TIMEOUT（默认 120s）强耦合：llm_timeout ≤ 90s+单次请求\n# 耗时时，持续限流的终点异常会变形为 wait_for 的 TimeoutError 掉回能力失败\n# 分支（#194 死法复现）。由调用方按配置派生（如 llm_timeout*0.75 封顶 90），\n# 或在 load_settings 校验并告警。\n_RATE_LIMIT_BUDGET_MAX = 90.0\n```\n\nThat's more of a doc fix; a real fix needs plumbing. I'll put the textual suggestion in content and give a light suggestion_code showing the derived-budget helper. Actually suggestion_code is optional? No — looking at schema, suggestion_code is optional (not in required). Required: content, existing_code, category, severity, path. I'll include a small suggestion sketch.\n\nAfter the comment, call task_done with DONE.",
+      "category": "bug",
+      "severity": "medium"
+    },
+    {
+      "path": "src/tree_walker/llm/client.py",
+      "content": "L2 退避预算是按单次 `get_action` 调用计的（每次进入 `_create_with_backoff` 都重置 90s deadline），但「90s \u003c llm_timeout=120s 保证终点异常类型不变形」这条不变量只对步内**第一次** L2 调用成立：step.py `_get_next_action` 的 `asyncio.wait_for(self._get_action_with_retry(trimmed), timeout=llm_timeout)` 覆盖的是整个重试梯子——首调 + 空动作澄清重试（step.py:1002/1020），以及每次调用内部 R4 text-not-tool_use 的递归重试（client.py:455）。当首次调用因限流退避/慢 create 消耗 \u003e30s 后成功返回、但响应为空动作或纯文本（限流风暴后小模型/proxy 常见），澄清重试再次撞上 429 时会拿到一个全新的 90s 预算，而外层 wait_for 只剩 \u003c30s——超时在退避 sleep 中触发，终点异常被变形为 builtin `TimeoutError`（step.py:799-803），既不匹配 `is_llm_infra_error` 也不匹配 `_CONNECTION_ERROR_PATTERNS`，落入 Branch 3：计 `consecutive_failures` 且烧 `n_steps`——恰好复活了 #194 要消除的「死于基建却被判能力死刑」。注：done-gate 重试已正确处理此问题（step.py:1112-1114 按剩余额度取小），本缺陷仅在澄清/R4 梯子。建议仿照该模式：在 `_get_next_action` 的 wait_for 起点记录步级单调 deadline，穿透 `get_action` 传入本方法并与自身预算取 min，使梯子内所有调用共享同一预算，维持「限流终点异常类型恒为 RateLimitError/APIConnectionError」的承诺。",
+      "suggestion_code": "        messages = create_kwargs.get(\"messages\")\n        # 步级共享 deadline（由 _get_next_action 在 wait_for 起点计算并穿透\n        # get_action 传入）：澄清重试/R4 递归与首调共用同一预算，防止第二次\n        # L2 退避把外层 wait_for 拖过期、终点异常变形为 TimeoutError 掉进\n        # Branch 3 能力失败（#194 死法复活）\n        deadline = _mono() + _RATE_LIMIT_BUDGET_MAX\n        step_deadline = create_kwargs.pop(\"_step_deadline\", None)\n        if step_deadline is not None:\n            deadline = min(deadline, step_deadline)",
+      "existing_code": "        messages = create_kwargs.get(\"messages\")\n        deadline = _mono() + _RATE_LIMIT_BUDGET_MAX",
+      "start_line": 169,
+      "end_line": 170,
+      "thinking": "Confirmed: `_CONNECTION_ERROR_PATTERNS` doesn't match \"LLM call timed out...\" → the builtin TimeoutError raised by `_get_next_action` lands in **Branch 3** (capability failure: `consecutive_failures += 1`, n_steps incremented). So in the ladder scenario I identified, the #194 death path (capability death + burned step budget) is resurrected despite the L2 budget design.\n\nSummary of my single reportable finding:\n\n**Finding (medium, bug, client.py)**: The 90s wall-clock budget is **per `get_action` call**, but the outer `asyncio.wait_for(llm_timeout=120s)` in `_get_next_action` spans the whole `_get_action_with_retry` ladder (first call + empty-action clarification retry, plus each call's internal R4 text-retry recursion). When the first call consumes \u003e30s (typical during a rate-limit window with backoff + slow creates with SDK internal retries) and returns an empty/text-only response, the clarification retry gets a FRESH 90s budget under an outer wait_for with \u003c30s remaining — the wait_for then expires mid-backoff and converts the terminal exception into builtin `TimeoutError`, which `_handle_step_error` classifies as Branch 3 capability failure (consecutive_failures++, n_steps burned) — exactly the #194 death this fix eliminates. The comment's guarantee (\"终点异常类型恒为 RateLimitError/APIConnectionError…不会变形为 TimeoutError 掉进能力失败分支\") only holds for the first L2 call within a step.\n\nSuggestion: thread a step-level deadline from `_get_next_action` (computed at wait_for start: `time.monotonic() + self.llm_timeout`) through `get_action` into `_create_with_backoff`, and clamp: `deadline = min(_mono() + _RATE_LIMIT_BUDGET_MAX, step_deadline - 安全余量)`, so all ladder calls share one budget; the done-gate retry already does this pattern correctly with its remaining-budget computation (step.py line 1112-1114).\n\nEverything else checked out:\n- `_skip_step_increment` scoping (only `_handle_step_error` from `_step`'s except; consumed in finally) ✓\n- infra_failures reset placement in `_post_process` ✓ (all model_output-non-None paths reach it)\n- run() infra budget check placement ✓\n- Branch ordering (1 → 2.5 → 2 → 3) ✓\n- fallback switch one-way lock; no double-switch between L2 and outer except ✓\n- create_kwargs model/max_tokens refresh after switch ✓\n- retry-after parsing robustness ✓\n- CancelledError passthrough ✓\n- config/views wiring ✓\n\nNow write the code_comment. Pin location: client.py, in `_create_with_backoff`:\n\n```\n        messages = create_kwargs.get(\"messages\")\n        deadline = _mono() + _RATE_LIMIT_BUDGET_MAX\n```\n\nThese are added lines in the diff (with `+` prefix in the raw diff; I provide the code content). Content in Chinese, category bug, severity medium.\n\nThen task_done.",
+      "category": "bug",
+      "severity": "medium"
+    }
+  ],
+  "groups": [
+    {
+      "label": "Issue 194 rate-limit fix: docs and debug example",
+      "files": [
+        "docs/bug-fix/code-review/review-issue-194-1.json",
+        "docs/bug-fix/code-review/review-issue-194-2.json",
+        "examples/debug_194_rate_limit_inject.py"
+      ]
+    },
+    {
+      "label": "Rate limit handling implementation (agent, config, LLM client)",
+      "files": [
+        "src/tree_walker/agent/agent.py",
+        "src/tree_walker/agent/step.py",
+        "src/tree_walker/agent/views.py",
+        "src/tree_walker/config.py",
+        "src/tree_walker/llm/client.py"
+      ]
+    }
+  ],
+  "session_id": "a0ab6f1e-2a3a-4b79-a8a8-2dfc973606e3",
+  "manifest": {
+    "schema_version": "ocr.run-manifest/v1",
+    "run_id": "a0ab6f1e-2a3a-4b79-a8a8-2dfc973606e3",
+    "operation": "review",
+    "terminal_state": "complete",
+    "repository": {
+      "identity_sha256": "2868bcfb033292e0d47631dc911d0e36e5dcedaf9e0bcacffe6c4716bb93dfda"
+    },
+    "input": {
+      "mode": "range",
+      "requested_from": "master",
+      "requested_head": "fix/194-rate-limit-infra-wait",
+      "resolved_base": "ab1f56fcd9c0edf2fa8cb599d124889420d21bed",
+      "resolved_head": "00d828311f449293fc9212f6038fb2f15c83028c",
+      "exact_range": "ab1f56fcd9c0edf2fa8cb599d124889420d21bed..00d828311f449293fc9212f6038fb2f15c83028c",
+      "source_artifact_sha256": "edaf7c61033f9ee89706a71007e64dfb6ca7fdfad2ab1affc0f6c9ca4c14cf44"
+    },
+    "execution": {
+      "ocr_version": "v1.12.7",
+      "model": "glm-5.3",
+      "configured_concurrency": 8,
+      "rule_config_sha256": "ddb40005eb732cb8b37d8d3dc1acb82f3aa51fded408c899a092c10349c369c4",
+      "runtime_config_sha256": "841fe9ad288d2dd9efc84c443193c492ef06b26edf31ff5f5a1b01637fef2b0c"
+    },
+    "coverage": {
+      "selected": [
+        {
+          "item_id": "05ea6ae46e6e85c25d4aa676c4acbe6552aac167dbe772307f715d2fe273edaf",
+          "path": "src/tree_walker/agent/step.py",
+          "fingerprint": "77ee6f45ee2b4be09d5d488fc0f69ec64b3d6fb8c1091e1134c1d833d6dc5217"
+        },
+        {
+          "item_id": "43c14cd781af742131d6635e7ed572d9bb36bb53bdce4a93c25381bc1b2ddc25",
+          "path": "src/tree_walker/agent/views.py",
+          "fingerprint": "7156d66538c837b6be3c65eb27877a9e26e7e7df6b77135fef882a957642c809"
+        },
+        {
+          "item_id": "688065a334063b8560930d765cc9d2c83d515fb99ea279c8dd67ec93a7de88fa",
+          "path": "docs/bug-fix/code-review/review-issue-194-2.json",
+          "fingerprint": "a86ecdeeb044f2e13eb503199b8aa82a4c03c8ca9bc23c7a0ce5d995d89a61d6"
+        },
+        {
+          "item_id": "6a76628ac06e3f4d449edde9f34e72b9f7aa80acd597c5a1f26c753dc9682808",
+          "path": "docs/bug-fix/code-review/review-issue-194-1.json",
+          "fingerprint": "1d4f8bb04ec54edb561802bc6ff5ae2ddde20d127058f9e0889900c038bd72a0"
+        },
+        {
+          "item_id": "82daffc9f57484aaefc183f4ffea0e3f0d8cba8e18924ea40532b585dc597c9e",
+          "path": "examples/debug_194_rate_limit_inject.py",
+          "fingerprint": "5b1e05ece90b3e74577b8487580cec76ee7eaedcde24e08117c06d3cf41332de"
+        },
+        {
+          "item_id": "c44b39733f418ca9b2e0598365872efd8171e43d76fd0b4412f1200989a9cbd8",
+          "path": "src/tree_walker/config.py",
+          "fingerprint": "f225fedb85026bf20547be13f78162a47ffd69f4f7ec510db8da7238b55541fa"
+        },
+        {
+          "item_id": "ec73fcf5c68d65ca601aa361fbe04d8a72aa474e0af3d2ca60063099052bfced",
+          "path": "src/tree_walker/llm/client.py",
+          "fingerprint": "df1a572283175f29d4056788c305fd10e2e98c5cce2b5d567dde8b0b78430208"
+        },
+        {
+          "item_id": "fb114deba92ef927cdf263ba6759dc0ec2971e3a956aadba7ffe715262074817",
+          "path": "src/tree_walker/agent/agent.py",
+          "fingerprint": "973280fedc41d3dc19246fa21ad442892338f3b0340cc5c560924a84723ab02c"
+        }
+      ],
+      "completed": [
+        {
+          "item_id": "05ea6ae46e6e85c25d4aa676c4acbe6552aac167dbe772307f715d2fe273edaf",
+          "path": "src/tree_walker/agent/step.py",
+          "fingerprint": "77ee6f45ee2b4be09d5d488fc0f69ec64b3d6fb8c1091e1134c1d833d6dc5217"
+        },
+        {
+          "item_id": "43c14cd781af742131d6635e7ed572d9bb36bb53bdce4a93c25381bc1b2ddc25",
+          "path": "src/tree_walker/agent/views.py",
+          "fingerprint": "7156d66538c837b6be3c65eb27877a9e26e7e7df6b77135fef882a957642c809"
+        },
+        {
+          "item_id": "688065a334063b8560930d765cc9d2c83d515fb99ea279c8dd67ec93a7de88fa",
+          "path": "docs/bug-fix/code-review/review-issue-194-2.json",
+          "fingerprint": "a86ecdeeb044f2e13eb503199b8aa82a4c03c8ca9bc23c7a0ce5d995d89a61d6"
+        },
+        {
+          "item_id": "6a76628ac06e3f4d449edde9f34e72b9f7aa80acd597c5a1f26c753dc9682808",
+          "path": "docs/bug-fix/code-review/review-issue-194-1.json",
+          "fingerprint": "1d4f8bb04ec54edb561802bc6ff5ae2ddde20d127058f9e0889900c038bd72a0"
+        },
+        {
+          "item_id": "82daffc9f57484aaefc183f4ffea0e3f0d8cba8e18924ea40532b585dc597c9e",
+          "path": "examples/debug_194_rate_limit_inject.py",
+          "fingerprint": "5b1e05ece90b3e74577b8487580cec76ee7eaedcde24e08117c06d3cf41332de"
+        },
+        {
+          "item_id": "c44b39733f418ca9b2e0598365872efd8171e43d76fd0b4412f1200989a9cbd8",
+          "path": "src/tree_walker/config.py",
+          "fingerprint": "f225fedb85026bf20547be13f78162a47ffd69f4f7ec510db8da7238b55541fa"
+        },
+        {
+          "item_id": "ec73fcf5c68d65ca601aa361fbe04d8a72aa474e0af3d2ca60063099052bfced",
+          "path": "src/tree_walker/llm/client.py",
+          "fingerprint": "df1a572283175f29d4056788c305fd10e2e98c5cce2b5d567dde8b0b78430208"
+        },
+        {
+          "item_id": "fb114deba92ef927cdf263ba6759dc0ec2971e3a956aadba7ffe715262074817",
+          "path": "src/tree_walker/agent/agent.py",
+          "fingerprint": "973280fedc41d3dc19246fa21ad442892338f3b0340cc5c560924a84723ab02c"
+        }
+      ],
+      "reused": [],
+      "failed": [],
+      "waived": []
+    },
+    "elapsed_ms": 902448
+  }
+}

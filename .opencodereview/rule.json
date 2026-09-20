@@ -1,0 +1,32 @@
+{
+  "rules": [],
+  "include": [
+    "src/**/*.py",
+    "tests/**/*.py",
+    "examples/**/*.py",
+    "scripts/*.{ps1,sh}",
+    "web_ui/src/**/*.{ts,tsx,css}",
+    "web_ui/*.{ts,json,html}",
+    "recording_extension/{capture,entrypoints,shared}/**/*.{ts,tsx,vue,css,html}",
+    "recording_extension/*.{ts,json}",
+    "domain-skills/**/*.md",
+    "pyproject.toml"
+  ],
+  "exclude": [
+    "docs/**",
+    "out/**",
+    "logs/**",
+    "evaluate_output/**",
+    "rerun-history/**",
+    ".venv/**",
+    "dist/**",
+    "**/__pycache__/**",
+    "**/node_modules/**",
+    "**/dist/**",
+    "**/.wxt/**",
+    "**/.output/**",
+    "uv.lock",
+    "package-lock.json",
+    "_*"
+  ]
+}

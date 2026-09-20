@@ -43,6 +43,9 @@ from tree_walker.browser.image_utils import resize_screenshot_bytes
 from tree_walker.browser.views import BrowserStateSummary, DOMInteractedElement
 from tree_walker.browser.url_utils import extract_host_with_port
 from tree_walker.config import _DEFAULT_LLM_SCREENSHOT_SIZE, model_supports_vision
+# issue #194：限流/网络基建错误谓词（client.py 不依赖 agent 包，无环）——
+# L3 分罪与 L2 client 层退避共用同一分类
+from tree_walker.llm.client import is_llm_infra_error
 from tree_walker.prompts.system_prompt import build_state_blocks, build_state_message, build_system_prompt
 
 if TYPE_CHECKING:
@@ -124,6 +127,9 @@ class StepPipeline:
     tools: Tools
     max_steps: int
     max_failures: int
+    # issue #194：LLM 基建失败（限流/网络）连续上限 + infra 步豁免步数递增标记
+    max_infra_failures: int
+    _skip_step_increment: bool
     llm_timeout: int
     action_timeout: int
     reconnect_timeout: int
@@ -256,7 +262,13 @@ class StepPipeline:
             # 处（_finalize 尾部副本已删）——吞异常不得跳过它（否则 run() 的
             # while 循环退化为无界 livelock），正确性也不再依赖「递增恰是
             # _finalize 最后一条语句」这条跨千行的顺序约定。
-            self.state.n_steps += 1
+            # issue #194 唯一豁免：Branch 2.5 的 infra 失败步不烧步数预算，
+            # 其 livelock 防护由 run() 顶部的 infra_failures 预算检查接管
+            # （独立、有界）。getattr 守卫：FakeAgent/MagicMock 测试桩不经
+            # Agent.__init__ 时按未置位处理。
+            if not getattr(self, "_skip_step_increment", False):
+                self.state.n_steps += 1
+            self._skip_step_increment = False
 
         return False
 
@@ -780,6 +792,13 @@ class StepPipeline:
             ))
 
         try:
+            # issue #194 review3 #1/#2：wait_for 起点向 LLM client 登记步级退避
+            # 窗口——梯子内（澄清重试/R4 递归/done-gate）所有 L2 退避共享同一
+            # deadline、单次预算按 llm_timeout 派生，防终点异常变形为
+            # TimeoutError 掉回 Branch 3 能力失败。getattr 守卫兼容测试桩。
+            set_window = getattr(self.llm, "set_llm_window", None)
+            if set_window is not None:
+                set_window(self.llm_timeout)
             response = await asyncio.wait_for(
                 self._get_action_with_retry(trimmed),
                 timeout=self.llm_timeout,
@@ -1557,6 +1576,12 @@ class StepPipeline:
         #   - multi-action step (any failure, partial or all) → do NOT count;
         #     loop_detector + replan nudges handle recovery instead
         #   - any non-counted step → reset counter if previously > 0
+        # issue #194 review2：infra 清零须在单动作失败 early return **之前**——
+        # 到达 _post_process 即证明 LLM 可达（model_output 非空、动作已执行），
+        # 能力失败步同样解除基建嫌疑；否则被能力失败步隔开的两个限流窗口
+        # 会叠加判死，违背「连续基建失败才累积」的语义。
+        if self.state.infra_failures > 0:
+            self.state.infra_failures = 0
         if results and len(results) == 1 and results[-1].error:
             self.state.consecutive_failures += 1
             logger.debug("Consecutive failures: %d", self.state.consecutive_failures)
@@ -1796,6 +1821,54 @@ class StepPipeline:
             logger.warning(msg)
             return
 
+        # Branch 2.5: LLM 基建失败（限流/网络传输，issue #194）——先于浏览器
+        # reconnect 分支：anthropic 类型精确（is_llm_infra_error 不认 builtin
+        # ConnectionError，浏览器侧仍走 Branch 2）。与能力失败分罪：不进
+        # consecutive_failures、不烧步数（_skip_step_increment）、真退避；
+        # infra 步不递增 n_steps 后，防 livelock 的界由 run() 顶部的
+        # infra_failures 预算检查接管。B 轮 task_550 的死法（20 秒 5 连发
+        # 触发能力止损死刑）由此消除。
+        if is_llm_infra_error(error):
+            self.state.infra_failures += 1
+            is_final = self.state.infra_failures >= self.max_infra_failures
+            if is_final:
+                # 预算耗尽：不再退避（run() 即将终止，白等无益），仍豁免步数
+                logger.error(
+                    "Infra failure budget (%d/%d) exhausted — run will stop",
+                    self.state.infra_failures, self.max_infra_failures,
+                )
+            else:
+                delay = min(
+                    _INFRA_BACKOFF_CAP,
+                    _INFRA_BACKOFF_BASE * 2 ** (self.state.infra_failures - 1),
+                )
+                logger.warning(
+                    "Infra failure (%d/%d): %s — backing off %.0fs "
+                    "(step budget not consumed)",
+                    self.state.infra_failures, self.max_infra_failures,
+                    type(error).__name__, delay,
+                )
+                await asyncio.sleep(delay)
+            self._skip_step_increment = True
+            # truthful 回显（替换旧文案"Rate limit reached. Waiting before
+            # retry."的谎言——Branch 3 从不等待）：下一步成功的模型读到它，
+            # 不会误以为自己做错过动作
+            self.state.last_result = [ActionResult(error=(
+                f"LLM API {type(error).__name__} "
+                "(infrastructure, not an action result); "
+                "backoff applied, no action executed this step"
+            ))]
+            return
+
+        # issue #194 review4 #2：走到这里 = 非 infra 失败（浏览器连接/能力失败
+        # 等）——同样解除基建嫌疑。Branch 2/3 结束的步不走 _post_process 的
+        # 清零路径，不清零则被这类步隔开的限流窗口叠加、提前按基建死法终止
+        # （B 轮正是 429+浏览器抖动并发的混合故障环境）。浏览器错误发生在 LLM
+        # 调用前时 LLM 可达性未证明，此重置偏宽——混合交替形态由 max_steps
+        # （Branch 2 步照常计步）/max_failures（Branch 3 步计连败）兜底有界。
+        if self.state.infra_failures > 0:
+            self.state.infra_failures = 0
+
         # Branch 2: Connection errors — attempt reconnect, stop on timeout
         if _is_connection_error(error):
             logger.warning("Connection error, attempting reconnect: %s", error)
@@ -1989,6 +2062,14 @@ def _is_connection_error(error: Exception) -> bool:
         return True
     msg = str(error).lower()
     return any(p in msg for p in _CONNECTION_ERROR_PATTERNS)
+
+
+# issue #194 Branch 2.5：LLM 基建失败（限流/网络）的 step 层退避——L2 client
+# 层预算耗尽后漏到这里的持续窗口才有此形态。5,10,20,40,60,60… 封顶 60；
+# 默认 max_infra_failures=8 时累计 ~5min（评测由 runner 600s 任务超时做最外
+# 层护栏；本层只须保证"不死于 20 秒级窗口 + 不烧有效步数"）。
+_INFRA_BACKOFF_BASE = 5.0
+_INFRA_BACKOFF_CAP = 60.0
 
 
 _CONNECTION_ERROR_PATTERNS = (

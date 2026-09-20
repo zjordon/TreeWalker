@@ -99,6 +99,11 @@ class AgentState(BaseModel):
     # run 封顶（防「每步重发带标记的 done」循环），0 = 未触发。AGENT_DONE_GATE=0
     # 关门禁时也保持 0（短路在计数之前）。
     done_gate_uses: int = 0
+    # issue #194：LLM 基建失败（限流/网络传输）的连续计数——与
+    # consecutive_failures 分罪：不烧 n_steps、不进能力止损；成功步清零；
+    # 达 max_infra_failures 由 run() 顶部检查独立终止（infra 步不递增
+    # n_steps 后，livelock 防护从步数递增移交至此）。
+    infra_failures: int = 0
 
     class Config:
         arbitrary_types_allowed = True

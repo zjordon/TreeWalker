@@ -117,6 +117,9 @@ def _loop_agent() -> Any:
 	agent.plan_manager = None
 	agent._compactor = None  # MagicMock 不可 await——_step 里 `await .maybe_compact`
 	agent._handle_step_error = AsyncMock()
+	# issue #194：finally 的豁免标记——MagicMock 自动属性恒 truthy，必须显式
+	# 置 False，否则 n_steps 递增被跳过（TestStepFinallyGuard 假阳性）
+	agent._skip_step_increment = False
 	return agent
 
 
