@@ -29,3 +29,12 @@
 - 即使测试全过、覆盖率达标、改动看起来完整且符合 plan，也**不主动提交**。
 - 只有当用户**明确要求提交**（如"提交一下"、"commit"、"创建 PR"）时，才执行 git 提交流程。
 - 用户授权提交时，仍需遵守通用 git 安全约定：不 force push、不 amend 已发布提交、不跳过 hooks、不提交 `.env` 等敏感文件。
+
+## Code Review 结果处理
+
+- review 工具（open-code-review）的结果在 `docs/bug-fix/code-review/review-issue-<issue>-<round>.json`。**读取/摘要必须用固定脚本** `scripts/review_summary.py`，不要每次临时写提取脚本：
+  - `uv run python scripts/review_summary.py --issue 194`（最新一轮；`--all` 全部轮次；`--full` 含建议代码全文；也可直接传 JSON 路径）
+- 两个固定坑（先核对再修）：
+  - 输出里的 `range` 是 review 实际审的**已提交** range（manifest.input）。分支无提交时跑出 skipped 空档（有提交后重跑即成真实结果）；修复未提交时跑新一轮，会重复报已修过的 findings——先比对 resolved_head 与当前分支最新提交再决定哪些是新增。
+  - comment 可能缺 `severity` 键（schema 违约，脚本标 `?` 并告警）——按该 comment 的 thinking 自述原意补键修复。
+- review 扫描范围由 `.opencodereview/rule.json` 限制（include=真实代码，exclude=docs/运行时产物）——改顶层目录结构时同步维护。
