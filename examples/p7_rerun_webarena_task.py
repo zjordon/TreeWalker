@@ -41,7 +41,11 @@ async def main() -> int:
 	ap.add_argument("--task-id", type=int, default=1)
 	ap.add_argument("--port", type=int, default=9223, help="Chrome CDP 端口（默认 9223）")
 	ap.add_argument("--max-steps", type=int, default=30)
-	ap.add_argument("--task-timeout", type=int, default=600, help="单任务总超时秒数")
+	ap.add_argument(
+		"--task-timeout", type=int, default=1800,
+		help="单任务总超时秒数（默认 30 分钟——视觉模型单次调用 25~50s，大页"
+		     " 30 步轻松超 600s；#197 视觉验收起把默认从 600 上调）",
+	)
 	ap.add_argument("--webarena-repo", type=Path, default=DEFAULT_WEBARENA_REPO)
 	ap.add_argument("--log-file", type=Path, default=None, help="轨迹日志落盘路径（可选）")
 	args = ap.parse_args()

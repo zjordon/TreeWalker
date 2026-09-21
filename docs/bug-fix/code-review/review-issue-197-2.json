@@ -1,0 +1,114 @@
+{
+  "status": "complete",
+  "llm": {
+    "model": "glm-5.3"
+  },
+  "message": "Review complete: 0 finding(s) across 4 selected item(s).",
+  "summary": {
+    "files_reviewed": 4,
+    "comments": 0,
+    "total_tokens": 499992,
+    "input_tokens": 464131,
+    "output_tokens": 35861,
+    "cache_read_tokens": 379968,
+    "elapsed": "9m0s"
+  },
+  "tool_calls": {
+    "total": 19,
+    "by_tool": {
+      "code_search": 9,
+      "file_read": 10
+    },
+    "failure": 0,
+    "failure_by_tool": {},
+    "failure_details": []
+  },
+  "comments": [],
+  "groups": [
+    {
+      "label": "Unknown action name handling: action schema, agent step logic, LLM client, and tests",
+      "files": [
+        "src/tree_walker/action_shape.py",
+        "src/tree_walker/agent/step.py",
+        "src/tree_walker/llm/client.py",
+        "tests/test_unknown_action_name.py"
+      ]
+    }
+  ],
+  "session_id": "d51868b1-9e21-4261-9ce1-21a5c078094b",
+  "manifest": {
+    "schema_version": "ocr.run-manifest/v1",
+    "run_id": "d51868b1-9e21-4261-9ce1-21a5c078094b",
+    "operation": "review",
+    "terminal_state": "complete",
+    "repository": {
+      "identity_sha256": "2868bcfb033292e0d47631dc911d0e36e5dcedaf9e0bcacffe6c4716bb93dfda"
+    },
+    "input": {
+      "mode": "range",
+      "requested_from": "master",
+      "requested_head": "fix/197-vision-malformed-action-ladder",
+      "resolved_base": "3c311784fcb971b3c743eacf235a0c9266f86410",
+      "resolved_head": "59608b6037dca2a57b351d71f906d914b40fccc2",
+      "exact_range": "3c311784fcb971b3c743eacf235a0c9266f86410..59608b6037dca2a57b351d71f906d914b40fccc2",
+      "source_artifact_sha256": "c7d5bb498ac6fd52768a8d90c5daec3f83807890b2cd1ac864fa2a9ebec85a8b"
+    },
+    "execution": {
+      "ocr_version": "v1.12.7",
+      "model": "glm-5.3",
+      "configured_concurrency": 8,
+      "rule_config_sha256": "457b6b84414b02082987184ccb891ca709dcb55e07bae48f2210b75863ce8a7b",
+      "runtime_config_sha256": "841fe9ad288d2dd9efc84c443193c492ef06b26edf31ff5f5a1b01637fef2b0c"
+    },
+    "coverage": {
+      "selected": [
+        {
+          "item_id": "05ea6ae46e6e85c25d4aa676c4acbe6552aac167dbe772307f715d2fe273edaf",
+          "path": "src/tree_walker/agent/step.py",
+          "fingerprint": "eced262e845b3a56174005698dcd92d5db9e29ab626906e20295a1822a16672a"
+        },
+        {
+          "item_id": "07a7ae0f37a9b4c9b8423a46d81c21de7d4fcdb96a74d1a711ac03bf66968b14",
+          "path": "src/tree_walker/action_shape.py",
+          "fingerprint": "e23786e07caad518dbd956049707cad22d0e38f051c178ff8bbd0e26eec87a34"
+        },
+        {
+          "item_id": "c6269941f876fba64ed0da08dd4dea76d676a6e3d723cc0b77b930ced442f376",
+          "path": "tests/test_unknown_action_name.py",
+          "fingerprint": "96af219039d3bdd15ef1b5096f20e524a230533f93fa7063c11dc0b699af7882"
+        },
+        {
+          "item_id": "ec73fcf5c68d65ca601aa361fbe04d8a72aa474e0af3d2ca60063099052bfced",
+          "path": "src/tree_walker/llm/client.py",
+          "fingerprint": "05698b236c2ad6092fa37d4281cd423b258b7c46df7807a2283735048eb2b2eb"
+        }
+      ],
+      "completed": [
+        {
+          "item_id": "05ea6ae46e6e85c25d4aa676c4acbe6552aac167dbe772307f715d2fe273edaf",
+          "path": "src/tree_walker/agent/step.py",
+          "fingerprint": "eced262e845b3a56174005698dcd92d5db9e29ab626906e20295a1822a16672a"
+        },
+        {
+          "item_id": "07a7ae0f37a9b4c9b8423a46d81c21de7d4fcdb96a74d1a711ac03bf66968b14",
+          "path": "src/tree_walker/action_shape.py",
+          "fingerprint": "e23786e07caad518dbd956049707cad22d0e38f051c178ff8bbd0e26eec87a34"
+        },
+        {
+          "item_id": "c6269941f876fba64ed0da08dd4dea76d676a6e3d723cc0b77b930ced442f376",
+          "path": "tests/test_unknown_action_name.py",
+          "fingerprint": "96af219039d3bdd15ef1b5096f20e524a230533f93fa7063c11dc0b699af7882"
+        },
+        {
+          "item_id": "ec73fcf5c68d65ca601aa361fbe04d8a72aa474e0af3d2ca60063099052bfced",
+          "path": "src/tree_walker/llm/client.py",
+          "fingerprint": "05698b236c2ad6092fa37d4281cd423b258b7c46df7807a2283735048eb2b2eb"
+        }
+      ],
+      "reused": [],
+      "failed": [],
+      "waived": []
+    },
+    "elapsed_ms": 540449
+  }
+}
