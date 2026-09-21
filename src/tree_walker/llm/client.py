@@ -44,6 +44,31 @@ def _strip_image_blocks(messages: list[dict[str, Any]]) -> None:
             if len(kept) != len(content):
                 msg["content"] = kept if kept else ""
 
+
+def copy_messages_without_images(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """返回剥离 image block 的消息**拷贝**（issue #197 review #1）。
+
+    与 ``_strip_image_blocks`` 的原地语义分野：梯子降级重试只应影响**当次
+    调用**——原地滤图会经共享消息 dict 泄漏回原 messages，使同一步后续的
+    参数反馈重试（设计上恒带图）在无图上下文修参数。降级路径必须走本函数
+    （新列表 + 复制含 block content 的消息 dict），原地版仅限 fallback 切换
+    那种「从此以后都不该带图」的场景。str content 的消息原样引用（无共享
+    可变结构需要隔离）。
+    """
+    out: list[dict[str, Any]] = []
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            m = {
+                **m,
+                "content": [
+                    b for b in content
+                    if not (isinstance(b, dict) and b.get("type") == "image")
+                ] or "",
+            }
+        out.append(m)
+    return out
+
 # R4（P7 02 方案）：text-not-tool_use 重试上限——旧实现无限递归
 _TEXT_RETRY_MAX = 2
 
@@ -362,7 +387,6 @@ class LLMClient:
         *,
         _no_action_retry_used: bool = False,
         _text_retry_count: int = 0,
-        drop_images: bool = False,
     ) -> dict[str, Any]:
         """Call the LLM and return a parsed agent response.
 
@@ -374,17 +398,7 @@ class LLMClient:
         防挂死，且每次重试带全上下文，是 wall-clock 的主要贡献者之一）。上限
         _TEXT_RETRY_MAX 次；超限返回空 dict 哨兵，交 step 层既有的
         clarification 重试 → fallback done 梯子接管（总调用次数有界）。
-
-        ``drop_images``（issue #197）：梯子降级重试——巨型截图+巨型 DOM 间歇
-        压垮视觉模型的工具调用形状（V 轮 19 行畸形 vs C 轮 2 行），文本口径
-        同任务可通过（task_108 C=1.0）。入口原地滤 image block，变异约定与
-        ``_shorten_urls_in_messages`` 一致；影响域=当步 state 消息（TYPE_STATE
-        每步重建、全局唯一）。内部递归透传（fallback 切换分支自身已按需滤图，
-        透传幂等无害）。
         """
-        if drop_images:
-            _strip_image_blocks(messages)
-
         # URL shortening
         url_map = self._shorten_urls_in_messages(messages)
 
@@ -429,7 +443,6 @@ class LLMClient:
                     system_prompt, messages, tool_schema,
                     _no_action_retry_used=_no_action_retry_used,
                     _text_retry_count=_text_retry_count,
-                    drop_images=drop_images,
                 )
             raise
 
@@ -496,8 +509,7 @@ class LLMClient:
                         system_prompt, retry_messages, tool_schema,
                         _no_action_retry_used=_no_action_retry_used,
                         _text_retry_count=_text_retry_count + 1,
-                        drop_images=drop_images,
-                    )
+                        )
 
         if not tool_input:
             # R2（P7 task1 附三）：空响应的关键证据上抛 WARNING——stop_reason 与
@@ -523,7 +535,6 @@ class LLMClient:
                     system_prompt, retry_messages, tool_schema,
                     _no_action_retry_used=True,
                     _text_retry_count=_text_retry_count,
-                    drop_images=drop_images,
                 )
             logger.warning("LLM still returned no parseable response after retry, using fallback done")
             # review7 #5：合成 done 统一挂 _HonestDone 带外标记（校验放行，
@@ -575,9 +586,12 @@ class LLMClient:
                 len(raw_action), names,
             )
         elif isinstance(raw_action, dict):
+            # issue #197 review #2：单动作分支同用 describe_action_entry——
+            # 单 dict 缺 name 键正是 #197 主犯错形态，占位符 '?' 歧义在主
+            # 形态上必须一并消除
             logger.info(
-                "multi_act: LLM emitted single action %r (schema allows up to %s)",
-                raw_action.get("name", "?"),
+                "multi_act: LLM emitted single action %s (schema allows up to %s)",
+                describe_action_entry(raw_action),
                 schema_max if schema_max else "1",
             )
 

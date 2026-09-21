@@ -565,7 +565,24 @@ class TestDescribeActionEntry:
 
 class TestVisionDegradeRetry:
 	"""#197 C+D：形状澄清升级（第二次起去图）、参数反馈恒不去图、外梯
-	预算 1→2、死刑保留。"""
+	预算 1→2、死刑保留。review #1 后去图走 copy_messages_without_images
+	拷贝——断言基于消息**内容**（降级调无图块 / 其余调带图 / 原 messages
+	不被泄漏破坏），不再依赖传输参数。"""
+
+	@staticmethod
+	def _messages_with_image() -> list[dict[str, Any]]:
+		return [{"role": "user", "content": [
+			{"type": "text", "text": "state"},
+			{"type": "image", "source": {"type": "base64", "data": "AAAA"}},
+		]}]
+
+	@staticmethod
+	def _has_image_block(messages: list[dict[str, Any]]) -> bool:
+		return any(
+			isinstance(m.get("content"), list)
+			and any(isinstance(b, dict) and b.get("type") == "image" for b in m["content"])
+			for m in messages
+		)
 
 	@pytest.mark.asyncio
 	async def test_outer_second_retry_drops_images_and_rescues(self):
@@ -575,11 +592,33 @@ class TestVisionDegradeRetry:
 			{"action": {"params": {"index": 2}}},               # 仍缺 name → 澄清 2（去图）
 			{"action": {"name": "click", "params": {"index": 3}}},  # 恢复合法
 		])
-		result = await agent._get_action_with_retry([])
+		messages = self._messages_with_image()
+		result = await agent._get_action_with_retry(messages)
 		assert agent.llm.get_action.await_count == 1 + _INVALID_ACTION_MAX_RETRIES
 		assert result["action"]["params"]["index"] == 3
-		assert not agent.llm.get_action.await_args_list[1].kwargs.get("drop_images")
-		assert agent.llm.get_action.await_args_list[2].kwargs["drop_images"] is True
+		calls = agent.llm.get_action.await_args_list
+		assert self._has_image_block(calls[1].kwargs["messages"])      # 澄清 1 带图
+		assert not self._has_image_block(calls[2].kwargs["messages"])  # 澄清 2 去图
+		assert self._has_image_block(messages)  # review #1：原 messages 不被降级泄漏破坏
+
+	@pytest.mark.asyncio
+	async def test_outer_degrade_rescue_keeps_images_for_param_retry(self):
+		# review #1 主场景：降级重试救回「形状合法但缺参」的动作 → 内梯参数
+		# 反馈必须仍在**带图**上下文修参数（拷贝式降级只影响当次调用）
+		agent = _LadderAgent([
+			{"action": {"params": {}}},                       # 缺 name → 澄清 1
+			{"action": {"params": {}}},                       # 仍缺 name → 澄清 2（去图）
+			{"action": {"name": "click", "params": {}}},      # 形状合法但缺 index → 内梯
+			{"action": {"name": "click", "params": {"index": 9}}},  # 参数修好 → 救回
+		])
+		messages = self._messages_with_image()
+		result = await agent._get_action_with_retry(messages)
+		assert agent.llm.get_action.await_count == 4
+		assert result["action"]["params"]["index"] == 9
+		calls = agent.llm.get_action.await_args_list
+		assert not self._has_image_block(calls[2].kwargs["messages"])  # 降级调去图
+		assert self._has_image_block(calls[3].kwargs["messages"])      # 参数反馈带图（不变量）
+		assert self._has_image_block(messages)
 
 	@pytest.mark.asyncio
 	async def test_outer_death_needs_three_invalid(self):
@@ -588,11 +627,13 @@ class TestVisionDegradeRetry:
 			{"action": {"params": {}}},
 			{"action": {"params": {}}},
 		])
-		result = await agent._get_action_with_retry([])
+		messages = self._messages_with_image()
+		result = await agent._get_action_with_retry(messages)
 		assert agent.llm.get_action.await_count == 3
 		assert result["action"]["name"] == "done"
 		assert result["action"]["params"]["success"] is False
-		assert agent.llm.get_action.await_args_list[2].kwargs["drop_images"] is True
+		assert not self._has_image_block(agent.llm.get_action.await_args_list[2].kwargs["messages"])
+		assert self._has_image_block(messages)  # 死刑路径同样不泄漏
 
 	@pytest.mark.asyncio
 	async def test_inner_param_retry_never_drops_images(self):
@@ -603,11 +644,13 @@ class TestVisionDegradeRetry:
 			{"action": {"name": "click", "params": {}}},
 			{"action": {"name": "click", "params": {}}},
 		])
-		result = await agent._get_action_with_retry([])
+		messages = self._messages_with_image()
+		result = await agent._get_action_with_retry(messages)
 		# 三连参数重试全败 → "proceeding anyway" 放行（#176 既有语义不变）
 		assert result["action"]["name"] == "click"
 		for call in agent.llm.get_action.await_args_list[1:]:
-			assert call.kwargs.get("drop_images") is False
+			assert self._has_image_block(call.kwargs["messages"])
+		assert self._has_image_block(messages)
 
 	@pytest.mark.asyncio
 	async def test_inner_second_shape_clarify_drops_images_and_rescues(self):
@@ -617,25 +660,22 @@ class TestVisionDegradeRetry:
 			{"action": {"params": {}}},                             # 仍缺 name → 形状澄清 2（去图）
 			{"action": {"name": "click", "params": {"index": 7}}},  # 恢复合法
 		])
-		result = await agent._get_action_with_retry([])
+		messages = self._messages_with_image()
+		result = await agent._get_action_with_retry(messages)
 		assert agent.llm.get_action.await_count == 4
 		assert result["action"]["params"]["index"] == 7
-		flags = [c.kwargs.get("drop_images") for c in agent.llm.get_action.await_args_list[1:]]
-		assert flags == [False, False, True]
+		calls = agent.llm.get_action.await_args_list[1:]
+		assert [self._has_image_block(c.kwargs["messages"]) for c in calls] == [True, True, False]
+		assert self._has_image_block(messages)
 
 
 class TestClientDropImagesAndLogShape:
-	"""#197 A+C 的 client 层：drop_images 入口滤图（原地变异约定）；
-	multi_act 日志畸形条目形状直出。"""
+	"""#197 A+C 的 client 层：copy_messages_without_images 拷贝式滤图
+	（review #1：降级只影响当次调用）；get_action 默认路径不碰图块；
+	multi_act 日志畸形条目形状直出（列表 + 单 dict 两分支）。"""
 
-	@pytest.mark.asyncio
-	async def test_drop_images_strips_blocks_before_create(self):
-		client = LLMClient(LLMSettings(api_key="test-key"))
-		client.client = MagicMock()
-		client.client.messages.create = MagicMock(return_value=_make_tool_use_response({
-			"evaluation_previous_goal": "", "memory": "", "next_goal": "g",
-			"action": {"name": "click", "params": {"index": 1}},
-		}))
+	def test_copy_messages_without_images_isolates_original(self):
+		from tree_walker.llm.client import copy_messages_without_images
 		messages = [
 			{"role": "user", "content": [
 				{"type": "text", "text": "state"},
@@ -643,20 +683,18 @@ class TestClientDropImagesAndLogShape:
 			]},
 			{"role": "user", "content": "plain"},
 		]
-		await client.get_action(
-			system_prompt="", messages=messages,
-			tool_schema={"name": "agent_response", "input_schema": {"type": "object"}},
-			drop_images=True,
-		)
-		sent = client.client.messages.create.call_args.kwargs["messages"]
-		block_types = [b.get("type") for b in sent[0]["content"]]
-		assert "image" not in block_types
-		assert block_types == ["text"]
-		# 原地变异约定（与 _shorten_urls_in_messages 一致）：调用方列表同步滤净
-		assert messages[0]["content"] == [{"type": "text", "text": "state"}]
+		out = copy_messages_without_images(messages)
+		assert [b["type"] for b in out[0]["content"]] == ["text"]  # 图块剥离
+		assert out[0] is not messages[0]                            # 消息 dict 是拷贝
+		assert out[0]["role"] == "user"                             # 其余键保留
+		assert out[1] is messages[1]                                # str content 原样引用
+		# review #1 核心：原 messages 完好（共享 dict 不被泄漏改写）
+		assert messages[0]["content"][1]["type"] == "image"
 
 	@pytest.mark.asyncio
-	async def test_drop_images_default_off_keeps_blocks(self):
+	async def test_get_action_default_path_keeps_image_blocks(self):
+		# 守门：任何人不得在 get_action 入口重新加无条件滤图（降级语义属于
+		# step 梯子的拷贝路径，client 默认路径图块原样送达 create）
 		client = LLMClient(LLMSettings(api_key="test-key"))
 		client.client = MagicMock()
 		client.client.messages.create = MagicMock(return_value=_make_tool_use_response({
@@ -691,3 +729,21 @@ class TestClientDropImagesAndLogShape:
 		multi_act_lines = [r.message for r in caplog.records if "multi_act" in r.message]
 		assert any("<dict:params>" in m and "'done'" in m and "<non-dict:str>" in m
 		           for m in multi_act_lines)
+
+	@pytest.mark.asyncio
+	async def test_single_action_log_shows_malformed_shape(self, caplog):
+		# review #2：单 dict 缺 name 键（#197 主犯错形态）同分支直出
+		client = LLMClient(LLMSettings(api_key="test-key"))
+		client.client = MagicMock()
+		client.client.messages.create = MagicMock(return_value=_make_tool_use_response({
+			"evaluation_previous_goal": "", "memory": "", "next_goal": "g",
+			"action": {"params": {"index": 5}},
+		}))
+		with caplog.at_level(logging.INFO, logger="tree_walker.llm.client"):
+			await client.get_action(
+				system_prompt="", messages=[],
+				tool_schema={"name": "agent_response", "input_schema": {"type": "object"}},
+			)
+		multi_act_lines = [r.message for r in caplog.records if "multi_act" in r.message]
+		assert any("<dict:params>" in m for m in multi_act_lines)
+		assert not any("'?'" in m for m in multi_act_lines)

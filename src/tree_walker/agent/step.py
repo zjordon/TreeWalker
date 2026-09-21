@@ -46,7 +46,7 @@ from tree_walker.browser.url_utils import extract_host_with_port
 from tree_walker.config import _DEFAULT_LLM_SCREENSHOT_SIZE, model_supports_vision
 # issue #194：限流/网络基建错误谓词（client.py 不依赖 agent 包，无环）——
 # L3 分罪与 L2 client 层退避共用同一分类
-from tree_walker.llm.client import is_llm_infra_error
+from tree_walker.llm.client import copy_messages_without_images, is_llm_infra_error
 from tree_walker.prompts.system_prompt import build_state_blocks, build_state_message, build_system_prompt
 
 if TYPE_CHECKING:
@@ -1019,11 +1019,13 @@ class StepPipeline:
     ) -> dict[str, Any]:
         """Call LLM; shape-targeted clarification retries; fallback to done.
 
-        issue #197：重试 1→2 次，**第二次起降级去图**（drop_images）——
-        V 轮 glm-5.3-flash 在巨型页上间歇输出缺 name 键的动作 dict，泛化
-        澄清 + 同款带图上下文重试原样再吐，二连即 fallback done 判死 10
-        任务（30 步预算只用 2 步）。死刑保留（调用次数有界是 #176 的
-        设计），触发条件升为「形状定向澄清 + 降级重试后仍无效」。
+        issue #197：重试 1→2 次，**第二次起降级去图**（copy_messages_
+        without_images 拷贝，只影响当次调用——review #1：原地滤图会经共享
+        dict 泄漏，破坏「参数反馈恒带图」不变量）——V 轮 glm-5.3-flash 在
+        巨型页上间歇输出缺 name 键的动作 dict，泛化澄清 + 同款带图上下文
+        重试原样再吐，二连即 fallback done 判死 10 任务（30 步预算只用
+        2 步）。死刑保留（调用次数有界是 #176 的设计），触发条件升为
+        「形状定向澄清 + 降级重试后仍无效」。
         """
         # Log available actions and tool schema for debugging
         action_enum = (
@@ -1052,8 +1054,12 @@ class StepPipeline:
         # Retry: append shape-targeted clarification message
         for attempt in range(_INVALID_ACTION_MAX_RETRIES):
             # #197：第二次澄清降级去图——同款带图上下文已失败一次，文本
-            # 口径同任务可通过（C 轮 task_108=1.0）
+            # 口径同任务可通过（C 轮 task_108=1.0）。review #1：降级必须走
+            # copy_messages_without_images 拷贝——原地滤图会经共享 dict 泄漏
+            # 回原 messages，使降级救回后的参数反馈重试（恒带图）在无图
+            # 上下文修参数
             degrade = attempt >= 1
+            base = copy_messages_without_images(messages) if degrade else messages
             logger.warning(
                 "LLM returned empty action (%s), retrying with clarification (%d/%d)%s",
                 describe_action_entry(response.get("action"))
@@ -1061,7 +1067,7 @@ class StepPipeline:
                 attempt + 1, _INVALID_ACTION_MAX_RETRIES,
                 " — text-only (screenshot dropped)" if degrade else "",
             )
-            retry_messages = list(messages) + [{
+            retry_messages = list(base) + [{
                 "role": "user",
                 "content": _invalid_action_feedback(response),
             }]
@@ -1069,7 +1075,6 @@ class StepPipeline:
                 system_prompt=self._system_prompt,
                 messages=retry_messages,
                 tool_schema=self._tool_schema,
-                drop_images=degrade,
             ))
 
             if self._is_valid_action(response):
@@ -1206,9 +1211,10 @@ class StepPipeline:
         ``_PARAM_VALIDATION_MAX_RETRIES`` 预算（#197 起 3 次），总 LLM 调用
         次数有界（外梯 1+2 + 内梯 3）。
         issue #197：形状澄清（else 分支）升级——第一次带图提示即可，**第二次
-        起降级去图**（与外梯第二次重试同语义，对齐 V 轮「同款带图上下文重试
-        原样再吐」证据）；参数反馈（if 分支）恒不去图——模型修 index/url 类
-        参数需要页面视觉，且参数连败不在 #197 证据链内。
+        起降级去图**（copy_messages_without_images 拷贝，与外梯第二次重试同
+        语义，对齐 V 轮「同款带图上下文重试原样再吐」证据）；参数反馈（if
+        分支）恒不去图——模型修 index/url 类参数需要页面视觉，且参数连败
+        不在 #197 证据链内。
         """
         param_error = self._validate_action_params(response)
         if param_error is None:
@@ -1226,7 +1232,7 @@ class StepPipeline:
                     f"Your action parameters are invalid: {param_error}. "
                     "Please fix the parameters and respond again with a valid action."
                 )
-                drop_images = False
+                base = original_messages
             else:
                 # P0-B：重试退化成无名字动作——外梯同款澄清（共用 attempt
                 # 预算），而非立即 fallback done
@@ -1241,8 +1247,9 @@ class StepPipeline:
                     " — text-only (screenshot dropped)" if degrade else "",
                 )
                 feedback = _invalid_action_feedback(response)
-                drop_images = degrade
-            retry_messages = list(original_messages) + [{
+                base = (copy_messages_without_images(original_messages)
+                        if degrade else original_messages)
+            retry_messages = list(base) + [{
                 "role": "user",
                 "content": feedback,
             }]
@@ -1250,7 +1257,6 @@ class StepPipeline:
                 system_prompt=self._system_prompt,
                 messages=retry_messages,
                 tool_schema=self._tool_schema,
-                drop_images=drop_images,
             ))
 
             if self._is_valid_action(response):
