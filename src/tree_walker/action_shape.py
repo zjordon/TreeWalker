@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
 	"actions_of",
 	"coerce_named_action",
+	"describe_action_entry",
 	"honest_done_action",
 	"is_honest_failure_action",
 	"name_of",
@@ -220,6 +221,23 @@ def normalize_actions_list(
 
 	if known_names is not None and context == "live":
 		_drop_unregistered_actions(actions_list, known_names)
+
+
+def describe_action_entry(entry: Any) -> str:
+	"""日志用动作条目描述（issue #197）——畸形形状直出，弃用占位符。
+
+	client 的 multi_act 诊断日志原用 ``a.get("name", "?")``：缺 name 键的
+	dict 与字面 ``"?"`` 名字显示成同一个 ``'?'``，#197 误诊（"模型吐问号"）
+	即源于此。脱敏约定与模块头一致：只记键名/类型，不记值（畸形条目的
+	params/值可能含已还原的敏感真值）。
+	"""
+	if isinstance(entry, dict):
+		name = entry.get("name")
+		if isinstance(name, str) and name:
+			return name
+		keys = ",".join(sorted(str(k) for k in entry)) or "empty"
+		return f"<dict:{keys}>"
+	return f"<non-dict:{type(entry).__name__}>"
 
 
 def name_of(action: Any) -> Any:

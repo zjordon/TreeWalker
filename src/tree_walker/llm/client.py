@@ -12,6 +12,7 @@ from typing import Any
 from anthropic import Anthropic, APIConnectionError, APIError, RateLimitError
 
 from tree_walker.action_shape import (
+    describe_action_entry,
     honest_done_action,
     normalize_actions_list,
 )
@@ -361,6 +362,7 @@ class LLMClient:
         *,
         _no_action_retry_used: bool = False,
         _text_retry_count: int = 0,
+        drop_images: bool = False,
     ) -> dict[str, Any]:
         """Call the LLM and return a parsed agent response.
 
@@ -372,7 +374,17 @@ class LLMClient:
         防挂死，且每次重试带全上下文，是 wall-clock 的主要贡献者之一）。上限
         _TEXT_RETRY_MAX 次；超限返回空 dict 哨兵，交 step 层既有的
         clarification 重试 → fallback done 梯子接管（总调用次数有界）。
+
+        ``drop_images``（issue #197）：梯子降级重试——巨型截图+巨型 DOM 间歇
+        压垮视觉模型的工具调用形状（V 轮 19 行畸形 vs C 轮 2 行），文本口径
+        同任务可通过（task_108 C=1.0）。入口原地滤 image block，变异约定与
+        ``_shorten_urls_in_messages`` 一致；影响域=当步 state 消息（TYPE_STATE
+        每步重建、全局唯一）。内部递归透传（fallback 切换分支自身已按需滤图，
+        透传幂等无害）。
         """
+        if drop_images:
+            _strip_image_blocks(messages)
+
         # URL shortening
         url_map = self._shorten_urls_in_messages(messages)
 
@@ -417,6 +429,7 @@ class LLMClient:
                     system_prompt, messages, tool_schema,
                     _no_action_retry_used=_no_action_retry_used,
                     _text_retry_count=_text_retry_count,
+                    drop_images=drop_images,
                 )
             raise
 
@@ -483,6 +496,7 @@ class LLMClient:
                         system_prompt, retry_messages, tool_schema,
                         _no_action_retry_used=_no_action_retry_used,
                         _text_retry_count=_text_retry_count + 1,
+                        drop_images=drop_images,
                     )
 
         if not tool_input:
@@ -509,6 +523,7 @@ class LLMClient:
                     system_prompt, retry_messages, tool_schema,
                     _no_action_retry_used=True,
                     _text_retry_count=_text_retry_count,
+                    drop_images=drop_images,
                 )
             logger.warning("LLM still returned no parseable response after retry, using fallback done")
             # review7 #5：合成 done 统一挂 _HonestDone 带外标记（校验放行，
@@ -550,7 +565,11 @@ class LLMClient:
             .get("maxItems")
         )
         if isinstance(raw_action, list):
-            names = [a.get("name", "?") for a in raw_action if isinstance(a, dict)]
+            # issue #197：畸形条目形状直出（describe_action_entry）——原
+            # a.get("name", "?") 把「缺 name 键」与「字面问号名字」显示成同一
+            # 个 '?'，且把非 dict 条目静默滤出名单（V 轮 ['done','?'] 中段畸形
+            # 不可见）。
+            names = [describe_action_entry(a) for a in raw_action]
             logger.info(
                 "multi_act: LLM emitted list with %d action(s): %s",
                 len(raw_action), names,

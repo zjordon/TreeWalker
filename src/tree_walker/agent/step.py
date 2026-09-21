@@ -17,6 +17,7 @@ from pydantic import ValidationError
 
 from tree_walker.action_shape import (
     actions_of,
+    describe_action_entry,
     honest_done_action,
     is_honest_failure_action,
     name_of,
@@ -64,16 +65,39 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_PARAM_VALIDATION_MAX_RETRIES = 2
+_PARAM_VALIDATION_MAX_RETRIES = 3  # #176 P0-B 引入；#197 2→3（视觉模型形状退化二连脆死）
+_INVALID_ACTION_MAX_RETRIES = 2    # #197：外梯形状澄清重试次数（原硬编码 1），第二次降级去图
 
 # 无效动作（无名字/空 action）的澄清消息——外梯（_get_action_with_retry）与
 # 参数校验内梯共用同一措辞（issue #176 P0-B：内梯对无效动作与外梯对称，先
 # 澄清重试而非一次 fallback 死刑）。
-_INVALID_ACTION_CLARIFICATION = (
-    "You forgot to return an action. Please respond with a valid "
-    "action using the agent_response tool, including your evaluation, "
-    "memory, next goal, and action."
-)
+def _invalid_action_feedback(response: Any) -> str:
+    """issue #197：无效动作的形状定向澄清（内外梯共用）。
+
+    泛化文案（"forgot to return an action"）与视觉模型主犯错形态——动作
+    dict 缺 name 键——不匹配：模型自认已返回动作，纠错信息为零，重试原样
+    再吐（V 轮二连判死 10 任务主因，glm-5.3-flash 在巨型页上间歇输出
+    ``{"params": ...}`` 形态）。按当次响应的实际畸形给一句话病灶 + 正确
+    形状示例；内外梯共用同一实现（同一错误同一反馈）。
+    """
+    action = response.get("action") if isinstance(response, dict) else None
+    if not isinstance(response, dict):
+        problem = "your response was not a JSON object"
+    elif not isinstance(action, dict):
+        problem = "your response contained no action object"
+    elif "name" not in action:
+        problem = "your action object is missing the required 'name' key"
+    elif not (isinstance(action.get("name"), str) and action["name"].strip()):
+        problem = "your action's 'name' must be a non-empty string"
+    else:
+        problem = "your action object was not usable"
+    return (
+        f"Your previous response could not be used: {problem}. Every action "
+        'MUST be an object like {"name": "click", "params": {"index": 5}}, '
+        "where 'name' is one of the action names in the tool schema and "
+        "'params' is an object. Respond again with the agent_response tool, "
+        "including your evaluation, memory, next goal, and action."
+    )
 
 # P0 消息分类管理：内部 _type 键标记消息类别（不送 SDK，_trim_messages 边界剥除）。
 # 对齐 browser-use MessageManager 的 state/context/agent_history 分类。
@@ -993,7 +1017,14 @@ class StepPipeline:
         self,
         messages: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        """Call LLM; retry once on empty action; fallback to done."""
+        """Call LLM; shape-targeted clarification retries; fallback to done.
+
+        issue #197：重试 1→2 次，**第二次起降级去图**（drop_images）——
+        V 轮 glm-5.3-flash 在巨型页上间歇输出缺 name 键的动作 dict，泛化
+        澄清 + 同款带图上下文重试原样再吐，二连即 fallback done 判死 10
+        任务（30 步预算只用 2 步）。死刑保留（调用次数有界是 #176 的
+        设计），触发条件升为「形状定向澄清 + 降级重试后仍无效」。
+        """
         # Log available actions and tool schema for debugging
         action_enum = (
             self._tool_schema.get("input_schema", {})
@@ -1018,24 +1049,38 @@ class StepPipeline:
             return await self._gate_uncertain_success_done(
                 await self._validate_params_or_retry(response, messages), messages)
 
-        # Retry: append clarification message
-        logger.warning("LLM returned empty action, retrying with clarification...")
-        retry_messages = list(messages) + [{
-            "role": "user",
-            "content": _INVALID_ACTION_CLARIFICATION,
-        }]
-        response = self._normalize_llm_response(await self.llm.get_action(
-            system_prompt=self._system_prompt,
-            messages=retry_messages,
-            tool_schema=self._tool_schema,
-        ))
+        # Retry: append shape-targeted clarification message
+        for attempt in range(_INVALID_ACTION_MAX_RETRIES):
+            # #197：第二次澄清降级去图——同款带图上下文已失败一次，文本
+            # 口径同任务可通过（C 轮 task_108=1.0）
+            degrade = attempt >= 1
+            logger.warning(
+                "LLM returned empty action (%s), retrying with clarification (%d/%d)%s",
+                describe_action_entry(response.get("action"))
+                if isinstance(response, dict) else "<non-dict>",
+                attempt + 1, _INVALID_ACTION_MAX_RETRIES,
+                " — text-only (screenshot dropped)" if degrade else "",
+            )
+            retry_messages = list(messages) + [{
+                "role": "user",
+                "content": _invalid_action_feedback(response),
+            }]
+            response = self._normalize_llm_response(await self.llm.get_action(
+                system_prompt=self._system_prompt,
+                messages=retry_messages,
+                tool_schema=self._tool_schema,
+                drop_images=degrade,
+            ))
 
-        if self._is_valid_action(response):
-            return await self._gate_uncertain_success_done(
-                await self._validate_params_or_retry(response, messages), messages)
+            if self._is_valid_action(response):
+                return await self._gate_uncertain_success_done(
+                    await self._validate_params_or_retry(response, messages), messages)
 
         # Fallback: insert safe done action
-        logger.warning("LLM still returned empty action after retry, using fallback done")
+        logger.warning(
+            "LLM still returned empty action after %d retries, using fallback done",
+            _INVALID_ACTION_MAX_RETRIES,
+        )
         return _fallback_done_output()
 
     async def _gate_uncertain_success_done(
@@ -1158,13 +1203,18 @@ class StepPipeline:
 
         issue #176 P0-B：重试响应本身无效（无名字动作——死亡链第 3 环）不再
         一次 fallback 死刑，与外梯对称地附澄清消息再试；澄清与参数重试共用
-        ``_PARAM_VALIDATION_MAX_RETRIES`` 预算（一次 Invalid-params + 一次
-        Invalid-action 封顶），总 LLM 调用次数有界（外梯 2 + 内梯 2）。
+        ``_PARAM_VALIDATION_MAX_RETRIES`` 预算（#197 起 3 次），总 LLM 调用
+        次数有界（外梯 1+2 + 内梯 3）。
+        issue #197：形状澄清（else 分支）升级——第一次带图提示即可，**第二次
+        起降级去图**（与外梯第二次重试同语义，对齐 V 轮「同款带图上下文重试
+        原样再吐」证据）；参数反馈（if 分支）恒不去图——模型修 index/url 类
+        参数需要页面视觉，且参数连败不在 #197 证据链内。
         """
         param_error = self._validate_action_params(response)
         if param_error is None:
             return response
 
+        invalid_action_seen = 0
         for attempt in range(_PARAM_VALIDATION_MAX_RETRIES):
             if self._is_valid_action(response):
                 logger.warning(
@@ -1176,15 +1226,22 @@ class StepPipeline:
                     f"Your action parameters are invalid: {param_error}. "
                     "Please fix the parameters and respond again with a valid action."
                 )
+                drop_images = False
             else:
                 # P0-B：重试退化成无名字动作——外梯同款澄清（共用 attempt
                 # 预算），而非立即 fallback done
+                invalid_action_seen += 1
+                degrade = invalid_action_seen >= 2
                 logger.warning(
                     "LLM returned invalid action during param validation retry "
-                    "— clarifying (%d/%d)",
+                    "(%s) — clarifying (%d/%d)%s",
+                    describe_action_entry(response.get("action"))
+                    if isinstance(response, dict) else "<non-dict>",
                     attempt + 1, _PARAM_VALIDATION_MAX_RETRIES,
+                    " — text-only (screenshot dropped)" if degrade else "",
                 )
-                feedback = _INVALID_ACTION_CLARIFICATION
+                feedback = _invalid_action_feedback(response)
+                drop_images = degrade
             retry_messages = list(original_messages) + [{
                 "role": "user",
                 "content": feedback,
@@ -1193,6 +1250,7 @@ class StepPipeline:
                 system_prompt=self._system_prompt,
                 messages=retry_messages,
                 tool_schema=self._tool_schema,
+                drop_images=drop_images,
             ))
 
             if self._is_valid_action(response):
