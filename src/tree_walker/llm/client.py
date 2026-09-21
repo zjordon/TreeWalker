@@ -12,6 +12,7 @@ from typing import Any
 from anthropic import Anthropic, APIConnectionError, APIError, RateLimitError
 
 from tree_walker.action_shape import (
+    describe_action_entry,
     honest_done_action,
     normalize_actions_list,
 )
@@ -42,6 +43,31 @@ def _strip_image_blocks(messages: list[dict[str, Any]]) -> None:
             ]
             if len(kept) != len(content):
                 msg["content"] = kept if kept else ""
+
+
+def copy_messages_without_images(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """返回剥离 image block 的消息**拷贝**（issue #197 review #1）。
+
+    与 ``_strip_image_blocks`` 的原地语义分野：梯子降级重试只应影响**当次
+    调用**——原地滤图会经共享消息 dict 泄漏回原 messages，使同一步后续的
+    参数反馈重试（设计上恒带图）在无图上下文修参数。降级路径必须走本函数
+    （新列表 + 复制含 block content 的消息 dict），原地版仅限 fallback 切换
+    那种「从此以后都不该带图」的场景。str content 的消息原样引用（无共享
+    可变结构需要隔离）。
+    """
+    out: list[dict[str, Any]] = []
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            m = {
+                **m,
+                "content": [
+                    b for b in content
+                    if not (isinstance(b, dict) and b.get("type") == "image")
+                ] or "",
+            }
+        out.append(m)
+    return out
 
 # R4（P7 02 方案）：text-not-tool_use 重试上限——旧实现无限递归
 _TEXT_RETRY_MAX = 2
@@ -483,7 +509,7 @@ class LLMClient:
                         system_prompt, retry_messages, tool_schema,
                         _no_action_retry_used=_no_action_retry_used,
                         _text_retry_count=_text_retry_count + 1,
-                    )
+                        )
 
         if not tool_input:
             # R2（P7 task1 附三）：空响应的关键证据上抛 WARNING——stop_reason 与
@@ -550,15 +576,22 @@ class LLMClient:
             .get("maxItems")
         )
         if isinstance(raw_action, list):
-            names = [a.get("name", "?") for a in raw_action if isinstance(a, dict)]
+            # issue #197：畸形条目形状直出（describe_action_entry）——原
+            # a.get("name", "?") 把「缺 name 键」与「字面问号名字」显示成同一
+            # 个 '?'，且把非 dict 条目静默滤出名单（V 轮 ['done','?'] 中段畸形
+            # 不可见）。
+            names = [describe_action_entry(a) for a in raw_action]
             logger.info(
                 "multi_act: LLM emitted list with %d action(s): %s",
                 len(raw_action), names,
             )
         elif isinstance(raw_action, dict):
+            # issue #197 review #2：单动作分支同用 describe_action_entry——
+            # 单 dict 缺 name 键正是 #197 主犯错形态，占位符 '?' 歧义在主
+            # 形态上必须一并消除
             logger.info(
-                "multi_act: LLM emitted single action %r (schema allows up to %s)",
-                raw_action.get("name", "?"),
+                "multi_act: LLM emitted single action %s (schema allows up to %s)",
+                describe_action_entry(raw_action),
                 schema_max if schema_max else "1",
             )
 

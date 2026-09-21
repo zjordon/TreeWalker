@@ -29,9 +29,18 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from pydantic import BaseModel
 
-from tree_walker.action_shape import normalize_actions_list, normalize_model_output
+from tree_walker.action_shape import (
+	describe_action_entry,
+	normalize_actions_list,
+	normalize_model_output,
+)
 from tree_walker.agent.plan_manager import PlanManager
-from tree_walker.agent.step import StepPipeline, _PARAM_VALIDATION_MAX_RETRIES
+from tree_walker.agent.step import (
+	StepPipeline,
+	_INVALID_ACTION_MAX_RETRIES,
+	_PARAM_VALIDATION_MAX_RETRIES,
+	_invalid_action_feedback,
+)
 from tree_walker.agent.views import ActionResult, AgentState, PlanItem
 from tree_walker.browser.views import BrowserStateSummary, SerializedDOMState
 from tree_walker.config import LLMSettings
@@ -292,23 +301,25 @@ class TestInnerLadderClarification:
 	@pytest.mark.asyncio
 	async def test_invalid_action_gets_clarification_before_death(self):
 		# 死因链第 3 环：Invalid-params 重试响应退化成无名字动作——不再
-		# 一次 fallback 死刑，先澄清重试；澄清仍无效才 fallback done
+		# 一次 fallback 死刑，先澄清重试；澄清仍无效才 fallback done。
+		# #197：内梯预算 2→3——responses 喂满 1 初调 + 3 内梯
 		agent = _LadderAgent([
 			{"action": {"name": "click", "params": {}}},   # 缺 index → Invalid-params
-			{"action": {"params": {"index": 5}}},          # 无 name → 澄清
-			{"action": {"params": {}}},                    # 仍无 name → 才死刑
+			{"action": {"params": {"index": 5}}},          # 无 name → 形状澄清 1
+			{"action": {"params": {}}},                    # 仍无 name → 形状澄清 2（去图）
+			{"action": {"params": {}}},                    # 三连无效 → 才死刑
 		])
 		result = await agent._get_action_with_retry([])
 
-		# 预算有界：初调 1 + 内梯 2（= _PARAM_VALIDATION_MAX_RETRIES），
-		# 一次 Invalid-params + 一次 Invalid-action 共用预算
+		# 预算有界：初调 1 + 内梯 3（= _PARAM_VALIDATION_MAX_RETRIES），
+		# 一次 Invalid-params + 两次 Invalid-action 共用预算
 		assert agent.llm.get_action.await_count == 1 + _PARAM_VALIDATION_MAX_RETRIES
 		assert result["action"]["name"] == "done"
 		assert result["action"]["params"]["success"] is False
 
-		# 第二次重试（澄清）用的是外梯同款无效动作措辞，非参数措辞
+		# 形状澄清用的是 #197 定向措辞（病灶 = 缺 name 键），非参数措辞
 		clarify_messages = agent.llm.get_action.await_args_list[2].kwargs["messages"]
-		assert "forgot to return an action" in clarify_messages[-1]["content"]
+		assert "missing the required 'name' key" in clarify_messages[-1]["content"]
 
 	@pytest.mark.asyncio
 	async def test_clarification_recovery_returns_valid_action(self):
@@ -340,9 +351,10 @@ class TestInnerLadderClarification:
 	@pytest.mark.asyncio
 	async def test_budget_bound_worst_case(self):
 		# 最坏路径（每次内梯重试都无效）：内梯调用次数恰为预算值，不超
-		# _PARAM_VALIDATION_MAX_RETRIES
+		# _PARAM_VALIDATION_MAX_RETRIES（#197 起 3——responses 喂满）
 		agent = _LadderAgent([
 			{"action": {"name": "click", "params": {}}},
+			{"action": {"params": {}}},
 			{"action": {"params": {}}},
 			{"action": {"params": {}}},
 		])
@@ -365,9 +377,10 @@ class TestOuterLadderRegression:
 
 	@pytest.mark.asyncio
 	async def test_invalid_after_clarification_falls_back(self):
-		agent = _LadderAgent([{}, {}])
+		# #197：外梯死刑门槛 2→3 次调用（1 初调 + 2 澄清，第二次去图）
+		agent = _LadderAgent([{}, {}, {}])
 		result = await agent._get_action_with_retry([])
-		assert agent.llm.get_action.await_count == 2
+		assert agent.llm.get_action.await_count == 3
 		assert result["action"]["name"] == "done"
 		assert result["action"]["params"]["success"] is False
 
@@ -375,7 +388,8 @@ class TestOuterLadderRegression:
 	async def test_nondict_response_clarified_not_crash(self):
 		# _normalize_llm_response 对非 dict 原样透传 → _is_valid_action 判假
 		# （isinstance 守卫）进外梯澄清——注入/旁路 LLM 的契约违反不再
-		# AttributeError 崩断（兑现透传 docstring 承诺）
+		# AttributeError 崩断（兑现透传 docstring 承诺）；#197 定向文案的
+		# 非 dict 分支
 		agent = _LadderAgent([
 			"not-a-dict",
 			{"action": {"name": "click", "params": {"index": 1}}},
@@ -383,7 +397,7 @@ class TestOuterLadderRegression:
 		result = await agent._get_action_with_retry([])
 		assert agent.llm.get_action.await_count == 2
 		first_retry = agent.llm.get_action.await_args_list[1].kwargs["messages"]
-		assert "forgot to return an action" in first_retry[-1]["content"]
+		assert "not a JSON object" in first_retry[-1]["content"]
 		assert result["action"]["name"] == "click"
 
 	@pytest.mark.asyncio
@@ -495,3 +509,241 @@ class TestUnknownNameRecordFlattenGuard:
 		from tree_walker.tools.actions import Tools as RealTools
 		with pytest.raises(KeyError):
 			RealTools()._flatten_params({"filters": {"a": 1}}, "read_gird")
+
+
+# ── 6. issue #197：形状定向澄清 + 第二次形状澄清去图 + 畸形日志直出 ─────
+
+
+class TestInvalidActionFeedback:
+	"""#197 B：泛化文案（"forgot to return an action"）与视觉模型主犯错
+	形态（动作 dict 缺 name 键）不匹配是二连判死主因——按实际畸形给病灶。
+	"""
+
+	def test_missing_name_key_names_the_defect(self):
+		msg = _invalid_action_feedback({"action": {"params": {"index": 5}}})
+		assert "missing the required 'name' key" in msg
+
+	def test_feedback_carries_shape_example(self):
+		msg = _invalid_action_feedback({"action": {"params": {}}})
+		assert '"name"' in msg and '"params"' in msg  # 正确形状示例在场
+
+	def test_nondict_response_branch(self):
+		msg = _invalid_action_feedback("not-a-dict")
+		assert "not a JSON object" in msg
+
+	def test_action_not_dict_branch(self):
+		msg = _invalid_action_feedback({"action": "click"})
+		assert "no action object" in msg
+
+	def test_invalid_name_value_branch(self):
+		msg = _invalid_action_feedback({"action": {"name": "", "params": {}}})
+		assert "non-empty string" in msg
+
+
+class TestDescribeActionEntry:
+	"""#197 A：畸形形状直出——``a.get("name", "?")`` 把「缺 name 键」与
+	「字面问号名字」显示成同一个 '?'（V 轮误诊源）；只记键名/类型不记值
+	（脱敏约定）。"""
+
+	def test_valid_name_passthrough(self):
+		assert describe_action_entry({"name": "click", "params": {}}) == "click"
+
+	def test_missing_name_shows_keys(self):
+		assert describe_action_entry({"params": {"index": 5}}) == "<dict:params>"
+
+	def test_empty_dict(self):
+		assert describe_action_entry({}) == "<dict:empty>"
+
+	def test_null_name_shows_keys(self):
+		assert describe_action_entry({"name": None, "params": {}}) == "<dict:name,params>"
+
+	def test_scalar_shows_type_only(self):
+		assert describe_action_entry("click") == "<non-dict:str>"
+		assert describe_action_entry(None) == "<non-dict:NoneType>"
+		assert describe_action_entry(5) == "<non-dict:int>"
+
+
+class TestVisionDegradeRetry:
+	"""#197 C+D：形状澄清升级（第二次起去图）、参数反馈恒不去图、外梯
+	预算 1→2、死刑保留。review #1 后去图走 copy_messages_without_images
+	拷贝——断言基于消息**内容**（降级调无图块 / 其余调带图 / 原 messages
+	不被泄漏破坏），不再依赖传输参数。"""
+
+	@staticmethod
+	def _messages_with_image() -> list[dict[str, Any]]:
+		return [{"role": "user", "content": [
+			{"type": "text", "text": "state"},
+			{"type": "image", "source": {"type": "base64", "data": "AAAA"}},
+		]}]
+
+	@staticmethod
+	def _has_image_block(messages: list[dict[str, Any]]) -> bool:
+		return any(
+			isinstance(m.get("content"), list)
+			and any(isinstance(b, dict) and b.get("type") == "image" for b in m["content"])
+			for m in messages
+		)
+
+	@pytest.mark.asyncio
+	async def test_outer_second_retry_drops_images_and_rescues(self):
+		# issue 验收句：连续 2 次 '?' 不再判死——第 3 调（去图降级）救回
+		agent = _LadderAgent([
+			{"action": {"params": {"index": 1}}},               # 缺 name → 澄清 1（带图）
+			{"action": {"params": {"index": 2}}},               # 仍缺 name → 澄清 2（去图）
+			{"action": {"name": "click", "params": {"index": 3}}},  # 恢复合法
+		])
+		messages = self._messages_with_image()
+		result = await agent._get_action_with_retry(messages)
+		assert agent.llm.get_action.await_count == 1 + _INVALID_ACTION_MAX_RETRIES
+		assert result["action"]["params"]["index"] == 3
+		calls = agent.llm.get_action.await_args_list
+		assert self._has_image_block(calls[1].kwargs["messages"])      # 澄清 1 带图
+		assert not self._has_image_block(calls[2].kwargs["messages"])  # 澄清 2 去图
+		assert self._has_image_block(messages)  # review #1：原 messages 不被降级泄漏破坏
+
+	@pytest.mark.asyncio
+	async def test_outer_degrade_rescue_keeps_images_for_param_retry(self):
+		# review #1 主场景：降级重试救回「形状合法但缺参」的动作 → 内梯参数
+		# 反馈必须仍在**带图**上下文修参数（拷贝式降级只影响当次调用）
+		agent = _LadderAgent([
+			{"action": {"params": {}}},                       # 缺 name → 澄清 1
+			{"action": {"params": {}}},                       # 仍缺 name → 澄清 2（去图）
+			{"action": {"name": "click", "params": {}}},      # 形状合法但缺 index → 内梯
+			{"action": {"name": "click", "params": {"index": 9}}},  # 参数修好 → 救回
+		])
+		messages = self._messages_with_image()
+		result = await agent._get_action_with_retry(messages)
+		assert agent.llm.get_action.await_count == 4
+		assert result["action"]["params"]["index"] == 9
+		calls = agent.llm.get_action.await_args_list
+		assert not self._has_image_block(calls[2].kwargs["messages"])  # 降级调去图
+		assert self._has_image_block(calls[3].kwargs["messages"])      # 参数反馈带图（不变量）
+		assert self._has_image_block(messages)
+
+	@pytest.mark.asyncio
+	async def test_outer_death_needs_three_invalid(self):
+		agent = _LadderAgent([
+			{"action": {"params": {}}},
+			{"action": {"params": {}}},
+			{"action": {"params": {}}},
+		])
+		messages = self._messages_with_image()
+		result = await agent._get_action_with_retry(messages)
+		assert agent.llm.get_action.await_count == 3
+		assert result["action"]["name"] == "done"
+		assert result["action"]["params"]["success"] is False
+		assert not self._has_image_block(agent.llm.get_action.await_args_list[2].kwargs["messages"])
+		assert self._has_image_block(messages)  # 死刑路径同样不泄漏
+
+	@pytest.mark.asyncio
+	async def test_inner_param_retry_never_drops_images(self):
+		# 参数反馈恒不去图（模型修 index 类参数需要页面视觉）——即使撑满预算
+		agent = _LadderAgent([
+			{"action": {"name": "click", "params": {}}},
+			{"action": {"name": "click", "params": {}}},
+			{"action": {"name": "click", "params": {}}},
+			{"action": {"name": "click", "params": {}}},
+		])
+		messages = self._messages_with_image()
+		result = await agent._get_action_with_retry(messages)
+		# 三连参数重试全败 → "proceeding anyway" 放行（#176 既有语义不变）
+		assert result["action"]["name"] == "click"
+		for call in agent.llm.get_action.await_args_list[1:]:
+			assert self._has_image_block(call.kwargs["messages"])
+		assert self._has_image_block(messages)
+
+	@pytest.mark.asyncio
+	async def test_inner_second_shape_clarify_drops_images_and_rescues(self):
+		agent = _LadderAgent([
+			{"action": {"name": "click", "params": {}}},            # Invalid-params → 参数反馈（带图）
+			{"action": {"params": {"index": 5}}},                   # 缺 name → 形状澄清 1（带图）
+			{"action": {"params": {}}},                             # 仍缺 name → 形状澄清 2（去图）
+			{"action": {"name": "click", "params": {"index": 7}}},  # 恢复合法
+		])
+		messages = self._messages_with_image()
+		result = await agent._get_action_with_retry(messages)
+		assert agent.llm.get_action.await_count == 4
+		assert result["action"]["params"]["index"] == 7
+		calls = agent.llm.get_action.await_args_list[1:]
+		assert [self._has_image_block(c.kwargs["messages"]) for c in calls] == [True, True, False]
+		assert self._has_image_block(messages)
+
+
+class TestClientDropImagesAndLogShape:
+	"""#197 A+C 的 client 层：copy_messages_without_images 拷贝式滤图
+	（review #1：降级只影响当次调用）；get_action 默认路径不碰图块；
+	multi_act 日志畸形条目形状直出（列表 + 单 dict 两分支）。"""
+
+	def test_copy_messages_without_images_isolates_original(self):
+		from tree_walker.llm.client import copy_messages_without_images
+		messages = [
+			{"role": "user", "content": [
+				{"type": "text", "text": "state"},
+				{"type": "image", "source": {"type": "base64", "data": "AAAA"}},
+			]},
+			{"role": "user", "content": "plain"},
+		]
+		out = copy_messages_without_images(messages)
+		assert [b["type"] for b in out[0]["content"]] == ["text"]  # 图块剥离
+		assert out[0] is not messages[0]                            # 消息 dict 是拷贝
+		assert out[0]["role"] == "user"                             # 其余键保留
+		assert out[1] is messages[1]                                # str content 原样引用
+		# review #1 核心：原 messages 完好（共享 dict 不被泄漏改写）
+		assert messages[0]["content"][1]["type"] == "image"
+
+	@pytest.mark.asyncio
+	async def test_get_action_default_path_keeps_image_blocks(self):
+		# 守门：任何人不得在 get_action 入口重新加无条件滤图（降级语义属于
+		# step 梯子的拷贝路径，client 默认路径图块原样送达 create）
+		client = LLMClient(LLMSettings(api_key="test-key"))
+		client.client = MagicMock()
+		client.client.messages.create = MagicMock(return_value=_make_tool_use_response({
+			"evaluation_previous_goal": "", "memory": "", "next_goal": "g",
+			"action": {"name": "click", "params": {"index": 1}},
+		}))
+		messages = [{"role": "user", "content": [
+			{"type": "text", "text": "state"},
+			{"type": "image", "source": {"type": "base64", "data": "AAAA"}},
+		]}]
+		await client.get_action(
+			system_prompt="", messages=messages,
+			tool_schema={"name": "agent_response", "input_schema": {"type": "object"}},
+		)
+		sent = client.client.messages.create.call_args.kwargs["messages"]
+		assert [b.get("type") for b in sent[0]["content"]] == ["text", "image"]
+
+	@pytest.mark.asyncio
+	async def test_multi_act_log_shows_malformed_shape(self, caplog):
+		# V 轮 19 行 ['?'] 的真身：<dict:params> 等——占位符歧义不再
+		client = LLMClient(LLMSettings(api_key="test-key"))
+		client.client = MagicMock()
+		client.client.messages.create = MagicMock(return_value=_make_tool_use_response({
+			"evaluation_previous_goal": "", "memory": "", "next_goal": "g",
+			"action": [{"params": {"index": 5}}, {"name": "done", "params": {}}, "click"],
+		}))
+		with caplog.at_level(logging.INFO, logger="tree_walker.llm.client"):
+			await client.get_action(
+				system_prompt="", messages=[],
+				tool_schema={"name": "agent_response", "input_schema": {"type": "object"}},
+			)
+		multi_act_lines = [r.message for r in caplog.records if "multi_act" in r.message]
+		assert any("<dict:params>" in m and "'done'" in m and "<non-dict:str>" in m
+		           for m in multi_act_lines)
+
+	@pytest.mark.asyncio
+	async def test_single_action_log_shows_malformed_shape(self, caplog):
+		# review #2：单 dict 缺 name 键（#197 主犯错形态）同分支直出
+		client = LLMClient(LLMSettings(api_key="test-key"))
+		client.client = MagicMock()
+		client.client.messages.create = MagicMock(return_value=_make_tool_use_response({
+			"evaluation_previous_goal": "", "memory": "", "next_goal": "g",
+			"action": {"params": {"index": 5}},
+		}))
+		with caplog.at_level(logging.INFO, logger="tree_walker.llm.client"):
+			await client.get_action(
+				system_prompt="", messages=[],
+				tool_schema={"name": "agent_response", "input_schema": {"type": "object"}},
+			)
+		multi_act_lines = [r.message for r in caplog.records if "multi_act" in r.message]
+		assert any("<dict:params>" in m for m in multi_act_lines)
+		assert not any("'?'" in m for m in multi_act_lines)

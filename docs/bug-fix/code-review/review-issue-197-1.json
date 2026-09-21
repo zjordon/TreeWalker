@@ -1,0 +1,137 @@
+{
+  "status": "complete",
+  "llm": {
+    "model": "glm-5.3"
+  },
+  "message": "Review complete: 2 finding(s) across 4 selected item(s).",
+  "summary": {
+    "files_reviewed": 4,
+    "comments": 2,
+    "total_tokens": 966706,
+    "input_tokens": 907891,
+    "output_tokens": 58815,
+    "cache_read_tokens": 700160,
+    "elapsed": "14m57s"
+  },
+  "tool_calls": {
+    "total": 42,
+    "by_tool": {
+      "code_comment": 2,
+      "code_search": 21,
+      "file_read": 19
+    },
+    "failure": 0,
+    "failure_by_tool": {},
+    "failure_details": []
+  },
+  "comments": [
+    {
+      "path": "src/tree_walker/agent/step.py",
+      "content": "外梯降级去图会通过共享消息 dict 泄漏，破坏本 diff 自己声明的「参数反馈恒不去图」不变量：`retry_messages = list(messages) + [...]` 是浅拷贝，内部 dict 与 `messages` 共享；`drop_images=True` 时 client.get_action 入口的 `_strip_image_blocks`（client.py:45 `msg[\"content\"] = kept`）原地改写这些共享 dict。若降级重试救回形状合法但参数无效的动作（如 `click` 缺 `index`），随后 `_validate_params_or_retry(response, messages)` 的参数分支虽设 `drop_images=False`（本 diff 注释明确\"模型修 index/url 类参数需要页面视觉\"），截图却已被剥离——模型在无图上下文修参数，违背设计意图并拉低救回率。同根影响还有两处：内梯 `degrade` 触发后同循环后续参数分支迭代（drop_images=False 但图已没了）；`_gate_uncertain_success_done` 的验证重试（step.py:1146 同样 `list(messages) + [...]` 且不带 drop_images）。新增测试 `test_inner_param_retry_never_drops_images` 未覆盖\"外梯降级→参数重试\"路径，故该不变量在被破坏处无测试守护。建议：degrade 分支不依赖 client 的原地滤图，改为传入一份剥离图片的深拷贝（复制消息 dict 与 content 列表），例如 `retry_messages = [_copy_msg_no_images(m) for m in messages] + [澄清消息]`，使降级只影响当次调用；或让 step 层在降级前对 messages 做去图快照。",
+      "existing_code": "            response = self._normalize_llm_response(await self.llm.get_action(\n                system_prompt=self._system_prompt,\n                messages=retry_messages,\n                tool_schema=self._tool_schema,\n                drop_images=degrade,\n            ))",
+      "start_line": 1068,
+      "end_line": 1073,
+      "thinking": "Confirmed: `_gate_uncertain_success_done` also builds `retry_messages = list(messages) + [...]` (line 1146) and calls `get_action` WITHOUT `drop_images` — this retry (done verification, where the model needs to see the page to verify) would also silently lose the screenshot after an outer-ladder degrade. Same root cause, one more affected consumer.\n\nNow I have everything needed. Final verdict:\n\n**Confirmed issue (medium, bug)**: In-place image stripping leaks through shared message dicts, breaking the same-diff invariant \"参数反馈恒不去图——模型修 index/url 类参数需要页面视觉\".\n\nChain of evidence:\n1. step.py outer ladder: `retry_messages = list(messages) + [...]` — shallow copy, dicts shared with `messages`.\n2. On attempt 2, `drop_images=degrade=True` → client.py:385-386 `_strip_image_blocks(messages)` → client.py:45 `msg[\"content\"] = kept` — in-place mutation of the shared dicts.\n3. If the degraded retry rescues the shape (`_is_valid_action` True), `_validate_params_or_retry(response, messages)` runs with `messages` already image-stripped; its param branch sets `drop_images = False` intending to keep vision (step.py:1229, docstring 1210-1211) but the screenshot is already gone — the model fixes index/url params blind.\n4. Same leak inside the inner ladder: once `degrade` fires (invalid_action_seen \u003e= 2), subsequent param-branch iterations (drop_images=False) run imageless.\n5. Also affects `_gate_uncertain_success_done` retry (line 1146) — verification retry without images after outer degrade.\n6. `test_inner_param_retry_never_drops_images` passes only because it never exercises the outer-degrade→param path — the invariant is untested where it actually breaks.\n\nAlso the docstring claim in client.py (\"影响域=当步 state 消息（TYPE_STATE 每步重建、全局唯一）\") covers cross-STEP history (typed mode protects history via `_strip_type` dict-copy) but misses the same-step param ladder.\n\nNon-issues (from plan): #1 (`_strip_image_blocks` defined at client.py:27), #2 (single get_action impl; tests use AsyncMock), #6 (docs-only references), #7 (imports present). #5 skipped (matches gatekeeper truthiness; too minor). #4 folded/skipped (typed-mode default protects history; untyped legacy mode impact marginal).\n\nPlace the comment at the outer-ladder call site with `drop_images=degrade,`. Provide a suggestion snippet.\n\nSeverity: I'll go medium. Category: bug.",
+      "category": "bug",
+      "severity": "medium"
+    },
+    {
+      "path": "src/tree_walker/llm/client.py",
+      "content": "#197 A 的占位符修复只覆盖了列表分支：紧随其后的 `elif isinstance(raw_action, dict)` 单动作分支（client.py:577-582）仍用 `raw_action.get(\"name\", \"?\")`。单 dict 缺 name 键（`{\"action\": {\"params\": ...}}`）正是 step.py/_invalid_action_feedback 文档自述的 #197 主犯错形态，该形态下此日志仍打印 `'?'`——「缺 name 键」与「字面问号名」的占位符歧义（#197 最初\"模型吐问号\"误诊的来源）在主形态上并未消除。建议该分支同用 describe_action_entry 直出形状。",
+      "suggestion_code": "        elif isinstance(raw_action, dict):\n            logger.info(\n                \"multi_act: LLM emitted single action %s (schema allows up to %s)\",\n                describe_action_entry(raw_action),\n                schema_max if schema_max else \"1\",\n            )",
+      "existing_code": "            names = [describe_action_entry(a) for a in raw_action]",
+      "start_line": 572,
+      "end_line": 572,
+      "thinking": "I've now reviewed all files. Let me consolidate my findings.\n\n**Confirmed finding #1 (skip)**: shallow-copy leak of drop_images via shared message dicts.\n\n**New finding candidates:**\n\n**F1 (client.py, single-dict log branch)**: The #197-A fix only updated the LIST branch of the multi_act diagnostic log; the sibling single-dict branch (line 577-582, unchanged) still logs `raw_action.get(\"name\", \"?\")` — for the exact primary malformed form cited in this PR (`{\"action\": {\"params\": ...}}` — a single dict missing name), the log still prints `'?'`, preserving the very misdiagnosis ambiguity (\"model output a literal ?\") that #197-A set out to eliminate. This is an incomplete fix / inconsistency within the changed area. I'll anchor the comment on the added lines (the new comment block + `names = ...` line) since the tool requires existing_code from the diff.\n\nSeverity: low (diagnostic logging only, but it's the PR's own stated goal — arguably medium?). The issue #197's initial misdiagnosis came from exactly this log. Given the PR goal is diagnosability, I'd rate medium... but it's log-only. I'll go with low severity, maintainability category. Hmm — actually let me think about impact: the V-round analysis initially believed the model emitted literal \"?\" — this branch keeps that ambiguity for the single-dict form. The step.py docstring explicitly names the single-dict form as the main form (\"间歇输出 ``{\"params\": ...}`` 形态\"). Wait — is it? step.py `_get_action_with_retry` docstring: \"V 轮 glm-5.3-flash 在巨型页上间歇输出缺 name 键的动作 dict\". And the inner-ladder docstring similarly. And `_invalid_action_feedback` docstring: \"``{\"params\": ...}`` 形态\". So the PRIMARY form is a single dict — which logs through the unfixed branch! The list form (`['?']`) appeared in V-round logs. Both. So the unfixed branch covers a primary form → medium severity seems justified. I'll say medium, category maintainability (diagnostic completeness). Actually category options: bug/security/performance/maintainability/test/style/documentation/other. This is a diagnostic inconsistency → \"maintainability\" or \"bug\"? It doesn't affect runtime behavior, only log diagnosability. I'll use maintainability, severity low→medium. I'll pick medium given it directly undermines the PR's own diagnostic goal for the primary malformed form.\n\n**F2 — anything else?**\n\nLet me re-scan for real defects once more:\n\na) `test_drop_images_strips_blocks_before_create`: `client.client.messages.create.call_args` — after `to_thread`, call_args recorded ✓. `_shorten_urls_in_messages(messages)` — need to verify it doesn't transform text blocks' \"state\" — it shortens URLs ≥100 chars in text; \"state\" has none ✓.\n\nWait — actually one more check on `_filter_sensitive_in_messages(messages, None)`: let me verify it no-ops with None. Let me check quickly... it's pre-existing and used with None on every first call (getattr default None). If it crashed on None, all existing calls would crash. ✓ skip.\n\nb) `_make_tool_use_response` block.input = tool_input where action is a LIST — `raw_action = tool_input.get(\"action\", {})` → list ✓.\n\nc) In `test_multi_act_log_shows_malformed_shape`, `normalize_actions_list` coerces \"click\" (str) → named action with warning log — fine; also `_normalize...` not involved (client direct). Result action = `{\"params\": {\"index\": 5}}` — client returns it. No assertion on result ✓.\n\nd) step.py `_invalid_action_feedback`: For `response = {}` — wait, client returns `{}` sentinel (text-retry exhaustion) → step `_normalize_llm_response({})` → `normalize_model_output({}, ...)`: `actions = None` → not list → `act = {}` → actions = [{}]... wait: `act = model_output.get(\"action\")` → None → `isinstance(None, (str, dict))` False → `actions = [{}]`. normalize: entry {} dict, no invalid name, params None → set to {}. action mirror = {} → `_is_valid_action`: `action = response.get(\"action\")` = {} → `not action` → False... wait `not {}` is True → return False ✓ invalid → outer ladder → feedback: response dict, `response.get(\"action\")` = {} → isinstance dict ✓ → `\"name\" not in {}` → \"missing the required 'name' key\". Reasonable (the model actually returned text, not an action object — the feedback slightly mis-describes but still guides toward correct shape). Fine.\n\ne) **`_invalid_action_feedback` for non-dict response `\"not-a-dict\"`**: `response.get` guarded ✓ (test covers).\n\nf) **Inner-ladder degrade semantics**: `degrade = invalid_action_seen \u003e= 2` — note the FIRST shape clarification in the inner ladder occurs after a param retry already happened; degrade on the second invalid action ✓ aligned with docstring.\n\ng) **`drop_images` propagation in `_gate_uncertain_success_done`**: not passed → False. After a degraded outer retry rescued a done(success=True)-with-uncertainty, the gate retry would send messages whose images were already stripped by the leak (finding #1's family) — covered.\n\nh) **Any `await` missing?** No.\n\ni) **`describe_action_entry` sorted keys with mixed types**: `sorted(str(k) for ...)` — all strs ✓.\n\nj) **Potential issue — `TestVisionDegradeRetry.test_outer_second_retry_drops_images_and_rescues` asserts `result[\"action\"][\"params\"][\"index\"] == 3`**: `_validate_params_or_retry(response, messages)` → click index=3 valid → returns response ✓. Then `_gate_uncertain_success_done` — click not done → passthrough ✓.\n\nk) **`_LadderAgent` responses consumption**: `AsyncMock(side_effect=list(responses))` — 3 responses for 3 calls ✓; if more calls needed → StopIteration... For death tests, exactly 3 calls ✓.\n\nl) One more: **`test_invalid_action_gets_clarification_before_death` asserts await_count == 1 + _PARAM_VALIDATION_MAX_RETRIES == 4** and provides exactly 4 responses ✓.\n\nm) **Check unused import in test file**: `normalize_actions_list`, `normalize_model_output` — used in earlier (pre-existing) tests presumably. `describe_action_entry` ✓ used. `_INVALID_ACTION_MAX_RETRIES` ✓ used. `logging` ✓ used (line 686 + caplog). `copy` import at line 23 — pre-existing? It was in the imports before this diff (line 23 in the file, not shown as added in diff — the diff at the top only shows the action_shape/step imports changed). ✓.\n\nn) **step.py: `_INVALID_ACTION_MAX_RETRIES = 2    # #197：外梯形状澄清重试次数（原硬编码 1），第二次降级去图`** — value 2, comment matches ✓.\n\no) **The `_PARAM_VALIDATION_MAX_RETRIES` comment**: \"总 LLM 调用次数有界（外梯 1+2 + 内梯 3）\" — worst case: outer 3 calls, last one valid-but-param-invalid → inner 3 more → 6 total. \"外梯 1+2 + 内梯 3\" = 6 ✓ accurate.\n\np) **Regression risk**: `test_outer_death_needs_three_invalid` replaces old `test_invalid_after_clarification_falls_back` behavior ✓ updated.\n\nq) **`normalize_actions_list` in client for single-element list `[{\"params\": ...}]`**: single=True but `_has_invalid_name` False (missing key) → NOT honest-done → stays → ladder ✓ — this is what makes the whole fix work. ✓ consistent with tests.\n\nNow — is there anything problematic about **`_invalid_action_feedback` being called with the pre-normalization response in the inner ladder**? No, response is post-normalization at both sites ✓.\n\n**One more potential issue — the else-branch dead code in `_invalid_action_feedback`**: As analyzed, unreachable given `_is_valid_action`'s definition at both call sites. It's a defensive default. Flagging as dead code would be pedantic and the checklist says favor precision. Skip.\n\n**Another look at client docstring claim**: \"影响域=当步 state 消息（TYPE_STATE 每步重建、全局唯一）\" — given finding #1 (shared dicts also affect other retry ladders within the step), this claim is inaccurate, but that's part of finding #1's substance. Skip.\n\nSo the only NEW finding I'm confident in: **F1 — the single-dict branch of the multi_act log still uses the `\"?\"` placeholder**, undermining #197-A for the single-dict (primary) malformed form.\n\nLet me also double-check F1's factual basis once more by re-reading client.py lines 567-582:\n\n```python\n        if isinstance(raw_action, list):\n            # issue #197：畸形条目形状直出（describe_action_entry）——原\n            # a.get(\"name\", \"?\") 把「缺 name 键」与「字面问号名字」显示成同一\n            # 个 '?'，且把非 dict 条目静默滤出名单（V 轮 ['done','?'] 中段畸形\n            # 不可见）。\n            names = [describe_action_entry(a) for a in raw_action]\n            logger.info(\n                \"multi_act: LLM emitted list with %d action(s): %s\",\n                len(raw_action), names,\n            )\n        elif isinstance(raw_action, dict):\n            logger.info(\n                \"multi_act: LLM emitted single action %r (schema allows up to %s)\",\n                raw_action.get(\"name\", \"?\"),\n                schema_max if schema_max else \"1\",\n            )\n```\n\nYes — confirmed. For `{\"action\": {\"params\": {\"index\": 5}}}` (single dict missing name), this logs `multi_act: LLM emitted single action '?' (schema allows up to N)` — exactly the ambiguity #197-A eliminates elsewhere. Suggestion: use `describe_action_entry(raw_action)` there too.\n\nNow, where to anchor? The added lines are the comment block + `names = [describe_action_entry(a) for a in raw_action]`. I'll anchor on the `names = ...` line (it's in the diff) and mention the sibling elif branch.\n\nSeverity: medium? Let me weigh: it's a diagnostic-log-only gap; runtime behavior unaffected. The PR's A-part is entirely about diagnosability (the \"?\" misdiagnosis led the issue author astray initially — the issue title says \"间歇输出 \"?\" 伪动作\" while the actual form was missing-name dicts). Leaving the primary form's log ambiguous partially defeats A. I'll rate **low** severity with maintainability category... Hmm, but the whole point of part A was to fix this exact misdiagnosis. For the single-dict form the misdiagnosis persists. I'll go medium — it's a direct gap in the change's stated objective, though non-functional. Actually the review checklist says treat correctness/security as blocking and style as non-blocking. This is a diagnosability gap — I'd categorize maintainability, severity low→medium. I'll choose \"low\" to stay conservative? Hmm.\n\nThe issue evidence shows the actual runtime logs that misled: \"multi_act: LLM emitted list with 1 action(s): ['?']\". The fixed list branch covers that exact line. The single-dict form would log \"single action '?'\" — same ambiguity but a different line. Since step.py's own docstring says the main form is the missing-name dict (could arrive as single dict), and part A's stated purpose is eliminating the '?' ambiguity, I'll go with **medium** for consistency-of-fix... Let me settle: **low** severity, **maintainability**. Rationale: log-only, and the outer/inner ladder logs (which this diff DID upgrade) already show `\u003cdict:params\u003e` for the same malformed response, so the information is available elsewhere in logs. That's a good point — the step-level warning logs now use describe_action_entry, so diagnosis isn't fully blind. Low severity is right.\n\nHmm wait, actually — let me reconsider one more time whether there is any *functional* defect I might be missing.\n\n**Deep check: the outer ladder loop and `_is_valid_action` on multi-element list responses.**\n\nScenario: model emits `{\"action\": [{\"name\": \"click\", \"params\": {...}}, {\"params\": {...}}]}` (head valid, tail malformed). Client: actions_list normalized; head valid kept; tail (missing name) left as-is (multi-element). result.action = actions_list[0] = valid click → `_is_valid_action` True → proceeds; tail gets visible error at execution ✓ (pre-existing design). Fine.\n\n**Scenario: response `{\"action\": []}` (empty list).** Client: raw_action = [] → isinstance list → actions_list = [] → log \"0 action(s)\" → normalize no-op → result.action = actions_list[0] if actions_list else {} → {} → `_is_valid_action` False → outer ladder ✓.\n\nHmm wait — `normalize_model_output` in step: `actions = []` → `not (isinstance(actions, list) and actions)` → True → act = model_output.get(\"action\") = {} → `isinstance({}, (str,dict))` → actions = [{}] → normalize → action = {} ✓ invalid → ladder. Feedback: action = {} → \"missing the required 'name' key\" — model sent an empty list; feedback says missing name key — acceptable guidance.\n\n**Deep check: `describe_action_entry` used in step ladder logs — `response.get(\"action\")` may be a LIST (multi-element malformed head → mirror = actions[0]... no wait, normalize_model_output refreshes action = actions[0], which is an element, not a list. Unless actions was truthy list — action = actions[0] ✓ always an element or {}. So describe gets a dict/scalar ✓.**\n\n**Deep check on `_normalize_llm_response` idempotence with known_names**: second normalization of already-normalized response — `_drop_unregistered_actions` only drops registered-name misses; missing-name dicts stay ✓ no crash.\n\n**Now let me also double check `test_nondict_response_clarified_not_crash`:** responses: \"not-a-dict\", valid click. Initial call → response \"not-a-dict\" → `_normalize_llm_response` passthrough → `_is_valid_action` False → loop attempt0: log describe — `isinstance(response, dict)` False → \"\u003cnon-dict\u003e\" ✓ no AttributeError. feedback `_invalid_action_feedback(\"not-a-dict\")` → \"not a JSON object\" ✓. Call 2 → click valid → `_validate_params_or_retry` → index=1 ✓ → result click ✓ await_count 2 ✓.\n\nEverything checks out. \n\n**Final check on `test_all_unknown_batch_kept_for_clarification_retry`** (pre-existing, updated? No — unchanged in this diff? The diff didn't touch it; it's context). It asserts \"Unknown action\" in first_retry — that's the inner-ladder param feedback (valid shape, unregistered name → `_validate_action_params` returns \"Unknown action ...\"). Flow: initial response `{\"action\": {\"name\": \"plan_update\", ...}}` → `_normalize_llm_response` with known_names → drop plan_update... wait, `_drop_unregistered_actions` drops it → all dropped → batch kept as-is → mirror = plan_update → `_is_valid_action` True (name str) → `_validate_params_or_retry` → \"Unknown action 'plan_update'\" → param feedback → retry ✓. Unchanged behavior ✓.\n\nSo: **one new comment (F1)**. \n\nLet me also consider flagging the **inner-ladder second manifestation of the leak** — no, covered by confirmed finding #1 (same mechanism, described generically).\n\nShould I also flag **`_invalid_action_feedback`'s unreachable else branch** as dead code? The checklist lists unreachable branches under Dead Code. But it's a defensive string default — many reviewers would keep it. \"favor precision over recall\" — skip.\n\nOne more consideration — **the `test_inner_param_retry_never_drops_images` assertion `call.kwargs.get(\"drop_images\") is False`** — this test would PASS even with the leak bug (mock doesn't strip anything), so it doesn't actually validate the invariant against the real client — but that's the nature of unit tests with mocks; the confirmed finding covers the real defect. Not a separate issue... though one could argue the test gives false confidence about the \"参数反馈恒不去图\" invariant (it tests step.py passes False, not that images survive). That's inherent to the mock-based design and the leak is already reported. Skip.\n\nAlright — I'll file one code_comment for F1, then summarize and task_done.\n\nFor the comment, I need existing_code that matches the diff exactly. The added lines in client.py:\n\n```\n\t\t\tnames = [describe_action_entry(a) for a in raw_action]\n```\n\nWith tab/space? client.py uses 4-space indentation (the file read shows standard spaces). In the diff:\n\n```\n+            names = [describe_action_entry(a) for a in raw_action]\n```\n\nI'll use:\n```python\n            names = [describe_action_entry(a) for a in raw_action]\n```\n\nAnd suggestion:\n```python\n        elif isinstance(raw_action, dict):\n            logger.info(\n                \"multi_act: LLM emitted single action %s (schema allows up to %s)\",\n                describe_action_entry(raw_action),\n                schema_max if schema_max else \"1\",\n            )\n```\n\nContent (Chinese): #197 A 只修了列表分支；elif 单 dict 分支（client.py:577-582）仍用 `raw_action.get(\"name\", \"?\")`——单 dict 缺 name 键正是本 issue 的主形态（step.py 文档所述 `{\"params\": ...}` 形态），该形态下日志仍打印 `'?'`，\"缺 name 键\" vs \"字面问号名\"的占位符歧义（#197 最初误诊源）在主形态上依旧存在。建议同用 describe_action_entry。\n\nSeverity: low. Category: maintainability. Hmm — or \"bug\"? It's a diagnosability gap in the fix — I'll use maintainability, low.\n\nWait, one consideration: the comment tool says existing_code should be \"newly added code lines\". The `names = ...` line is newly added ✓.\n\nAlso — should I double-check there's nothing wrong in `action_shape.py` diff? describe_action_entry added to __all__ ✓. Function placement before name_of ✓. No issues.\n\nAnd step.py diff — constants, feedback function, loops — reviewed ✓ (leak covered by confirmed finding).\n\nTest file diff — reviewed ✓.\n\nNow finalize: one code_comment + summary + task_done(DONE).",
+      "category": "maintainability",
+      "severity": "low"
+    }
+  ],
+  "groups": [
+    {
+      "label": "Unknown action name handling: action shape definitions, agent step logic, LLM client, and tests",
+      "files": [
+        "src/tree_walker/action_shape.py",
+        "src/tree_walker/agent/step.py",
+        "src/tree_walker/llm/client.py",
+        "tests/test_unknown_action_name.py"
+      ]
+    }
+  ],
+  "session_id": "cc2fb003-ac6f-43cd-bb17-fc849a8f653c",
+  "manifest": {
+    "schema_version": "ocr.run-manifest/v1",
+    "run_id": "cc2fb003-ac6f-43cd-bb17-fc849a8f653c",
+    "operation": "review",
+    "terminal_state": "complete",
+    "repository": {
+      "identity_sha256": "2868bcfb033292e0d47631dc911d0e36e5dcedaf9e0bcacffe6c4716bb93dfda"
+    },
+    "input": {
+      "mode": "range",
+      "requested_from": "master",
+      "requested_head": "fix/197-vision-malformed-action-ladder",
+      "resolved_base": "3c311784fcb971b3c743eacf235a0c9266f86410",
+      "resolved_head": "05bd15b34170dc1eb6af77a15add04c2ee7f3508",
+      "exact_range": "3c311784fcb971b3c743eacf235a0c9266f86410..05bd15b34170dc1eb6af77a15add04c2ee7f3508",
+      "source_artifact_sha256": "ee02c4096a471ea8a740f3b21d8e895fbb3e6b3fba5f5e07afbe495b32fce2b7"
+    },
+    "execution": {
+      "ocr_version": "v1.12.7",
+      "model": "glm-5.3",
+      "configured_concurrency": 8,
+      "rule_config_sha256": "457b6b84414b02082987184ccb891ca709dcb55e07bae48f2210b75863ce8a7b",
+      "runtime_config_sha256": "841fe9ad288d2dd9efc84c443193c492ef06b26edf31ff5f5a1b01637fef2b0c"
+    },
+    "coverage": {
+      "selected": [
+        {
+          "item_id": "05ea6ae46e6e85c25d4aa676c4acbe6552aac167dbe772307f715d2fe273edaf",
+          "path": "src/tree_walker/agent/step.py",
+          "fingerprint": "116d55a28ab6e2e7d8fb0cf11db05fa36cf3e19ba9089c529c15cd0898ced809"
+        },
+        {
+          "item_id": "07a7ae0f37a9b4c9b8423a46d81c21de7d4fcdb96a74d1a711ac03bf66968b14",
+          "path": "src/tree_walker/action_shape.py",
+          "fingerprint": "e23786e07caad518dbd956049707cad22d0e38f051c178ff8bbd0e26eec87a34"
+        },
+        {
+          "item_id": "c6269941f876fba64ed0da08dd4dea76d676a6e3d723cc0b77b930ced442f376",
+          "path": "tests/test_unknown_action_name.py",
+          "fingerprint": "4e1986b76340d6e14c6b469cbfabe680b127826c427c17bcaf12ec753de7dd96"
+        },
+        {
+          "item_id": "ec73fcf5c68d65ca601aa361fbe04d8a72aa474e0af3d2ca60063099052bfced",
+          "path": "src/tree_walker/llm/client.py",
+          "fingerprint": "9aeae4100439c987b03172efd974b3f4973d5d3b7c734d5248b39b58dd4431f4"
+        }
+      ],
+      "completed": [
+        {
+          "item_id": "05ea6ae46e6e85c25d4aa676c4acbe6552aac167dbe772307f715d2fe273edaf",
+          "path": "src/tree_walker/agent/step.py",
+          "fingerprint": "116d55a28ab6e2e7d8fb0cf11db05fa36cf3e19ba9089c529c15cd0898ced809"
+        },
+        {
+          "item_id": "07a7ae0f37a9b4c9b8423a46d81c21de7d4fcdb96a74d1a711ac03bf66968b14",
+          "path": "src/tree_walker/action_shape.py",
+          "fingerprint": "e23786e07caad518dbd956049707cad22d0e38f051c178ff8bbd0e26eec87a34"
+        },
+        {
+          "item_id": "c6269941f876fba64ed0da08dd4dea76d676a6e3d723cc0b77b930ced442f376",
+          "path": "tests/test_unknown_action_name.py",
+          "fingerprint": "4e1986b76340d6e14c6b469cbfabe680b127826c427c17bcaf12ec753de7dd96"
+        },
+        {
+          "item_id": "ec73fcf5c68d65ca601aa361fbe04d8a72aa474e0af3d2ca60063099052bfced",
+          "path": "src/tree_walker/llm/client.py",
+          "fingerprint": "9aeae4100439c987b03172efd974b3f4973d5d3b7c734d5248b39b58dd4431f4"
+        }
+      ],
+      "reused": [],
+      "failed": [],
+      "waived": []
+    },
+    "elapsed_ms": 896956
+  }
+}
