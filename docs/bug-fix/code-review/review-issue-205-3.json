@@ -1,0 +1,183 @@
+{
+  "status": "complete",
+  "llm": {
+    "model": "glm-5.3"
+  },
+  "message": "Review complete: 0 finding(s) across 4 selected item(s).",
+  "summary": {
+    "files_reviewed": 4,
+    "comments": 0,
+    "total_tokens": 269068,
+    "input_tokens": 245147,
+    "output_tokens": 23921,
+    "cache_read_tokens": 202752,
+    "elapsed": "5m43s"
+  },
+  "tool_calls": {
+    "total": 11,
+    "by_tool": {
+      "code_search": 6,
+      "file_read": 5
+    },
+    "failure": 0,
+    "failure_by_tool": {},
+    "failure_details": []
+  },
+  "comments": [],
+  "groups": [
+    {
+      "label": "Click action behavior fix (issue 198): debug example, browser session, actions tooling, and click tests",
+      "files": [
+        "examples/debug_198_attribute_set_click.py",
+        "src/tree_walker/browser/session.py",
+        "src/tree_walker/tools/actions.py",
+        "tests/test_click.py"
+      ]
+    }
+  ],
+  "session_id": "ddde58e1-d77d-4555-97c8-0c15f082130e",
+  "manifest": {
+    "schema_version": "ocr.run-manifest/v1",
+    "run_id": "ddde58e1-d77d-4555-97c8-0c15f082130e",
+    "operation": "review",
+    "terminal_state": "complete",
+    "repository": {
+      "identity_sha256": "2868bcfb033292e0d47631dc911d0e36e5dcedaf9e0bcacffe6c4716bb93dfda"
+    },
+    "input": {
+      "mode": "range",
+      "requested_from": "7fbe160",
+      "requested_head": "fix/205-click-silent-failure",
+      "resolved_base": "7fbe1609cba151e8509ceffe8106e0dc72b3c4b0",
+      "resolved_head": "361e8523913cd67cf61c362d87da7ed22e0e31f9",
+      "exact_range": "7fbe1609cba151e8509ceffe8106e0dc72b3c4b0..361e8523913cd67cf61c362d87da7ed22e0e31f9",
+      "source_artifact_sha256": "11ae6a9fc9c30c197e4fb6e989e073b981fcb60a6bbb126aa52ed67f7a8ad54a"
+    },
+    "execution": {
+      "ocr_version": "v1.12.9",
+      "model": "glm-5.3",
+      "configured_concurrency": 8,
+      "rule_config_sha256": "6187a596eb16890083d1aef51c9aa98c896dd21651d4fd6e855a4b736a770cac",
+      "runtime_config_sha256": "841fe9ad288d2dd9efc84c443193c492ef06b26edf31ff5f5a1b01637fef2b0c"
+    },
+    "coverage": {
+      "selected": [
+        {
+          "item_id": "792af82db3a901ec511c2489ffea6fc7d5ae980f0e6d865413218761d7c97d45",
+          "path": "tests/test_click.py",
+          "fingerprint": "744e09c4f73d663af2aacd62e5d2bbb1a7967b5255cbf4b96ae17c9ccd2d3910"
+        },
+        {
+          "item_id": "9648d199d9f92dffd0c60bfea16fe64f3695bbfe963292e7b7fb964cc92c21b1",
+          "path": "src/tree_walker/tools/actions.py",
+          "fingerprint": "5d5a657d431733240988ac84a81d2a073bc436ec5ce22e6d750fe88d799faf60"
+        },
+        {
+          "item_id": "9932efe4e9494be618ed91e3e77812ba901e8403cccfa6417c9da7c83e77bfbd",
+          "path": "src/tree_walker/browser/session.py",
+          "fingerprint": "0e2a1965b3ebff60071fcfed14da46685aacdf8d1ee65e6546cc9ddec0b28d55"
+        },
+        {
+          "item_id": "f49bfb06bb0e281cd50cdb8d23aeaad0814cc9570ecb510587ef1ae0ff0f9e18",
+          "path": "examples/debug_198_attribute_set_click.py",
+          "fingerprint": "232b79e2d8ebc84bdb14af02cf90e53a8847171ccbeab5cd1b8dc301e14c7b68"
+        }
+      ],
+      "completed": [
+        {
+          "item_id": "792af82db3a901ec511c2489ffea6fc7d5ae980f0e6d865413218761d7c97d45",
+          "path": "tests/test_click.py",
+          "fingerprint": "744e09c4f73d663af2aacd62e5d2bbb1a7967b5255cbf4b96ae17c9ccd2d3910"
+        },
+        {
+          "item_id": "9648d199d9f92dffd0c60bfea16fe64f3695bbfe963292e7b7fb964cc92c21b1",
+          "path": "src/tree_walker/tools/actions.py",
+          "fingerprint": "5d5a657d431733240988ac84a81d2a073bc436ec5ce22e6d750fe88d799faf60"
+        },
+        {
+          "item_id": "9932efe4e9494be618ed91e3e77812ba901e8403cccfa6417c9da7c83e77bfbd",
+          "path": "src/tree_walker/browser/session.py",
+          "fingerprint": "0e2a1965b3ebff60071fcfed14da46685aacdf8d1ee65e6546cc9ddec0b28d55"
+        },
+        {
+          "item_id": "f49bfb06bb0e281cd50cdb8d23aeaad0814cc9570ecb510587ef1ae0ff0f9e18",
+          "path": "examples/debug_198_attribute_set_click.py",
+          "fingerprint": "232b79e2d8ebc84bdb14af02cf90e53a8847171ccbeab5cd1b8dc301e14c7b68"
+        }
+      ],
+      "reused": [],
+      "failed": [],
+      "waived": []
+    },
+    "elapsed_ms": 343129
+  },
+  "retry_report": {
+    "schema_version": "ocr.llm-retry-report/v1",
+    "total_requests": 10,
+    "retried_requests": 1,
+    "total_retries": 4,
+    "recovered_requests": 1,
+    "failed_requests": 0,
+    "cancelled_requests": 0,
+    "requests": [
+      {
+        "logical_request_id": "5fa6bd7ffacdb239fb8ee075fdbcbdf35ebc3ead38165c3d09f97408db7abf9b",
+        "provider": "",
+        "model": "glm-5.3",
+        "file_path": "examples/debug_198_attribute_set_click.py,src/tree_walker/browser/session.py,src/tree_walker/tools/actions.py,tests/test_click.py",
+        "task_type": "main_task",
+        "request_no": 4,
+        "outcome": "recovered",
+        "attempts": [
+          {
+            "attempt": 1,
+            "outcome": "error",
+            "error_class": "rate_limited",
+            "failure_phase": "http",
+            "status_code": 429,
+            "request_id": "20260927124816e253719d523d49be",
+            "duration_to_headers_ms": 372
+          },
+          {
+            "attempt": 2,
+            "outcome": "error",
+            "error_class": "rate_limited",
+            "failure_phase": "http",
+            "status_code": 429,
+            "request_id": "20260927124817fa12bf8e2f1e4b3d",
+            "observed_backoff_ms": 496,
+            "duration_to_headers_ms": 402
+          },
+          {
+            "attempt": 3,
+            "outcome": "error",
+            "error_class": "rate_limited",
+            "failure_phase": "http",
+            "status_code": 429,
+            "request_id": "20260927124819cf49b39a940b41eb",
+            "observed_backoff_ms": 892,
+            "duration_to_headers_ms": 394
+          },
+          {
+            "attempt": 4,
+            "outcome": "error",
+            "error_class": "rate_limited",
+            "failure_phase": "http",
+            "status_code": 429,
+            "request_id": "20260927124821691a502a643a4a80",
+            "observed_backoff_ms": 1664,
+            "duration_to_headers_ms": 435
+          },
+          {
+            "attempt": 5,
+            "outcome": "success",
+            "status_code": 200,
+            "request_id": "67c2a650-b6c5-46b8-9c39-c667ac639203",
+            "observed_backoff_ms": 3579,
+            "duration_to_headers_ms": 9315
+          }
+        ]
+      }
+    ]
+  }
+}
