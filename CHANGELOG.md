@@ -5,6 +5,52 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.18.0] - 2026-09-28
+
+### Added
+
+**任务级 skill 体系（#172 / #182，PR #183）**
+
+- 任务级 skill 检索与 `[Task Skill]` 注入（v2 方案 S1-S4）：任务卡 catalog（44 卡）+
+  same_task/same_template 语义判据 + 注入头分级——检索命中走流程、未命中回落自主探索
+- 模板语义匹配泛化（#182）：两轴判据 + 分级注入头 + 离线回归门槛
+  （`examples/p7_task_skill_match_regression.py`）——泛化正确率 30%→80%，真误命中 0
+- C2 口径全量 184 验收 84.2%（8 精确靶全翻绿，#205 修复折算 85.9%）
+
+**LLM 视觉通道（#175，PR #177）**
+
+- GLM-5.3-Flash 视觉接入（screenshot.md 阶段二全链路）：`use_vision` /
+  `llm_screenshot_size` 配置 + `model_supports_vision` 名单门控 + 图文并存
+  state 消息 + **fallback 滤图**（文本模型收图静默致盲防线）+ 截图超时降级 +
+  落盘归档；专项测试 58 例
+- V 口径全量 184 = 72.3%（超时政策敏感性定稿 2700s；瓶颈=模型有效性非时间预算）
+- web 设置面补视觉通道与任务级 skill 参数（#179，PR #181）
+
+### Fixed
+
+- **#205 点击静默失败可感知**（PR #206）：`_js_click` detached 守卫（isConnected +
+  exceptionDetails）+ 点击无效果检测扩展到自定义交互控件（值级判定：markers / role
+  交互角色集 / tabindex 非 -1 / data-bind 冒号锚定）+ toggle 重试警示
+- **#197 视觉畸形动作梯子**（PR #204）：形状定向澄清 + 第二次澄清去图 + 重试预算扩容
+- **#194 限流/网络基建分罪**（PR #202）：client 层退避重试 + infra 预算不烧步数
+- **#193 表格取值路由**（PR #201）：read_grid 优先 + 合计行捕获与列加和交叉校验
+- **#192 select_dropdown 多选**（PR #200）：values 一次设全（替换语义补能力）
+- **#195 任务卡批量修复**（PR #203）：5 卡 _sop + 站点 quirks 3 条
+- **#186 行为纪律两缺口**（PR #190）+ **#186-c2 语义无进展**（PR #199）：连败止损
+  nudge + done 完整性门禁 + 零结果降级 + 不可能子句止损
+- **#185 工具层可靠性五修复**（PR #189）+ **#185-c2 定界符平衡**（PR #196）：evaluate
+  自愈 / read_file 诚实窗口 / C 轮 22/22 编译失败自愈覆盖
+- **#187 anthropic 依赖封顶 `<1.0`**（PR #191）：1.x 移除 temperature，上界防下游解析断裂
+- **#176 未知动作名整步连坐**（PR #178）；**#184** dom-snapshot v0.1.1 bump（PR #188）；
+  **778/782 崩溃**（PR #174）
+
+### Docs
+
+- ROADMAP 状态推进：P8 扩展化迁移 TreeChrome；P7 路线三 C2 验收（84.2%）；P10 视觉
+  变体评测（72.3%，净效应不可归因——A' 轮不经济结案）
+- 分析报告：#187 SDK 版本叙事反转、#198 截图读星勘误（零代码关闭）；ocr 产出闸规则
+  入库（`.opencodereview/rule.json`）
+
 ## [0.17.0] - 2026-09-05
 
 ### Added
