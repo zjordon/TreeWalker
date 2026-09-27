@@ -28,8 +28,9 @@ import argparse
 import asyncio
 import re
 import sys
+from pathlib import Path
 
-sys.path.insert(0, f"{__file__}/../src")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from tree_walker.browser.session import BrowserSession
 from tree_walker.config import _fetch_ws_url
@@ -122,8 +123,13 @@ async def main() -> int:
 		sid = browser.current_session_id
 		client = browser.client
 
-		await browser.navigate(NEW_PRODUCT_URL) if not args.stay else None
-		await asyncio.sleep(2.0) if not args.stay else asyncio.sleep(0.3)
+		# R1#2：await 一元优先级高于三元——`await sleep(2) if cond else sleep(0.3)`
+		# 的 else 分支协程从未被 await（无等待 + RuntimeWarning），展开为显式分支。
+		if not args.stay:
+			await browser.navigate(NEW_PRODUCT_URL)
+			await asyncio.sleep(2.0)
+		else:
+			await asyncio.sleep(0.3)
 
 		# ── A. 关闭态 agent 视图 ──
 		state = await browser.get_state(include_screenshot=False)
@@ -289,8 +295,13 @@ async def main() -> int:
 					stable_bid = bid
 
 			print(f"[D-render] bid 时间线：{ {k: (v[0], v[-1]) for k, v in seen.items()} }")
-			if len(seen) == 1:
+			# R1#6：唯一键不是有效 bid（querySelector 未命中→None、持续 CDP 异常→err
+			# 字符串）时是「零有效观测」，不能当「无漂移」的决定性否定结论输出。
+			if len(seen) == 1 and isinstance(next(iter(seen)), int):
 				print("[D-render] ✓ 12s 内 bid 无漂移——节点替换假说不成立（本机本时段）")
+			elif len(seen) == 1:
+				print(f"[D-render] ⚠ 12s 内未取得任何有效 bid（唯一 key={next(iter(seen))!r}）"
+					"——选择器未命中/持续异常，不能据此否定假说")
 			else:
 				old_bid = next(iter(seen))
 				print(f"[D-render] ⚠ bid 漂移！旧 id={old_bid} —— 用旧 id 点击验证 detached 行为")
@@ -366,6 +377,11 @@ async def main() -> int:
 			print("[D-timeline] 已点 body 收起（现场恢复）")
 
 		if args.click:
+			# R1#5：--verify/--render 等前置实验块可能已变更页面（--render 移除节点
+			# 不恢复、--verify 结尾重新 navigate）——基线按当前页重取，否则
+			# 条目差/差异行对照失真。
+			state = await browser.get_state(include_screenshot=False)
+			region = _slice_attr_set_region(state.dom_state.element_tree_text or "")
 			n_before = len(state.dom_state.selector_map or {})
 			region_before = list(region)
 			await browser.execute_js(

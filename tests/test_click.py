@@ -539,6 +539,19 @@ class TestJsClickDetachedGuard:
 		assert await s._js_click(42) is True
 
 	@pytest.mark.asyncio
+	async def test_js_exception_details_returns_false(self):
+		"""R1#3：cdp_use 对 JS 执行异常返回 exceptionDetails 而非抛 Python 异常
+		——漏检会读成「已派发」的静默成功（#205 要消除的类别）。"""
+		s, client = self._make_session()
+		client.send.Runtime.callFunctionOn = AsyncMock(
+			return_value={
+			 "result": {"type": "object", "subtype": "error"},
+			 "exceptionDetails": {"text": "Uncaught", "description": "TypeError: ..."},
+			}
+		)
+		assert await s._js_click(42) is False
+
+	@pytest.mark.asyncio
 	async def test_resolve_failure_returns_false(self):
 		s, client = self._make_session()
 		client.send.DOM.resolveNode = AsyncMock(side_effect=RuntimeError("node gone"))
@@ -730,6 +743,58 @@ class TestClickNoEffectDetection:
 
 		assert result.error is None
 		browser.evaluate.assert_not_awaited()
+
+	@pytest.mark.asyncio
+	async def test_non_interactive_role_value_skips_fingerprint(self):
+		"""R1#1：role 存在但值非交互角色（presentation/row）不命中。"""
+		entry = _make_entry(tag="DIV", backend_node_id=42, attributes={"role": "presentation"})
+		state = _make_state({5: entry})
+		browser = _make_browser()
+		browser.evaluate = AsyncMock()
+
+		result = await Tools().execute("click", {"index": 5}, browser, browser_state=state)
+
+		assert result.error is None
+		browser.evaluate.assert_not_awaited()
+
+	@pytest.mark.asyncio
+	async def test_tabindex_minus_one_skips_fingerprint(self):
+		"""R1#1：tabindex="-1"（程序性排除焦点）显式排除。"""
+		entry = _make_entry(tag="DIV", backend_node_id=42, attributes={"tabindex": "-1"})
+		state = _make_state({5: entry})
+		browser = _make_browser()
+		browser.evaluate = AsyncMock()
+
+		result = await Tools().execute("click", {"index": 5}, browser, browser_state=state)
+
+		assert result.error is None
+		browser.evaluate.assert_not_awaited()
+
+	@pytest.mark.asyncio
+	async def test_presentation_only_data_bind_skips_fingerprint(self):
+		"""R1#1：data-bind 纯展示绑定（text:/css:）不命中——KO 站点全页都有 data-bind。"""
+		entry = _make_entry(tag="DIV", backend_node_id=42, attributes={"data-bind": "text: label, css: {warn: w()}"})
+		state = _make_state({5: entry})
+		browser = _make_browser()
+		browser.evaluate = AsyncMock()
+
+		result = await Tools().execute("click", {"index": 5}, browser, browser_state=state)
+
+		assert result.error is None
+		browser.evaluate.assert_not_awaited()
+
+	@pytest.mark.asyncio
+	async def test_interactive_role_button_no_effect_appends_warning(self):
+		"""R1#1：交互角色值（role=button）命中检测。"""
+		entry = _make_entry(tag="DIV", backend_node_id=42, attributes={"role": "button"})
+		state = _make_state({5: entry})
+		browser = _make_browser()
+		browser.evaluate = AsyncMock(side_effect=["fp|100|5000", "10,10", "fp|100|5000", "10,10"])
+
+		result = await Tools().execute("click", {"index": 5}, browser, browser_state=state)
+
+		assert result.error is None
+		assert "no visible effect" in result.extracted_content
 
 	@pytest.mark.asyncio
 	async def test_button_click_form_reset_detected(self):

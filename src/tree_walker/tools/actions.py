@@ -380,25 +380,35 @@ _JS_PAGE_FINGERPRINT = """
 # R7-1：点击后等待页面反应的秒数（DOM 更新/导航/表单回显）
 _CLICK_EFFECT_WAIT = 0.6
 
-# #205：点击后做「无可见效果」检测的目标范围——交互特征属性命中其一即视为
-# 自定义交互控件（KO/jQuery toggle、菜单、下拉；C2 694~698 属性集 .action-select
-# 即 data-role+data-bind）。序列化白名单不含这些属性（模型看到裸 div），但
-# selector_map entry.attributes 里有，程序侧可判。
+# #205：点击后做「无可见效果」检测的目标范围——交互特征命中才视为自定义交互
+# 控件（KO/jQuery toggle、菜单、下拉；C2 694~698 属性集 .action-select 即
+# data-role+data-bind click 绑定）。序列化白名单不含这些属性（模型看到裸 div），
+# 但 selector_map entry.attributes 里有，程序侧可判。
+# R1#1 收紧：属性「存在即命中」会捞进大量非交互元素（role="presentation"/
+# "row"、tabindex="-1" 程序性排除焦点、data-bind="text:..." 纯展示绑定——KO
+# 站点全页命中）→ 误报「无效果」诱导模型放弃有效交互 + 每次点击多付 0.6s/2 次
+# evaluate。改为值级判定：role 限交互角色集、tabindex 显式排除 -1、data-bind
+# 需含 click/toggle/event 类绑定词。
 _INTERACTIVE_ATTR_MARKERS = (
-	"data-bind", "data-role", "role", "tabindex", "onclick",
+	"data-role", "onclick",
 	"aria-expanded", "aria-haspopup", "aria-controls",
 )
+_INTERACTIVE_ROLES = {
+	"button", "menu", "menubar", "menuitem", "tab", "option",
+	"listbox", "tree", "treeitem",
+}
 
 
 def _click_effect_watch_target(tag: str, attrs: dict) -> bool:
 	"""#205：该点击目标是否值得做「无可见效果」检测（R7-1 从 BUTTON 放宽）。
 
 	- BUTTON / submit·button 型 INPUT（原有范围，行为不变）；
-	- 带交互特征属性的容器元素（DIV/SPAN/LABEL/LI 等）：命中
-	  _INTERACTIVE_ATTR_MARKERS 之一；
-	- A 除外——链接开新页由 G7 标签页检测负责，指纹判定会与它打架；
-	- 纯装饰容器（无任何交互属性）除外——正常「无页面变化」点击的误报面
-	  不放宽到全量。
+	- 容器元素（DIV/SPAN/LABEL/LI 等）命中其一：
+	  - data-role / onclick / aria-expanded / aria-haspopup / aria-controls 存在；
+	  - role ∈ _INTERACTIVE_ROLES（presentation/row 等非交互角色不命中）；
+	  - data-bind 值含 click/toggle/event 绑定词（text:/css: 纯展示绑定不命中）；
+	- tabindex="-1"（程序性排除焦点的滚动容器/表格）显式排除；
+	- A 除外——链接开新页由 G7 标签页检测负责，指纹判定会与它打架。
 	"""
 	if tag == "BUTTON":
 		return True
@@ -406,7 +416,14 @@ def _click_effect_watch_target(tag: str, attrs: dict) -> bool:
 		return attrs.get("type") in ("submit", "button")
 	if tag == "A":
 		return False
-	return any(k in attrs for k in _INTERACTIVE_ATTR_MARKERS)
+	if attrs.get("tabindex") == "-1":
+		return False
+	if any(k in attrs for k in _INTERACTIVE_ATTR_MARKERS):
+		return True
+	if attrs.get("role") in _INTERACTIVE_ROLES:
+		return True
+	data_bind = attrs.get("data-bind") or ""
+	return any(word in data_bind for word in ("click", "toggle", "event"))
 
 # B3-2（P7 02 批次三）：表单字段值摘要——input.value 是 property 非 attribute，
 # outerHTML 指纹检测不到「值被页面部件清掉」（R7-1 盲区，batch2_task1.log Step 6-8

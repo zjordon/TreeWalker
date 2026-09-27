@@ -2747,6 +2747,17 @@ class BrowserSession:
                 },
                 session_id=self.current_session_id,
             )
+            # R1#3：cdp_use 对 JS 执行异常不抛 Python 异常而是返回
+            # exceptionDetails（execute_js/evaluate 均手动检查，session.py:3692
+            # 等）——此处漏检会把 JS 异常（如 resolveNode 得到非 Element 节点时
+            # this.click() 抛 TypeError）读成「已派发」的静默成功（#205 要消除
+            # 的类别）。
+            if result and result.get("exceptionDetails"):
+                logger.debug(
+                    "_js_click JS exception: %s",
+                    result["exceptionDetails"].get("text"),
+                )
+                return False
             value = ((result or {}).get("result") or {}).get("value")
             return value is not False
         except Exception as e:
