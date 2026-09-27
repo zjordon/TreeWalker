@@ -380,6 +380,59 @@ _JS_PAGE_FINGERPRINT = """
 # R7-1：点击后等待页面反应的秒数（DOM 更新/导航/表单回显）
 _CLICK_EFFECT_WAIT = 0.6
 
+# #205：点击后做「无可见效果」检测的目标范围——交互特征命中才视为自定义交互
+# 控件（KO/jQuery toggle、菜单、下拉；C2 694~698 属性集 .action-select 即
+# data-role+data-bind click 绑定）。序列化白名单不含这些属性（模型看到裸 div），
+# 但 selector_map entry.attributes 里有，程序侧可判。
+# R1#1 收紧（值级判定）+ R2 纠偏：role 限交互角色集（R2#2 扩充 checkbox/radio/
+# switch/combobox 等 + 多 token 求交）、tabindex 非 -1 为正向信号但不一票否决
+# -1（R2#1：ARIA roving tabindex 下 role=option/tab/menuitem 非聚焦项标准写法
+# 就是 tabindex="-1"，前置否决会漏检恰属目标的自定义控件；裸 -1 无其他特征
+# 时自然落空）、data-bind 锚定「绑定名:」防变量名子串误命中（R2#4：text:
+# clickCount）。
+_INTERACTIVE_ATTR_MARKERS = (
+	"data-role", "onclick",
+	"aria-expanded", "aria-haspopup", "aria-controls",
+)
+_INTERACTIVE_ROLES = {
+	"button", "menu", "menubar", "menuitem", "tab", "option",
+	"listbox", "tree", "treeitem",
+	"checkbox", "radio", "switch", "combobox", "slider",
+	"spinbutton", "gridcell",
+}
+
+
+def _click_effect_watch_target(tag: str, attrs: dict) -> bool:
+	"""#205：该点击目标是否值得做「无可见效果」检测（R7-1 从 BUTTON 放宽）。
+
+	- BUTTON / submit·button 型 INPUT（原有范围，行为不变）；
+	- 容器元素（DIV/SPAN/LABEL/LI 等）命中其一：
+	  - data-role / onclick / aria-expanded / aria-haspopup / aria-controls 存在；
+	  - role 的 token 与 _INTERACTIVE_ROLES 求交（presentation/row 等不命中；
+	    多 token 如 "button menuitem" 任一命中即算）；
+	  - tabindex 存在且非 "-1"（0/正值=作者刻意可聚焦；-1 不否决——roving
+	    tabindex 模式下配合交互 role 仍命中，裸 -1 无其他特征自然落空）；
+	  - data-bind 含 "click:"/"toggle:"/"event:" 绑定（锚定绑定名冒号，
+	    text: clickCount 类变量名不命中）；
+	- A 除外——链接开新页由 G7 标签页检测负责，指纹判定会与它打架。
+	"""
+	if tag == "BUTTON":
+		return True
+	if tag == "INPUT":
+		return attrs.get("type") in ("submit", "button")
+	if tag == "A":
+		return False
+	if any(k in attrs for k in _INTERACTIVE_ATTR_MARKERS):
+		return True
+	role_tokens = set((attrs.get("role") or "").split())
+	if role_tokens & _INTERACTIVE_ROLES:
+		return True
+	tabindex = attrs.get("tabindex")
+	if tabindex is not None and tabindex != "-1":
+		return True
+	data_bind = attrs.get("data-bind") or ""
+	return any(f"{word}:" in data_bind for word in ("click", "toggle", "event"))
+
 # B3-2（P7 02 批次三）：表单字段值摘要——input.value 是 property 非 attribute，
 # outerHTML 指纹检测不到「值被页面部件清掉」（R7-1 盲区，batch2_task1.log Step 6-8
 # 实锤：点击后字段被迟到部件重置为空）。按表单收集前 30 个字段值的长度指纹。
@@ -983,9 +1036,12 @@ class Tools:
         tabs_before = tuple(t.target_id for t in await browser.get_tabs())  # G7 新页检测快照
         # R7-1：按钮类目标先取点击前指纹（无效果检测；非按钮零开销）
         # B3-2：同时取表单字段值摘要（值是 property，指纹检测不到清值）
+        # #205：检测范围从 BUTTON/submit-button 放宽到「带交互特征属性的容器
+        # 元素」——KO/jQuery 自定义控件（如属性集 .action-select）点击静默失效
+        # 时模型当步可感知，不再盲试。
         fp_before = None
         fv_before = None
-        if tag == "BUTTON" or (tag == "INPUT" and attrs.get("type") in ("submit", "button")):
+        if _click_effect_watch_target(tag, attrs):
             fp_before = await self._page_fingerprint(browser)
             fv_before = await self._form_values_digest(browser)
         try:
@@ -1028,10 +1084,12 @@ class Tools:
                     )
                 else:
                     memory += (
-                        "  ⚠️ The click had no visible effect (page unchanged). The button may "
-                        "have no handler attached or the submit was blocked silently — re-observe "
-                        "the form (values/validation marks), consider retrying, or trigger the "
-                        "page's own submit function via evaluate."
+                        "  ⚠️ The click had no visible effect (page unchanged). The element may "
+                        "have no handler attached, or the click was silently swallowed — re-observe "
+                        "the page (values/validation marks). NOTE: if this is an expand/collapse "
+                        "(toggle) widget, clicking the same element again will CLOSE it — check "
+                        "its current expanded/active state before retrying, or trigger the page's "
+                        "own handler via evaluate."
                     )
             # P7 tool_layer B3：页面消息显式确认——保存成功/失败浮层是比指纹更
             # 强的信号（指纹变了≠保存成功；toast 文案才是确定性的"已保存"证据）。

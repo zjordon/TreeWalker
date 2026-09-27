@@ -2724,8 +2724,11 @@ class BrowserSession:
         element is occluded. Calls this.click() directly, bypassing the mouse
         event pipeline. Mirrors browser-use _click_element_node_impl:957-992.
 
-        Returns True if the JS click dispatched without error, False on any
-        failure (DOM.resolveNode miss, JS exception, transport glitch).
+        Returns True if the JS click dispatched on a connected node, False on
+        any failure (DOM.resolveNode miss, JS exception, transport glitch) or
+        when the node is detached (isConnected=false) — a detached node's
+        .click() dispatches into nowhere without raising, which used to read
+        as success and left the LLM retrying a dead target (#205).
         """
         try:
             resolve = await self.client.send.DOM.resolveNode(
@@ -2733,15 +2736,33 @@ class BrowserSession:
                 session_id=self.current_session_id,
             )
             object_id = resolve["object"]["objectId"]
-            await self.client.send.Runtime.callFunctionOn(
+            result = await self.client.send.Runtime.callFunctionOn(
                 {
                     "objectId": object_id,
-                    "functionDeclaration": "function() { this.click(); }",
+                    "functionDeclaration": (
+                        "function() { if (!this.isConnected) { return false; }"
+                        " this.click(); return true; }"
+                    ),
                     "returnByValue": True,
                 },
                 session_id=self.current_session_id,
             )
-            return True
+            # R1#3：cdp_use 对 JS 执行异常不抛 Python 异常而是返回
+            # exceptionDetails（execute_js/evaluate 均手动检查，session.py:3692
+            # 等）——此处漏检会把 JS 异常（如 resolveNode 得到非 Element 节点时
+            # this.click() 抛 TypeError）读成「已派发」的静默成功（#205 要消除
+            # 的类别）。
+            if result and result.get("exceptionDetails"):
+                # R2#3：text 字段通常仅为 "Uncaught"（#185 教训），具体异常
+                # 类型与堆栈在 description——只记 text 无诊断价值。
+                exc = result["exceptionDetails"]
+                logger.debug(
+                    "_js_click JS exception: %s",
+                    exc.get("description") or exc.get("text") or exc,
+                )
+                return False
+            value = ((result or {}).get("result") or {}).get("value")
+            return value is not False
         except Exception as e:
             logger.debug("_js_click failed: %s", e)
             return False
