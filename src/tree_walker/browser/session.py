@@ -2724,8 +2724,11 @@ class BrowserSession:
         element is occluded. Calls this.click() directly, bypassing the mouse
         event pipeline. Mirrors browser-use _click_element_node_impl:957-992.
 
-        Returns True if the JS click dispatched without error, False on any
-        failure (DOM.resolveNode miss, JS exception, transport glitch).
+        Returns True if the JS click dispatched on a connected node, False on
+        any failure (DOM.resolveNode miss, JS exception, transport glitch) or
+        when the node is detached (isConnected=false) — a detached node's
+        .click() dispatches into nowhere without raising, which used to read
+        as success and left the LLM retrying a dead target (#205).
         """
         try:
             resolve = await self.client.send.DOM.resolveNode(
@@ -2733,15 +2736,19 @@ class BrowserSession:
                 session_id=self.current_session_id,
             )
             object_id = resolve["object"]["objectId"]
-            await self.client.send.Runtime.callFunctionOn(
+            result = await self.client.send.Runtime.callFunctionOn(
                 {
                     "objectId": object_id,
-                    "functionDeclaration": "function() { this.click(); }",
+                    "functionDeclaration": (
+                        "function() { if (!this.isConnected) { return false; }"
+                        " this.click(); return true; }"
+                    ),
                     "returnByValue": True,
                 },
                 session_id=self.current_session_id,
             )
-            return True
+            value = ((result or {}).get("result") or {}).get("value")
+            return value is not False
         except Exception as e:
             logger.debug("_js_click failed: %s", e)
             return False

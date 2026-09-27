@@ -495,6 +495,56 @@ class TestClickElementFallback:
 		s.click_at.assert_awaited_once_with(799, 20)  # x 裁剪，y 不变
 
 
+# ── Session-layer: _js_click detached guard (#205) ────────────────────────────
+
+
+class TestJsClickDetachedGuard:
+	"""#205：_js_click 对脱离文档（isConnected=false）的节点必须返回 False。
+
+	C2 694~698 现场：悬空 backendNodeId 的 JS fallback .click() 派发到无处且
+	不抛异常，旧实现返回 True（静默成功）→ 模型收不到失败信号重试死环。
+	"""
+
+	def _make_session(self) -> tuple[BrowserSession, MagicMock]:
+		s = BrowserSession.__new__(BrowserSession)
+		s.current_session_id = "sid"
+		client = MagicMock()
+		client.send.DOM.resolveNode = AsyncMock(
+			return_value={"object": {"objectId": "obj-1"}}
+		)
+		s.client = client
+		return s, client
+
+	@pytest.mark.asyncio
+	async def test_detached_node_returns_false(self):
+		s, client = self._make_session()
+		client.send.Runtime.callFunctionOn = AsyncMock(
+			return_value={"result": {"type": "boolean", "value": False}}
+		)
+		assert await s._js_click(42) is False
+
+	@pytest.mark.asyncio
+	async def test_connected_node_returns_true(self):
+		s, client = self._make_session()
+		client.send.Runtime.callFunctionOn = AsyncMock(
+			return_value={"result": {"type": "boolean", "value": True}}
+		)
+		assert await s._js_click(42) is True
+
+	@pytest.mark.asyncio
+	async def test_missing_result_value_treated_as_dispatched(self):
+		"""响应缺 result.value（旧式无返回值实现）→ 视为已派发，保持 True。"""
+		s, client = self._make_session()
+		client.send.Runtime.callFunctionOn = AsyncMock(return_value={})
+		assert await s._js_click(42) is True
+
+	@pytest.mark.asyncio
+	async def test_resolve_failure_returns_false(self):
+		s, client = self._make_session()
+		client.send.DOM.resolveNode = AsyncMock(side_effect=RuntimeError("node gone"))
+		assert await s._js_click(42) is False
+
+
 # ── Session-layer: _best_quad_rect ────────────────────────────────────────────
 
 
@@ -586,9 +636,12 @@ class TestFetchSelectOptions:
 
 
 class TestClickNoEffectDetection:
-	"""按钮类点击后页面指纹不变 → ⚠️ 提示（「点了没反应」当步可感知）。
+	"""按钮类/自定义交互控件点击后页面指纹不变 → ⚠️ 提示（「点了没反应」当步可感知）。
 
 	B3-2 后 evaluate 调用为 4 次：点击前（指纹, 表单值摘要）+ 点击后（指纹, [必要时]表单值摘要）。
+	#205 后检测范围放宽：带交互特征属性（data-bind/data-role/role/...）的容器
+	元素（DIV/SPAN/LABEL 等）也检测——KO/jQuery 自定义控件静默失效可感知；
+	A 与无交互属性的纯装饰容器仍跳过。
 	"""
 
 	@pytest.mark.asyncio
@@ -602,6 +655,7 @@ class TestClickNoEffectDetection:
 
 		assert result.error is None
 		assert "no visible effect" in result.extracted_content
+		assert "will CLOSE it" in result.extracted_content  # #205 toggle 重试警示
 
 	@pytest.mark.asyncio
 	async def test_button_click_effect_no_warning(self):
@@ -618,6 +672,56 @@ class TestClickNoEffectDetection:
 	@pytest.mark.asyncio
 	async def test_non_button_target_skips_fingerprint(self):
 		entry = _make_entry(tag="A", backend_node_id=42)
+		state = _make_state({5: entry})
+		browser = _make_browser()
+		browser.evaluate = AsyncMock()
+
+		result = await Tools().execute("click", {"index": 5}, browser, browser_state=state)
+
+		assert result.error is None
+		browser.evaluate.assert_not_awaited()
+
+	@pytest.mark.asyncio
+	async def test_div_with_interactive_marker_no_effect_appends_warning(self):
+		"""#205：data-role+data-bind 的 DIV（KO 自定义控件）点击无效果 → 警告+toggle 提示。
+
+		C2 694~698 现场：属性集 .action-select 即此形态（data-role=advanced-select
+		+ data-bind click 绑定），序列化白名单剥掉这些属性后模型看到裸 div。
+		"""
+		entry = _make_entry(
+			tag="DIV", backend_node_id=42,
+			attributes={"data-role": "advanced-select", "data-bind": "click: toggleListVisible"},
+		)
+		state = _make_state({5: entry})
+		browser = _make_browser()
+		browser.evaluate = AsyncMock(side_effect=["fp|100|5000", "10,10", "fp|100|5000", "10,10"])
+
+		result = await Tools().execute("click", {"index": 5}, browser, browser_state=state)
+
+		assert result.error is None
+		assert "no visible effect" in result.extracted_content
+		assert "will CLOSE it" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_div_with_interactive_marker_effect_no_warning(self):
+		"""#205：同一 DIV 点击后页面指纹变化（如展开渲染选项）→ 不警告。"""
+		entry = _make_entry(
+			tag="DIV", backend_node_id=42,
+			attributes={"data-role": "advanced-select", "data-bind": "click: toggleListVisible"},
+		)
+		state = _make_state({5: entry})
+		browser = _make_browser()
+		browser.evaluate = AsyncMock(side_effect=["fp|100|5000", "10,10", "fp|130|7100", "10,10"])
+
+		result = await Tools().execute("click", {"index": 5}, browser, browser_state=state)
+
+		assert result.error is None
+		assert "no visible effect" not in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_plain_div_without_markers_skips_fingerprint(self):
+		"""#205：无交互属性的纯装饰 DIV 仍跳过检测（误报面不放宽到全量）。"""
+		entry = _make_entry(tag="DIV", backend_node_id=42)
 		state = _make_state({5: entry})
 		browser = _make_browser()
 		browser.evaluate = AsyncMock()
