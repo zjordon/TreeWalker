@@ -303,8 +303,15 @@ async def main() -> int:
 				print(f"[D-render] ⚠ 12s 内未取得任何有效 bid（唯一 key={next(iter(seen))!r}）"
 					"——选择器未命中/持续异常，不能据此否定假说")
 			else:
-				old_bid = next(iter(seen))
-				print(f"[D-render] ⚠ bid 漂移！旧 id={old_bid} —— 用旧 id 点击验证 detached 行为")
+				# R2#5：混合键时间线（前段 querySelector 未命中→None / 瞬时异常→err
+				# 字符串，之后才取到有效 int bid）首键可能是无效键——先过滤有效
+				# int 键再下结论，≥2 个有效 bid 才是真漂移。
+				valid_bids = [k for k in seen if isinstance(k, int)]
+				if len(valid_bids) >= 2:
+					print(f"[D-render] ⚠ bid 漂移！id 序列={valid_bids} —— 用旧 id 点击验证 detached 行为")
+				else:
+					print(f"[D-render] ⚠ 仅 {len(valid_bids)} 个有效 bid（其余为未命中/异常键 "
+						f"{[k for k in seen if not isinstance(k, int)]!r}）——前段无有效观测，不能据此判定漂移")
 
 			# detached 点击验证：即便 bid 没漂移，也验证「悬空 id」的行为——
 			# 构造一个已移除节点的 bid：先抓当前 bid，再强制重渲染（打开再关闭下拉会

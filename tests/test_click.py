@@ -797,6 +797,74 @@ class TestClickNoEffectDetection:
 		assert "no visible effect" in result.extracted_content
 
 	@pytest.mark.asyncio
+	async def test_roving_tabindex_option_still_watched(self):
+		"""R2#1：ARIA roving tabindex——role=option + tabindex=-1（listbox 非聚焦项
+		标准写法）不得被 -1 一票否决，仍命中检测。"""
+		entry = _make_entry(
+			tag="DIV", backend_node_id=42, attributes={"role": "option", "tabindex": "-1"})
+		state = _make_state({5: entry})
+		browser = _make_browser()
+		browser.evaluate = AsyncMock(side_effect=["fp|100|5000", "10,10", "fp|100|5000", "10,10"])
+
+		result = await Tools().execute("click", {"index": 5}, browser, browser_state=state)
+
+		assert result.error is None
+		assert "no visible effect" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_checkbox_role_watched_after_expansion(self):
+		"""R2#2：角色集扩充——div role=checkbox（KO/jQuery 自定义复选控件）命中。"""
+		entry = _make_entry(tag="DIV", backend_node_id=42, attributes={"role": "checkbox"})
+		state = _make_state({5: entry})
+		browser = _make_browser()
+		browser.evaluate = AsyncMock(side_effect=["fp|100|5000", "10,10", "fp|100|5000", "10,10"])
+
+		result = await Tools().execute("click", {"index": 5}, browser, browser_state=state)
+
+		assert result.error is None
+		assert "no visible effect" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_multi_token_role_any_match_watched(self):
+		"""R2#2：多 token role（"button menuitem"）任一 token 命中即算。"""
+		entry = _make_entry(tag="DIV", backend_node_id=42, attributes={"role": "button menuitem"})
+		state = _make_state({5: entry})
+		browser = _make_browser()
+		browser.evaluate = AsyncMock(side_effect=["fp|100|5000", "10,10", "fp|100|5000", "10,10"])
+
+		result = await Tools().execute("click", {"index": 5}, browser, browser_state=state)
+
+		assert result.error is None
+		assert "no visible effect" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_tabindex_zero_watched(self):
+		"""R2#2：tabindex="0"（作者刻意可聚焦）为正向信号。"""
+		entry = _make_entry(tag="DIV", backend_node_id=42, attributes={"tabindex": "0"})
+		state = _make_state({5: entry})
+		browser = _make_browser()
+		browser.evaluate = AsyncMock(side_effect=["fp|100|5000", "10,10", "fp|100|5000", "10,10"])
+
+		result = await Tools().execute("click", {"index": 5}, browser, browser_state=state)
+
+		assert result.error is None
+		assert "no visible effect" in result.extracted_content
+
+	@pytest.mark.asyncio
+	async def test_data_bind_variable_name_substring_not_matched(self):
+		"""R2#4：data-bind="text: clickCount" 变量名含 click 子串不命中——
+		绑定词须锚定「绑定名:」。"""
+		entry = _make_entry(tag="DIV", backend_node_id=42, attributes={"data-bind": "text: clickCount"})
+		state = _make_state({5: entry})
+		browser = _make_browser()
+		browser.evaluate = AsyncMock()
+
+		result = await Tools().execute("click", {"index": 5}, browser, browser_state=state)
+
+		assert result.error is None
+		browser.evaluate.assert_not_awaited()
+
+	@pytest.mark.asyncio
 	async def test_button_click_form_reset_detected(self):
 		"""B3-2：页面未变但表单值被清 → 专属提示（值是 property，指纹检测不到）。"""
 		entry = _make_entry(backend_node_id=42)

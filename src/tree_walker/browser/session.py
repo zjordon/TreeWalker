@@ -2753,9 +2753,12 @@ class BrowserSession:
             # this.click() 抛 TypeError）读成「已派发」的静默成功（#205 要消除
             # 的类别）。
             if result and result.get("exceptionDetails"):
+                # R2#3：text 字段通常仅为 "Uncaught"（#185 教训），具体异常
+                # 类型与堆栈在 description——只记 text 无诊断价值。
+                exc = result["exceptionDetails"]
                 logger.debug(
                     "_js_click JS exception: %s",
-                    result["exceptionDetails"].get("text"),
+                    exc.get("description") or exc.get("text") or exc,
                 )
                 return False
             value = ((result or {}).get("result") or {}).get("value")
