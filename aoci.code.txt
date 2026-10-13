@@ -1,0 +1,923 @@
+#AOCI-CODE-VOLUME: 1
+
+===D:/dev/git/z_jordon/TreeWalker/===
+.env.example[FC6T]: F:全量环境变量模板：LLM 主备/CDP 连接/Agent 步数与超时预算/文本截断阈值/下载追踪/敏感数据映射/消息压缩/计划系统/可观测性/上传路径白名单，含默认值与分组注释 | R:code:src/tree_walker/config.py | A:- | S:并非所有设置都有 env 绑定（config.py 部分字段仅 dataclass 默认不读 env），新增键须核对 config.py 是否消费
+.gitattributes[FV4T]: F:全仓文本强制 LF 检出行尾（text=auto eol=lf），二进制自动检测不动——保证 AOCI 按字节精确基线在任意平台检出一致 | R:- | A:- | S:-
+.gitignore[FV5M]: F:Git 忽略权威：Python/IDE 产物外含项目特定项——rerun-history、evaluate_output、out、registry、web_ui 构建产物、web/static、.mcp.json（AOCI 宿主配置）等；aoci scan 以本文件取文件集 | R:- | A:- | S:被忽略文件会被 aoci scan 静默跳过——认知资产与新源码目录勿加入本文件或 .git/info/exclude
+AGENTS.md[SG6T]: F:AOCI 仓库认知接入说明（aoci:begin/end 区块）：认知闭环最小入口（rules/overview/maintain/update_entry/report）、建立恢复认知流程、任务收尾维护原则与结构化状态安全边界 | R:- | A:- | S:aoci:begin…end 区块由工具生成；专项流程以 aoci_rules 与实时 Guide 为权威，本文件不承载状态机
+CHANGELOG.md[SV3M]: F:Keep a Changelog 格式版本史：各版本 Added/Fixed/Docs 分类，逐条关联 issue/PR 号与交付摘要（0.18.0 为最新） | R:- | A:- | S:-
+CLAUDE.md[SG7T]: F:项目规范：制表符缩进/Windows+PowerShell 运行环境/uv 包管理与 uv run/测试覆盖>85% 要求/不主动 commit 与 push/review 结果用 scripts/review_summary.py 固定脚本读取及两个已知坑 | R:- | A:- | S:缩进 TAB 与 4 空格按文件混用（recorder 系=tab，agent/config=4 空格）——编辑前核对目标文件现状，勿按本文件一刀切
+LICENSE[SZ2M]: F:Creative Commons Attribution-NonCommercial 4.0 国际版许可证全文（署名-非商业性使用） | R:- | A:- | S:-
+README.md[SG5M]: F:项目门面文档：uv 安装与快速开始（tw-web 连 Chrome 9223、tw-tui 连 9222 双入口约定）、Agent/LLMClient/BrowserSession 编程接口、24 动作清单、录制→重放三路径降级链、Web 流程库与 CSV 批量重放、配置指引 | R:code:src/tree_walker/__init__.py | A:- | S:-
+ROADMAP.md[SG4M]: F:战略路线图：2026-07-18 手工录制→agent 探索转折定调；P1-P10 各阶段状态与验收数据（P7 WebArena 评测闭环为主线，P8 迁 TreeChrome，P10 视觉已交付）；与 TreeForge/dom-snapshot 协作关系 | R:- | A:- | S:-
+pyproject.toml[FV5T]: F:项目定义：Python 3.12+/依赖（anthropic 封顶 >=0.109,<1.0 #187 契约/dom-snapshot 公共库）/vision extra（pillow）/CLI 入口 tw-tui tw-web | R:code:src/tree_walker/config.py | A:- | S:anthropic 1.x 移除 temperature——上界 <1.0 是防静默 TypeError 的硬契约，勿「顺手升级」（#187）
+uv.lock[FV3L]: F:uv 锁文件：全量 Python 依赖锁定解析（anthropic 0.x 线/dom-snapshot/aiohttp/textual 等），机器生成 | R:code:pyproject.toml | A:- | S:裸 uv sync 会摘 Pillow——须 uv sync --extra vision
+
+===D:/dev/git/z_jordon/TreeWalker/.opencodereview/===
+rule.json[FQ5T]: F:review 扫描范围与产出闸：include 覆盖 src/tests/examples/scripts/web_ui/recording_extension/domain-skills，exclude=docs 与运行时产物；系统规则要求只报有具体失效场景的必修问题 | R:- | A:- | S:顶层目录结构调整时须同步增删 include/exclude，否则新目录代码不进 review 扫描
+
+===D:/dev/git/z_jordon/TreeWalker/docs/===
+B站标签输入修复与input_text_Tool说明.md[SB3T]: F:修复记录+澄清：type_text 已封装为 input_text Tool（schema/注册 key/handler/dispatch 四层锚点表）；标签输入失败根因=_trigger_framework_events 曾派发 change/blur 触发 B 站 Vue 副作用洗掉输入，已移除 | R:code:src/tree_walker/browser/session.py,code:src/tree_walker/tools/actions.py | A:- | S:-
+B站标题输入框清空失效分析与修复方案.md[SB3M]: F:根因分析：type_text(clear=True) 纯靠 CDP Ctrl+A+Backspace，被 B 站 keydown 拦截器吞掉致清空失效；四清空策略实测对比（原生 setter/execCommand 可行，CDP 按键全败）；给出复刻 browser-use 两层防线方案 | R:code:src/tree_walker/browser/session.py | A:- | S:-
+multi_act_诊断与prompt优化方案.md[SB4M]: F:multi_act 落地后实测调优：典型多动作场景 LLM 仍逐步单动作——根因是 prompt/schema 文案主动强调默认单动作；给出文案改法与验证方案 | R:code:src/tree_walker/prompts/system_prompt.py | A:- | S:-
+multi_act实现方案.md[SB4L]: F:multi_act（一步多动作）实现方案：四阶段落地（schema 包装 array/双兼容解析/执行循环含终止门/统计），对齐 browser-use multi_act；解决 LLM 调用浪费与简单流程切碎 | R:code:src/tree_walker/agent/step.py | A:- | S:-
+对比评估_browser-use_vs_TreeWalker_Tools子系统.md[SB3M]: F:Tools 子系统工业级评估（browser-use vs TreeWalker，2026-06-14）：能力对标与差距清单 | R:- | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/Tools技术细节/===
+01_类图与模块结构.md[SB4M]: F:Tools 子系统静态类图（Agent/StepPipeline/Tools/ActionRegistry/RegisteredAction/LLMClient/BrowserSession 关系与成员）、tools/ 目录文件清单、「无 Tool 基类」设计哲学 | R:code:src/tree_walker/tools/registry.py,code:src/tree_walker/tools/actions.py,code:src/tree_walker/tools/models.py | A:- | S:-
+02_注册与执行机制.md[SB4M]: F:三张序列图：启动期 ACTION_DEFINITIONS 驱动 _action_{name} 命名约定注册、get_tool_schema 动态生成（单一 agent_response tool + page_url 过滤 + output_mode 三态）、execute 展平路由到 handler | R:code:src/tree_walker/tools/models.py,code:src/tree_walker/tools/registry.py,code:src/tree_walker/tools/actions.py | A:- | S:-
+03_Agent_Loop交互序列图.md[SB4L]: F:主循环与一次 step 完整序列图：Agent.run 三种退出路径（stopped/连败上限/done）、五阶段管道交互、max_steps 上限与 force_done、Judge 可选评估、keep_alive 语义 | R:code:src/tree_walker/agent/agent.py,code:src/tree_walker/agent/step.py | A:- | S:-
+04_动作清单与CDP映射.md[SB5L]: F:24 个注册动作逐一参考手册：name/参数/主要逻辑/CDP 调用矩阵/边界处理（click 的 SELECT 读取分支与 file-input 守卫、navigate 健康检查、extract 分页去重等），文末附 CDP 域总览 | R:code:src/tree_walker/tools/actions.py,code:src/tree_walker/tools/models.py,code:src/tree_walker/browser/session.py | A:- | S:-
+05_output_mode与JSON样例.md[SB4L]: F:flash/standard/thinking 三种 output_mode 的 agent_response schema 完整 JSON 对比与真实 tool_use 响应样例；enable_planning 叠加 plan_update/current_plan_item 字段（不入 required）的说明 | R:code:src/tree_walker/tools/registry.py | A:- | S:-
+README.md[SB4S]: F:目录导读：LLM→Agent→Tools→CDP 四层数据流 Mermaid 架构图、一轮 step 文字版数据流、子文档导航表、术语速查表（action/handler/registry/terminates_sequence 等含源码锚点）、关键源码文件行数索引 | R:- | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/agent-core/===
+agent运行逻辑分析.md[SB5L]: F:Agent 系统总览文档：Sense-Think-Act 架构与五阶段单步管线、Mixin 分层（Agent 继承 StepPipeline）、工具注册模式、三层容错（重试/降级/兜底）、EventBus 可观测管道，含完整类图 | R:code:src/tree_walker/agent/agent.py,code:src/tree_walker/agent/step.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/agent-core/step内部流程/===
+1-准备上下文.md[SB3T]: F:Phase1 Sense 概览：_prepare_context 五子步骤流程图（get_state/日志与 schema 更新/循环检测与计划/构建状态消息/注入控制消息）与 BrowserState→state_message 数据流图 | R:code:src/tree_walker/agent/step.py | A:- | S:-
+2-LLM决策.md[SB3T]: F:Phase2 Think 概览：消息修剪压缩→asyncio.wait_for 超时保护的调用链（空动作重试+参数校验重试）→ModelResultEvent/assistant 摘要消息/结构化日志三路记录 | R:code:src/tree_walker/agent/step.py | A:- | S:-
+3-执行动作.md[SB3T]: F:Phase3 Act 概览：stopped/paused 前置检查→.get 安全解析动作与参数→ToolCallEvent→execute 超时保护与异常分类→URL 变化检测，两子文档导航 | R:code:src/tree_walker/agent/step.py | A:- | S:-
+4-后处理.md[SB3T]: F:Phase4 概览导航：状态存储与计划更新（last_result/last_model_output+PlanManager 两路径）、循环检测与失败计数管理（豁免过滤/连败计数/颜色日志） | R:code:src/tree_walker/agent/step.py | A:- | S:-
+5-终结化.md[SB3T]: F:Phase5 概览：_finalize 在 finally 中保证执行——历史记录与事件发射（model_output 非空才入 history）、日志总结与步数递增，两子文档导航 | R:code:src/tree_walker/agent/step.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/agent-core/step内部流程/1-准备上下文内部逻辑/===
+1-获取浏览器状态.md[SB3T]: F:get_state 细节：DOM 缓存轮转（previous←current 支持新元素检测）、单 JS 表达式取 url/title、DOM 采集断路器（连败 3 次熔断 30s 半开恢复）、截图前后高亮摘除与恢复 | R:code:src/tree_walker/browser/session.py | A:- | S:-
+2-日志记录与动作模型更新.md[SB3T]: F:_log_step_context 两级日志；_update_action_models_for_page 每步按 URL 重建 tool schema 与 system prompt，fnmatch glob 页面级动作过滤（page_patterns） | R:code:src/tree_walker/agent/step.py,code:src/tree_walker/tools/registry.py | A:- | S:-
+3-循环检测与计划上下文准备.md[SB3T]: F:record_page 入 recent_urls（maxlen 15）；PlanManager 渲染 [x]/[>]/[ ] 状态文本；replan（连败阈值）与 exploration（无计划步数阈值）两条互斥 nudge | R:code:src/tree_walker/agent/loop_detector.py,code:src/tree_walker/agent/plan_manager.py | A:- | S:-
+4-构建状态消息.md[SB3T]: F:build_state_message 组装分段 user 消息（[Task]/[Previous]/[Plan]/[URL]/[Tabs]/[Page DOM]/[Downloads]/[System Notice]/[Planning Suggestion]）；循环 nudge 分级阈值 5/8/12 | R:code:src/tree_walker/prompts/system_prompt.py | A:- | S:-
+5-注入控制消息.md[SB3T]: F:三种控制注入：步数≥75% 预算警告（鼓励保存部分结果）、最后一步与连败上限 force_done——消息注入+done-only schema 双重强制，LLM 只能调 done | R:code:src/tree_walker/agent/step.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/agent-core/step内部流程/2-LLM决策内部逻辑/===
+1-消息修剪与压缩.md[SB3T]: F:_trim_messages 双模式：压缩器在时仅做 3×max_messages 硬上限兜底、无压缩器保留末 20 条；maybe_compact 双门控（步数间隔+总字符量）与 [首条,摘要,尾部N] 就地替换 | R:code:src/tree_walker/agent/message_compactor.py | A:- | S:-
+2-LLM调用与超时保护.md[SB3T]: F:wait_for(llm_timeout) 包裹整条重试链；_get_action_with_retry 空动作追加澄清重试一次→仍空 fallback done；LLMClient 内 URL 缩短/敏感过滤/解析降级（tool_use→文本 JSON→重试→fallback） | R:code:src/tree_walker/agent/step.py,code:src/tree_walker/llm/client.py | A:- | S:-
+3-参数校验重试链.md[SB3T]: F:Pydantic 参数校验链：_flatten_params 展平嵌套格式→param_model.model_validate→错误拼接反馈 LLM 重试最多 2 次→仍失败用原始输出继续执行（非阻塞设计，registry 不校验 execute 路径） | R:code:src/tree_walker/agent/step.py,code:src/tree_walker/tools/models.py | A:- | S:-
+4-结果记录与日志.md[SB3T]: F:决策落地三路同步记录：ModelResultEvent（可观测）、assistant 摘要消息（维持 user/assistant 交替，只留 eval+goal+action 省 token）、log_response 四行结构化日志 | R:code:src/tree_walker/agent/step.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/agent-core/step内部流程/3-执行动作内部逻辑/===
+1-动作解析与事件发射.md[SB3T]: F:执行前置：stopped/paused 时直接返回错误结果；动作名缺省 done/参数缺省空字典的安全降级；ToolCallEvent 记录 model_call_id→tool_call_id 关联实现决策链追踪 | R:code:src/tree_walker/agent/step.py | A:- | S:-
+2-动作执行与错误处理.md[SB3T]: F:action_timeout（默认 30s）独立于 LLM 超时；异常三分支：Timeout→错误结果/连接错误上抛触发重连/其余捕获为 ActionResult；_NO_URL_CHECK_ACTIONS 豁免不变页动作的 URL 检测 | R:code:src/tree_walker/agent/step.py,code:src/tree_walker/tools/actions.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/agent-core/step内部流程/4-后处理内部逻辑/===
+1-状态存储与计划更新.md[SB3T]: F:结果与输出存入 AgentState 供下一步上下文引用；PlanManager 两互斥路径：plan_update 整体替换重置索引 / current_plan_item 推进并将中间步骤标 done | R:code:src/tree_walker/agent/plan_manager.py | A:- | S:-
+2-循环检测与失败计数管理.md[SB3T]: F:循环检测记录：wait/done/go_back 豁免，哈希排除 text/clear 参数；失败计数单动作错误+1 早退、任一成功即归零（连续语义）；任务完成输出绿 SUCCESS/红 FAILED 日志 | R:code:src/tree_walker/agent/loop_detector.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/agent-core/step内部流程/5-终结化内部逻辑/===
+1-历史记录与事件发射.md[SB3T]: F:AgentHistory 追加（step_number/model_output/result/state_summary 含耗时）供 final_result/Judge 消费；StepEndEvent 驱动指标聚合/JSONL 录制/异常检测/TUI 事件面板 | R:code:src/tree_walker/agent/views.py | A:- | S:-
+2-日志总结与步数递增.md[SB3T]: F:步完成日志（耗时/ok/errs 计数）后 n_steps 才 +1——历史/事件/日志全部消费当前步号后递增，保证步号一致 | R:code:src/tree_walker/agent/step.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/agent-core/tui-架构/===
+tui架构分析.md[SU3S]: F:Textual TUI 架构：click 入口四阶段启动（强制开 observability 供事件流）、Widget 树（欢迎面板/双列工作区/底部任务输入）、视图切换与事件桥接 | R:code:src/tree_walker/cli.py,code:src/tree_walker/tui/app.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/agent-core/类的职责/===
+ActionRegistry类职责.md[SB3T]: F:ActionRegistry 职责详解：RegisteredAction 元数据管理，产出 Anthropic tool_use schema（全部动作打包单一 agent_response）与人类可读描述文本；page_patterns 过滤、三 output_mode、include_actions 白名单 | R:code:src/tree_walker/tools/registry.py | A:- | S:-
+Agent类职责.md[SB4S]: F:Agent 顶层编排类详解：run 主循环生命周期、pause/resume/stop 协作式控制（asyncio.Event）、SIGINT 渐进处理（一次暂停两次停止）、可选子系统装配（Judge/Compactor/Plan/Obs）、_finalize_session 评估收尾 | R:code:src/tree_walker/agent/agent.py | A:- | S:-
+BrowserSession类职责.md[SB4S]: F:CDP 会话类详解：start 连接与 target 发现/set_autoAttach iframe、get_state 采集、click_element 三级坐标降级（Quads→BoxModel→JS rect）、type_text 逐字符+框架事件、DOM 双层缓存与断路器、下载追踪、高亮管理 | R:code:src/tree_walker/browser/session.py | A:- | S:-
+LLMClient类职责.md[SB3T]: F:Anthropic SDK 封装详解：get_action（tool_use 决策）与 extract 两能力；URL 压缩还原（≥100 字符→[uN]）、敏感数据双向过滤、_try_switch_to_fallback 单向切换、响应解析降级链 | R:code:src/tree_walker/llm/client.py | A:- | S:-
+StepPipeline类职责.md[SB4S]: F:五阶段混入管线详解：_step 编排器与五 Phase 方法逐个展开、_handle_step_error 三分支（用户中断不计数/连接错误重连循环/其余失败计数）、超时分层与参数校验重试设计 | R:code:src/tree_walker/agent/step.py | A:- | S:-
+Tools类职责.md[SB3S]: F:Tools 执行引擎详解：构造期 ACTION_DEFINITIONS 驱动自动注册、execute 参数展平+路由+_normalize、_get_element_by_index 缓存优先回退实时、upload_file 智能定位（DOM 树遍历+坐标距离）与 allowed_upload_paths 白名单 | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+数据模型类职责.md[SB3T]: F:agent/views.py 数据模型：ActionResult（success 仅 is_done 时可设）、AgentState 运行状态、AgentHistory(List) 查询接口（final_result 等）、PlanItem/AgentBrain/DownloadInfo | R:code:src/tree_walker/agent/views.py | A:- | S:-
+辅助系统类职责.md[SB3S]: F:四辅助类详解：ActionLoopDetector 软循环检测（分级 nudge 不阻断）、PlanManager 无状态计划操作、JudgeEvaluator 独立轨迹审查（前 3+尾部采样、impossible_task 标志）、MessageCompactor 双门控增量压缩 | R:code:src/tree_walker/agent/loop_detector.py,code:src/tree_walker/agent/plan_manager.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/agent-loop-optimize/===
+01-准备上下文对齐browser-use方案.md[SB4L]: F:Sense 阶段对齐 browser-use 方案文档：18 子步骤全景对照表、现状精确锚点（消息累积核心缺失、脱敏/URL 压缩的 str 守卫、RerunMixin 不读 messages 的决定性结论）；范围 P0+P1 落地、P2/P3 暂缓 | R:code:src/tree_walker/agent/step.py | A:- | S:-
+02-LLM决策对齐browser-use方案.md[SB4M]: F:Think 阶段对齐方案文档：12 子步骤对照，两个 P0 gap（post-LLM stop 检查缺失、max_actions_per_step 仅 prompt 告知无硬截断）+对话持久化 P1；实施范围 P0-1/P0-2/P1-3/P3 | R:code:src/tree_walker/agent/step.py,code:src/tree_walker/llm/client.py | A:- | S:-
+03-执行动作对齐browser-use方案.md[SB4M]: F:Act 阶段对齐方案：5 道中断门/runtime drift/per-action 超时已领先 browser-use；P0 循环内 stop 检查缺失 + P1 per-action 日志与日志脱敏 + P3 七参数架构说明；落地范围 P0-1/P1-2/P3-3 | R:code:src/tree_walker/agent/step.py,code:src/tree_walker/tools/actions.py | A:- | S:-
+04-后处理对齐browser-use方案.md[SB4L]: F:Post 阶段对齐方案：计划更新/循环检测调用点/ANSI 颜色已对齐；两个 P1 分歧——失败计数语义对齐 len==1、完成日志补 attachments 与 Final Result 文案；下载架构与 loop_detector 模块差异剔除暂缓 | R:code:src/tree_walker/agent/step.py | A:- | S:-
+05-终结化对齐browser-use方案.md[SB4M]: F:Final 阶段对齐方案：finally 语义/计时元数据/interacted_elements 投影/步数递增时序逐项命中已对齐；唯一实质缺口=截图入历史（被视觉通道阶段二阻塞仅记集成点）；本期零代码落地 | R:code:src/tree_walker/agent/step.py | A:- | S:-
+06-异常处理对齐browser-use方案.md[SB4L]: F:异常处理对齐方案：_handle_step_error 三分支结构已对齐无 P0；缺口集中 Branch3 可观测性——P1 错误格式化器/条件 traceback/解析错误模型名日志/中断消息拼接；P2 暂缓 P3 N/A | R:code:src/tree_walker/agent/step.py,code:src/tree_walker/llm/client.py | A:- | S:-
+上传失败诊断-P1对文件上传影响分析.md[SB3L]: F:抖音封面上传失败诊断（二次修订）：根因是 P0 把每步 state 全局唯一替换致模型丧失 DOM 对比能力（非 P1c、非 Semi UI 既有问题）；A/B 实测+Option A 修复保留最近 2 份 state；纯分析零代码 | R:code:src/tree_walker/browser/session.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/bug-evidence/douyin-cover-upload-timing/===
+replay-full-timing.txt[XB2S]: F:抖音上传 22 步重放日志（带完整时序版）：upload 后等待/页面漂移检测/元素 EXACT 级重定位逐事件记录，作为封面时序问题的对照组证据 | R:- | A:- | S:-
+replay-no-timing.txt[XB2S]: F:抖音上传 22 步重放日志（无时序基线版）：与 full-timing 对照，逐步骤 DOM 状态/元素定位/动作回显 | R:- | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/bug-fix/===
+176-unknown-action-name-collateral.md[SB4S]: F:issue #176 分析方案：未知动作名整步连坐三根因——plan_update 等 schema 字段被误发为动作、兄弟动作陪葬、校验梯子不对称；「?」实为缺 name 键占位符（与 #197 同族） | R:code:src/tree_walker/agent/step.py,code:src/tree_walker/llm/client.py | A:- | S:-
+185-c2-balance-repair-impl-plan.md[SB4S]: F:issue #185-c2 实施方案：定界符平衡修复候选（_delimiter_scan 字符串感知扫描+补缺失闭合/删错位闭合/裸 return 组合候选）+ 截断提示改失衡语义 + fixer 无损性单测 | R:code:src/tree_walker/browser/session.py | A:- | S:-
+185-c2-reopen-analysis.md[SB3T]: F:issue #185 重开分析（C 轮）：22 处 evaluate 编译失败全为定界符失衡，「传输截断」零证据——agent 自评误读 V8 报错+我方提示措辞助长；修复覆盖缺口属实 | R:code:src/tree_walker/browser/session.py | A:- | S:-
+185-tool-layer-reliability-analysis.md[SB4M]: F:issue #185 工具层五现象分析：evaluate 自愈死代码（匹配 text 恒 Uncaught）/read_grid 无分组计数/read_file 双截断链/legacy 网格无提示/screenshot 超时空文案；根因锚点表+探针实证 | R:code:src/tree_walker/browser/session.py,code:src/tree_walker/tools/actions.py | A:- | S:-
+185-tool-layer-reliability-impl-plan.md[SB4M]: F:issue #185 五修复实施方案：A1 匹配源复活自愈 + B 截图超时分层文案 + C1 窗口显示上限对齐 + D read_grid group_count + E legacy 不兼容提示；平衡候选等三项后置 | R:code:src/tree_walker/browser/session.py | A:- | S:-
+186-behavior-discipline-analysis.md[SB4S]: F:issue #186 行为纪律两缺口分析：连败不止损（现有三层机制形状全不匹配）+ 数据不完整仍 done success（问号自然蒸发+循环验证+Judge 同被骗）；B 轮 11/46 任务同工具连败≥2 | R:code:src/tree_walker/agent/loop_detector.py | A:- | S:-
+186-behavior-discipline-impl-plan.md[SB4M]: F:issue #186 两修复实施方案：F FailureStreakTracker（per-action 连败计数+分级 nudge 去抖）+ G done 完整性门禁（一次澄清重试）+ P prompt 第 7 条；软干预原则不硬拦截 | R:code:src/tree_walker/agent/loop_detector.py | A:- | S:-
+186-c2-reopen-analysis.md[SB3T]: F:issue #186 重开分析（C 轮）：三新形态全是工具成功但语义无进展——不可能子句不止损/精确检索不降级/自洽验证，是 streak 与门禁的正交盲区非其失效 | R:code:src/tree_walker/agent/loop_detector.py | A:- | S:-
+186-c2-semantic-progress-impl-plan.md[SB4S]: F:issue #186-c2 实施方案：A ZeroResultStreakTracker+查询总计 metadata 管道（零结果不进连败走旁路）+ B/C 两条 prompt 规则（不可能子句止损/验证外部判据） | R:code:src/tree_walker/agent/loop_detector.py | A:- | S:-
+187-anthropic-sdk-cap-impl-plan.md[SV4S]: F:issue #187 实施方案：anthropic 依赖封顶 >=0.109,<1.0（1.x 移除 temperature 的契约防线）+ 定向锁刷新 0.x + 透传与守护单测；依赖契约修复非功能开发 | R:code:pyproject.toml | A:- | S:-
+187-anthropic-sdk-version-analysis.md[SV4T]: F:issue #187 版本分析（叙事反转）：本仓锁 0.109 已支持 temperature，「1.4.0」是 eval 仓解析的 2026 新 1.x 线；真根因=spec 无上界，升级当前版恰重新引入 TypeError；修法=封顶不升级 | R:code:pyproject.toml | A:- | S:-
+192-select-multiple-analysis.md[SB4S]: F:issue #192 分析：select_dropdown 对 multiple 是替换语义（三连写全先清空再选中，回读恒过=假成功）；quirks 卡教错方法构成系统性翻车；方向 1+2 都做（values 一次设全+语义明示） | R:code:src/tree_walker/browser/session.py | A:- | S:-
+192-select-multiple-impl-plan.md[SB4M]: F:issue #192 实施方案：A _SELECT_OPTION_MULTI_JS 整组设置+选中集回读验证；B SelectDropdownParams.values 字段+守卫路由；C DROPDOWN_RULES/描述/quirks 纠错；D 四层测试+699 真机探针 | R:code:src/tree_walker/browser/session.py,code:src/tree_walker/tools/models.py | A:- | S:-
+193-table-read-header-binding-analysis.md[SB4M]: F:issue #193 分析：表格读数缺列头绑定——快照无表格结构语义（行界列界不可见）+结构化通道不可见+合计校验假；107 烘焙值=答案源头、111 卡外月份取错列实证 | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+193-table-read-header-binding-impl-plan.md[SB4M]: F:issue #193 实施方案：read_grid 优先路由+合计行捕获与列加和交叉校验；四轮 review 9→2→3→0 收敛记录在案（footer 角色过滤/colspan 游标/负号摘出/欧陆千分位严格化等 14 findings 全修） | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+194-rate-limit-infra-wait-analysis.md[SB3T]: F:issue #194 分析：限流重试烧死任务——致死机制是 max_failures=5 连败上限非步数耗尽，击杀串仅 20 秒；六环因果链（SDK 默认 2 次亚秒退避→client 无退避→记连败→烧步→死刑） | R:code:src/tree_walker/llm/client.py | A:- | S:-
+194-rate-limit-infra-wait-impl-plan.md[SB4M]: F:issue #194 实施方案：L2 client 层指数退避（总预算封顶保终点异常类型）+ L3 Branch 2.5 infra 分罪（不进连败/不计步/真退避/独立 infra 预算）；runner 超时豁免另案 | R:code:src/tree_walker/llm/client.py,code:src/tree_walker/agent/step.py | A:- | S:-
+195-task-card-batch-repair-impl-plan.md[SB3S]: F:issue #195 任务卡批量修复方案：5 卡 _sop（烘焙值换 Orders 真值/Author 字段优先/Apply 映射/values 多选/属性集映射）+站点 quirks 3 条（拼写差异/逐字引用/日期双标准）；纯文档零 src | R:code:domain-skills/localhost_7780/quirks.md | A:- | S:-
+197-vision-missing-name-action-analysis.md[SB4S]: F:issue #197 分析：「?」伪动作是缺 name 键的畸形 dict（日志占位符被误读）；glm-5.3-flash 巨型页间歇形状崩坏，双梯二连即 fallback done；V 轮 19 行 vs C 轮 2 行高一个数量级 | R:code:src/tree_walker/llm/client.py | A:- | S:-
+197-vision-missing-name-action-impl-plan.md[SB4M]: F:issue #197 实施方案：A 畸形日志形状直出（describe_action_entry）+ B 形状定向澄清 + C 第二次澄清起去图（drop_images）+ D 外梯 1→2 内梯 2→3；死刑保留但条件升为定向+降级后仍无效 | R:code:src/tree_walker/action_shape.py,code:src/tree_walker/agent/step.py | A:- | S:-
+198-vision-rating-misread-analysis.md[SB3S]: F:issue #198 证据链核查：前提不成立——截图从未参与读星（全程 DOM 通道且读数全对）、无卡 A/B/V 同构全 0；真因=判分口径不可知+771/774 互斥对；三条修复方向全无效，零代码关闭 | R:- | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/bug-fix/code-review/===
+review-issue-185-1.json[XQ3M]: F:issue #185 修复链 review 第 1 轮（glm-5.3）：7 findings（medium×4/low×3）审读 10 文件，含 evaluate 自愈运行期误触发等；逐条带建议代码与 thinking 审计链 | R:- | A:- | S:-
+review-issue-185-10.json[XQ3M]: F:issue #185-c2 分支 review 第 10 轮：4 findings（medium×1/low×3）审读 5 文件 | R:- | A:- | S:-
+review-issue-185-11.json[XQ3S]: F:issue #185-c2 分支 review 第 11 轮（终轮）：0 findings 收敛，审读 5 文件 | R:- | A:- | S:-
+review-issue-185-2.json[XQ3M]: F:issue #185 修复链 review 第 2 轮：0 findings 收敛（10 文件审读）；结构同 185-1（summary/tool_calls/comments） | R:- | A:- | S:-
+review-issue-185-3.json[XQ3M]: F:issue #185-c2 分支 review 第 3 轮：6 findings（medium×2/low×4）审读 4 文件（定界符平衡修复链） | R:- | A:- | S:-
+review-issue-185-4.json[XQ3S]: F:issue #185-c2 分支 review 第 4 轮：2 findings（medium×1/low×1）审读 4 文件 | R:- | A:- | S:-
+review-issue-185-5.json[XQ3S]: F:issue #185-c2 分支 review 第 5 轮：3 findings（medium×2/low×1）审读 4 文件 | R:- | A:- | S:-
+review-issue-185-6.json[XQ3S]: F:issue #185-c2 分支 review 第 6 轮：4 findings（medium×1/low×3）审读 5 文件 | R:- | A:- | S:-
+review-issue-185-7.json[XQ3S]: F:issue #185-c2 分支 review 第 7 轮：1 finding（medium×1）审读 5 文件 | R:- | A:- | S:-
+review-issue-185-8.json[XQ3S]: F:issue #185-c2 分支 review 第 8 轮：2 findings（medium×1/low×1）审读 5 文件 | R:- | A:- | S:-
+review-issue-185-9.json[XQ3S]: F:issue #185-c2 分支 review 第 9 轮：4 findings（medium×1/low×3）审读 5 文件 | R:- | A:- | S:-
+review-issue-186-1.json[XQ3M]: F:issue #186 修复链 review 第 1 轮：4 findings（medium×1/low×3）审读 11 文件（FailureStreakTracker 连败止损+done 门禁链），含 nudge max 掩蔽新动作首报 | R:- | A:- | S:-
+review-issue-186-2.json[XQ3M]: F:issue #186 修复链 review 第 2 轮：5 findings（medium×1/low×4）审读 11 文件 | R:- | A:- | S:-
+review-issue-186-3.json[XQ3M]: F:issue #186 修复链 review 第 3 轮：2 findings（medium×1/low×1）审读 11 文件 | R:- | A:- | S:-
+review-issue-186-4.json[XQ3M]: F:issue #186 修复链 review 第 4 轮：3 findings（medium×1/low×2）审读 11 文件 | R:- | A:- | S:-
+review-issue-186-5.json[XQ3M]: F:issue #186 修复链 review 第 5 轮：2 findings（medium×1/low×1）审读 11 文件 | R:- | A:- | S:-
+review-issue-186-6.json[XQ3M]: F:issue #186 修复链 review 第 6 轮：0 findings 收敛（11 文件审读） | R:- | A:- | S:-
+review-issue-186-7.json[XQ3M]: F:issue #186-c2 分支 review 第 7 轮：10 findings（medium×2/low×8）审读 8 文件（零结果降级+prompt 规则链） | R:- | A:- | S:-
+review-issue-186-8.json[XQ3M]: F:issue #186-c2 分支 review 第 8 轮：4 findings（medium×1/low×3）审读 8 文件 | R:- | A:- | S:-
+review-issue-186-9.json[XQ3S]: F:issue #186-c2 分支 review 第 9 轮（终轮）：0 findings 收敛，审读 10 文件 | R:- | A:- | S:-
+review-issue-187-1.json[XQ3S]: F:issue #187 修复链 review 第 1 轮：2 findings（medium×1/low×1）审读 3 文件（依赖封顶+守护测试），含下界断言未钉版本号 | R:- | A:- | S:-
+review-issue-187-2.json[XQ3S]: F:issue #187 修复链 review 第 2 轮（终轮）：0 findings 收敛，审读 3 文件 | R:- | A:- | S:-
+review-issue-192-1.json[XQ3S]: F:issue #192 修复链 review 第 1 轮：4 findings（medium×1/low×3）审读 7 文件（select 多选 values 一次设全链） | R:- | A:- | S:-
+review-issue-192-2.json[XQ3S]: F:issue #192 修复链 review 第 2 轮（终轮）：0 findings 收敛，审读 8 文件 | R:- | A:- | S:-
+review-issue-193-1.json[XQ3M]: F:issue #193 修复链 review 第 1 轮：9 findings（high×1/medium×4/low×4）审读 4 文件（read_grid 合计校验链，footer 角色过滤/colspan 游标等） | R:- | A:- | S:-
+review-issue-193-2.json[XQ3S]: F:issue #193 修复链 review 第 2 轮：2 findings（medium×2）审读 5 文件（subtotal 对称/单行基准收严） | R:- | A:- | S:-
+review-issue-193-3.json[XQ3S]: F:issue #193 修复链 review 第 3 轮：3 findings（medium×1/low×2）审读 6 文件（负号摘出/非可加列过滤） | R:- | A:- | S:-
+review-issue-193-4.json[XQ3S]: F:issue #193 修复链 review 第 4 轮（终轮）：0 findings 收敛，审读 7 文件 | R:- | A:- | S:-
+review-issue-194-1.json[XQ3M]: F:issue #194 修复链 review 第 1 轮：7 findings（high×1/medium×3/low×3）审读 6 文件（client 退避+infra 分罪链） | R:- | A:- | S:-
+review-issue-194-2.json[XQ3S]: F:issue #194 修复链 review 第 2 轮：5 findings（high×1/medium×1/low×3）审读 6 文件 | R:- | A:- | S:-
+review-issue-194-3.json[XQ3S]: F:issue #194 修复链 review 第 3 轮：2 findings（medium×2）审读 8 文件 | R:- | A:- | S:-
+review-issue-194-4.json[XQ3M]: F:issue #194 修复链 review 第 4 轮：4 findings（high×1/medium×2/low×1）审读 8 文件 | R:- | A:- | S:-
+review-issue-194-5.json[XQ3S]: F:issue #194 修复链 review 第 5 轮（终轮）：1 finding（medium×1）审读 10 文件 | R:- | A:- | S:-
+review-issue-197-1.json[XQ3S]: F:issue #197 修复链 review 第 1 轮：2 findings（medium×1/low×1）审读 4 文件（畸形动作梯子韧性链） | R:- | A:- | S:-
+review-issue-197-2.json[XQ3S]: F:issue #197 修复链 review 第 2 轮（终轮）：0 findings 收敛，审读 4 文件 | R:- | A:- | S:-
+review-issue-205-1.json[XQ3S]: F:issue #205 修复链 review 第 1 轮：6 findings（medium×3/low×3）审读 4 文件（点击静默失败可感知链） | R:- | A:- | S:-
+review-issue-205-2.json[XQ3S]: F:issue #205 修复链 review 第 2 轮：5 findings（medium×2/low×3）审读 4 文件 | R:- | A:- | S:-
+review-issue-205-3.json[XQ3S]: F:issue #205 修复链 review 第 3 轮（终轮）：0 findings 收敛，审读 4 文件 | R:- | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/examples-implementation/===
+01-结构化输出.md[SG3M]: F:examples 移植 Issue #1 方案：output_model 结构化输出三示例（done 切变体 B、final_result 可直接 model_validate_json），含 issue 正文与完整目标代码 | R:code:examples/features/structured_output.py | A:- | S:-
+02-浏览器能力演示.md[SG3M]: F:examples 移植 Issue #2 方案：多标签/save_as_pdf/scroll 三示例（任务驱动用内置动作）；注记 save_as_pdf 写盘不受 allowed_write_paths 约束 | R:code:examples/features/multi_tab.py | A:- | S:-
+03-LLM配置.md[SG3M]: F:examples 移植 Issue #3 方案：fallback 模型/抽取小模型/flash 模式三示例（LLMSettings+AgentSettings 接线）；提示词扩展点缺失部分丢弃 | R:code:examples/features/fallback_model.py | A:- | S:-
+04-安全与扩展机制.md[SG3M]: F:examples 移植 Issue #4 方案：敏感数据（仅扁平，按域嵌套不支持）+自定义动作注册（@tools.registry.action 范式，无 per-decorator domains）两示例 | R:code:examples/features/sensitive_data.py | A:- | S:-
+05-文件落地.md[SG3S]: F:examples 移植 Issue #5 方案：下载文件（无 downloads_path，track_downloads+done 附件回传）/生成 CSV（无 agent file system，write_file+白名单）两示例 | R:code:examples/features/download_file.py | A:- | S:-
+06-并发.md[SG3S]: F:examples 移植 Issue #6 方案：asyncio.gather 多 agent 并发；关键 caveat：同 Chrome 同端口共享上下文会互相干扰，真隔离需独立 Chrome 实例（无 user_data_dir） | R:code:examples/custom-functions/parallel_agents.py | A:- | S:-
+07-入门补全.md[SG3S]: F:examples 移植 Issue #7 方案：表单填写（httpbin 多字段链式 input_text+click 提交）与多步任务（搜索→进结果→抽取→汇报）两入门示例 | R:code:examples/getting_started/form_filling.py | A:- | S:-
+README.md[SG4T]: F:examples 移植目录导读：7 个主题 issue（16 个 example）裁决表与类别目录映射，及不可移植清单（云/多 provider/浏览器自启等） | R:- | A:- | S:-
+browser-use-examples移植方案.md[SG4L]: F:移植 triage 总方案：约 20 可直接/25 需适配/60+ 不可移植；根因差异表（浏览器自启 vs CDP 连接、langchain vs Anthropic 兼容）+通用移植范式与逐项配方 | R:- | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/issue/===
+185.md[SQ3T]: F:issue #185 存档：工具层四类可靠性问题（evaluate 长代码截断 SyntaxError 连环/read_grid 无分组计数/read_file 预览 5000 过小/legacy 网格无提示） | R:- | A:- | S:-
+186.md[SQ3T]: F:issue #186 存档：行为纪律两缺口（工具连败不止损原地发明 workaround/数据不完整仍 done）+自评系统性偏高背景（真实自认成功判分失败 A42/B46/C34） | R:- | A:- | S:-
+187.md[SQ3T]: F:issue #187 存档：anthropic SDK 1.4.0 不支持 temperature 致 66 次评测静默判 0（judge 异常被吞），eval 仓已兼容修复+离线重判翻绿 | R:- | A:- | S:-
+192.md[SQ3T]: F:issue #192 存档（已关）：select_dropdown 对 multiple 是替换语义致 699 系统性翻车；修复方向 values 一次设全+语义明示，验收三组选中全持久化 | R:- | A:- | S:-
+193.md[SQ3T]: F:issue #193 存档：表格读数缺列头绑定（按行位置硬取混列）+合计校验是假的（没真做算术，130≠67）；修复方向表头解析取格/Total 交叉校验/列举列全自查 | R:- | A:- | S:-
+194.md[SQ3T]: F:issue #194 存档：API 限流重试消耗步数预算烧死任务（最佳路径死于基建）；修复方向 infra 等待不计步数/任务超时，与 #180 同属评测基建不应吃任务预算 | R:- | A:- | S:-
+195.md[SQ3T]: F:issue #195 存档：任务卡批量修复 checklist（5 卡烘焙值/人名取数/Apply 语义/Top 硬编码/Stock Status）+站点 quirks 3 条，修复后预计翻绿约 9 任务 | R:- | A:- | S:-
+197.md[SQ3T]: F:issue #197 存档：视觉模式「?」伪动作二连判死 10 任务（≈5.4pp）；V 新败 7+C 也败交叉 3，对照同任务 C 轮文本口径通过 | R:- | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/judge-optimize/===
+Judge复核器一期修复_token控制与截断保尾.md[SQ4T]: F:Judge 一期问题修复方案（#58 二期）：截断保头砍尾丢 done 的真 bug（改保尾）+token 控制（DOM 摘要差异化而非每步塞满） | R:code:src/tree_walker/agent/judge.py | A:- | S:-
+Judge复核器改造方案_补全页面证据.md[SQ4S]: F:Judge 改造一期方案（#58）：信息不对称根因（序列化只看 goal/action/截断 result）→每步持久化 dom_excerpt+补全页面证据+结构化 JudgementResult，verdict 不覆盖自报 success | R:code:src/tree_walker/agent/judge.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/loop-detector-optimize/===
+01-循环检测对齐browser-use方案.md[SB4L]: F:循环检测对齐方案：骨架与调用点已对齐；三处模块内缺失——哈希归一化不区分动作类型/页面指纹维度缺失（recent_urls 死代码）/nudge 不读页面停滞；窗口 15→20；落地 P1-1/2/3/4 | R:code:src/tree_walker/agent/loop_detector.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/p10/===
+01-vision-web-settings-impl-plan.md[SU4S]: F:issue #179 实施方案：tw-web 设置面接入视觉通道两参数（AGENT_USE_VISION/AGENT_LLM_SCREENSHOT_SIZE）；后端注册表加两行+SET 校验新 type，前端零改动，默认 off 评测红线不变 | R:code:src/tree_walker/web/server.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/p3/===
+01-探索可靠性提升方案.md[SB4S]: F:P2 探索可靠性方案：P0 把重放端已验证的 actionability（visible/stable/enabled+settle）移植到探索端盲发路径，给文件级步骤；P1 失败恢复/P2 多跑选优/P3 产物质量评估分级设计暂缓 | R:code:src/tree_walker/agent/step.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/p4/===
+01-可视化编辑与CSV批量执行方案.md[SU4S]: F:P4 方案（#149 子任务 1+2）：可视化编辑走自动检测+人工标注混合（detect_variables 有边界），CSV 批量 for row 逐行 deepcopy 替换；业界四层经验锚点框定边界 | R:code:src/tree_walker/agent/variable_detector.py | A:- | S:-
+02-编辑器形态业界调研.md[SU3M]: F:P4 编辑器形态业界调研：录制回放工具编辑 UI 五类形态分类（扩展/DevTools/桌面/Web/IDE）与重点工具交互细节查证；结论本地 HTTP+SPA 与本仓本地 JSON+Python 后端同构 | R:- | A:- | S:-
+03-编辑器React升级方案.md[SU4M]: F:P4 编辑器 React+Vite 升级方案：从单文件 HTML MVP 升级组件化 SPA（拖拽重排/试跑/变量面板强化）；拖拽选 dnd-kit、状态 useReducer，后端 /history/* 全复用仅增试跑端点 | R:code:web_ui/package.json | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/p5/===
+01-select-as-variable-plan.md[SB4T]: F:P5 方案（重写）：原生 select 选择动作变量化——agent 路径零代码改动即通（P4 手工标注已覆盖 value 整链）；实测 value 放可见文本非 value 码；录制向方案废弃 | R:code:src/tree_walker/agent/variable_detector.py | A:- | S:-
+02-native-select-test-sites.md[SG3T]: F:P5 测试站点清单：仍在用原生 select 的外部站点核实（the-internet Dropdown 等，抓原始 HTML 确认）；抖音/B 站全自定义组件无法验证原生链路 | R:- | A:- | S:-
+03-serve-fixture-locally.md[SG3T]: F:P5 fixture 本地托管说明：内置 http.server --directory 一条命令托管静态页，供扩展注入/CSP 贴真场景（file:// 下 MV3 默认不注入） | R:- | A:- | S:-
+04-select-record-replay-mechanism.md[SB4S]: F:P5 录制重放原理：agent 用 select_dropdown（value=可见文本）选中→history 记录→CSV 换值重放全链机制，以 fixture country 下拉为例逐环讲解 | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+05-p5-takeaways-and-custom-dropdown-bridge.md[SB4T]: F:P5 关键知识总结：value=可见文本=选中键=CSV 替换目标；变量化是四环通用链（记录/标注/替换/重定位）；执行端多类型分发已存在——自定义下拉桥接判断点 | R:- | A:- | S:-
+06-custom-dropdown-support-plan.md[SB4S]: F:issue #160 方案：非原生/非 ARIA 自定义下拉的 agent 录制重放——闭态判型器四形态全 miss 根因（B 站无 role/抖音 portal+虚拟化），兜底 open→discover→read/write + 精确→包含匹配 | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+07-how-agent-infers-select_dropdown.md[SB3T]: F:P5 分析：模型如何从 DOM 推断用 select_dropdown——语义识别（占位词+svg 箭头）+系统提示规则三件套，非靠 role/aria 标记，故能覆盖判型器认不出的形态 | R:code:src/tree_walker/prompts/system_prompt.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/p6/===
+01-ui-framework-proposal.md[SU4S]: F:P6 界面框架提案：TUI→web 迁移 IA 定调（Flow 为中心/AppShell+四视图/注册表驱动 shell/扩展插槽），调研 OpenClaw/Skyvern 等；TUI 后修订为并存保留 | R:code:web_ui/src/AppShell.tsx | A:- | S:-
+02-implementation-plan.md[SU4M]: F:P6 实施方案：M1-M6 里程碑（扩展现有 web_ui+server 非重写；Flow Workspace 四视图+/task/* SSE+截图推帧+tw-web CLI 连 9223） | R:code:src/tree_walker/web/server.py | A:- | S:-
+03-web-e2e-runbook.md[SU3S]: F:P6 M3 真机 e2e 手册：live 控制台验收门（场景 A/B/C：实时步骤/截图/日志+暂停停止+录制存盘），含前置检查与服务启动步骤 | R:- | A:- | S:-
+04-implementation-retrospective.md[SU3T]: F:P6 实施复盘：M1-M5+M6 前半落地与计划偏差；关键修订=TUI 并存保留下线取消；含截图 race 修复记录 | R:- | A:- | S:-
+05-followup-plan.md[SU3S]: F:P6 后续 backlog：01 提到未实现项分级表（A 直播视口/B 技能面/C 设置面/G Context/H 进行中 zone/I1-I6），标来源现状阻塞工作量与分期 | R:- | A:- | S:-
+06-skills-and-run-enhancements-plan.md[SU4M]: F:T1 实施方案：B 技能面（/skills/* 端点+分栏编辑器热更新）+ I1 活动 skill 标示/I2 token 耗时环/I3 元素高亮标注层 | R:code:src/tree_walker/skills/loader.py | A:- | S:-
+07-skills-and-run-enhancements-e2e-runbook.md[SU3S]: F:T1 真机 e2e 手册：技能面+Run 增强验收（场景 G 等），承接 03 基础流起服务步骤相同 | R:- | A:- | S:-
+08-livestream-viewport-plan.md[SU4L]: F:A 直播视口方案：CDP Page.startScreencast 连续推流三里程碑（browser 原语+最新帧槽/独立 /task/screencast SSE/BrowserView 双 mode）；已交付 e2e 全绿 | R:code:src/tree_walker/browser/session.py | A:- | S:-
+09-livestream-viewport-e2e-runbook.md[SU3S]: F:直播视口真机 e2e 手册：场景 H/I/J/K 验收（模式切换/toggle/收尾），承接 03/07 基础流 | R:- | A:- | S:-
+10-livestream-viewport-retrospective.md[SU3T]: F:直播视口复盘：M4 真机暴露三问题与投递方案两轮迭代（v1 合并→v2 节流窗）；可见性与投递节奏是方案写作时未预见的硬约束 | R:- | A:- | S:-
+11-t2-settings-context-livezone-plan.md[SU4M]: F:T2 实施方案（M1-M8）：设置面 C 启用+右 Context 面板 G+进行中 zone H+I4 ⌘K/I5 模型选择/I6 任务历史（与 TUI 共享 ~/.treewalker/history.json） | R:code:src/tree_walker/web/server.py | A:- | S:-
+12-t2-e2e-runbook.md[SU3S]: F:T2 真机 e2e 手册：场景 L-R（状态提升/zone/设置面/任务历史/模型选择/Context/⌘K）；本轮 vite 加 /settings 代理的 dev 注意项 | R:- | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/p7/===
+01-task1-trajectory-anatomy.md[SA3S]: F:P7 首篇轨迹解剖：task 1 死因=thinking-only 响应零重试直接 done（max_tokens 4096 被思考耗尽）；菜单翻页/表单被拒均非死因，DB 真值验证 | R:- | A:- | S:-
+02-optimization-plan.md[SB4M]: F:Task 1 短板优化方案：max_tokens 4096→16384（猝死主因）+批次一 R1 空响应重试/R2 诊断日志/R3a 结果可见性 500→4000；工程层与 #167 策略层交叉标注 | R:code:src/tree_walker/llm/client.py | A:- | S:-
+03-task-skill-loading-design.md[SB4L]: F:任务级 skill 加载 v2 定稿：S0-S5（catalog 44 卡/same_task 语义判据/注入头分级/env 卫生）；TreeForge 定义契约 TreeWalker 实现；两轴判据修订见 04 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+04-task-skill-template-matching-plan.md[SB4M]: F:issue #182 模板语义匹配升级：泛化命中 30%→80%（两轴判据：实体=参数忽略/模板=判据）+分级注入头+离线回归门槛；真误命中 0 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/p7/code-review/===
+2026-09-06-pr174-malformed-action-params-crash-round2.md[XQ3T]: F:PR #174 review 第 2 轮：6 CONFIRMED——choke point 归一化本身稳，遗留 EventBus 异常隔离/历史加载归一化/生产接线无测试三根因 | R:- | A:- | S:-
+2026-09-06-pr174-malformed-action-params-crash-round3.md[XQ3S]: F:PR #174 review 第 3 轮：9 CONFIRMED+1 PLAUSIBLE（high effort 8 finder 角度，24 原始候选存活 10） | R:- | A:- | S:-
+2026-09-06-pr174-malformed-action-params-crash-round4.md[XQ3S]: F:PR #174 review 第 4 轮：6 correctness+4 清理类 CONFIRMED——EventBus 隔离熔断/_step finally 守卫/n_steps 单一所有者/历史加载归一化落地 | R:- | A:- | S:-
+2026-09-06-pr174-malformed-action-params-crash-round5.md[XQ3S]: F:PR #174 review 第 5 轮：9 CONFIRMED+1 PLAUSIBLE——新增 action_shape.py 等 17 文件；新测试 6 失败由 finding #7 解释 | R:- | A:- | S:-
+2026-09-06-pr174-malformed-action-params-crash-round6.md[XQ3S]: F:PR #174 review 第 6 轮：10 项全 CONFIRMED（3 项为本 diff 引入回归）；全套 38 失败均环境问题非分支问题 | R:- | A:- | S:-
+2026-09-06-pr174-malformed-action-params-crash-round7.md[XQ3S]: F:PR #174 review 第 7 轮：9 CONFIRMED+1 PLAUSIBLE——单一策略表 normalize_model_output(live|history)+_HonestDone 带外标记+归一化前移落地 | R:- | A:- | S:-
+2026-09-06-pr174-malformed-action-params-crash-round8.md[XQ3S]: F:PR #174 review 第 8 轮：5 CONFIRMED+4 PLAUSIBLE——新机制与既有代码交互缝隙；快速收尾路径分级处置（微修后合并/接受留档） | R:- | A:- | S:-
+2026-09-06-pr174-malformed-action-params-crash.md[XQ3S]: F:PR #174 review 第 1 轮：7 CONFIRMED+1 PLAUSIBLE——归一化未回写 model_output 致三下游仍崩+未脱敏日志；1 候选证伪排除 | R:- | A:- | S:-
+2026-09-07-pr177-llm-vision-round2.md[XQ3T]: F:PR #177 review 第 2 轮：1 CONFIRMED+1 REJECTED（前提不成立降为加固项）；人工逐条实证核源码调用链 | R:- | A:- | S:-
+2026-09-07-pr177-llm-vision-round3.md[XQ3T]: F:PR #177 review 第 3 轮（修复提交 970ade0 后复核）：0 findings 收敛 | R:- | A:- | S:-
+2026-09-07-pr177-llm-vision.md[XQ3T]: F:PR #177 视觉通道 review 第 1 轮（low 档单遍）：0 findings，覆盖 use_vision 门控/截图超时降级/压缩器兼容等 7 文件 | R:- | A:- | S:-
+2026-09-08-pr178-unknown-action-name.md[XQ3T]: F:PR #178 review（low 档单遍）：0 findings——action_shape 未注册名丢弃+_normalize_llm_response+梯子对称化 | R:- | A:- | S:-
+2026-09-08-pr181-web-vision-settings-ocr.md[XQ3T]: F:PR #181 OCR 首轮：5 条全 low 全部核实并当场修复（设置面视觉通道+任务 skill 参数含 size 校验），29m14s 约 340 万 input token | R:- | A:- | S:-
+review-20260910-1.md[XQ3S]: F:ocr review 产物（2026-09-10 第 1 份）：6 findings 含 .gitignore out/ 未锚定仓库根、task_matcher 匹配判据等，逐条带建议 diff | R:- | A:- | S:-
+review-20260910-2.md[XQ3T]: F:ocr review 产物（第 2 份）：3 findings——intent_template_id 缺键 fail-late（184 次 LLM 调用后才炸）等 | R:- | A:- | S:-
+review-20260910-3.json[XQ3S]: F:ocr review JSON 记录：status=failed（cancelled，5/5 项失败，0 findings）——运行失败存档，供复盘 review 链路用 | R:- | A:- | S:-
+review-20260910-4.json[XQ3S]: F:ocr review JSON 记录：0 findings 收敛（6 文件审读），同批第 4 份 | R:- | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/p7/data_truncated/===
+01-failure-analysis.md[SA4M]: F:data_truncated 类 17 任务失败分析（新基线 88 失败）：仅 6/17 真截断，重跑早于 form_interaction 修复；真截断四链机制；复盘修正 9 任务参考答案后真实完成 10/17 | R:- | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/p7/env_issue/===
+01-env-issue-failure-analysis.md[SA4S]: F:env_issue 类 21 任务分析：有效 4/混合 5/归类存疑 12——自述把「我搞不定」大量上报为「环境有问题」；同条件重跑 6 翻盘 15 复败；轨迹+判分配置+DB 真值三方交叉 | R:- | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/p7/form_interaction/===
+01-failure-analysis.md[SA4M]: F:form_interaction 类 18 任务首轮分析：四大链（KO 网格行渲染冻结 7 正例/书签过滤器跨任务污染/type_text 缺 change 空提交/dialog 只记录不处理 493 挂死）；重跑 4/18 | R:- | A:- | S:-
+02-failure-analysis.md[SA4S]: F:form_interaction 二轮分析（六修复落地后重跑）：SR 4/18→8/18，新翻 499/503/505/712；含 rule 5/6/7 的实机 DOM 探针（对齐 checker locator 语义） | R:- | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/p7/tool_layer/===
+01-feasibility-and-impl-plan.md[SB4M]: F:工具层方向 2 方案（B0-B3 已落地验证）：read_grid 三级通道（uiRegistry→legacy AJAX→DOM）+[Grid] 快照元信息+保存成功信号+KO 冻结 kick；探针实证 mui 不可用通道序反转 | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/rerun_history/===
+01-数据模型与序列化.md[SB4M]: F:重放系列 01：AgentHistory 数据模型扩展与磁盘序列化 save/load 设计（后续录制/匹配/重放的基石） | R:code:src/tree_walker/agent/views.py | A:- | S:-
+02-录制改造.md[SB4S]: F:重放系列 02：在五阶段管线的执行点把「动作当年点的元素特征」与步骤计时一并录进 AgentHistory，提供 save_history 落盘 | R:code:src/tree_walker/agent/step.py | A:- | S:-
+03-五级元素匹配.md[SB4S]: F:重放系列 03（核心技术）：五级元素匹配算法 EXACT→STABLE→XPATH→AX_NAME→ATTRIBUTE→CLASS——页面动态变化后凭历史元素特征重定位并更新 index | R:code:src/tree_walker/agent/rerun.py | A:- | S:-
+04-重放执行器.md[SB4M]: F:重放系列 04：rerun_history 主流程——不调决策 LLM（extract 除外）、五级匹配重定位、tools.execute 真实执行、等待机制与摘要 | R:code:src/tree_walker/agent/rerun.py | A:- | S:-
+05-变量检测与替换.md[SB4S]: F:重放系列 05：DetectedVariable 模型+detect_variables 自动发现可替换值（email/phone/date 等有规律字段）+精确整串替换语义 | R:code:src/tree_walker/agent/variable_detector.py | A:- | S:-
+06-AI摘要（无截图适配）.md[SB3S]: F:重放系列 06：重放结束成功判定——从 browser-use 的视觉判定改为纯文本执行证据判定（无截图是最重要适配点） | R:code:src/tree_walker/prompts/rerun_summary.py | A:- | S:-
+07-集成入口与示例.md[SB4M]: F:重放系列 07：暴露给用户的入口——save_history/detect_variables/load_and_rerun/batch_rerun 编程 API+示例脚本+CLI+TUI | R:code:src/tree_walker/agent/rerun.py | A:- | S:-
+08-测试与落地清单.md[SB3S]: F:重放系列 08：测试策略（单测清单/mock 范式）+落地顺序+关键陷阱清单 | R:- | A:- | S:-
+09-重放文件根目录与路径校验.md[SB3S]: F:重放系列 09（设计）：重放文件根目录配置（默认 rerun-history/）+强制相对路径（绝对拒绝）+拒绝 .. 越界防越权写入 | R:- | A:- | S:-
+README.md[SG4T]: F:历史重放总方案导读：录制 AgentHistory→变量替换→不调 LLM 重放，让一次昂贵 LLM 决策成果可复用；对齐 browser-use rerun_history 并本地化适配 | R:code:src/tree_walker/agent/rerun.py | A:- | S:-
+batch-rerun-ui-plan.md[SU3S]: F:issue #155 批量重放 UI 方案：CSV 上传+SSE 行级进度+协作式中止——后端 batch_rerun（CSV 列头=变量名逐行串行）已就绪，只补 UI 层 | R:code:web_ui/src/components/BatchRunPanel.tsx | A:- | S:-
+upload-semantic-clue-agent-port-plan.md[SB3S]: F:上传封面语义线索移植 agent 路径方案：csv_rerun 纯重放不调决策 LLM，封面槽位不稳定根因=重放时 file input 重定位错误（#123 等待机制另案） | R:- | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/skill/===
+bilibili-ab-test-2026-07-27.md[SB3S]: F:B 站 skill A/B 实测首轮（N=3）：手写 skill vs 无 skill 对照，步数与成功率判据设计 | R:code:src/tree_walker/skills/loader.py | A:- | S:-
+bilibili-ab-test-2026-07-28.md[SB3S]: F:B 站 skill A/B 手写版 N=3 复测：判据达标（精简版系统性 100% vs 原始版 80% 的后续轮基线） | R:- | A:- | S:-
+bilibili-ab-test-distilled-simplified-n5-2026-07-28.md[SB3S]: F:蒸馏精简版 skill N=5 A/B：与手写/蒸馏各变体同批对照，检验 TreeForge 蒸馏链路产物质量 | R:- | A:- | S:-
+bilibili-ab-test-handwritten-n5-2026-07-28.md[SB3S]: F:手写精简版 skill N=5 A/B：同批对照变体之一，检验 N=5 下各版本 skill 的步数与成功率 | R:- | A:- | S:-
+bilibili-ab-test-n5-2026-07-28.md[SB3S]: F:蒸馏版 skill N=5 A/B（关键结论轮）：步数差从 N=3 的 +37% 翻转为 -24%——A/B 步数差是随机噪声，不是 skill 内容质量的可靠指标 | R:- | A:- | S:-
+bilibili-ab-test-simplified-n5-2026-07-28.md[SB3S]: F:精简版 skill N=5 A/B：同批对照变体之一 | R:- | A:- | S:-
+distilled-skill-quality-2026-07-28.md[SB3S]: F:蒸馏 skill 静态质量分析（Q1-Q7 对比维度）：缺 upload_file 直注等静态缺口存在；其步数归因结论被 n5 轮校正 | R:- | A:- | S:-
+skill-injection-design.md[SB4M]: F:skill 注入设计方案（ROADMAP P1）：按域名读 domain-skills/<host>/ 注入上下文；三元门控+per-host 缓存+invalidate；默认关闭 enable_skill_injection（未开启零行为变更） | R:code:src/tree_walker/skills/loader.py | A:- | S:-
+skill-simplification-plan.md[SB3S]: F:skill 精简方案：A/B 证据「少而精」——只留 DOM 看不出的决策指导，删冗余描述 | R:- | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/tools-optimize/===
+bilibili-cover-upload-regression.md[SB3S]: F:B 站封面假成功回归修复：Fix B 临时副本过早删除（页面晚读=假成功），清理时机改延迟到 session 结束；Fix A 无辜不动 | R:code:src/tree_walker/browser/session.py | A:- | S:-
+click.md[SB4L]: F:click 完善方案（对齐 browser-use）：坐标失败静默吞掉/SELECT 查全页/无回显/缺 mouseMoved/遮挡检查+JS 回退/quad 视口对齐六类问题逐一修 | R:code:src/tree_walker/tools/actions.py,code:src/tree_walker/browser/session.py | A:- | S:-
+close.md[SB3M]: F:close_tab 完善方案：对齐 browser-use close——工具本身差距分析+关闭最后一个标签页的健壮性 | R:code:src/tree_walker/browser/session.py | A:- | S:-
+done.md[SB4M]: F:done 优化阶段一：long_term_memory 双写+空 text 运行时守卫+min_length=1+anti-hallucination 富描述+全量单测 | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+done_follow_up.md[SB4M]: F:done 阶段二蓝图：5 项能力展开（files_to_display 白名单对标 write_file 先例/下载附件复用 downloaded_files/结构化校验）；红线=任何失败不阻断 done 终止 | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+douyin-cover-unsupported-format.md[SB3S]: F:issue #96 抖音封面「不支持的图片格式」：上游修复后残留根因——与文件名无关、传完后才报错；诊断探针两枚 | R:- | A:- | S:-
+douyin-cover-upload-50pct.md[SB3S]: F:issue #36 抖音封面 50% 失败：两个独立根因（中文文件名 ASCII 正则+file_inputs 元数据），Fix B 临时名+Fix A file_inputs_meta | R:- | A:- | S:-
+dropdown_options.md[SB4L]: F:dropdown_options 完善方案：P0 范围 bug（查全页 select）+tag 校验+成功回显+软降级；P1 蓝图 ARIA menu/listbox/custom class/combobox/子树搜索/懒加载 | R:code:src/tree_walker/browser/session.py | A:- | S:-
+dropdown_options_follow_up.md[SB4L]: F:dropdown_options 阶段二：P1 蓝图落地展开——判型链深化（ARIA/custom/combobox）与懒加载等待 | R:code:src/tree_walker/browser/session.py | A:- | S:-
+evaluate.md[SB4M]: F:evaluate 分阶段方案：per-call 运行时守卫+大结果落盘+ActionResult.metadata 扩字段；结构对齐 find_elements/search_page/extract 同族阶段一 | R:code:src/tree_walker/browser/session.py | A:- | S:-
+evaluate_follow_up.md[SB4L]: F:evaluate 阶段二：阶段一后的进阶能力展开（守卫细化/错误分级/返回值结构化） | R:code:src/tree_walker/browser/session.py | A:- | S:-
+extract.md[SB4M]: F:extract 优化方案：页面转 markdown+LLM 抽取链（分页+去重+大结果落盘），对齐 browser-use 阶段一 | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+extract_follow_up.md[SB4L]: F:extract 阶段二：抽取链进阶（小模型抽取/结构化输出/already_collected 续采） | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+find_elements.md[SB4M]: F:find_elements 优化方案：CSS 选择器查询穿透 shadow/iframe+几何/可见性+return_node_ids（同族阶段一） | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+find_elements_follow_up.md[SB4L]: F:find_elements 阶段二：阶段一后的进阶展开（结果格式化/总数/分页语义） | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+find_text.md[SB3M]: F:find_text 优化方案：CDP performSearch 滚动到文本并高亮（Runtime 兜底），对齐阶段一 | R:code:src/tree_walker/browser/session.py | A:- | S:-
+find_text_follow_up.md[SB3M]: F:find_text 阶段二：滚动/高亮/匹配语义进阶 | R:code:src/tree_walker/browser/session.py | A:- | S:-
+go_back.md[SB3M]: F:go_back 完善方案：Page.navigateHistory+健康检查+统一回显，对齐 navigate 惯例 | R:code:src/tree_walker/browser/session.py | A:- | S:-
+input_text.md[SB4M]: F:input_text 完善方案：点击+输入+框架事件触发链（clear 策略/change/blur 副作用）对齐 browser-use | R:code:src/tree_walker/browser/session.py | A:- | S:-
+navigate.md[SB4M]: F:navigate 完善方案：健康检查+错误映射+统一回显（navigate/go_back/search 回显惯例的开创者） | R:code:src/tree_walker/browser/session.py | A:- | S:-
+pingkai-form-dropdown-step-bloat.md[SB3S]: F:scroll 30s 超时复盘：大 deltaY 打死渲染线程+cdp_use send_raw 无单请求超时（非等 networkidle）；backendNodeId 跨加载漂移同次内自洽 | R:code:src/tree_walker/browser/session.py | A:- | S:-
+read_file.md[SB3M]: F:read_file 优化方案：offset/limit 窗口读+allowed_read_paths 白名单+富文档（阶段一） | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+read_file_follow_up.md[SB3M]: F:read_file 阶段二：窗口/回显/白名单语义进阶 | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+replace_file.md[SB3M]: F:replace_file 完善方案：字符串替换写回+双层运行时守卫（min_length=1+if not old；registry 不校验 execute 路径故 handler 自加） | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+replace_file_follow_up.md[SB3M]: F:replace_file 阶段二：守卫/编码/白名单语义进阶 | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+save_as_pdf.md[SB3M]: F:save_as_pdf 完善方案：Page.printToPDF 参数化+错误映射（阶段一） | R:code:src/tree_walker/browser/session.py | A:- | S:-
+screenshot.md[SB4M]: F:screenshot 分阶段方案：阶段一参数化+降采样+断路止血；阶段二 LLM 视觉通道（image block 回流，后由 PR #177 交付） | R:code:src/tree_walker/browser/session.py | A:- | S:-
+scroll.md[SB3M]: F:scroll 完善方案：鼠标滚轮翻页+deltaY 语义+节流，对齐阶段一 | R:code:src/tree_walker/browser/session.py | A:- | S:-
+search_page.md[SB3M]: F:search_page 优化方案：页面正文搜索（text+attr 双计数+滚到首个命中），阶段一 | R:code:src/tree_walker/browser/session.py | A:- | S:-
+search_page_follow_up.md[SB4L]: F:search_page 阶段二：匹配/导航/计数语义进阶展开 | R:code:src/tree_walker/browser/session.py | A:- | S:-
+search多引擎实现方案.md[SB3M]: F:search 多引擎方案：URL 编码 bug 修复（query 含空格/中文/& 时结构错乱）+可配引擎列表 | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+select_dropdown.md[SB4L]: F:select_dropdown 完善方案：P0 native select 完整链（范围 bug+tag 校验+框架兼容设值+读回验证+点击回退+软回显）；P1 判型蓝图 | R:code:src/tree_walker/browser/session.py | A:- | S:-
+select_dropdown_follow_up.md[SB4L]: F:select_dropdown 阶段二：P1 判型链落地展开（ARIA/custom/combobox/子树）+多选语义（#192 另案补 values） | R:code:src/tree_walker/browser/session.py | A:- | S:-
+send_keys.md[SB3M]: F:send_keys 完善方案：组合键解析+修饰键序列，对齐阶段一 | R:code:src/tree_walker/browser/session.py | A:- | S:-
+switch.md[SB3S]: F:switch_tab 完善方案：工具本身差距分析+点击打开新标签页自动切换 | R:code:src/tree_walker/browser/session.py | A:- | S:-
+upload_file.md[SB4M]: F:upload_file 完善方案：智能定位（DOM 树遍历+坐标距离）+allowed_upload_paths 白名单+file-input 守卫，对齐阶段一 | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+upload_file_fix.md[SB3S]: F:upload_file 修复 v2（实证推翻 v1 前提）：结论=抖音封面不可经 CDP 自动上传（无 label+trusted 点击也不触发）；修=破死循环+防收藏弹窗+label-click chooser+诚实回退 | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+write_file.md[SB3M]: F:write_file 完善方案：原子写+encoding+allowed_write_paths 白名单+newline 翻译（同族阶段二先例） | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+write_file_follow_up.md[SB3M]: F:write_file 阶段二：白名单/编码/原子写语义进阶 | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/user_recording/===
+README.md[SB4M]: F:用户操作录制总方案（设计定稿）：录制来源从 agent 探索换成用户真实操作，产物仍是 AgentHistory，重放侧完全复用 rerun_history 不改核心 | R:code:src/tree_walker/recorder/recorder.py | A:- | S:-
+align-browser-bc.md[SB3S]: F:对齐 Browser-BC 录制方案（选择性）：只搬对回放有增益的事件/字段+结构优雅化，不照搬分析型事件（两项目目标不同） | R:- | A:- | S:-
+auto-nav-dedupe.md[SB3T]: F:排除自动跳转 navigate 步骤方案：副作用导航（操作后页面自动跳转）从录制产物剔除，避免回放重复定向丢页面状态 | R:code:src/tree_walker/recorder/rules.py | A:- | S:-
+cover-upload-fix-plan-v2.md[SB3M]: F:封面上传选错 file input 根因订正与正解（v2，已被 #136 证伪）：D1 标记→area_text 方向错误；本文保留为探索史，正解见 upload-general-identity | R:- | A:- | S:-
+cover-upload-fix.md[SB3S]: F:封面上传修复首版：录制侧 file input 定位问题初探（后被 v2 订正根因） | R:- | A:- | S:-
+fingerprint-realtime.md[SB3S]: F:录制侧指纹为何必须实时算：modal DOM 活着时才能算指纹，录完再批量算（Browser-BC 式）会失败——重设计 §3.4 的依据 | R:- | A:- | S:-
+js-click-capture-fix-plan.md[SB3S]: F:JS 监听器元素点击捕获修复（方案 A）：MAIN-world wrap addEventListener 打 data-tw-jsclick DOM 标记（跨 world 必须 DOM 属性）+findInteractiveAncestor 认标记 | R:code:recording_extension/entrypoints/injected.ts | A:- | S:-
+modal-trigger-capture.md[SB3S]: F:modal 触发器 click 录制方案：封面编辑器/合集下拉等 modal 内步骤全失败的根因=触发 click 未被捕获；扩展侧捕获打开 modal 的点击 | R:- | A:- | S:-
+recorder-performance-optimization.md[SB3S]: F:录制器性能优化方案：快慢路径折中（普通动作轻量线索/关键动作实时指纹）+skip_llm_text（P3 备选，被战略转折降级） | R:- | A:- | S:-
+recorder-timing-solutions.md[SB4M]: F:录制器时序劣势两解法方向：语义线索回放+半主动 get_state——把具体 bug 提炼为架构层方案（治标不治本的历史结论） | R:- | A:- | S:-
+recording-reliability-fixes-retrospective.md[SB3S]: F:录制可靠性修复系列复盘：多个录制 bug 的修复记录与经验总结 | R:- | A:- | S:-
+redesign-impl-plan.md[SB3S]: F:录制器重设计实施计划：recorder/{models,translation,rules,flatten}.py 新包+side-effect-observer.ts+/signal 端点；定位/指纹仍在 handle_event 实时做 | R:code:src/tree_walker/recorder/recorder.py | A:- | S:-
+redesign-retrospective.md[SB3S]: F:录制器重设计复盘：Signal 模型落地经验与偏差记录 | R:- | A:- | S:-
+redesign.md[SB4L]: F:录制器重设计总方案（Signal 模型+统一翻译层）：业界四工具蓝本；四阶段翻译管线；定位/指纹实时做（§3.4）；10 类 DOM 事件采集 | R:code:src/tree_walker/recorder/translation.py | A:- | S:-
+semantic-clue-replay.md[SB3S]: F:语义线索回放方案：点 submit/链接触发跳转的录制失败步，重放端凭语义线索（xpath/属性/位置）在稳定页面重新定位——利用重放主动时序优势 | R:code:src/tree_walker/agent/rerun.py | A:- | S:-
+semi-active-get-state.md[SB3S]: F:半主动 get_state 方案（已放弃，issue #134 NOT_PLANNED 存档）：抢读窗口短靠抢大概率抢不到；两个代码事实仍成立（file input 在 selector_map/accept 是被迫兤底） | R:- | A:- | S:-
+stage2_plan.md[SB3S]: F:录制阶段 2 实施方案：补全动作覆盖+去噪+iframe+文件上传（阶段 1 MVP 后的扩展） | R:- | A:- | S:-
+troubleshooting.md[SB3T]: F:录制阶段 1 MVP 踩坑记录：实施阶段 2 前的经验清单 | R:- | A:- | S:-
+upload-accept-fix-retrospective.md[SB3S]: F:upload accept 兜底修复复盘：#34 修复链的验收与经验 | R:- | A:- | S:-
+upload-dedupe.md[SB3S]: F:录制文件上传去重方案：单次上传被录 4 步→合并单步 upload_file（index 指向 file input），与 agent 手工产物同构 | R:code:src/tree_walker/recorder/rules.py | A:- | S:-
+upload-general-identity-e2e-analysis.md[SB3S]: F:upload 通用身份 e2e 验收分析（PR #140）：B 站/抖音真机验证结果与偏差记录 | R:- | A:- | S:-
+upload-general-identity-impl-plan.md[SB3S]: F:upload 通用身份实施方案（PR #140）：去掉 4 个 Semi-UI 写死选择器→label/aria/region_text/in_dialog 通用信号+Layer2 trigger_affordance（原生 picker 是 OS 模态→lastVisibleClick 可靠） | R:code:src/tree_walker/agent/upload_identity.py | A:- | S:-
+upload-general-identity-plan.md[SB3S]: F:upload 通用身份方案（方向篇）：从写死选择器到通用身份信号的思路转变 | R:- | A:- | S:-
+upload-record-fix-plan.md[SB3T]: F:录制上传修复计划（早期）：阶段 1 的上传录制问题初修 | R:- | A:- | S:-
+upload-record-replay-research.md[SB3M]: F:文件上传 record-replay 业界调研：Playwright/Selenium IDE 源码级调研（setInputFiles 直设路径/不上真对话框），校验自研方向 | R:- | A:- | S:-
+upload-semantic-clue-plan.md[SB3M]: F:issue #139 upload 语义线索根治方案：无指纹 upload 在重放端凭 accept 线索定位 file input（三层：element_hash→accept→语义线索） | R:code:src/tree_walker/agent/rerun.py | A:- | S:-
+upload-semantic-clue-retrospective.md[SB3S]: F:upload 语义线索复盘：方案落地后的验收与经验（#122 覆盖面：upload 不含其中，5 处硬排除） | R:- | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/docs/wait-and-timing/===
+01-阶段1-录制间隔回放与时序配置.md[SB4M]: F:等待机制阶段 1（#124）：录制间隔回放+时序配置（user_pause/default delay 语义）+page-settle | R:code:src/tree_walker/agent/rerun.py | A:- | S:-
+02-阶段2-等目标元素与actionability阶段一.md[SB4M]: F:等待机制阶段 2（#125）：等目标元素+actionability 阶段一（visible/enabled 检查进重放端） | R:code:src/tree_walker/agent/rerun.py | A:- | S:-
+03-阶段3-networkidle开关与清理upload硬编码wait.md[SB4L]: F:等待机制阶段 3（#126）：networkidle 等待（默认关）+清理录制端 upload 硬编码 wait | R:code:src/tree_walker/browser/network_idle.py | A:- | S:-
+04-发布click录制残缺-issue129兜底补全.md[SB3M]: F:issue #129 发布 click 录制残缺：handle_event 三重兤底补全+常驻 server 重启陷阱；已修复+单测覆盖 | R:code:src/tree_walker/recorder/recorder.py | A:- | S:-
+05-阶段4-actionability完善与step_interval语义清理.md[SB4L]: F:等待机制阶段 4（#127 收尾）：actionability 完善（receives-events+stable）+step_interval 语义清理，对齐 Playwright 五级检查 | R:code:src/tree_walker/agent/rerun.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/creator.douyin.com/===
+_sop.md[FC3T]: F:抖音创作者中心站点 SOP：视频上传与发布流程步骤清单（agent 探索时按 host 注入） | R:code:src/tree_walker/skills/loader.py | A:- | S:-
+quirks.md[FC3T]: F:抖音站点 quirks：file input 必须直接注入（绝不能先点击否则弹 OS 对话框）等坑位清单 | R:code:src/tree_walker/skills/loader.py | A:- | S:-
+selectors.md[FC3T]: F:抖音站点 selectors：关键元素定位表（用途/找法/稳定标识/备注） | R:code:src/tree_walker/skills/loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/===
+_sop.md[FC3S]: F:Magento 后台（localhost:7780）站点卡：站点功能地图（菜单结构/报表入口/表单路径），站点级 skill 注入源 | R:code:src/tree_walker/skills/loader.py | A:- | S:-
+quirks.md[FC3S]: F:Magento 站点 quirks：刷缓存才生效/TinyMCE 富文本全屏陷阱/Page Builder 只能走 POST 保存/后台改动前台延迟等坑位 | R:code:src/tree_walker/skills/loader.py | A:- | S:-
+selectors.md[FC3T]: F:Magento 站点 selectors：sop 未覆盖元素的指纹补充说明 | R:code:src/tree_walker/skills/loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/add-phoebe-brown-color-option/===
+_sop.md[FC2T]: F:任务卡 SOP：为 Phoebe Zipper Sweatshirt 指定尺码新增 brown 颜色配置（Magento 可配置产品变体步骤） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：slug/task_description/task_keywords（task_matcher 检索输入） | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：该任务特定坑位（颜色配置流程注意事项） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：该任务关键元素定位补充 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/add-simple-product/===
+_sop.md[FC2T]: F:任务卡 SOP：新增 Simple Product（Energy-Bulk Women Shirt）——菜单路径/表单字段/保存链；#195 修复后含属性集映射教法 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：add-simple-product 的 slug/描述/关键词（模板匹配输入） | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：新建产品流程坑位（含 #192 改后的 values 多选教法） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：新建产品表单关键元素定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/antonia-racer-tank-negatives/===
+_sop.md[FC2T]: F:任务卡 SOP：找客户对 Antonia Racer Tank 的负面评价要点（Reviews 筛选→逐条读全文→总结） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：antonia-racer-tank-negatives 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：评论筛选/读取流程坑位（含 Author vs Nickname 口径） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：评论列表/详情页关键元素定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/antonia-racer-tank-positives/===
+_sop.md[FC2T]: F:任务卡 SOP：查客户喜欢 Antonia Racer Tank 的原因（正面评价要点，Reviews 筛选→Edit Review 读 textarea#detail 全文→总结） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：antonia-racer-tank-positives 的 slug/描述（正面评价理由）与关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：列表页评论截断需进 Edit 读全文/筛选状态保 URL 返回不丢/该产品 3 条评论含负面标题但需通读提正面点 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：元素定位速查表（本卡多数元素已在 sop 就地描述） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/approve-positive-reviews/===
+_sop.md[FC2S]: F:任务卡 SOP：批准 Pending 正面评价（负面如 Bad!/won't recommand 不批）；#193/#195 修复后含判分口径（positive 含 3★）与回放验收基准 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：approve-positive-reviews 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：grid filter select 数字值/URL base64 筛选段后按钮 id 每次变（用 aria-label 定位）/保存成功信号=页头 You saved the review | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：全部关键元素已在 sop 以 id/aria-label 就地描述，无需指纹表 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/bestsellers-report-custom-range/===
+_sop.md[FC2S]: F:任务卡 SOP：创建自定义日期区间 Bestsellers 报表（日期输入/Show Report 提交/读结果）；#193 修复后含报表取数与列头绑定教法 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：bestsellers-report-custom-range 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：日期框直接 input_text 填 M/D/YY（勿点日历弹层）/Show Report 是整页跳转需等重读/无记录提示=日期未生效 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：sales_report_from/to 与 filter_form_submit 已用 id 唯一描述 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/cancel-order-302/===
+_sop.md[FC2T]: F:任务卡 SOP：取消订单 302（筛 increment_id→详情页 Cancel→确认弹窗 OK） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：cancel-order-302 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：筛短号 302 即命中（页面显示补零格式）/筛选面板 Cancel 是关闭面板非取消订单/模态确认必须点 OK | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：元素定位速查表（关键元素已在 sop 描述） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/change-404-page-title/===
+_sop.md[FC2T]: F:任务卡 SOP：修改 404 Not Found 页面标题（CMS 页面列表→Edit→改 title→Save） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：change-404-page-title 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：Action 列 Edit 需先点 Select 展开/编辑页表单字段异步渲染需等/标题框 id 随机用 name=title 定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：元素已用 tag+id/name/文本唯一描述，无需指纹表 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/count-pending-reviews/===
+_sop.md[FC2T]: F:任务卡 SOP：统计 Pending 状态评价数量（状态筛选→读 records found） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：count-pending-reviews 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：计数以 records found 为准（多页也是全量）/筛选后按 id 重新找元素/先 Reset Filter 防旧筛选污染 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：元素均有唯一 id/name，无需指纹表 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/count-total-reviews/===
+_sop.md[FC2T]: F:任务卡 SOP：统计全店评论总数（读工具栏 N records found，勿数表格行） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：count-total-reviews 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：总数读 records found（每页 20 行共 4 页勿翻页累加）/过滤残留先 Reset Filter | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：菜单与计数文本已就地描述，无额外指纹 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/create-spring-sale-price-rule/===
+_sop.md[FC2S]: F:任务卡 SOP：创建 spring sale 全站 20% 折扣 Cart Price Rule；#195 修复后含 Apply 语义映射表与多选 values 教法、cart_fixed 值域注记 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：create-spring-sale-price-rule 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：表单 id 随机必须用 name 定位/customer_group_ids 多选用 values=[...] 一次设全（#192 新教法）/Actions 区块需点开才渲染字段 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：关键字段 name 清单；强调 id 随机勿依赖，必须 name 定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/delete-pending-negative-circe-reviews/===
+_sop.md[FC2T]: F:任务卡 SOP：删除 Circe fleece 全部 Pending 负面评论（筛 Pending+名称→逐条 Edit→Delete→确认 OK） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：delete-pending-negative-circe-reviews 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：Delete 弹 aside 确认框必须点 OK（不点不生效）/删除整页跳转看 The review has been deleted/筛前先 Reset Filter 防残留 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：筛选项/Search/Reset/Edit/Delete 等已在 sop 以 id/aria-label 描述 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/disable-teton-pullover-hoodie/===
+_sop.md[FC2T]: F:任务卡 SOP：下架 Teton Pullover Hoodie（可配置产品禁用父产品即整体下架） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：disable-teton-pullover-hoodie 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：Enable Product 复选框取消勾选才是 Disabled（语义反直觉）/只改父产品勿逐变体/搜索前 Clear all 防旧过滤 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：元素定位速查表（关键元素已在 sop 描述） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/dissatisfied-circe-fleece-reviewers/===
+_sop.md[FC2S]: F:任务卡 SOP：查找对 Circe fleece 不满的客户；#195 修复后含 Author 字段优先取人名教法（Guest 回退 Nickname+大小写规范） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：dissatisfied-circe-fleece-reviewers 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：grid 控件 id 每次刷新变用 aria-label/正文截断需进详情页读/过滤状态保 URL 返回不丢 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：全部关键元素已在 sop 以 id/aria-label 就地描述 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/edit-order-299-address/===
+_sop.md[FC2T]: F:任务卡 SOP：修改订单 299 收货地址（Billing/Shipping 两条独立记录需分别编辑保存） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：edit-order-299-address 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：两个地址各独立 Edit 入口只改一个另一条仍旧/改地址不重算金额属正常/299 短号即可命中 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：元素定位速查表（关键元素已在 sop 描述） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/find-customer-by-phone/===
+_sop.md[FC2T]: F:任务卡 SOP：按电话号码查客户姓名与邮箱（billing_telephone 过滤→读结果行） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：find-customer-by-phone 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：过滤框 id 随机用 name=billing_telephone 定位/电话需去 +1 前缀输 10 位纯数字否则空结果/Apply Filters 整页刷新 index 全失效 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：过滤输入框用 name 定位等已在 sop/quirks 描述，速查表补充 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/find-products-by-quantity-name/===
+_sop.md[FC2T]: F:任务卡 SOP：查库存为 0 的产品名（产品列表 Quantity 筛选→读 Name 列） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：find-products-by-quantity-name 的 slug/描述（0 库存产品名）/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：库存筛选与结果读取流程坑位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：产品列表筛选与结果列定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/find-products-by-quantity-sku/===
+_sop.md[FC2T]: F:任务卡 SOP：按库存数量查产品 SKU（同族变体：读 SKU 列而非 Name） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：find-products-by-quantity-sku 的 slug/描述（10 库存 SKU）/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：库存筛选流程坑位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：SKU 列与筛选控件定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/invoice-grand-total-lookup/===
+_sop.md[FC2T]: F:任务卡 SOP：查发票 Grand Total（Sales→Invoices 筛单号→读 Grand Total 列） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：invoice-grand-total-lookup 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：发票列表筛选与读数坑位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：发票筛选项与 Grand Total 列定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/latest-cancelled-order-customer/===
+_sop.md[FC2T]: F:任务卡 SOP：查最近取消订单的客户名（状态筛 Cancelled+按时间排序→读 Bill-to Name） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：latest-cancelled-order-customer 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：排序/筛选与客户名读取坑位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：订单网格筛选/排序/客户列定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/lookup-completed-orders/===
+_sop.md[FC2T]: F:任务卡 SOP：查 Completed 状态订单列表（状态筛选→读单号/客户） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：lookup-completed-orders 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：订单状态筛选流程坑位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：订单网格筛选项定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/lookup-suspected-fraud-orders/===
+_sop.md[FC2T]: F:任务卡 SOP：查 Suspected Fraud 状态订单（状态筛选择特定值→读结果） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：lookup-suspected-fraud-orders 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：欺诈状态筛选流程坑位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：状态筛选项定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/mark-hollister-shirts-on-sale/===
+_sop.md[FC2T]: F:任务卡 SOP：将所有 Hollister 衬衫标为 On Sale（产品筛品牌→逐个勾 Sale 属性→保存） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：mark-hollister-shirts-on-sale 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：批量勾选/多行保存流程坑位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：品牌筛选/Sale 勾选框定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/monthly-orders-may-dec-2022/===
+_sop.md[FC2S]: F:任务卡 SOP：查 2022 年 5-12 月每月 Complete 订单数（MM:COUNT）；#195 修复后步 4 含 Orders 列真值 8/13/9/8/10/4/5/10（加和 67）与列头绑定校验教法 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：monthly-orders-may-dec-2022 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：读第 2 列 Orders 勿取相邻 Sales Items/读后与 Total 行校验（#195 新增） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：报表筛选与结果列定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/oldest-complete-order-billing-name/===
+_sop.md[FC2T]: F:任务卡 SOP：查最早 Complete 订单的账单名（状态筛+时间排序→读 Bill-to Name） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：oldest-complete-order-billing-name 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：排序方向与最早记录判定坑位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：订单网格排序/账单名列定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/orders-report-custom-range/===
+_sop.md[FC2T]: F:任务卡 SOP：生成自定义日期范围订单报表（Reports→Orders 设 from/to→Show Report） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：orders-report-custom-range 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：报表日期输入与提交坑位（同类 bestsellers 卡） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：报表表单控件定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/preview-blank-theme/===
+_sop.md[FC2T]: F:任务卡 SOP：预览 Magento Blank 主题（Content→Design→Configuration 切主题→预览） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：preview-blank-theme 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：主题切换与预览流程坑位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：主题选择与预览控件定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/reduce-product-price/===
+_sop.md[FC2T]: F:任务卡 SOP：绿色 Hollister sweater 全尺寸降价 $5（筛产品→逐变体改 price→保存） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：reduce-product-price 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：可配置产品变体价格修改流程坑位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：变体价格输入框与保存按钮定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/refund-report-q1/===
+_sop.md[FC2T]: F:任务卡 SOP：生成 Q1 退款报表（Reports→Refunds 设日期区间→Show Report→读合计）；含 #193 修复的合计行校验教法 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：refund-report-q1 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：报表日期/合计行坑位（含 #193 新增的非可加列跳过与容差规则） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：退款报表表单控件定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/sales-order-report-last-month/===
+_sop.md[FC2T]: F:任务卡 SOP：生成上月销售订单报表（日期=今天往前推一个月区间） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：sales-order-report-last-month 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：上月区间推导与报表流程坑位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：报表表单控件定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/ship-order-tracking-number/===
+_sop.md[FC2T]: F:任务卡 SOP：为订单 299 添加 FedEx 跟踪号（详情→Ship→填 tracking number→Submit Shipment）；含 #193 表格取数与校验教法 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：ship-order-tracking-number 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：Shipment 创建/数量勾选/跟踪号保存坑位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：Ship 入口/数量框/Submit 定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/taurus-shell-out-of-stock/===
+_sop.md[FC2T]: F:任务卡 SOP：将 Taurus Elements Shell 全部设为 Out of Stock（筛产品→改 qty+Stock Status→保存） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：taurus-shell-out-of-stock 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：Stock Status 需同步检查/翻转（#195 教法：补货=改 qty 并检查状态） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：qty 输入与 Stock Status 定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/top-3-bestsellers-jan-2023/===
+_sop.md[FC2T]: F:任务卡 SOP：查 2023 年 1 月 top-3 畅销品（Bestsellers 报表设月区间→读前三行）；含品牌首词提取法 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：top-3-bestsellers-jan-2023 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：报表行序/多页与件数口径坑位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：报表控件与结果行定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/top-bestseller-2022/===
+_sop.md[FC2T]: F:任务卡 SOP：查 2022 年销量第一商品（Bestsellers 年区间→读首行） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：top-bestseller-2022 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：年区间设置与首行判读坑位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：报表控件定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/top-bestseller-q1-2022/===
+_sop.md[FC2T]: F:任务卡 SOP：查 2022 Q1 热卖品牌（Bestsellers Q1 区间→读首行提品牌）；品牌=产品名首词口径 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：top-bestseller-q1-2022 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：品牌提取与报表口径坑位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：报表控件定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/top-cancellations-customer/===
+_sop.md[FC2T]: F:任务卡 SOP：查历史取消订单最多的客户（状态筛 Cancelled→按客户聚合计数→取最大）；含 #193 分组计数教法 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：top-cancellations-customer 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：聚合计数与并列第一坑位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：状态筛选与客户列定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/top-completed-orders-customer/===
+_sop.md[FC2T]: F:任务卡 SOP：查历史完成订单最多的客户（状态筛+客户聚合计数）；含 #193 分组计数教法 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：top-completed-orders-customer 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：聚合计数与多页统计坑位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：状态筛选与客户列定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/top-search-term/===
+_sop.md[FC2T]: F:任务卡 SOP：查店内第一搜索词（Marketing→Search Terms→读首行） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：top-search-term 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：搜索词列表行序/条数口径坑位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：Search Terms 页面元素定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/top-search-terms-brands/===
+_sop.md[FC2T]: F:任务卡 SOP：分析 Top Search Terms 中出现最频繁的品牌（读列表→提品牌→计数聚合） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：top-search-terms-brands 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：品牌提取与多页阅读坑位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：Search Terms 列表定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/total-items-last-2-orders/===
+_sop.md[FC2T]: F:任务卡 SOP：统计最近 2 笔订单售出总件数（订单详情 Items Ordered 数量求和） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：total-items-last-2-orders 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：订单内多行数量求和与详情页阅读坑位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：订单详情 Items 表定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/total-last-2-completed-orders/===
+_sop.md[FC2T]: F:任务卡 SOP：获取最近 2 笔已完成订单支付总额（状态筛+时间排序→Grand Total 求和）；含 #193 合计校验教法 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：total-last-2-completed-orders 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：金额列读取与求和口径坑位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：Grand Total 列与筛选定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/update-antonia-description-reviews/===
+_sop.md[FC2T]: F:任务卡 SOP：把 Antonia Racer Tank 描述更新为引用真实正面评论（读评论→摘引→Description 编辑保存）；含 #195 引用类逐字引用教法 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：update-antonia-description-reviews 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：Description 是 Page Builder（UI 写入不可靠）只能走 POST 保存接口路径/TinyMCE 全屏陷阱 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：描述编辑区与保存接口定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/update-product-stock/===
+_sop.md[FC2T]: F:任务卡 SOP：收货到货更新库存（逐尺码简单商品改 qty）；#195 修复后含 Stock Status 同步检查/翻转教法（补货≠只改数量） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：update-product-stock 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：原 qty=0（Out of Stock）只改 qty 不翻状态即 done 是 #768 型错误（#195 教法） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：qty 输入/Stock Status/保存定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/localhost_7780/tasks/worst-review-customer-email/===
+_sop.md[FC2T]: F:任务卡 SOP：找对 Circe fleece 最不满客户的邮箱（筛产品评论→读差评详情→取 Email 字段） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+_task.json[FC2T]: F:任务卡元数据：worst-review-customer-email 的 slug/描述/关键词 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+quirks.md[FC2T]: F:任务级 quirks：差评判定与 Email 字段读取坑位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+selectors.md[FC2T]: F:任务级 selectors：评论详情 Email 字段定位 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/domain-skills/member.bilibili.com/===
+_sop.md[FC3S]: F:B 站创作中心投稿 SOP：视频上传与存草稿分步流程（进入创作中心→传视频→填标题/标签/分区→存草稿/发布） | R:code:src/tree_walker/skills/loader.py | A:- | S:-
+quirks.md[FC3S]: F:B 站站点 quirks：多 file input 陷阱（accept 区分主视频/字幕/附件，误传字幕通道）/标签提交方式/创作声明自定义下拉等坑位 | R:code:src/tree_walker/skills/loader.py | A:- | S:-
+selectors.md[FC3S]: F:B 站 selectors：上传 input（accept 区分）/标题框（placeholder）等关键元素定位表 | R:code:src/tree_walker/skills/loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/examples/===
+basic_agent.py[EB2T]: F:入门示例：Agent+LLMClient+BrowserSession 三件套跑一个搜索任务并打印 final_result | R:code:src/tree_walker/__init__.py | A:- | S:-
+csv_rerun.py[EB2S]: F:P4 子任务 2 CLI 示例：CSV 批量重放（列头=变量名逐行 batch_rerun）；默认连 Chrome 9223 | R:code:src/tree_walker/agent/rerun.py | A:- | S:-
+debug_192_async_revert_probe.py[XB3S]: F:issue #192 验收探针：异步重导航后多选状态回退验证（values 持久性） | R:code:src/tree_walker/browser/session.py | A:- | S:-
+debug_192_persist_check.py[XB3S]: F:issue #192 验收探针：多选 values 保存后持久化检查（DB 级回读） | R:code:src/tree_walker/browser/session.py | A:- | S:-
+debug_192_request_submit.py[XB3S]: F:issue #192 验收探针：requestSubmit 提交链验证（699 环境保存链探针） | R:- | A:- | S:-
+debug_192_save_click_effect.py[XB3S]: F:issue #192 验收探针：Save 点击后选中集效果检测（值级判定） | R:- | A:- | S:-
+debug_192_screenshot.py[XB3S]: F:issue #192 验收探针：保存后页面截图取证 | R:- | A:- | S:-
+debug_192_select_multiple.py[XB3M]: F:issue #192 真机验收探针：select multiple values 一次设全 + 替换语义修复验证（699 Cart Price Rule 场景） | R:code:src/tree_walker/browser/session.py | A:- | S:-
+debug_194_rate_limit_inject.py[XB3M]: F:issue #194 真机验收探针：限流注入回放——验证有效步数消耗与无限流时一致（infra 步不烧步数） | R:code:src/tree_walker/llm/client.py | A:- | S:-
+debug_198_attribute_set_click.py[XB3L]: F:issue #198 关联探针：New Product 页属性集控件「首击点错」结构取证（关闭态可点节点集实测） | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+debug_bilibili_tag.py[XB3S]: F:诊断探针：B 站创作中心标签输入交互（issue 输入链验证） | R:- | A:- | S:-
+debug_bilibili_tag_interact.py[XB3M]: F:B 站标签输入修复验证探针：修复后 type_text 能否成功创建标签（框架事件副作用链） | R:code:src/tree_walker/browser/session.py | A:- | S:-
+debug_bilibili_title_clear.py[XB3M]: F:B 站标题清空失效验证探针：四清空策略对比（CDP 按键被 keydown 拦截 vs JS setter） | R:code:src/tree_walker/browser/session.py | A:- | S:-
+debug_c2_eval_failure_shapes.py[XB3S]: F:C 轮 evaluate 编译失败分类诊断脚本（#185 重开证据）：WARNING 失败行×回显全量抽取+字符串感知定界符平衡分类；classify 函数被复用为生产 _delimiter_scan 底座 | R:code:src/tree_walker/browser/session.py | A:- | S:-
+debug_c2_exc_position_shape.py[XB3S]: F:C 轮 exceptionDetails 形状探针：编译期 vs 运行期错误形态实证（#185 自愈匹配源修复依据） | R:code:src/tree_walker/browser/session.py | A:- | S:-
+debug_ce_input.py[XB3S]: F:诊断探针：CE 输入框交互验证 | R:- | A:- | S:-
+debug_cover.py[XB3M]: F:诊断探针：抖音创作者中心封面选择区域 DOM 检测问题分析 | R:- | A:- | S:-
+debug_cover_area.py[XB3S]: F:诊断探针：封面上传 area_text 区域定位分析 | R:- | A:- | S:-
+debug_cover_auto.py[XB3S]: F:诊断探针：封面自动切换行为分析 | R:- | A:- | S:-
+debug_cover_click.py[XB3S]: F:诊断探针：封面区域点击行为分析 | R:- | A:- | S:-
+debug_cover_click_target.py[XB3S]: F:诊断探针：封面点击目标元素定位分析 | R:- | A:- | S:-
+debug_cover_clickpath.py[XB3S]: F:诊断探针：封面点击路径（事件链）分析 | R:- | A:- | S:-
+debug_cover_event.py[XB3S]: F:诊断探针：封面区域事件监听分析 | R:- | A:- | S:-
+debug_cover_input_container.py[XB3M]: F:#96 诊断探针：封面容器结构+setFileInputFiles 反应（「不支持的格式」根因取证，两枚之一） | R:- | A:- | S:-
+debug_cover_inputs.py[XB3S]: F:诊断探针：封面区域全部 file input 盘点 | R:- | A:- | S:-
+debug_cover_locate.py[XB3S]: F:诊断探针：封面元素定位策略分析 | R:- | A:- | S:-
+debug_cover_meta.py[XB3S]: F:诊断探针：封面 file_inputs_meta 元数据（Fix A）验证 | R:- | A:- | S:-
+debug_cover_rectfix.py[XB3S]: F:诊断探针：封面矩形坐标修复验证（rectfix） | R:- | A:- | S:-
+debug_cover_struct.py[XB3S]: F:诊断探针：封面上传区 DOM 结构盘点 | R:- | A:- | S:-
+debug_cover_switch.py[XB3S]: F:诊断探针：封面横竖版切换交互分析 | R:- | A:- | S:-
+debug_cover_switch_auto.py[XB3S]: F:诊断探针：封面自动切换模式验证 | R:- | A:- | S:-
+debug_cover_switch_click.py[XB3S]: F:诊断探针：封面切换点击行为验证 | R:- | A:- | S:-
+debug_cover_trigger.py[XB3T]: F:诊断探针：抖音 post 页「选择封面」触发器为何录制时 locate 失败 | R:- | A:- | S:-
+debug_cover_xpath.py[XB3S]: F:诊断探针：扩展 xpathFor vs CDP xpath 对比+findInteractiveAncestor 模拟，定位封面上传定位链断裂点 | R:- | A:- | S:-
+debug_custom_dropdown_classify.py[XB3M]: F:issue #160 假设验证探针：B 站等自定义下拉为何走不通 agent 的 select_dropdown（四判型全 miss 实证） | R:code:src/tree_walker/browser/session.py | A:- | S:-
+debug_custom_dropdown_local.py[XB3S]: F:issue #160 修复本地验证：fixture 复刻 3 种自定义下拉拓扑 headless 跑探针+断言兤底成功 | R:- | A:- | S:-
+debug_declaration_dropdown.py[XB3M]: F:诊断探针：B 站「自主声明」下拉是否被正确识别并能点击（自定义下拉 `<article>` 形态） | R:- | A:- | S:-
+debug_dedupe_upload.py[XB3T]: F:验证探针：新翻译管线 rules.apply_rules 不误吸收「打开编辑器」的 click（去噪回归） | R:code:src/tree_walker/recorder/rules.py | A:- | S:-
+debug_dump_flow.py[XB3T]: F:dump 工具：手工录制每步 url+动作名，看视频上传步页面跳转时序 | R:- | A:- | S:-
+debug_dump_uploads.py[XB3T]: F:dump 工具：对比两个录制文件的 upload_file 步骤指纹（class/accept/xpath） | R:- | A:- | S:-
+debug_find_elements_id_mismatch.py[XB3M]: F:诊断探针：find_elements(return_node_ids) 的 id 与 selector_map index 是否自洽（证伪「命名空间陷阱」假设） | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+debug_httpbin.py[XB3S]: F:诊断探针：httpbin 表单 submit button/p 在 selector_map 的可见性与 xpath/bounds 对不上问题 | R:- | A:- | S:-
+debug_httpbin_submit.py[XB3S]: F:诊断探针：httpbin submit button 的 findInteractiveAncestor 模拟+matches 检查 | R:- | A:- | S:-
+debug_input_context.py[XB3M]: F:探针 3：每个 file input 的 DOM 容器归属（横/竖封面标签层判定，upload 身份链证据） | R:code:src/tree_walker/agent/upload_identity.py | A:- | S:-
+debug_issue185_cdp_shape.py[XB3T]: F:issue #185 分析探针：CDP 编译期 SyntaxError 的 exceptionDetails 形状实证（text 恒 Uncaught/语义在 description） | R:code:src/tree_walker/browser/session.py | A:- | S:-
+debug_model_page_view.py[XB3S]: F:诊断探针：打印抖音封面页发给模型的最终页面结构（模型视角盲区取证） | R:- | A:- | S:-
+debug_patch_step8.py[XB3S]: F:一次性补丁：把 douyin_redesign2.json step8 误匹配 svg 指纹替换为真实封面指纹（录制调试辅助） | R:- | A:- | S:-
+debug_read_grid_totals.py[XB3S]: F:issue #193 真机探针（只读）：Orders 报表页 footer 捕获+totals-check 验证（合计校验链取证） | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+debug_recmark.py[XB3S]: F:诊断 D1：file input 打 data-tw-recmark 标记后 get_state selector_map 能否读到（录制标记链验证） | R:code:src/tree_walker/recorder/recorder.py | A:- | S:-
+debug_recorder_inputs.py[XB3S]: F:诊断探针：抖音上传页「作品描述」区域可输入元素盘点（录制覆盖面验证） | R:- | A:- | S:-
+debug_upload_btn.py[XB3M]: F:诊断探针：「上传」按钮点击到底怎么关联上 file input（按钮→input 关联链取证，333 行最全版） | R:- | A:- | S:-
+debug_upload_click.py[XB3M]: F:自动点击探针：程序化点「上传视频」按钮，三套 hook 看它怎么关联 file input（fileChooserOpened 验证） | R:- | A:- | S:-
+debug_upload_flow.py[XB3S]: F:issue #34 Bug 2 修复验证：新 upload_file 流程上传「设置竖封面」端到端 | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+debug_upload_probe.py[XB3S]: F:只读探针：当前上传界面的 file input 盘点+上传按钮形态（零副作用） | R:- | A:- | S:-
+dump_model_page_view.py[XB3T]: F:把当前页面发给模型的 DOM 树原样写入文件（无诊断，调试辅助） | R:- | A:- | S:-
+e2e_vision_channel.py[XB3M]: F:issue #175 阶段二真机验收：回流契约带图/随机底色答对+文本对照无法作答/截图落盘/门控零泄漏 | R:code:src/tree_walker/agent/step.py | A:- | S:-
+multi_act_demo.py[XB3M]: F:示例：multi_act 单步链式多动作（max_actions_per_step 演示） | R:code:src/tree_walker/agent/step.py | A:- | S:-
+p5_agent_records_select.py[XB3S]: F:P5 验证探针：agent 探索原生 select 页时自动产出 select_dropdown（而非 click） | R:code:src/tree_walker/agent/step.py | A:- | S:-
+p5_select_e2e_live.py[XB3S]: F:P5 live e2e：agent history 的 select_dropdown 经手工标注+变量替换 live 重放真选中替换项 | R:code:src/tree_walker/agent/rerun.py | A:- | S:-
+p5_select_manual_var_verify.py[XB3S]: F:P5 验证：select_dropdown.value 手工标注后变量合并+替换命中（位置替换语义） | R:code:src/tree_walker/agent/variable_detector.py | A:- | S:-
+p7_probe_agentpath.py[XB3S]: F:P7 终审探针：完整复刻 agent 输入路径+三个修复候选对照 | R:code:src/tree_walker/agent/step.py | A:- | S:-
+p7_probe_bestsellers_ui.py[XB3M]: F:P7 UI 探针（自包含，Chrome 9223）：bestsellers 报表筛选链路排查 | R:- | A:- | S:-
+p7_probe_datefield.py[XB3M]: F:P7 探针：报表日期字段值丢失定位——从落值到提交逐环追踪（日历部件清空值链） | R:- | A:- | S:-
+p7_probe_elclick.py[XB3T]: F:P7 微测试探针：el.click() 能否触发 Show Report（修复路径验证） | R:- | A:- | S:-
+p7_probe_grid_channels.py[XB3M]: F:P7 只读探针：验证 plan-tool-layer-grid-and-sorting 三条技术前提（mui/uiRegistry/legacy 通道；证伪 mui 可用） | R:code:src/tree_walker/browser/session.py | A:- | S:-
+p7_probe_registry_fields.py[XB3S]: F:P7 探针补丁：uiRegistry 组件枚举与字段面（grid_channels 的追加验证，uiRegistry 主通道实证） | R:- | A:- | S:-
+p7_probe_report_qty_column.py[XB3S]: F:P7 探针（只读）：报表 Order Quantity 列快照空值根因（issue #184 现象③，单字符过滤 bug） | R:- | A:- | S:-
+p7_probe_themes_grid.py[XB3M]: F:P7 探针（只读）：system_design_theme 网格「渲染 0 行」归因（task 374 墙取证） | R:- | A:- | S:-
+p7_probe_validator.py[XB3S]: F:P7 探针：jQuery validate errorList——哪个字段在拦提交（提交无反馈墙取证） | R:- | A:- | S:-
+p7_read_grid_selftest.py[XB3S]: F:P7 tool_layer 验收自测：read_grid+[Grid] 元信息在真实 Magento 跑通（行序/残留过滤/legacy 通道） | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+p7_replay_batch1_step3.py[XB3S]: F:P7 复刻探针：batch1_task1 Step 3 五动作序列原样重放（生产代码路径） | R:code:src/tree_walker/agent/rerun.py | A:- | S:-
+p7_rerun_vision_no_skill.py[XB3S]: F:P7 轨迹重跑：视觉开+skill 关版（issue #197 真机验收，#204 修复回放用） | R:code:src/tree_walker/agent/agent.py | A:- | S:-
+p7_rerun_webarena_task.py[XB3S]: F:P7 轨迹重跑：用 TreeWalker Agent 重跑单个 WebArena 任务（轨迹分析通用工具，#205 回放用） | R:code:src/tree_walker/agent/agent.py | A:- | S:-
+p7_rerun_with_task_skill.py[XB3T]: F:P7 轨迹重跑：任务级 skill 注入版（口径 C 冒烟） | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+p7_task_skill_match_regression.py[XB3M]: F:P7 任务级 skill 匹配离线回归（#182 S3 门槛）：泛化命中/真误命中双重指标 | R:code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+p7_verify_bestsellers_brand.py[XB3S]: F:P7 轨迹假设验证（DB 路径）：Task 1 bestsellers 品牌聚合（确定性无 LLM 无浏览器） | R:- | A:- | S:-
+record_user_actions.py[EB2S]: F:录制入口：启动后端 HTTP 服务（8765），接收扩展事件，落盘 rerun-history/history.json | R:code:src/tree_walker/recorder/server.py | A:- | S:-
+replay.py[EB2S]: F:示例：重放录制好的历史文件（只重放，不录制不变量） | R:code:src/tree_walker/agent/rerun.py | A:- | S:-
+replay_actionability_stage4.py[XB3S]: F:重放验证示例：actionability 阶段二/三+step_interval 语义清理（#127 阶段 4） | R:code:src/tree_walker/agent/rerun.py | A:- | S:-
+replay_full_timing.py[XB3S]: F:重放验证示例：全开时序/等待/actionability/networkidle 参数（#126 阶段 3；bug-evidence 对照组生成器） | R:code:src/tree_walker/agent/rerun.py | A:- | S:-
+serve_web.py[EB2T]: F:示例：启动 TreeWalker web 后端（独立于 tw-web CLI 的示例入口，端口 8766） | R:code:src/tree_walker/web/server.py | A:- | S:-
+smoke_pipeline_cdp.py[XB3S]: F:新录制管线 CDP 只读冒烟（不导航不切 flag 不落盘） | R:code:src/tree_walker/recorder/recorder.py | A:- | S:-
+smoke_vision_glm53.py[XB3S]: F:P0 冒烟（issue #175）：GLM-5.3-Flash 视觉接入前置验证（image block 直通/思考不挤占） | R:code:src/tree_walker/llm/client.py | A:- | S:-
+upload_file.py[EB2S]: F:示例：抖音创作者中心传视频存草稿（upload 动作链演示；工作区有未提交实验改动） | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+upload_file_bilibili.py[EB2S]: F:示例：B 站创作者中心传视频存草稿 | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+upload_file_vision.py[XB3S]: F:示例：抖音传视频存草稿——视觉开+skill 关（#197 回放口径） | R:code:src/tree_walker/agent/agent.py | A:- | S:-
+vision_mode.py[XB3S]: F:示例：视觉模式开+skill 注入关（use_vision 演示） | R:code:src/tree_walker/agent/agent.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/examples/custom-functions/===
+custom_action.py[XB2S]: F:自定义动作注册范式示例：@tools.registry.action 注册 count_words（内置 upload_file 已存在故用计数演示） | R:code:src/tree_walker/tools/registry.py | A:- | S:-
+parallel_agents.py[XB2S]: F:并发多 agent 示例（asyncio.gather）；含共享 Chrome 同端口互扰 caveat 与独立实例隔离说明 | R:code:src/tree_walker/agent/agent.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/examples/features/===
+_debug_selectors.py[XB3S]: F:调试工具：dump 当前页 select/option 元素+hash 冲突检测 | R:- | A:- | S:-
+csv_generation.py[EB2T]: F:示例：用 write_file 在工作区生成 CSV（agent file system 缺失的本地替代） | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+douyin_upload_rerun.py[EB2M]: F:示例：抖音创作者中心发视频+历史重放（录/重放全链演示） | R:code:src/tree_walker/agent/rerun.py | A:- | S:-
+download_file.py[EB2T]: F:示例：下载文件（track_downloads+done 附件回传，无 downloads_path 的本地形态） | R:code:src/tree_walker/browser/session.py | A:- | S:-
+extraction_small_model.py[EB2T]: F:示例：抽取专用小模型（AgentSettings extract_llm） | R:code:src/tree_walker/config.py | A:- | S:-
+fallback_model.py[EB2T]: F:示例：fallback 模型（LLMSettings fallback 配置，主模型限流自动回退） | R:code:src/tree_walker/llm/client.py | A:- | S:-
+multi_tab.py[EB2T]: F:示例：多标签（navigate new_tab/switch_tab/close_tab） | R:code:src/tree_walker/browser/session.py | A:- | S:-
+rerun_history.py[EB2S]: F:示例：录制 Agent 历史+换数据重放（save_history/detect_variables/load_and_rerun 全链） | R:code:src/tree_walker/agent/rerun.py | A:- | S:-
+save_as_pdf.py[EB2T]: F:示例：网页存 PDF（save_as_pdf 动作） | R:code:src/tree_walker/browser/session.py | A:- | S:-
+scrolling_page.py[EB2T]: F:示例：滚动长页面（scroll 动作） | R:code:src/tree_walker/browser/session.py | A:- | S:-
+sensitive_data.py[EB2S]: F:示例：敏感数据扁平形式（占位符替换/还原，日志不见真值） | R:code:src/tree_walker/llm/client.py | A:- | S:-
+structured_output.py[EB2S]: F:示例：结构化输出（output_model，done 切变体 B 返回可解析 JSON） | R:code:src/tree_walker/agent/agent.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/examples/file_system/===
+README.md[SG3T]: F:file_system 示例导读：本地文件读写/抽取落盘/Excel 构建三件套说明 | R:- | A:- | S:-
+alphabet_earnings.py[EB2S]: F:示例：extract 网页数据到本地文件（输出结构化 dataclass；工作区含产物 md 与 PDF） | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+excel_sheet.py[EB2S]: F:示例：从网页数据构建 CSV（写表头+行） | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+file_system.py[EB2S]: F:示例：本地文件读写往返（write_file/read_file/replace_file + 白名单） | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/examples/file_system/alphabet_earnings_workspace/===
+alphabet_earnings.md[SG2T]: F:示例运行产物：Alphabet Q2 2025 财报三个数据点（alphabet_earnings.py 的 extract 输出） | R:- | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/examples/getting_started/===
+data_extraction.py[EB2T]: F:示例：数据抽取（output_model 结构化，任务驱动） | R:code:src/tree_walker/agent/agent.py | A:- | S:-
+fast_agent.py[EB2T]: F:示例：flash 快速模式（output_mode=flash+时延参数，仅保留可移植部分） | R:code:src/tree_walker/config.py | A:- | S:-
+form_filling-pingkai.py[EB2S]: F:示例：表单填写变体（pingkai 站点多字段+提交） | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+form_filling.py[EB2T]: F:示例：表单填写（httpbin 多字段链式 input_text+click 提交） | R:code:src/tree_walker/tools/actions.py | A:- | S:-
+multi_step_task.py[EB2T]: F:示例：多步任务（搜索→进结果→抽取→汇报） | R:code:src/tree_walker/agent/agent.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/examples/skill/===
+_check_host_match.py[XB3T]: F:临时验证：示例 URL 的 host 与 skill 目录匹配 | R:code:src/tree_walker/skills/loader.py | A:- | S:-
+_smoke_skill_injection.py[XB3S]: F:冒烟验证：skill 注入链路不依赖 Chrome/LLM/网络（离线链路验证） | R:code:src/tree_walker/skills/loader.py | A:- | S:-
+ab_test_bilibili.py[XB3S]: F:A/B 实测：无 skill vs 有 skill agent 在 B 站发视频（skill 注入收益验证） | R:code:src/tree_walker/skills/loader.py | A:- | S:-
+upload_bilibili_with_skill.py[XB3S]: F:示例：skill 加持 agent 在 B 站发视频并录成可重放历史 | R:code:src/tree_walker/skills/loader.py | A:- | S:-
+upload_douyin_with_skill.py[XB3S]: F:示例：skill 加持 agent 在抖音发视频存草稿并录成可重放历史 | R:code:src/tree_walker/skills/loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/examples/use-cases/===
+phone_price_comparison.py[EB2S]: F:示例：跨站结构化价格对比（output_model+CDP） | R:code:src/tree_walker/agent/agent.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/recording_extension/===
+.gitignore[FV2T]: F:录制扩展忽略项：node_modules/ 等 WXT 构建产物 | R:- | A:- | S:-
+README.md[SG3T]: F:录制扩展说明：MV3/WXT 结构、加载方式、与后端 recorder 的对接 | R:code:src/tree_walker/recorder/recorder.py | A:- | S:-
+package-lock.json[FV3L]: F:npm 依赖锁定（WXT/React/TS 工具链，机器生成） | R:code:recording_extension/package.json | A:- | S:-
+package.json[FV3T]: F:扩展 npm 定义：WXT 楼架/React/TypeScript 脚本与依赖 | R:- | A:- | S:-
+tsconfig.json[FV2T]: F:TS 配置壳：仅 extends .wxt/tsconfig.json（WXT 生成的基础配置） | R:code:recording_extension/package.json | A:- | S:-
+wxt.config.ts[FV2T]: F:WXT 扩展配置：MV3 manifest（权限 activeTab/tabs/scripting/storage、host_permissions 8765、injected.js web_accessible）；不含 debugger——指纹归后端 CDP | R:code:recording_extension/package.json | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/recording_extension/capture/===
+action-recorder.ts[SB4L]: F:扩展动作采集器（10 类 DOM 事件）：借鉴 Browser-BC 针对回放适配；监听 click/input/change 等并带选择器线索发给 background | R:code:src/tree_walker/recorder/event_mapper.py | A:- | S:-
+navigation-recorder.ts[SB3T]: F:SPA 导航采集：MAIN-world hook pushState/replaceState 发 tw:nav | R:code:recording_extension/entrypoints/injected.ts | A:- | S:-
+selector.ts[SB3S]: F:元素线索生成：buildElementRef/bestSelector/xpathFor（移植自 Browser-BC，录制指纹来源） | R:code:src/tree_walker/recorder/locator.py | A:- | S:-
+side-effect-observer.ts[SB3S]: F:副作用观察器：检测动作引发的 DOM 变化（modal/dropdown 打开）作为后端 signal detection 输入（重设计新增） | R:code:src/tree_walker/recorder/translation.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/recording_extension/entrypoints/===
+background.ts[SB4S]: F:扩展录制中枢（service worker）：维护录制状态/转发事件到后端/广播状态给 content；与后端唯一通信入口 | R:code:recording_extension/shared/backend.ts | A:- | S:-
+content.ts[SB4S]: F:Content script：装配 action 采集器+副作用观察器，DOM 事件/信号归一化发 background；document_idle 无条件注入 injected.ts | R:code:recording_extension/entrypoints/background.ts | A:- | S:-
+injected.ts[SB3T]: F:MAIN-world 注入脚本：hook history.pushState/replaceState 派发 tw:nav CustomEvent + wrap addEventListener 打 data-tw-jsclick DOM 标记（跨 world 必须 DOM 属性） | R:code:recording_extension/capture/navigation-recorder.ts | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/recording_extension/entrypoints/popup/===
+Popup.tsx[SU3S]: F:扩展 popup UI：开始/停止录制按钮与状态显示 | R:- | A:- | S:-
+index.html[SU2T]: F:扩展 popup 宿主页面 | R:- | A:- | S:-
+main.tsx[SU2T]: F:popup React 挂载入口 | R:- | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/recording_extension/shared/===
+backend.ts[SB3S]: F:后端 HTTP 通信封装：background 是唯一与后端通信的入口（content 不直连），/event+/signal+/stop | R:code:src/tree_walker/recorder/server.py | A:- | S:-
+types.ts[SB3S]: F:扩展事件协议：对应后端 event_mapper.py 的类型定义（signal/event 契约两端） | R:code:src/tree_walker/recorder/event_mapper.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/scripts/===
+build_editor.ps1[OV2T]: F:Windows 构建脚本：npm install+build web_ui→拷 dist 到 web/static（产物 gitignore，clone 后跑一次） | R:code:src/tree_walker/web/server.py | A:- | S:-
+build_editor.sh[OV2T]: F:web 前端构建脚本（bash 版）：npm build web_ui→拷 dist 到 web/static 供 aiohttp 托管；Windows 用 ps1 版 | R:code:scripts/build_editor.ps1 | A:- | S:-
+review_summary.py[XQ3S]: F:open-code-review 固定摘要脚本（--issue/--all/--full 或直传 JSON）：range/status/逐条 finding+建议代码；缺 severity 键标 ? 告警；stdout 强制 UTF-8 防 GBK 乱码 | R:- | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/src/tree_walker/===
+__init__.py[CG4T]: F:包门面：SDK 级 API 导出——Agent/BrowserSession/LLMClient/Tools/Settings 族/load_settings（README 编程接口落点） | R:code:src/tree_walker/agent/agent.py,code:src/tree_walker/browser/session.py,code:src/tree_walker/llm/client.py | A:- | S:-
+action_shape.py[CW5M]: F:动作形态共享工具（#173/#176）：畸形动作（裸串/params 非 dict/name 无效）归一化与安全访问的唯一实现——actions_of/params_of/诚实失败 done（带外标记）/未注册动作丢弃；无依赖叶子模块 | R:code:src/tree_walker/llm/client.py,code:src/tree_walker/agent/step.py,code:src/tree_walker/agent/rerun.py | A:- | S:_HonestDone 是 dict 子类按 isinstance 判定——不进动作数据载荷，LLM 无法借 _honest_failure key 绕过校验
+cli.py[EU4S]: F:CLI 入口 tw-tui/tw-web：TUI 强制开 observability；--rerun 历史重放+--var 变量；web 命令默认 CDP 9223（web/重放路径约定，TUI 走 9222） | R:code:src/tree_walker/config.py,code:src/tree_walker/tui/app.py,code:src/tree_walker/web/server.py | A:- | S:-
+config.py[FC6L]: F:全量配置 dataclass 族（Agent/LLM/Fallback/Judge/Browser/Highlight/TUI/Truncation/Compaction/Settings）+ load_settings env 绑定 | R:code:pyproject.toml | A:- | S:全部是 dataclass 非 pydantic——运行时改配置用 dataclasses.replace，model_copy 会炸（#194 教训）；部分字段无 env 绑定，新增键须核对消费点
+
+===D:/dev/git/z_jordon/TreeWalker/src/tree_walker/agent/===
+__init__.py[CG3T]: F:agent 门面：Agent/ActionLoopDetector/views 数据模型 re-export | R:code:src/tree_walker/agent/agent.py | A:- | S:-
+actionability.py[DR5S]: F:动作可用性单一事实源（探索与重放共用）：is_actionable（visible+enabled+L1/L2 静态遮挡）、file input 防御短路、index-based 轮询等待与 rect 稳定；超时/漂移降级放行不引入新失败 | R:code:src/tree_walker/agent/step.py,code:src/tree_walker/agent/rerun.py | A:- | S:-
+agent.py[AW7L]: F:Agent 顶层编排（StepPipeline+RerunMixin）：run 主循环三退出路径、stop/pause/resume 协作控制、SIGINT 渐进、敏感数据与 skill 注入构建、Judge/Compactor/Plan/Obs 可选装配、finalize_session 收尾 | R:code:src/tree_walker/agent/step.py,code:src/tree_walker/agent/rerun.py,code:src/tree_walker/agent/views.py | A:- | S:-
+judge.py[AA5M]: F:独立 LLM 复核器：审轨迹判真成功（不信任自报），tool_use 强制 schema 出 verdict/impossible_task/captcha；轨迹保尾截断对齐 Step 边界；空响应 nudge 重试；同步 create 经 to_thread 防卡死（#163） | R:code:src/tree_walker/agent/agent.py | A:- | S:-
+log_formatter.py[XO3S]: F:步日志格式化纯函数：动作参数截断+着色、log_response 四行结构块（Eval/Memory/Goal/Action）、步完成红绿标 | R:code:src/tree_walker/agent/step.py | A:- | S:-
+loop_detector.py[DR5M]: F:软循环检测（对齐 browser-use 两维）：动作语义归一化哈希（适配 24 动作词表）滑窗 20 计重复+三维页面指纹（url+元素数+文本哈希）计停滞；只产 nudge 注入上下文不阻断 | R:code:src/tree_walker/agent/step.py | A:- | S:-
+message_compactor.py[DA4S]: F:LLM 消息压缩器：双门控（步数间隔+字符量）触发，[首条,摘要,尾部N] 就地替换；压缩输入丢图留文（图只活在 keep_last 原文里） | R:code:src/tree_walker/llm/client.py | A:- | S:-
+plan_manager.py[DW4T]: F:无状态计划服务：渲染 [x]/[>]/[ ] 文本；两互斥更新（plan_update 整体替换/current_plan_item 推进回填 done）；replan/exploration 两 nudge | R:code:src/tree_walker/agent/views.py | A:- | S:-
+rerun.py[DW6L]: F:RerunMixin 重放执行器：load_and_rerun/batch_rerun、五级元素匹配、upload 语义线索精筛、变量替换、actionability 等待（hist_elem 定位）、重试与菜单 opener 重执行、AI 摘要 | R:code:src/tree_walker/agent/agent.py,code:src/tree_walker/agent/actionability.py,code:src/tree_walker/agent/upload_identity.py | A:- | S:-
+step.py[AW7L]: F:StepPipeline 五阶段单步管线（Sense-Think-Act-后处理-终结化）：上下文准备与状态消息/预算警告/force_done、LLM 决策与参数校验重试、动作执行+元素投影、失败计数、错误三分支；finalize 恒在 finally | R:code:src/tree_walker/agent/agent.py,code:src/tree_walker/action_shape.py | A:- | S:-
+upload_identity.py[DB5M]: F:upload file input 站点无关身份单一真相源（#139/#151）：单次 execute_js 扫全部 input[type=file] 算身份（label/aria/region/dialog/affordance/container_rect），重放精筛与 agent 端采集共用 | R:code:src/tree_walker/agent/rerun.py | A:- | S:隐藏 input 自身 rect 恒 {0,0,0,0}——位置信号靠 container_rect（最近非零祖先），否则重放 rect 就近退化 candidates[0] 无法区分横/竖封面槽
+variable_detector.py[DD4S]: F:变量检测纯规则（无 LLM）：识别 text/query 字段可替换值——元素属性策略（type 映射+id/name/placeholder/aria-label）优先、值模式正则兜底；manual 绑定覆盖自动检测 | R:code:src/tree_walker/agent/rerun.py | A:- | S:-
+views.py[CW6L]: F:agent 数据模型：ActionResult（success 仅 done 可设）、AgentState、AgentHistory(List) 查询、PlanItem/AgentBrain/DownloadInfo/StepMetadata/DetectedVariable + 老格式加载 | R:code:src/tree_walker/agent/step.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/src/tree_walker/browser/===
+__init__.py[CI3T]: F:browser 门面：BrowserSession+自有聚合类型；DOM 快照类型 re-export 自公共库 dom-snapshot（迁移期 shim，新代码直接 import dom_snapshot） | R:code:src/tree_walker/browser/session.py | A:- | S:-
+circuit_breaker.py[RR4T]: F:DOM 管线 CDP 熔断器：closed→open（连败 3 次）→half_open（30s 探针）三态；is_open 自动迁移；reset 供重连强复 | R:code:src/tree_walker/browser/session.py | A:- | S:-
+highlight.py[IU3S]: F:视觉高亮管理：CDP Overlay 元素高亮（定时隐藏）、click 坐标扩散环 JS 动画、调试索引标签注入、清理；全部失败仅 debug 日志 | R:code:src/tree_walker/browser/session.py | A:- | S:-
+html_source.py[IN3S]: F:CDP DOM 树→干净 HTML 纯函数重建（extract markdown 路径）：递归 children/shadowRoots/contentDocument、剥噪声标签、门控 a href/img src；跨源 iframe 不可达 | R:code:src/tree_walker/browser/session.py | A:- | S:-
+image_utils.py[IU3T]: F:截图缩放：Pillow 可选依赖缺失时全 no-op 返原字节；fit-within 保纵横 LANCZOS→PNG；<100px 拒绝；异常返原图不抛 | R:code:src/tree_walker/browser/session.py | A:- | S:-
+network_idle.py[IN4S]: F:CDP Network inflight 追踪（networkidle 等待）：4 回调维护在飞集合；WebSocket/EventSource 按 responseReceived.type 剔出 idle 判定；线程安全锁；降级=立即 idle | R:code:src/tree_walker/browser/session.py | A:- | S:-
+session.py[IN7L]: F:BrowserSession：CDP 会话核心——连接/target 发现、get_state 采集（缓存+断路器+grid 元信息）、click 多级降级、type_text+框架事件、原生/ARIA/自定义三型 select、截图/screencast、下载与 dialog 追踪 | R:code:src/tree_walker/browser/views.py,code:src/tree_walker/browser/circuit_breaker.py,code:src/tree_walker/browser/network_idle.py | A:- | S:-
+url_utils.py[CN3T]: F:URL 纯函数：extract_host（schemeless 补 // 重解析、垃圾拒否）；extract_host_with_port——domain-skills 目录键（带端口 host_port，本机不同服务各挂 skill） | R:code:src/tree_walker/skills/loader.py | A:- | S:-
+views.py[CI4S]: F:browser 聚合类型：TabInfo/BrowserEvent（首期仅 dialog——单回调机制不能与 download 双注册）/BrowserStateSummary（含 grid_meta+recent_events）；重放侧 MatchLevel/DOMInteractedElement | R:code:src/tree_walker/browser/session.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/src/tree_walker/llm/===
+__init__.py[CA3T]: F:llm 门面：LLMClient re-export | R:code:src/tree_walker/llm/client.py | A:- | S:-
+client.py[IA7L]: F:Anthropic SDK 封装：get_action 决策（URL 压缩/敏感过滤/解析降级链/infra 退避/单向 fallback）、extract 结构化、structured_call；视觉 image blocks 直通（#175） | R:code:src/tree_walker/config.py,code:src/tree_walker/action_shape.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/src/tree_walker/observability/===
+__init__.py[CO3T]: F:observability 门面：EventBus/事件模型族/JsonlRecorder/MetricsAggregator/AnomalyDetector/SessionEvaluator/决策 prompt re-export | R:code:src/tree_walker/observability/event_bus.py | A:- | S:-
+anomaly_detector.py[RO3T]: F:异常检测规则引擎（订阅事件）：连败 3 次工具错误/步数达 90% 上限/连续 2 次空响应→发 AnomalyEvent | R:code:src/tree_walker/observability/events.py,code:src/tree_walker/observability/event_bus.py | A:- | S:-
+decision_prompt.py[SO2T]: F:决策归因 prompt 片段：evaluation_previous_goal 按 目标/候选/选择/原因/预期 五行格式输出 | R:- | A:- | S:-
+event_bus.py[MO4S]: F:进程内同步事件总线：具名+通配订阅；emit 按订阅隔离（订阅者异常不穿透杀 run）+连败 3 次熔断该投递路径；close 回调隔离+熔断汇总显形 | R:code:src/tree_walker/observability/events.py | A:- | S:-
+events.py[CM4T]: F:结构化事件模型族：Step/ModelCall/ModelResult/ToolCall（含元素几何归一化 bbox）/ToolResult/StepEnd/Anomaly/SessionEnd/SkillActive（站点级与任务级 skill 分开标） | R:code:src/tree_walker/observability/event_bus.py | A:- | S:-
+jsonl_recorder.py[PO3T]: F:JSONL 落盘：订阅全部事件逐行写 logs/agent_{session_id}.jsonl 每行 flush；close 经 bus.on_close 注册 | R:code:src/tree_walker/observability/event_bus.py | A:- | S:-
+metrics.py[RO3T]: F:运行指标聚合器：工具调用/错误计数、token 累计、步时长序列、按严重度异常计数；get_summary 供终评 | R:code:src/tree_walker/observability/session_evaluator.py | A:- | S:-
+session_evaluator.py[AO3T]: F:会话启发式终评：has_done/无 high 异常/错误率≤30%/均步长≤30s 四检查→PASSED/FAILED+failed_checks | R:code:src/tree_walker/observability/metrics.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/src/tree_walker/prompts/===
+__init__.py[CA3T]: F:prompts 门面：build_system_prompt/build_state_message re-export | R:code:src/tree_walker/prompts/system_prompt.py | A:- | S:-
+rerun_summary.py[DA3T]: F:重放 AI 摘要 prompt（无截图版）：task+执行统计+文字证据→JSON 判 success/completion_status | R:code:src/tree_walker/agent/rerun.py | A:- | S:-
+system_prompt.py[DA6M]: F:system prompt 与状态消息构建：build_system_prompt（动作清单/敏感数据/技能/计划模式注入）；build_state_message 分段 user 消息（Task/Goal/Results/Plan/URL/Tabs/DOM/Downloads/Notice） | R:code:src/tree_walker/agent/step.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/src/tree_walker/recorder/===
+__init__.py[CU3T]: F:recorder 门面：录制管线组件 re-export（map_event/translate/apply_rules/flatten/locator/模型）——事件→翻译→实时定位指纹→去噪→flatten | R:code:src/tree_walker/recorder/recorder.py | A:- | S:-
+event_mapper.py[DU4T]: F:Stage1 纯映射：扩展事件→action 1:1（click/input/select/scroll clamp/navigate/go_back/tab 两态/send_keys/upload 带 accept 签名）；无意图判断无去噪 | R:code:src/tree_walker/recorder/recorder.py | A:- | S:-
+flatten.py[DU3T]: F:Stage3 后纯 reshape：Recording→AgentHistoryList（step 重排、interacted_element 原样带过、user_pause_seconds=相邻动作时间差）；不再二次定位（modal 已关 locate 必失败） | R:code:src/tree_walker/recorder/models.py,code:src/tree_walker/recorder/recorder.py | A:- | S:-
+locator.py[DU4M]: F:录制元素定位：locate_by_xpath（XPATH 级）/locate_by_ref（ATTRIBUTE 级兜底：tag/id/name/ariaLabel+rect 就近）+xpath 归一化；事件到达时实时定位填 index | R:code:src/tree_walker/recorder/recorder.py | A:- | S:-
+models.py[CU3S]: F:录制内部模型：SignalKind 五种/Signal 副作用附到触发动作/ElementRef 线索/ActionRecord/Recording/RecordingState——去噪在带 signal 的 ActionRecord 列表上做 | R:code:src/tree_walker/recorder/flatten.py | A:- | S:-
+recorder.py[DU5L]: F:Recorder 录制后端状态机：handle_event 实时定位+指纹投影（modal DOM 活着时算）、signal 关联、start/stop 生命周期、upload 线索存储、落盘 rerun-history | R:code:src/tree_walker/recorder/translation.py,code:src/tree_walker/recorder/locator.py,code:src/tree_walker/recorder/rules.py | A:- | S:-
+rules.py[DU4M]: F:Stage3 意图感知去噪规则（整表变换串接）：导航信号关联（<5s 副作用跳转丢弃+附 NAVIGATION）、upload 前置 fakepath 吸收（10s 窗）、短时重复 click 折叠（0.5s） | R:code:src/tree_walker/recorder/models.py,code:src/tree_walker/recorder/translation.py | A:- | S:副作用 navigate 必须丢弃：重放前置动作会再次触发跳转，Page.navigate 不幂等整页重载丢状态
+server.py[DU4T]: F:录制后端 aiohttp HTTP 服务（8765）：/start /event /signal /stop /health 五端点转发 Recorder；无状态 MV3 友好（SW 按需唤醒，规避 WS 长连接断开） | R:code:src/tree_walker/recorder/recorder.py | A:- | S:并发 /event+/stop 曾致录不全——串行化靠 Recorder 内 asyncio.Lock，handler 层勿再加锁重排
+translation.py[DU4S]: F:Stage1+4：translate_event 扩展事件→ActionRecord（调 map_event 纯映射+连续同 xpath input 聚合取最终值+focus/pending_modal 状态机）；不做定位——实时定位在 Recorder.handle_event | R:code:src/tree_walker/recorder/event_mapper.py,code:src/tree_walker/recorder/recorder.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/src/tree_walker/skills/===
+__init__.py[CE3T]: F:skills 门面：SkillLoader/TaskSkillLoader re-export——domain-skills/<host> 站点级与 tasks/<slug>/ 任务级两层 | R:code:src/tree_walker/skills/loader.py | A:- | S:-
+loader.py[IE4S]: F:站点级 skill 装载：domain-skills/<host>/{_sop,selectors,quirks}.md 固定读序渲染注入文本；按 host 缓存零每步 IO；相对路径 miss 回退包仓库根（评测 runner 独立 CWD 踩坑） | R:code:src/tree_walker/browser/url_utils.py | A:- | S:-
+task_loader.py[IE4S]: F:任务级 skill 卡装载：扫 domain-skills/<host_key>/tasks/*/_task.json 建 catalog（slug+description+keywords），命中才读三件套注入 [Task Skill]；坏卡静默跳过、catalog 空大声日志 | R:code:src/tree_walker/skills/loader.py,code:src/tree_walker/skills/task_matcher.py | A:- | S:-
+task_matcher.py[AA5M]: F:任务卡 LLM 匹配器（#182 模板语义匹配）：匹配单元=操作模板——实体/槽位值是参数永不拒绝，动作族/对象族/过滤维度差异才不命中；拿不准 null，confidence 非 high/medium 强制降档；structured_call 工具强制输出 | R:code:src/tree_walker/skills/task_loader.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/src/tree_walker/tools/===
+__init__.py[CB4T]: F:tools 门面：ActionRegistry/RegisteredAction/Tools re-export | R:code:src/tree_walker/tools/registry.py,code:src/tree_walker/tools/actions.py | A:- | S:-
+actions.py[AB7L]: F:Tools 执行引擎：24 动作 handler（_action_{name} 命名约定注册）；execute 参数展平+路由+_normalize；index 缓存优先回退实时；upload 智能定位+allowed_upload_paths 白名单；read_grid 表格读取；detached 守卫与无效果检测 | R:code:src/tree_walker/tools/registry.py,code:src/tree_walker/tools/models.py,code:src/tree_walker/browser/session.py | A:- | S:registry 不用 param_model 校验 execute 路径——handler 必须自加运行时守卫（params.get 而非 []，min_length 只是 schema 层）
+extract_markdown.py[KB3M]: F:HTML→干净 markdown 纯函数（markdownify+剥 nav/footer 噪声+折叠连续换行）与结构感知分块（按行贪心打包/表头延续），供 extract 分页 | R:code:src/tree_walker/browser/html_source.py,code:src/tree_walker/tools/actions.py | A:- | S:-
+models.py[CB6L]: F:动作参数 Pydantic 模型族（24 动作 *Params：定位 mixin/scroll clamp/upload/write/read/replace/evaluate/read_grid/done 等）——LLM schema 与直接构造的校验层 | R:code:src/tree_walker/tools/registry.py,code:src/tree_walker/tools/actions.py | A:- | S:-
+registry.py[CB6M]: F:ActionRegistry：RegisteredAction 元数据→单一 agent_response tool schema（动态生成/page_patterns 页面级过滤/三 output_mode/include_actions 白名单）与人类可读描述文本；registry_version 随定义变更 | R:code:src/tree_walker/tools/models.py,code:src/tree_walker/tools/actions.py | A:- | S:加新动作须三处同步：models.py Params+actions.py _action_ handler+schema 注册，漏一处即 Unknown action
+
+===D:/dev/git/z_jordon/TreeWalker/src/tree_walker/tui/===
+__init__.py[CU3T]: F:tui 门面：TreeWalkerApp/AgentLog/MultilineInput/RichLogHandler/EventBridge re-export | R:code:src/tree_walker/tui/app.py | A:- | S:-
+app.py[AU4M]: F:Textual TUI 主应用：四阶段启动（强制 observability）、Widget 树（欢迎面板/双列工作区/底部任务输入）、/rerun 命令解析、录制开关（yyyyMMddHHMM.json 落盘）、agent 任务桥接 | R:code:src/tree_walker/agent/agent.py,code:src/tree_walker/tui/widgets.py | A:- | S:-
+event_bridge.py[MU3T]: F:EventBus→RichLog 桥：订阅事件流按类型着色格式化写入 TUI 事件面板 | R:code:src/tree_walker/observability/events.py | A:- | S:-
+log_handler.py[MU2T]: F:Python logging→RichLog 桥：log_formatter 的 ANSI 彩色行原生渲染进 TUI | R:code:src/tree_walker/agent/log_formatter.py | A:- | S:-
+widgets.py[CU3S]: F:自定义 Textual 部件：AgentLog 自动滚动日志面板；MultilineInput 多行输入（Enter 提交/Shift+Enter 换行/历史导航消息） | R:code:src/tree_walker/tui/app.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/src/tree_walker/web/===
+__init__.py[CU1T]: F:web 包声明（单行 docstring；实现在 server.py） | R:code:src/tree_walker/web/server.py | A:- | S:-
+server.py[AU6L]: F:web 后端 aiohttp：live agent 任务（start/events SSE/pause-resume-stop/screencast 投屏）、流程库 /history CRUD+变量检测+重放+CSV 批量、技能面 /skills、设置面脱敏读写、静态托管 | R:code:src/tree_walker/agent/agent.py,code:src/tree_walker/recorder/server.py | A:- | S:加路由前缀必须同步 web_ui/vite.config.ts proxy 白名单——否则 dev 5173 SPA fallback 回 index.html 报 Unexpected token '<'（api.ts readJson 守卫只是兜底）
+
+===D:/dev/git/z_jordon/TreeWalker/web_ui/===
+index.html[FV2T]: F:Vite SPA 宿主页：root 挂载点+main.tsx 入口 | R:code:web_ui/src/main.tsx | A:- | S:-
+package-lock.json[FV2L]: F:npm 依赖锁定（React/Vite/TypeScript 工具链，机器生成） | R:code:web_ui/package.json | A:- | S:-
+package.json[FV2T]: F:web 前端 npm 定义：React+Vite+TypeScript 脚本与依赖（dev/build/test:jsdom） | R:- | A:- | S:-
+tsconfig.json[FV2T]: F:TS 编译配置（Vite React 模板） | R:code:web_ui/package.json | A:- | S:-
+vite.config.ts[FV3T]: F:Vite 配置：dev 5173 代理 /history+/task+/skills+/settings+/health→8766 同源免 CORS；vitest jsdom | R:code:web_ui/src/api.ts,code:src/tree_walker/web/server.py | A:- | S:后端新路由前缀必须同步 proxy 白名单（否则 dev SPA fallback）
+
+===D:/dev/git/z_jordon/TreeWalker/web_ui/src/===
+App.css[FV2S]: F:全局样式：模式布局/面板/live 状态点/事件时间线等 SPA 样式 | R:code:web_ui/src/AppShell.tsx | A:- | S:-
+AppShell.tsx[AU5S]: F:SPA 外壳：注册表驱动顶部模式（探索/流程库/技能/设置）、LiveTaskProvider 包裹（切模式保 live state）、TopBar 运行状态点与模型选择、⌘K 命令面板挂载 | R:code:web_ui/src/appNav.ts,code:web_ui/src/liveContext.tsx | A:- | S:-
+FlowWorkspace.tsx[AU4M]: F:流程库工作区：左 sidebar 流程列表+编辑/重放/详情 tab；reducer/handlers 全复用原编辑器（零回归）；「进行中」zone 接管活跃 live task（ADOPT+SSE 重订） | R:code:web_ui/src/reducer.ts,code:web_ui/src/components/ActionEditor.tsx | A:- | S:-
+api.ts[IU4M]: F:后端 API 封装：/history CRUD+变量检测+重放+批量、/task 启动与 SSE 订阅、/skills、/settings；readJson 守卫把 SPA fallback 的 HTML 响应转可诊断错误 | R:code:web_ui/vite.config.ts,code:src/tree_walker/web/server.py | A:- | S:-
+appNav.ts[CU2T]: F:跨组件导航 context（mode/skillsHost/openSkills/flowsName/openFlow/model）与模型静态候选 | R:code:web_ui/src/AppShell.tsx | A:- | S:-
+liveContext.tsx[CU3T]: F:live 任务 React context：唯一 reducer 实例挂 AppShell 级（切模式不卸载丢 state），RunView 为消费者 | R:code:web_ui/src/liveReducer.ts | A:- | S:-
+liveReducer.ts[CU3S]: F:live 任务单一 state reducer：phase/taskId/events/logs/screenshot/activeSkill/highlights/tokens；action 族 FIELD/STARTING/ADOPT/EVENT/PAUSED 等（SSE 事件驱动） | R:code:web_ui/src/types.ts | A:- | S:-
+main.tsx[EU2T]: F:React 挂载入口：createRoot→StrictMode→AppShell | R:code:web_ui/src/AppShell.tsx | A:- | S:-
+reducer.ts[CU3S]: F:流程编辑器 reducer：LOAD/SELECT/UPDATE_PARAM/MOVE_STEP/DELETE_STEP/手动变量增删/DETECT_DONE/RUN_DONE/BATCH_* action 族 | R:code:web_ui/src/types.ts | A:- | S:-
+types.ts[CU3S]: F:前端类型：与后端 AgentHistoryList.model_dump(mode=json) 对齐的 TS 镜像（ActionResult/AgentHistory/变量绑定/LiveState/TaskEvent 等） | R:code:src/tree_walker/agent/views.py | A:- | S:-
+
+===D:/dev/git/z_jordon/TreeWalker/web_ui/src/components/===
+ActionEditor.tsx[AU3T]: F:单步动作编辑器：参数字段编辑/增删动作（P4 可视化编辑） | R:code:web_ui/src/reducer.ts | A:- | S:-
+ActionList.tsx[AU3S]: F:历史步骤与动作列表：步骤选择/移动/删除/变量标注入口 | R:code:web_ui/src/reducer.ts | A:- | S:-
+BatchRunPanel.tsx[AU3T]: F:CSV 批量重放面板：批量启动与进度展示（行/步两级） | R:code:web_ui/src/api.ts,code:web_ui/src/reducer.ts | A:- | S:-
+BrowserView.tsx[AU2T]: F:浏览器视口面板：screencast 帧展示（截图/直播流双 mode） | R:code:web_ui/src/liveReducer.ts | A:- | S:-
+CommandPalette.tsx[AU3S]: F:⌘K 命令面板：模式切换/打开流程/模型切换等快捷命令 | R:code:web_ui/src/appNav.ts | A:- | S:-
+ContextPanel.tsx[AU3S]: F:右侧上下文面板：时间线选中事件的详情（params/结果/元素几何） | R:code:web_ui/src/liveReducer.ts | A:- | S:-
+DetailView.tsx[AU3S]: F:流程详情 tab：历史元信息与统计展示 | R:code:web_ui/src/FlowWorkspace.tsx | A:- | S:-
+LiveZone.tsx[AU2T]: F:运行视图 live 区：任务输入+启停控制+阶段状态 | R:code:web_ui/src/liveReducer.ts | A:- | S:-
+RunPanel.tsx[AU2T]: F:单流程重放面板：变量替换+重放触发与结果 | R:code:web_ui/src/api.ts | A:- | S:-
+RunView.tsx[AU4M]: F:探索模式运行视图：任务表单+事件时间线+日志+截图/投屏+活动技能 chip（站点级/任务级分开）+token 统计；SSE 订阅随 taskId 重订续播 | R:code:web_ui/src/liveContext.tsx,code:web_ui/src/api.ts | A:- | S:-
+SettingsShell.tsx[AU3S]: F:设置面：后端 /settings 白名单字段的读写（含密钥脱敏显示） | R:code:web_ui/src/api.ts | A:- | S:-
+SkillsShell.tsx[AU3S]: F:技能面：domain-skills 按 host 浏览与在线编辑（_sop/selectors/quirks） | R:code:web_ui/src/api.ts | A:- | S:-
+VariablePanel.tsx[AU2T]: F:变量面板：自动检测+人工标注变量的合并展示与编辑 | R:code:web_ui/src/reducer.ts | A:- | S:-

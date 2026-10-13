@@ -248,3 +248,7 @@ web_ui/node_modules/
 web_ui/dist/
 # 编辑器前端构建产物（由 scripts/build_editor.ps1 生成，不进 git）
 src/tree_walker/web/static/
+
+# AOCI agent host integration (machine-bound; do not commit)
+.mcp.json
+.mcp.json.backup.*
