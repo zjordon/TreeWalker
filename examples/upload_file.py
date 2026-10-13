@@ -55,6 +55,7 @@ async def main():
         reconnect_timeout=settings.agent.reconnect_timeout,
         truncation=settings.agent.truncation,
         enable_planning=True,
+        enable_skill_injection=False,
         allowed_upload_paths=[
             r"D:\Videos\test\final\2026-04-29-20-41-59.mp4",
             r"D:\dev\git\claude\skills-deom\ppt\browser-use\heng.png",
